@@ -57,8 +57,9 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
 subtle = { version = "2", default-features = false }
 # MCP `files` (A171/A172): openat with O_NOFOLLOW per component + fstat of the opened fd, without
-# unsafe code. Already in the tree (moochy-sandbox); only the `fs` feature.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+# unsafe code. Already in the tree (moochy-sandbox). `net` + `process`: CONTRACT §15.2 validator
+# (SCM_RIGHTS from the key-less zygote, reaping its single-use children), same safe API.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "net", "process"] }
 keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [lints.rust]

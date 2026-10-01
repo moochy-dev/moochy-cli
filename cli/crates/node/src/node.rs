@@ -107,6 +107,8 @@ pub struct Node {
     pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
+    /// Worker: single-use jailed request validators (CONTRACT §15.2).
+    pub validator: Option<Arc<crate::validator::Pool>>,
     /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
     pub store: Option<Arc<Mutex<Store>>>,
     /// Owner: requests waiting for this device's signature (pushed by the relay).
@@ -167,6 +169,7 @@ impl Node {
             catalogs: Mutex::new(VecDeque::new()),
             adapters: w.adapters,
             store: w.store,
+            validator: w.validator,
             approvals: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
@@ -453,6 +456,7 @@ pub fn plain_id(s: &str) -> bool {
 pub struct WorkerParts {
     pub adapters: Vec<Arc<Adapter>>,
     pub store: Option<Arc<Mutex<Store>>>,
+    pub validator: Option<Arc<crate::validator::Pool>>,
 }
 
 /// RAII counter for in-flight work (`gateway_tasks`, `worker_busy`).

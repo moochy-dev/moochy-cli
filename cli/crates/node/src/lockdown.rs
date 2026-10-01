@@ -18,6 +18,8 @@ pub struct Boot {
     pub cfg: Config,
     pub secrets: Secrets,
     pub listener: std::net::TcpListener,
+    /// Worker role: the key-less validator zygote, exec'd before the lockdown (§15.2).
+    pub validator: Option<std::sync::Arc<crate::validator::Pool>>,
 }
 
 impl Boot {
@@ -42,7 +44,14 @@ impl Boot {
             cfg.gateway_addr = Some(format!("127.0.0.1:{port}"));
             home.save(&cfg)?;
         }
-        Ok(Self { cfg, secrets, listener })
+        let validator = if cfg.has_role("worker") && !offline && secrets.device.is_some() {
+            let v = crate::validator::Pool::spawn().ctx("start the request validator")?;
+            v.fill();
+            Some(std::sync::Arc::new(v))
+        } else {
+            None
+        };
+        Ok(Self { cfg, secrets, listener, validator })
     }
 
     pub fn port(&self) -> u16 {

@@ -77,6 +77,10 @@ ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_D
 ";
 
 pub fn main() -> ExitCode {
+    // The validator zygote (CONTRACT §15.2): nothing else may run before it.
+    if let Some(code) = crate::validator::zygote_entry() {
+        return ExitCode::from(code);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -730,12 +734,12 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         }
     }
     let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
-    Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))) })
+    Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
 }
 
 async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
     let port = boot.port();
-    let crate::lockdown::Boot { cfg, secrets, listener } = boot;
+    let crate::lockdown::Boot { cfg, secrets, listener, validator } = boot;
     let listener = tokio::net::TcpListener::from_std(listener).ctx("gateway listener")?;
     let sock_path = home.socket_path();
     let sock = crate::ctl::bind(&sock_path).await?;
@@ -743,7 +747,8 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
         (Some(d), Some(id)) => Some(Keys { sign: d.sign_key(), enc: d.enc_key()?, device_id: id.parse().map_err(|_| auth("stored device id is invalid"))? }),
         _ => None,
     };
-    let parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
+    let mut parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
+    parts.validator = validator;
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));

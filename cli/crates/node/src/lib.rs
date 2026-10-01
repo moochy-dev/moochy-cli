@@ -34,6 +34,7 @@ pub mod scrub;
 pub mod task;
 pub mod tls;
 pub mod util;
+pub mod validator;
 pub mod worker;
 #[cfg(test)]
 mod voice;

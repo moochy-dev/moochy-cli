@@ -11,12 +11,13 @@ use crate::pb::local::JournalEntry;
 use crate::task::now_us;
 use crate::util::{clean, log, now_ms};
 use bytes::Bytes;
-use moochy_proto::crypto::{self, ContentKey, RequestOpener, ResponseSealer, SaltName};
+use moochy_proto::crypto::{self, ContentKey, RequestDecryptor, ResponseSealer, SaltName};
 use moochy_proto::money::{self, CatalogEntry};
 use moochy_proto::msg::{InnerPayload, Projection, Receipt, ReceiptStatus, RouteHeader, Usage};
 use moochy_proto::{PledgeId, TaskId};
 use moochy_worker::Effort;
 use moochy_worker::firewall::{self, MaxPrice, Policy, Route};
+use moochy_worker::validate::ValidateRequest;
 use moochy_worker::provider::Adapter;
 use moochy_worker::store::{Reservation, Store, StoreError};
 use moochy_worker::stream::StreamParser;
@@ -51,7 +52,7 @@ fn device_cap(node: &Node) -> Option<u64> {
 }
 
 fn can_serve(node: &Node) -> bool {
-    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && device_cap(node).is_some() && !node.adapters.is_empty()
+    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && node.validator.as_ref().is_some_and(|v| v.alive()) && device_cap(node).is_some() && !node.adapters.is_empty()
 }
 
 fn slots_max(node: &Node) -> u32 {
@@ -99,7 +100,7 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
     let headroom = |m: &str| rl.get(m).filter(|(_, exp)| *exp > now).map_or(100, |(p, _)| u32::from(*p));
     let models = served_models(node).into_iter().map(|(d, m)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m }).collect();
     drop(rl);
-    let free = if paused { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
+    let free = if paused || !can_serve(node) { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
     let cap = device_cap(node).unwrap_or(0);
     let left = node.store.as_ref().map_or(0, |s| lock(s).device_left(cap, now_ms()));
     let local_cap_left_uusd = i64::try_from(left).unwrap_or(i64::MAX);
@@ -108,7 +109,9 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
 
 /// Send a fresh offer (after a task ends, pause/resume, catalog change).
 pub fn reoffer(node: &Node) {
-    if can_serve(node)
+    // Also when we can no longer serve (validator gone): the offer then says 0 slots.
+    if node.cfg.has_role("worker")
+        && node.keys.is_some()
         && let Some(l) = node.link()
     {
         let _ = l.up.try_send(offer(node));
@@ -386,24 +389,89 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let task: TaskId = assign.task.parse().map_err(|_| refuse("bad_envelope", false, None))?;
     let attempt = u8::try_from(assign.attempt).map_err(|_| refuse("bad_envelope", false, None))?;
     let wrap = <[u8; crypto::WRAP_LEN]>::try_from(assign.wrap.as_ref()).map_err(|_| refuse("bad_envelope", false, None))?;
-    // 1. unwrap (fails if the route header was touched: HPKE AAD) → decrypt → decompress.
+    // 1. unwrap (fails if the route header was touched: HPKE AAD) → decrypt only. The stranger's
+    // bytes (zstd, JSON) are parsed in the jailed single-use validator, never here (§15.2).
     let ck = crypto::unwrap(&keys.enc, &task, &assign.route, &wrap).map_err(|_| refuse("bad_envelope", false, None))?;
     let with_ck = |code: &str, retry: bool, d: Option<String>| (Some(ck.clone()), Failure::new(code, retry, d));
-    let mut opener = RequestOpener::new(&ck, &task).map_err(|_| with_ck("bad_envelope", false, None))?;
+    let mut dec = RequestDecryptor::new(&ck, &task).map_err(|_| with_ck("bad_envelope", false, None))?;
     for c in body {
-        opener.push(c).map_err(|_| with_ck("bad_envelope", false, None))?;
+        dec.push(c).map_err(|_| with_ck("bad_envelope", false, None))?;
     }
-    if opener.chunks() != assign.body_chunks {
+    if dec.chunks() != assign.body_chunks {
         return Err(with_ck("bad_envelope", false, None));
     }
-    let payload = opener.finish().map_err(|_| with_ck("bad_envelope", false, None))?;
-    let inner = InnerPayload::parse(&payload).map_err(|_| with_ck("bad_envelope", false, None))?;
-    drop(payload);
+    let payload = dec.finish().map_err(|_| with_ck("bad_envelope", false, None))?;
+    // The route header is fixed-size-ish signed JSON: the parent's strict parser (CONTRACT §1).
     let route = RouteHeader::parse(&assign.route).map_err(|_| with_ck("bad_envelope", false, None))?;
-    // 2. Task authenticity (03 §7.2).
     if route.repo_id.text() != assign.repo_id {
         return Err(with_ck("unauthorized_task", false, Some("the request is for another project than this donation".into())));
     }
+    let now = now_ms();
+    if !task.admissible(now, node.boot_ms) {
+        return Err(with_ck("unauthorized_task", false, Some("task id outside the freshness window".into())));
+    }
+    let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
+    // 2. Adapter + catalog entry, pledge policy, route expectations for the validator.
+    let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
+    let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
+    let Some((adapter, entry)) = node.adapters.iter().find_map(|a| {
+        let e = cat.entry(&route.model, a.provider().as_str())?;
+        (a.provider().serves(dialect.worker()) && e.dialects.contains(&route.dialect)).then(|| (a.clone(), e.clone()))
+    }) else {
+        return Err(with_ck("model_unavailable", true, None));
+    };
+    let fwc = engine::fw_catalog(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
+    let policy = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
+    let mut aliases: Vec<&str> = vec![entry.model.as_str(), entry.provider_model_id.as_str()];
+    aliases.extend(entry.aliases.iter().map(String::as_str));
+    let effort = Effort::parse(&route.effort).ok_or_else(|| with_ck("route_mismatch", false, Some("effort".into())))?;
+    let flags = engine::route_flags(&route).ok_or_else(|| with_ck("route_mismatch", false, Some("flags".into())))?;
+    // ponytail: the gateway device is only known inside the payload, which the parent must not
+    // parse; until Assign carries it (verified against the child's answer), the provider-facing
+    // pseudonym is per (repo, donation) rather than per (repo, member device).
+    let pseudo = user_pseudonym(&assign.repo_id, &assign.pledge_id);
+    let req = ValidateRequest {
+        provider: adapter.provider(),
+        dialect: dialect.worker(),
+        policy,
+        catalog: fwc,
+        provider_model_id: &entry.provider_model_id,
+        user_pseudonym: &pseudo,
+        max_price: Some(MaxPrice { prompt_uusd_per_mtok: entry.input, completion_uusd_per_mtok: entry.out }),
+        route: Route {
+            dialect: dialect.worker(),
+            model_aliases: &aliases,
+            effort,
+            max_tokens: route.max_tokens.into(),
+            est_input_tokens: route.est_input_tokens,
+            cache_ttl: engine::cache_ttl_w(route.cache_ttl),
+            stream: route.stream,
+            flags,
+        },
+        payload: &payload,
+    };
+    // 3. Decompress + inner payload + firewall + route/body consistency, in the jailed child.
+    let validator = node.validator.as_ref().ok_or_else(|| with_ck("busy", true, None))?;
+    let v = validator.validate(&req).await.map_err(|e| {
+        let (code, retry) = e.nack();
+        if code == "busy" {
+            log("warn", "request validator failed", &json!({"task": task.text(), "error": e.to_string()}));
+        }
+        with_ck(code, retry, Some(e.to_string()))
+    })?;
+    drop(payload);
+    // The child's verdict is the firewall, but authenticity is checked here, by the parent:
+    // body hash + task signature over the exact bytes the child returned (03 §7.2).
+    let inner = InnerPayload {
+        v: 1,
+        body_b64: moochy_proto::Blob(v.body.to_vec()),
+        body_sha256: moochy_proto::B(v.body_sha256),
+        headers: v.headers.iter().cloned().collect(),
+        s: moochy_proto::B(v.s),
+        gateway_device: v.gateway_device.parse().map_err(|_| with_ck("bad_envelope", false, None))?,
+        task_sig: moochy_proto::B(v.task_sig),
+    };
+    let prepared = v.prepared;
     let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
     match gateway_key(node, &inner.gateway_device.text(), &assign.repo_id) {
         Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
@@ -416,63 +484,12 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         }
         None => return Err(with_ck("unauthorized_task", false, Some("gateway key not in the key log".into()))),
     }
-    let now = now_ms();
-    if !task.admissible(now, node.boot_ms) {
-        return Err(with_ck("unauthorized_task", false, Some("task id outside the freshness window".into())));
-    }
     let (gw, tid, ts) = (inner.gateway_device.text(), task.text(), task.0.timestamp_ms());
     match with_store(node, move |s| s.check_served(&gw, &tid, ts, now)).await {
         Some(Ok(())) => {}
         Some(Err(StoreError::Stale | StoreError::Replay)) => return Err(with_ck("unauthorized_task", false, Some("task already served".into()))),
         _ => return Err(with_ck("busy", true, None)),
     }
-    let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
-    // 3. Adapter + catalog entry, firewall, route/body consistency.
-    let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
-    let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
-    let Some((adapter, entry)) = node.adapters.iter().find_map(|a| {
-        let e = cat.entry(&route.model, a.provider().as_str())?;
-        (a.provider().serves(dialect.worker()) && e.dialects.contains(&route.dialect)).then(|| (a.clone(), e.clone()))
-    }) else {
-        return Err(with_ck("model_unavailable", true, None));
-    };
-    let fwc = engine::fw_catalog(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
-    let policy = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
-    let hdrs: Vec<(&str, &str)> = inner.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let pseudo = user_pseudonym(&assign.repo_id, &inner.gateway_device.text());
-    let fw = firewall::Request {
-        provider: adapter.provider(),
-        dialect: dialect.worker(),
-        body: &inner.body_b64.0,
-        headers: &hdrs,
-        policy: &policy,
-        catalog: &fwc,
-        provider_model_id: &entry.provider_model_id,
-        user_pseudonym: &pseudo,
-        max_price: Some(MaxPrice { prompt_uusd_per_mtok: entry.input, completion_uusd_per_mtok: entry.out }),
-    };
-    let prepared = firewall::prepare(&fw).map_err(|r| {
-        let (code, retry) = r.code.nack();
-        with_ck(code, retry, Some(r.to_string()))
-    })?;
-    let mut aliases: Vec<&str> = vec![entry.model.as_str(), entry.provider_model_id.as_str()];
-    aliases.extend(entry.aliases.iter().map(String::as_str));
-    let effort = Effort::parse(&route.effort).ok_or_else(|| with_ck("route_mismatch", false, Some("effort".into())))?;
-    let flags = engine::route_flags(&route).ok_or_else(|| with_ck("route_mismatch", false, Some("flags".into())))?;
-    let r = Route {
-        dialect: dialect.worker(),
-        model_aliases: &aliases,
-        effort,
-        max_tokens: route.max_tokens.into(),
-        est_input_tokens: route.est_input_tokens,
-        cache_ttl: engine::cache_ttl_w(route.cache_ttl),
-        stream: route.stream,
-        flags,
-    };
-    prepared.facts.check_route(dialect.worker(), &r).map_err(|e| {
-        let (code, retry) = e.code.nack();
-        with_ck(code, retry, Some(e.to_string()))
-    })?;
     // 4. Local reservation: device cap, plus the pledge's per-task cap and headroom from Assign.
     let amount = money::reserve_for_route(&entry, &route).ok().and_then(|a| u64::try_from(a).ok()).ok_or_else(|| with_ck("local_cap", true, None))?;
     let positive = |v: i64| u64::try_from(v).ok().filter(|v| *v > 0);
