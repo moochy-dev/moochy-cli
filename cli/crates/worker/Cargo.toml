@@ -28,6 +28,9 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
+# Test-only: an HTTP/2 + TLS fake provider to exercise the production h2 path.
+hyper = { version = "1.7", default-features = false, features = ["server", "http1", "http2"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"

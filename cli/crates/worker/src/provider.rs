@@ -341,8 +341,12 @@ impl Adapter {
             return Err(Failure::new(FailKind::Unsupported, "dialect not served by this provider"));
         }
         let t = &self.target;
-        let scheme = if t.tls { "https" } else { "http" };
-        let uri = format!("{scheme}://{}{}{}", t.authority, t.root, path(self.provider, dialect));
+        // h2 needs the absolute URI (:scheme/:authority); HTTP/1.1 wants origin-form + Host.
+        let uri = if t.tls {
+            format!("https://{}{}{}", t.authority, t.root, path(self.provider, dialect))
+        } else {
+            format!("{}{}", t.root, path(self.provider, dialect))
+        };
         let mut b = hyper::Request::post(uri)
             .header("content-type", "application/json")
             .header("user-agent", USER_AGENT)

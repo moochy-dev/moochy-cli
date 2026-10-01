@@ -1,6 +1,6 @@
 //! Table-driven firewall tests (plan 06 §7): every deny, nested content, strict JSON,
 //! huge inputs, header allowlist, route facts, safe mutations.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines)]
+#![allow(clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines)]
 
 use moochy_worker::firewall::{self, Catalog, CacheTtl, Level, MaxPrice, Policy, RejectCode, Request, Route};
 use moochy_worker::{Dialect, Effort, Flags, Provider};
@@ -368,5 +368,30 @@ fn route_check() {
         let e = f.check_route(Dialect::AnthropicMessages, &r).unwrap_err();
         assert_eq!((e.code, e.path.as_str()), (RejectCode::RouteMismatch, field));
         assert_eq!(e.code.nack(), ("route_mismatch", false));
+    }
+}
+
+/// CONTRACT §13 (Assign → Ack ≤ 1 ms): firewall + facts + mutations on a ~100 KB agent body.
+#[test]
+fn prepare_latency_100kb() {
+    let turn = r#",{"role":"assistant","content":[{"type":"text","text":"Reading the file now."},{"type":"tool_use","id":"toolu_x","name":"Bash","input":{"command":"cat src/main.rs"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_x","content":"fn main() {\n    println!(\"hello\");\n}\n// padding padding padding padding padding padding padding padding padding padding"}]}"#;
+    let body = CLAUDE_CODE_LIKE.replacen(
+        r#"{"role":"user","content":[{"type":"text","text":"list files"}]}"#,
+        &format!(r#"{{"role":"user","content":[{{"type":"text","text":"list files"}}]}}{}"#, turn.repeat(100_000 / turn.len())),
+        1,
+    );
+    assert!(body.len() > 95_000);
+    let p = policy(Flags::NONE);
+    let r = req(Provider::Anthropic, Dialect::AnthropicMessages, &body, &p, None);
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..50 {
+        let t = std::time::Instant::now();
+        let out = firewall::prepare(&r).unwrap();
+        best = best.min(t.elapsed());
+        assert!(out.body.len() > 90_000);
+    }
+    println!("prepare({} B): best {best:?}", body.len());
+    if !cfg!(debug_assertions) {
+        assert!(best < std::time::Duration::from_millis(1));
     }
 }

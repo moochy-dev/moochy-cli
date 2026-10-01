@@ -1,6 +1,6 @@
 //! Outbox / served-set / reservation store: caps, replay protection, retention, and crash
 //! safety (a kill mid-write simulated by truncating the log at every byte offset).
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#![allow(clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use std::path::PathBuf;
 

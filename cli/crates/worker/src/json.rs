@@ -217,6 +217,10 @@ impl Parser<'_, '_> {
         let start = self.pos;
         let mut esc = false;
         loop {
+            // Fast skip of plain bytes (the bulk of prompts), then handle the special byte.
+            let rest = self.s.get(self.pos..).unwrap_or_default();
+            let plain = rest.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(rest.len());
+            self.pos = self.pos.saturating_add(plain);
             match self.peek() {
                 None => return self.err("unterminated string"),
                 Some(b'"') => break,

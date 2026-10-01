@@ -1,6 +1,6 @@
 //! Response parser tests against recorded-shape SSE fixtures (plan 05 §3, 03 §12.3), plus
 //! the throughput / per-chunk cost measurement required by CONTRACT §13.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
+#![allow(clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
 
 use moochy_worker::Dialect;
 use moochy_worker::stream::{Event, Outcome, Span, StreamError, StreamParser, Usage};
