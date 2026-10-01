@@ -59,7 +59,15 @@ pub enum Event<'a> {
     Error,
     /// End of message (`message_stop` / `[DONE]`).
     Stop,
+    /// An event this parser cannot fully account for (unparsable or duplicate-key JSON,
+    /// stray `\r`, BOM, tool input outside the delta stream, deltas for closed or unknown
+    /// tool blocks, extra choices, unindexed or reopened tool calls). **Fail closed:** the
+    /// Gateway must not forward it and should fail the task; usage becomes estimated.
+    Invalid,
 }
+
+/// Most tool-call blocks open at once (bounds the per-stream index set).
+const MAX_OPEN_TOOLS: usize = 64;
 
 /// Per-chunk summary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +109,8 @@ pub struct Outcome {
     pub provider_error: bool,
     /// A forbidden block type appeared (06 §8 structural check).
     pub forbidden: bool,
+    /// At least one [`Event::Invalid`] was emitted.
+    pub malformed: bool,
     /// Offset of the first byte not covered by any span (unterminated tail).
     pub tail: u64,
 }
@@ -160,8 +170,17 @@ struct State {
     done: bool,
     error: bool,
     forbidden: bool,
+    malformed: bool,
     tainted: bool,
     out_bytes: u64,
+    /// OpenAI: highest tool-call index started (indices only move forward).
+    oa_last: Option<u32>,
+}
+
+fn invalid(st: &mut State, span: Span, sink: &mut dyn FnMut(Span, Event<'_>)) {
+    st.malformed = true;
+    st.tainted = true;
+    sink(span, Event::Invalid);
 }
 
 pub struct StreamParser {
@@ -170,6 +189,8 @@ pub struct StreamParser {
     line: Vec<u8>,
     data: Vec<u8>,
     has_data: bool,
+    /// The current event contained a line we refuse to interpret.
+    bad_line: bool,
     tape: Vec<Node>,
     pos: u64,
     ev_start: u64,
@@ -194,6 +215,7 @@ impl StreamParser {
             line: Vec::new(),
             data: Vec::new(),
             has_data: false,
+            bad_line: false,
             tape: Vec::new(),
             pos: 0,
             ev_start: 0,
@@ -247,13 +269,23 @@ impl StreamParser {
             let span = Span { start: self.ev_start, end: self.pos };
             self.ev_start = self.pos;
             out.events = out.events.saturating_add(1);
-            if self.has_data {
+            if std::mem::replace(&mut self.bad_line, false) {
+                self.has_data = false;
+                self.data.clear();
+                invalid(&mut self.st, span, sink);
+            } else if self.has_data {
                 self.has_data = false;
                 self.dispatch(span, sink, out);
                 self.data.clear();
             } else {
                 sink(span, Event::Other);
             }
+            return Ok(());
+        }
+        // The SSE spec also ends lines at a lone CR and strips a BOM; providers never send
+        // either, so instead of a second line-splitting rule we refuse them (no differential).
+        if line.contains(&b'\r') || line.starts_with(b"\xEF\xBB\xBF") {
+            self.bad_line = true;
             return Ok(());
         }
         if line.first() == Some(&b':') {
@@ -296,10 +328,7 @@ impl StreamParser {
                 };
                 out.tool_ends = out.tool_ends.saturating_add(ends);
             }
-            Err(_) => {
-                self.st.tainted = true;
-                sink(span, Event::Other);
-            }
+            Err(_) => invalid(&mut self.st, span, sink),
         }
         self.tape = tape;
     }
@@ -351,6 +380,7 @@ impl StreamParser {
             complete: st.done,
             provider_error: st.error,
             forbidden: st.forbidden,
+            malformed: st.malformed,
             tail: if self.stream { self.ev_start } else { self.pos },
         }
     }
@@ -368,39 +398,44 @@ const PLAIN_BLOCKS: [&str; 3] = ["text", "thinking", "redacted_thinking"];
 
 fn anthropic_event(st: &mut State, v: Val<'_>, data_len: u64, span: Span, sink: &mut dyn FnMut(Span, Event<'_>)) -> u32 {
     let Some(ty) = v.get("type") else {
-        st.tainted = true;
-        sink(span, Event::Other);
+        invalid(st, span, sink);
         return 0;
     };
     let index = u32_of(v.get("index"));
     if ty.is_str("content_block_delta") {
         let d = v.get("delta");
-        if let (Some(i), Some(pj)) = (index, d.and_then(|d| d.get("partial_json")))
-            && st.open_tools.contains(&i)
-        {
-            sink(span, Event::ToolArgs { index: i, json: pj });
-        } else {
-            st.out_bytes = st.out_bytes.saturating_add(data_len);
-            sink(span, Event::Other);
+        let pj = d.and_then(|d| d.get("partial_json"));
+        let is_json = pj.is_some() || d.and_then(|d| d.get("type")).is_some_and(|t| t.is_str("input_json_delta"));
+        match (index, pj) {
+            (Some(i), Some(pj)) if pj.kind() == Kind::Str && st.open_tools.contains(&i) => sink(span, Event::ToolArgs { index: i, json: pj }),
+            // Tool input for a block that is not an open tool_use block: refuse.
+            _ if is_json || index.is_some_and(|i| st.open_tools.contains(&i)) => invalid(st, span, sink),
+            _ => {
+                st.out_bytes = st.out_bytes.saturating_add(data_len);
+                sink(span, Event::Other);
+            }
         }
     } else if ty.is_str("content_block_start") {
-        let cb = v.get("content_block");
+        let cb = v.get("content_block").filter(|c| c.kind() == Kind::Obj);
         let bt = cb.and_then(|c| c.get("type"));
         match (bt, index) {
             (Some(t), Some(i)) if t.is_str("tool_use") => {
+                // Real streams send `"input":{}` here; input smuggled into the start event
+                // would bypass delta assembly and inspection.
+                let empty_input = cb.and_then(|c| c.get("input")).is_none_or(|x| x.kind() == Kind::Obj && x.entries().next().is_none());
+                if !empty_input || st.open_tools.contains(&i) || st.open_tools.len() >= MAX_OPEN_TOOLS {
+                    invalid(st, span, sink);
+                    return 0;
+                }
                 st.open_tools.push(i);
-                let cb = cb.and_then(|c| (c.kind() == Kind::Obj).then_some(c));
                 sink(span, Event::ToolStart { index: i, id: cb.and_then(|c| c.get("id")), name: cb.and_then(|c| c.get("name")) });
             }
-            (Some(t), _) if PLAIN_BLOCKS.iter().any(|p| t.is_str(p)) => sink(span, Event::Other),
-            (Some(t), _) => {
+            (Some(t), Some(i)) if PLAIN_BLOCKS.iter().any(|p| t.is_str(p)) && !st.open_tools.contains(&i) => sink(span, Event::Other),
+            (Some(t), Some(_)) if !PLAIN_BLOCKS.iter().any(|p| t.is_str(p)) => {
                 st.forbidden = true;
                 sink(span, Event::Forbidden { block_type: t });
             }
-            (None, _) => {
-                st.tainted = true;
-                sink(span, Event::Other);
-            }
+            _ => invalid(st, span, sink),
         }
     } else if ty.is_str("content_block_stop") {
         if let Some(p) = index.and_then(|i| st.open_tools.iter().position(|&o| o == i)) {
@@ -411,6 +446,11 @@ fn anthropic_event(st: &mut State, v: Val<'_>, data_len: u64, span: Span, sink: 
         sink(span, Event::Other);
     } else if ty.is_str("message_start") {
         let m = v.get("message");
+        // Content must arrive as blocks; a pre-filled message could carry a tool call.
+        if m.and_then(|m| m.get("content")).is_some_and(|c| c.kind() != Kind::Arr || c.items().next().is_some()) {
+            invalid(st, span, sink);
+            return 0;
+        }
         set_once(&mut st.id, m.and_then(|m| m.get("id")));
         set_once(&mut st.model, m.and_then(|m| m.get("model")));
         if let Some(u) = m.and_then(|m| m.get("usage")) {
@@ -464,25 +504,47 @@ fn openai_chunk(st: &mut State, v: Val<'_>, data_len: u64, span: Span, sink: &mu
     set_once(&mut st.model, v.get("model"));
     let mut ends = 0u32;
     let mut emitted = false;
-    for c in v.get("choices").map(Val::items).into_iter().flatten() {
-        if c.get("index").and_then(Val::as_u64) != Some(0) {
-            st.tainted = true;
-            continue;
-        }
+    let choices = v.get("choices");
+    // Refuse what the tool-call tracker cannot account for (n > 1 is denied upstream).
+    let bad = choices.is_some_and(|ch| {
+        ch.items().any(|c| {
+            let d = c.get("delta");
+            c.get("index").and_then(Val::as_u64) != Some(0)
+                || c.get("message").is_some()
+                || d.and_then(|d| d.get("function_call")).is_some_and(|f| !f.is_null())
+                || d.and_then(|d| d.get("tool_calls")).is_some_and(|t| t.kind() != Kind::Arr && !t.is_null())
+        })
+    });
+    if bad {
+        invalid(st, span, sink);
+        return 0;
+    }
+    for c in choices.map(Val::items).into_iter().flatten() {
         let d = c.get("delta");
         for tc in d.and_then(|d| d.get("tool_calls")).map(Val::items).into_iter().flatten() {
-            let Some(i) = u32_of(tc.get("index")) else {
-                st.tainted = true;
-                continue;
-            };
             let f = tc.get("function");
-            if st.oa_open != Some(i) {
+            let name = f.and_then(|f| f.get("name"));
+            let Some(i) = u32_of(tc.get("index")) else {
+                invalid(st, span, sink);
+                return ends;
+            };
+            if st.oa_open == Some(i) {
+                if name.is_some_and(|n| n.kind() != Kind::Null && !n.raw().is_empty()) {
+                    invalid(st, span, sink); // a second name for the same call
+                    return ends;
+                }
+            } else {
+                if st.oa_last.is_some_and(|last| i <= last) {
+                    invalid(st, span, sink); // reopened or out-of-order tool call
+                    return ends;
+                }
                 if let Some(prev) = st.oa_open {
                     ends = ends.saturating_add(1);
                     sink(span, Event::ToolEnd { index: prev });
                 }
                 st.oa_open = Some(i);
-                sink(span, Event::ToolStart { index: i, id: tc.get("id"), name: f.and_then(|f| f.get("name")) });
+                st.oa_last = Some(i);
+                sink(span, Event::ToolStart { index: i, id: tc.get("id"), name });
             }
             if let Some(a) = f.and_then(|f| f.get("arguments")).filter(|a| a.kind() == Kind::Str) {
                 sink(span, Event::ToolArgs { index: i, json: a });

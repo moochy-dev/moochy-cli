@@ -153,6 +153,10 @@ fn anthropic_gated_features_set_flags() {
     assert_eq!(f.text_bytes, body.len() as u64 - 12);
     assert_eq!(f.est_input_tokens, f.text_bytes.div_ceil(3) + 1600);
 
+    let tier = anth(r#""hi""#, r#","service_tier":"standard_only","inference_geo":"us""#);
+    let f = firewall::analyze(Dialect::AnthropicMessages, tier.as_bytes(), &[], &Policy::PERMISSIVE, &CAT).unwrap();
+    assert_eq!(f.flags, Flags::SERVICE_TIER.with(Flags::INFERENCE_GEO), "gated features are recorded for the route header");
+
     let paranoid = Policy { level: Level::Paranoid, ..all };
     let e = analyze(Dialect::AnthropicMessages, &body, &[], paranoid).unwrap_err();
     assert!(e.to_string().contains("paranoid"), "{e}");

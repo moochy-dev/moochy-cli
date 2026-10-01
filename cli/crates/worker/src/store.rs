@@ -12,7 +12,9 @@
 //! at its amount after 24 h (like the Relay's sweep, 05 §5.2).
 //!
 //! Frames: `u32_be len | u32_be crc32(body) | body`. A torn or corrupt tail (crash mid-
-//! write) is truncated on open. Blocking file I/O: call from a blocking-friendly thread.
+//! write) is truncated on open. A corrupt frame in the *middle* (bit rot) also truncates
+//! everything after it: unacked receipts after it are lost and settle pessimistically on
+//! the Relay side (05 §5.2). Blocking file I/O: call from a blocking-friendly thread.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -327,16 +329,18 @@ impl Store {
             }
         }
         let tmp = self.path.with_extension("compact");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&out)?;
-            f.sync_all()?;
-        }
+        // Keep the handle across the rename: it then *is* the live log, so a later failure
+        // (directory fsync) can never leave appends going to an unlinked file.
+        let mut f = OpenOptions::new().read(true).append(true).create(true).truncate(false).open(&tmp)?;
+        f.set_len(0)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
+        self.file = f;
+        #[cfg(unix)]
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             File::open(dir)?.sync_all()?;
         }
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
         Ok(())
     }
 }

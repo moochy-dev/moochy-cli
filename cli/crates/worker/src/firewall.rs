@@ -42,7 +42,13 @@ impl Policy {
     /// Everything a pledge could opt into: used by the Gateway to compute route facts.
     pub const PERMISSIVE: Self = Self {
         level: Level::Strict,
-        flags: Flags(0).with(Flags::IMAGES).with(Flags::DOCUMENTS).with(Flags::FAST).with(Flags::LONG_CONTEXT),
+        flags: Flags(0)
+            .with(Flags::IMAGES)
+            .with(Flags::DOCUMENTS)
+            .with(Flags::FAST)
+            .with(Flags::LONG_CONTEXT)
+            .with(Flags::SERVICE_TIER)
+            .with(Flags::INFERENCE_GEO),
         max_effort: Effort::Max,
     };
 }
@@ -625,8 +631,14 @@ impl<'a> Walk<'a> {
                     self.acc.flags = self.acc.flags.with(Flags::FAST);
                 }
             }
-            Hook::ServiceTier => self.need(Flags::SERVICE_TIER, "is not allowed: the service tier is the donor's call")?,
-            Hook::InferenceGeo => self.need(Flags::INFERENCE_GEO, "is not allowed: data residency is the donor's call")?,
+            Hook::ServiceTier => {
+                self.need(Flags::SERVICE_TIER, "is not allowed: the service tier is the donor's call")?;
+                self.acc.flags = self.acc.flags.with(Flags::SERVICE_TIER);
+            }
+            Hook::InferenceGeo => {
+                self.need(Flags::INFERENCE_GEO, "is not allowed: data residency is the donor's call")?;
+                self.acc.flags = self.acc.flags.with(Flags::INFERENCE_GEO);
+            }
             Hook::One => {
                 if v.as_u64() != Some(1) {
                     return self.fail("must be 1 (n > 1 multiplies output beyond max_tokens)");
