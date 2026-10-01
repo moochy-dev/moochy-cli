@@ -23,15 +23,17 @@ fn message(f: &Failure) -> String {
     if let Some(d) = &f.detail {
         return d.clone();
     }
-    match f.code.as_str() {
-        "over_task_cap" => "moochy: this request could cost more than the donors' limit per request; lower max_tokens".into(),
-        "quota_exceeded" => "moochy: your monthly limit for this project, or its donations for the month, are used up".into(),
-        "firewall" => "moochy: request refused by the safety checks".into(),
-        "route_mismatch" => "moochy: route header does not match the request body".into(),
-        "rate_limited" => "moochy: the donor's provider is rate limited; retry later".into(),
-        "bad_envelope" => "moochy: response failed authentication (possible tampering); retry".into(),
-        code => format!("moochy: {code}"),
-    }
+    // Plain words first (docs/brand/VOICE.md), then the machine code for agents and scripts.
+    let text = match f.code.as_str() {
+        "over_task_cap" => "this request could cost more than the donors' limit per request; lower max_tokens",
+        "quota_exceeded" => "your monthly limit for this project, or its donations for the month, are used up",
+        "firewall" => "request refused by the safety checks",
+        "route_mismatch" => "the route header does not match the request body",
+        "rate_limited" => "the donor's provider is rate limited; retry later",
+        "bad_envelope" => "the response failed authentication (possible tampering); retry",
+        code => return format!("moochy: {code}"),
+    };
+    format!("moochy: {text} ({})", f.code)
 }
 
 /// Status + JSON body in the dialect's shape.
