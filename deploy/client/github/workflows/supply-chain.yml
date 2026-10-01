@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Supply-chain gate for every PR and push (06 §12, CI-08).
+name: supply-chain
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - run: deploy/client/scripts/dco-check.sh "origin/${GITHUB_BASE_REF}" HEAD
+
+  deny-vet:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Install cargo-deny and cargo-vet (pinned, locked)
+        run: cargo install --locked cargo-deny@0.20.2 cargo-vet@0.10.0
+      - run: deploy/client/scripts/supply-chain.sh
+
+  reproducible:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - run: sudo apt-get install -y musl-tools
+      - run: rustup target add "${{ matrix.target }}"
+      - name: Two builds at different paths must be bit-identical
+        run: deploy/client/scripts/repro-check.sh --target "${{ matrix.target }}"

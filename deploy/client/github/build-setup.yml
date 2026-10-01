@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Injected by cargo-dist into every build job (dist-workspace.toml:
+# github-build-setup). Keep in sync with deploy/client/scripts/repro-check.sh.
+- name: Reproducible build flags
+  shell: bash
+  run: |
+    cargo_home=${CARGO_HOME:-$HOME/.cargo}
+    {
+      echo "CARGO_INCREMENTAL=0"
+      echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)"
+      echo "RUSTFLAGS=--remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$cargo_home=/cargo"
+    } >> "$GITHUB_ENV"
+    # ring's C code on native musl builds (dist installs musl-tools)
+    if command -v musl-gcc >/dev/null; then
+      printf 'CC_x86_64_unknown_linux_musl=musl-gcc\nCC_aarch64_unknown_linux_musl=musl-gcc\n' >> "$GITHUB_ENV"
+    fi
