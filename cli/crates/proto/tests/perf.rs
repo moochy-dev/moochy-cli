@@ -1,5 +1,7 @@
-//! Performance + allocation checks (CONTRACT §13). Own binary so the counting allocator only
-//! sees this test. Run: `cargo test --release -p moochy-proto --test perf -- --ignored --nocapture`
+//! Performance + allocation checks (CONTRACT §13, R6). Own binary so the counting allocator only
+//! sees this test. Runs in every `cargo test` (smaller workload, allocation budget enforced);
+//! throughput/latency budgets are enforced in release builds, which CI must run:
+//! `cargo test --release -p moochy-proto --test perf -- --nocapture`
 #![allow(clippy::pedantic, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 use bytes::BytesMut;
@@ -18,7 +20,6 @@ fn pct(mut v: Vec<Duration>, p: usize) -> Duration {
 }
 
 #[test]
-#[ignore = "benchmark: run in release"]
 fn perf() {
     let ck = ContentKey::from_bytes([0x11; 32]);
     let task: TaskId = "01K6A0000000000000000000T1".parse().unwrap();
@@ -75,48 +76,52 @@ fn perf() {
     println!("RequestOpener: {} chunks, {} allocations, {} reallocations (output growth only)", sealed.chunks.len() - 1, st.allocations, st.reallocations);
     assert_eq!(o.finish().unwrap(), big);
 
-    // 3) Response stream: 64 KiB chunks, MB/s and allocations per chunk.
+    // 3) Response stream: 64 KiB chunks, MB/s and allocations per chunk. Best of 3 runs (shared
+    //    machines are noisy; the budget is about what the code can do, not about the neighbours).
     let total = if release { 1 << 30 } else { 32 << 20 };
-    let n = total / MAX_CHUNK;
+    let n = total / MAX_CHUNK / 3;
     let pt = vec![0x5Au8; MAX_CHUNK];
-    let mut s = ResponseSealer::new(&ck, &r, &task, &w, 1).unwrap();
-    let mut op = ResponseOpener::new(&ck, &r, &task, &w, 1).unwrap();
     let mut out = BytesMut::with_capacity(MAX_CHUNK + 64);
-    // Warm up: first chunk sizes the arenas.
-    let c = s.seal(&pt, false).unwrap();
-    op.open_into(&c, &mut out).unwrap();
-    drop(c);
-    let (mut ts, mut to) = (Duration::ZERO, Duration::ZERO);
-    let reg = Region::new(GLOBAL);
-    for i in 1..n {
-        let t = Instant::now();
-        let c = s.seal(&pt, i + 1 == n).unwrap();
-        ts += t.elapsed();
+    let mbps = |d: Duration| (n * MAX_CHUNK) as f64 / d.as_secs_f64() / 1e6;
+    let (mut best_seal, mut best_open, mut allocs) = (0f64, 0f64, 0u64);
+    for rep in 0..3u8 {
+        let mut s = ResponseSealer::new(&ck, &r, &task, &w, 1 + rep).unwrap();
+        let mut op = ResponseOpener::new(&ck, &r, &task, &w, 1 + rep).unwrap();
+        // Warm up: first chunk sizes the arenas.
+        let c = s.seal(&pt, false).unwrap();
         out.clear();
-        let t = Instant::now();
         op.open_into(&c, &mut out).unwrap();
-        to += t.elapsed();
+        drop(c);
+        let (mut ts, mut to) = (Duration::ZERO, Duration::ZERO);
+        let reg = Region::new(GLOBAL);
+        for i in 0..n {
+            let t = Instant::now();
+            let c = s.seal(&pt, i + 1 == n).unwrap();
+            ts += t.elapsed();
+            out.clear();
+            let t = Instant::now();
+            op.open_into(&c, &mut out).unwrap();
+            to += t.elapsed();
+        }
+        let st = reg.change();
+        assert!(op.is_complete());
+        allocs += (st.allocations + st.reallocations) as u64;
+        best_seal = best_seal.max(mbps(ts));
+        best_open = best_open.max(mbps(to));
     }
-    let st = reg.change();
-    assert!(op.is_complete());
-    let mbps = |d: Duration| ((n - 1) * MAX_CHUNK) as f64 / d.as_secs_f64() / 1e6;
-    println!(
-        "64 KiB chunks × {}: seal {:.0} MB/s, open {:.0} MB/s (incl. running SHA-256); allocations {} over {} chunks",
-        n - 1,
-        mbps(ts),
-        mbps(to),
-        st.allocations + st.reallocations,
-        n - 1
-    );
-    assert_eq!(st.allocations + st.reallocations, 0, "no allocation per chunk once warm");
+    println!("64 KiB chunks × {n} × 3: best seal {best_seal:.0} MB/s, best open {best_open:.0} MB/s (incl. running SHA-256); allocations {allocs}");
+    assert_eq!(allocs, 0, "no allocation per chunk once warm");
 
-    // 3b) AEAD only (request path, no running hash): 256 MiB through seal_compressed + open.
+    // 3b) AEAD only (request path, no running hash): best of 3 × 64 MiB through seal_compressed.
     let raw = vec![0x5Au8; 256 << 20];
-    let t = Instant::now();
-    let sealed = crypto::seal_compressed(&ck, &task, &raw).unwrap();
-    let aead_seal = (256 << 20) as f64 / t.elapsed().as_secs_f64() / 1e6;
-    println!("AEAD only (no SHA-256): seal {aead_seal:.0} MB/s over {} chunks", sealed.chunks.len());
-    drop(sealed);
+    let mut aead_seal = 0f64;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let sealed = crypto::seal_compressed(&ck, &task, &raw[..64 << 20]).unwrap();
+        aead_seal = aead_seal.max((64 << 20) as f64 / t.elapsed().as_secs_f64() / 1e6);
+        assert!(sealed.body_len > 0);
+    }
+    println!("AEAD only (no SHA-256): best seal {aead_seal:.0} MB/s");
 
     // 3c) One-shot SHA-256 (body_sha256 of a large body).
     let t = Instant::now();
@@ -138,7 +143,8 @@ fn perf() {
 
     if release {
         assert!(p50 <= Duration::from_millis(1) && p99 <= Duration::from_millis(3), "100 KB seal over budget");
-        assert!(aead_seal >= 800.0, "AEAD below the 800 MB/s target");
-        assert!(mbps(ts) >= 600.0 && mbps(to) >= 600.0, "AEAD + running SHA-256 below 600 MB/s");
+        // CONTRACT R6: AEAD ≥ 800 MB/s per core; AEAD + running SHA-256 ≥ 750 MB/s per core.
+        assert!(aead_seal >= 800.0, "AEAD below the R6 800 MB/s budget");
+        assert!(best_seal >= 750.0 && best_open >= 750.0, "AEAD + running SHA-256 below the R6 750 MB/s budget");
     }
 }
