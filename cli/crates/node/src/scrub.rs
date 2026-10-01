@@ -6,6 +6,7 @@ const TOKEN_PREFIXES: &[(&[u8], usize, &str)] = &[
     (b"sk-ant-", 20, "anthropic_key"),
     (b"sk-or-v1-", 20, "openrouter_key"),
     (b"sk-proj-", 20, "openai_key"),
+    (b"xai-", 20, "xai_key"),
     (b"sk-", 32, "api_key"),
     (b"ghp_", 30, "github_token"),
     (b"gho_", 30, "github_token"),

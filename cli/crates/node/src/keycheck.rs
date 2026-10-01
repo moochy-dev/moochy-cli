@@ -12,6 +12,9 @@ use tokio::time::timeout;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Donor providers `moochy keys add` accepts (CONTRACT §9).
+pub const PROVIDERS: &[&str] = &["anthropic", "openai", "openrouter", "deepseek", "xai"];
+
 /// Provider origin and models path (relative to the origin).
 fn endpoint(provider: &str) -> Option<(&'static str, &'static str)> {
     Some(match provider {
@@ -19,6 +22,7 @@ fn endpoint(provider: &str) -> Option<(&'static str, &'static str)> {
         "openai" => ("https://api.openai.com", "/v1/models"),
         "deepseek" => ("https://api.deepseek.com", "/models"),
         "openrouter" => ("https://openrouter.ai", "/api/v1/models"),
+        "xai" => ("https://api.x.ai", "/v1/models"),
         _ => return None,
     })
 }
