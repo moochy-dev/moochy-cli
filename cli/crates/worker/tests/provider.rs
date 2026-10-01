@@ -95,10 +95,11 @@ async fn fake(mode: Mode) -> Fake {
             tokio::spawn(async move {
                 let Some(r) = read_request(&mut s).await else { return };
                 rtx.send(r).unwrap();
-                const SSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+                // One request per connection, so say so (the adapter pools keep-alive connections).
+                const SSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n";
                 match mode {
                     Mode::Status(code, extra, body) => {
-                        let resp = format!("HTTP/1.1 {code} X\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\n\r\n{body}", body.len());
+                        let resp = format!("HTTP/1.1 {code} X\r\ncontent-type: application/json\r\nconnection: close\r\n{extra}content-length: {}\r\n\r\n{body}", body.len());
                         let _ = s.write_all(resp.as_bytes()).await;
                     }
                     Mode::Sse(_) | Mode::SlowHeaders(_) => {
@@ -521,7 +522,10 @@ async fn against_e2e_fakes() {
             limits: Limits::default(),
         })
         .unwrap();
-        for (d, body) in [(Dialect::AnthropicMessages, ABODY), (Dialect::OpenAiChat, OBODY)] {
+        // Warm first: the Go harness then asserts one TCP connection per fake for every
+        // request below (E77 semantics on the dev path).
+        a.warm().await.unwrap();
+        for (d, body) in [(Dialect::AnthropicMessages, ABODY), (Dialect::OpenAiChat, OBODY)].repeat(3) {
             if !p.serves(d) {
                 continue;
             }
@@ -537,5 +541,96 @@ async fn against_e2e_fakes() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 6);
+    assert_eq!(checked, 18);
+}
+
+// --- HTTP/1.1 keep-alive (the loopback dev path the e2e fakes speak) ---------------------
+
+/// A keep-alive HTTP/1.1 fake (hyper server): counts TCP connections, streams the fixture,
+/// or (`#hang`) streams two events and then waits, reporting when the client drops it.
+async fn h1_keepalive_fake() -> (SocketAddr, Arc<AtomicUsize>, mpsc::UnboundedReceiver<()>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let (rtx, reset) = mpsc::unbounded_channel();
+    let c2 = conns.clone();
+    tokio::spawn(async move {
+        loop {
+            let (s, _) = l.accept().await.unwrap();
+            s.set_nodelay(true).unwrap();
+            c2.fetch_add(1, Ordering::SeqCst);
+            let rtx = rtx.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let rtx = rtx.clone();
+                    async move {
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let hang = body.windows(5).any(|w| w == b"#hang");
+                        let (dtx, drx) = oneshot::channel();
+                        tokio::spawn(async move {
+                            if drx.await.is_ok() && hang {
+                                let _ = rtx.send(());
+                            }
+                        });
+                        let chunks = ANTH.split_inclusive("\n\n").map(|e| Bytes::from(e.to_owned())).take(if hang { 2 } else { usize::MAX }).collect();
+                        Ok::<_, Infallible>(hyper::Response::new(TestBody { chunks, hang, dropped: Some(dtx) }))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
+            });
+        }
+    });
+    (addr, conns, reset)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_dev_path_warm_keepalive_and_cancel() {
+    let (addr, conns, mut reset) = h1_keepalive_fake().await;
+    let a = adapter(Provider::Anthropic, format!("http://{addr}"), Limits::default());
+    a.warm().await.unwrap();
+    a.warm().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(conns.load(Ordering::SeqCst), 1, "warm() opens exactly one connection");
+    let prep = prepare(Provider::Anthropic, Dialect::AnthropicMessages, ABODY);
+    let read_all = |mut r: moochy_worker::provider::Response| async move {
+        let mut n = 0;
+        while let Some(c) = r.next().await.unwrap() {
+            n += c.len();
+        }
+        n
+    };
+    for _ in 0..5 {
+        let r = a.send(Dialect::AnthropicMessages, prep.body.clone(), &prep.headers).await.unwrap();
+        assert_eq!(read_all(r).await, ANTH.len());
+    }
+    assert_eq!(conns.load(Ordering::SeqCst), 1, "sequential tasks reuse the warm connection");
+
+    // Cancel mid-stream: the connection is closed (provider stops) and never reused.
+    let hang = prepare(Provider::Anthropic, Dialect::AnthropicMessages, &ABODY.replace("hi", "hi #hang"));
+    let mut r = a.send(Dialect::AnthropicMessages, hang.body, &hang.headers).await.unwrap();
+    assert!(r.next().await.unwrap().is_some());
+    drop(r);
+    tokio::time::timeout(Duration::from_secs(2), reset.recv()).await.expect("provider never saw the abort").unwrap();
+    let r = a.send(Dialect::AnthropicMessages, prep.body.clone(), &prep.headers).await.unwrap();
+    assert_eq!(read_all(r).await, ANTH.len());
+    assert_eq!(conns.load(Ordering::SeqCst), 2, "a fresh connection replaces the cancelled one");
+
+    // Concurrent tasks each get their own connection, then all return to the pool.
+    let a = Arc::new(a);
+    let tasks: Vec<_> = (0..4)
+        .map(|_| {
+            let (a, b, h) = (a.clone(), prep.body.clone(), prep.headers.clone());
+            tokio::spawn(async move { read_all(a.send(Dialect::AnthropicMessages, b, &h).await.unwrap()).await })
+        })
+        .collect();
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), ANTH.len());
+    }
+    let after = conns.load(Ordering::SeqCst);
+    assert!(after <= 5, "{after}");
+    for _ in 0..5 {
+        let r = a.send(Dialect::AnthropicMessages, prep.body.clone(), &prep.headers).await.unwrap();
+        assert_eq!(read_all(r).await, ANTH.len());
+    }
+    assert_eq!(conns.load(Ordering::SeqCst), after, "pooled connections are reused afterwards");
 }

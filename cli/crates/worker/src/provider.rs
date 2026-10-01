@@ -9,7 +9,7 @@
 use std::future::{Future, poll_fn};
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -263,6 +263,8 @@ pub struct Adapter {
     auth: HeaderValue,
     tls: Option<TlsConnector>,
     h2: Mutex<Option<H2>>,
+    /// Idle HTTP/1.1 keep-alive connections (`http://` loopback dev targets only).
+    h1_idle: Arc<StdMutex<Vec<H1Conn>>>,
     limits: Limits,
 }
 
@@ -294,7 +296,7 @@ impl Adapter {
         let mut auth = HeaderValue::from_str(&value).map_err(|_| ConfigError("API key is not a valid header value"))?;
         auth.set_sensitive(true);
         let tls = if target.tls { Some(TlsConnector::from(tls_config(cfg.dev_root.as_ref())?)) } else { None };
-        Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, h2: Mutex::new(None), limits: cfg.limits })
+        Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, h2: Mutex::new(None), h1_idle: Arc::default(), limits: cfg.limits })
     }
 
     pub fn provider(&self) -> Provider {
@@ -304,10 +306,51 @@ impl Adapter {
     /// Open (or keep) the warm HTTP/2 connection. Call at startup, on key add, and every
     /// minute or so; keep-alive PINGs hold it open in between. No-op for `http://` dev targets.
     pub async fn warm(&self) -> Result<(), Failure> {
-        if self.tls.is_some() {
-            tokio::time::timeout(self.limits.headers, self.h2_sender()).await.map_err(|_| Failure::new(FailKind::Timeout, "connect timed out"))??;
+        let warm = async {
+            if self.tls.is_some() {
+                self.h2_sender().await.map(drop)
+            } else if self.h1_idle_count() == 0 {
+                let c = self.dial_h1().await?;
+                self.h1_return(c);
+                Ok(())
+            } else {
+                Ok(())
+            }
+        };
+        tokio::time::timeout(self.limits.headers, warm).await.map_err(|_| Failure::new(FailKind::Timeout, "connect timed out"))?
+    }
+
+    fn h1_idle_count(&self) -> usize {
+        self.h1_idle.lock().map_or(0, |g| g.iter().filter(|c| !c.sender.is_closed()).count())
+    }
+
+    fn h1_return(&self, c: H1Conn) {
+        return_h1(&self.h1_idle, c);
+    }
+
+    async fn dial_h1(&self) -> Result<H1Conn, Failure> {
+        let tcp = self.tcp().await?;
+        let (sender, conn) =
+            http1::handshake(TokioIo::new(tcp)).await.map_err(|_| Failure::new(FailKind::Network, "HTTP/1 handshake failed"))?;
+        let task = AbortOnDrop(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
+        Ok(H1Conn { sender, _task: task })
+    }
+
+    /// An idle keep-alive connection that is still usable, else a fresh one.
+    async fn h1_conn(&self) -> Result<(H1Conn, bool), Failure> {
+        loop {
+            let idle = self.h1_idle.lock().ok().and_then(|mut g| g.pop());
+            let Some(mut c) = idle else { break };
+            if c.sender.is_closed() {
+                continue;
+            }
+            if c.sender.ready().await.is_ok() {
+                return Ok((c, true));
+            }
         }
-        Ok(())
+        Ok((self.dial_h1().await?, false))
     }
 
     async fn h2_sender(&self) -> Result<H2, Failure> {
@@ -394,15 +437,21 @@ impl Adapter {
                 let resp = s.send_request(req).await.map_err(|_| Failure::new(FailKind::Network, "request failed before headers"))?;
                 Ok::<_, Failure>((resp, None))
             } else {
-                let tcp = self.tcp().await?;
-                let (mut s, conn) =
-                    http1::handshake(TokioIo::new(tcp)).await.map_err(|_| Failure::new(FailKind::Network, "HTTP/1 handshake failed"))?;
-                let conn = tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                let guard = AbortOnDrop(conn);
-                let resp = s.send_request(req).await.map_err(|_| Failure::new(FailKind::Network, "request failed before headers"))?;
-                Ok((resp, Some(guard)))
+                // Keep-alive pool, like production's warm h2 connection. A request is retried
+                // on a fresh connection only when hyper proves it was never sent (a reused
+                // connection closed by the server in between): no double execution.
+                let (mut c, reused) = self.h1_conn().await?;
+                let resp = match c.sender.try_send_request(req).await {
+                    Ok(r) => r,
+                    Err(mut e) => match e.take_message() {
+                        Some(req) if reused => {
+                            c = self.dial_h1().await?;
+                            c.sender.send_request(req).await.map_err(|_| Failure::new(FailKind::Network, "request failed before headers"))?
+                        }
+                        _ => return Err(Failure::new(FailKind::Network, "request failed before headers")),
+                    },
+                };
+                Ok((resp, Some(H1Lease { conn: Some(c), pool: self.h1_idle.clone(), reusable: false })))
             }
         };
         let (resp, conn) =
@@ -422,7 +471,7 @@ impl Adapter {
             deadline: now.checked_add(self.limits.total).unwrap_or(now),
             limits: self.limits,
             read: 0,
-            _conn: conn,
+            lease: conn,
         })
     }
 
@@ -465,6 +514,44 @@ fn header_u64(h: &HeaderMap, names: &[&str]) -> Option<u64> {
 
 struct AbortOnDrop(JoinHandle<()>);
 
+/// Most idle keep-alive connections kept per adapter (dev `http://` targets).
+const H1_MAX_IDLE: usize = 16;
+
+struct H1Conn {
+    sender: http1::SendRequest<Full<Bytes>>,
+    /// Dropping the connection aborts its task, which closes the socket (cancellation).
+    _task: AbortOnDrop,
+}
+
+fn return_h1(pool: &StdMutex<Vec<H1Conn>>, c: H1Conn) {
+    if c.sender.is_closed() {
+        return;
+    }
+    if let Ok(mut g) = pool.lock() {
+        g.retain(|c| !c.sender.is_closed());
+        if g.len() < H1_MAX_IDLE {
+            g.push(c);
+        }
+    }
+}
+
+struct H1Lease {
+    conn: Option<H1Conn>,
+    pool: Arc<StdMutex<Vec<H1Conn>>>,
+    /// Set when the body was read to the end: only then may the connection serve again.
+    reusable: bool,
+}
+
+impl Drop for H1Lease {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take()
+            && self.reusable
+        {
+            return_h1(&self.pool, c);
+        }
+    }
+}
+
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -483,7 +570,8 @@ pub struct Response {
     deadline: Instant,
     limits: Limits,
     read: u64,
-    _conn: Option<AbortOnDrop>,
+    /// HTTP/1.1 connection, returned to the keep-alive pool only after the body ended.
+    lease: Option<H1Lease>,
 }
 
 impl std::fmt::Debug for Response {
@@ -513,7 +601,12 @@ impl Response {
             .await
             .map_err(|()| Failure::new(FailKind::Timeout, "provider stream stalled"))?;
             match frame {
-                None => return Ok(None),
+                None => {
+                    if let Some(l) = &mut self.lease {
+                        l.reusable = true;
+                    }
+                    return Ok(None);
+                }
                 Some(Err(_)) => return Err(Failure::new(FailKind::Network, "provider stream broke")),
                 Some(Ok(f)) => {
                     let Ok(data) = f.into_data() else { continue };
