@@ -19,6 +19,7 @@
 )]
 
 use std::io::{Read, Write};
+use std::net::ToSocketAddrs as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -317,7 +318,6 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     assert!(has(&o, "gw-bind-ok"), "{}", o.stdout);
     assert!(has(&o, "bind-other-fail"), "{}", o.stdout);
     // After lockdown the donor still resolves provider hosts and reaches :443.
-    use std::net::ToSocketAddrs as _;
     if ("api.anthropic.com", 443).to_socket_addrs().is_ok() {
         assert!(has(&o, "dns-ok https-connect-ok"), "{}", o.stdout);
     } else {
@@ -412,7 +412,7 @@ fn e97_linked_worktree_read_only_and_isolated() {
     let f = Fixture::new("e97lw");
     let main = f.root.join("main");
     let git = |dir: &Path, args: &[&str]| {
-        Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).output().is_ok_and(|o| o.status.success())
     };
     std::fs::create_dir_all(&main).unwrap();
     if !git(&main, &["init", "-q"]) {

@@ -52,6 +52,17 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     let masks = mask::collect(&worktree)?;
     let git = crate::git::view(&worktree, spec.git_writable);
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
+    let mut proxy = if spec.allow_hosts.is_empty() {
+        None
+    } else {
+        let allow = crate::proxy::Allowlist::new(&spec.allow_hosts)?;
+        Some(crate::proxy::Proxy::bind(base.path().join("proxy.sock"), allow)?)
+    };
+    let cgroup = {
+        let mut id = [0u8; 8];
+        getrandom(&mut id)?;
+        crate::cgroup::Cgroup::create(&spec.limits, &crate::hex(&id))
+    };
 
     let plan = Plan {
         base: base.path().to_path_buf(),
@@ -63,6 +74,8 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
             None => None,
         },
         gateway_port: spec.gateway_loopback_port,
+        proxy_socket: proxy.as_ref().map(|p| p.sock().to_path_buf()),
+        cgroup_procs: cgroup.as_ref().map(crate::cgroup::Cgroup::procs),
         cwd: spec.cwd.clone(),
         git,
         masks,
@@ -89,7 +102,12 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     sys::set_pre_exec(&mut cmd, move || child_main(&plan, &agent_filter));
 
     let mut child = cmd.spawn().map_err(Error::Exec)?;
+    if let Some(p) = proxy.as_mut() {
+        p.start();
+    }
     let status = child.wait().map_err(Error::Exec)?;
+    drop(proxy);
+    drop(cgroup);
     drop(base);
     Ok(exit_code(status))
 }
@@ -113,6 +131,10 @@ struct Plan {
     rw_paths: Vec<Bind>,
     gateway_socket: Option<PathBuf>,
     gateway_port: Option<u16>,
+    /// Host socket of the `--allow-host` proxy (in the scratch dir).
+    proxy_socket: Option<PathBuf>,
+    /// `cgroup.procs` of the run's cgroup, when a delegated one exists.
+    cgroup_procs: Option<PathBuf>,
     cwd: Option<PathBuf>,
     git: crate::git::GitView,
     masks: Vec<PathBuf>,
@@ -126,13 +148,15 @@ struct Plan {
 /// The pre_exec closure. Returns `Ok(())` only in the agent branch (std then
 /// execs). Any error aborts the spawn (fail closed).
 fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Result<()> {
+    // Into the run's cgroup first, so every descendant is counted (graceful:
+    // rlimits remain if the move fails).
+    if let Some(procs) = &plan.cgroup_procs {
+        let _ = std::fs::write(procs, b"0");
+    }
     enter_namespaces(plan).map_err(to_io)?;
-    // Inside the new (empty) netns: `lo` up and the gateway listener bound before
-    // the agent exists, so the agent can never squat the port.
-    let listener = match plan.gateway_port {
-        Some(port) => Some(bridge_listen(port).map_err(to_io)?),
-        None => None,
-    };
+    // Inside the new (empty) netns: `lo` up and the bridge listeners bound before
+    // the agent exists, so the agent can never squat a port.
+    let listeners = bridge_listeners(plan).map_err(to_io)?;
 
     // Fork: the child becomes PID 1 in the new PID namespace (it is the agent);
     // the current process stays outside and reaps it. Both branches reach execve
@@ -142,7 +166,7 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
         sys::Fork::Parent(agent_pid) => {
             // Reaper: serve the gateway bridge, wait for the agent, propagate its
             // code. Never returns.
-            let timed_out = supervise(listener.as_ref(), agent_pid, plan.limits.wall_seconds);
+            let timed_out = supervise(&listeners, agent_pid, plan.limits.wall_seconds);
             if timed_out {
                 let _ = rustix::process::kill_process(
                     rustix::process::Pid::from_raw(agent_pid).unwrap_or(rustix::process::Pid::INIT),
@@ -154,7 +178,7 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
             sys::exit_immediately(code);
         }
         sys::Fork::Child => {
-            drop(listener);
+            drop(listeners);
             build_view(plan).map_err(to_io)?;
             harden_agent(plan, filter).map_err(to_io)?;
             Ok(()) // → std performs execve(program, argv, envp)
@@ -167,19 +191,36 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
 // Agents speak HTTP to `127.0.0.1:<port>`. The reaper lives in the sandbox netns
 // (but outside its PID namespace and seccomp/Landlock cage) and splices every
 // loopback connection to the gateway Unix socket bind-mounted at
-// GATEWAY_SOCK_PATH. pivot_root moved the reaper's root along with the agent's,
-// so that path resolves in the sandbox view. No other route exists.
+// GATEWAY_SOCK_PATH (and, with `--allow-host`, the proxy port to PROXY_SOCK_PATH).
+// pivot_root moved the reaper's root along with the agent's, so those paths
+// resolve in the sandbox view. No other route exists.
 
 /// Max concurrent bridged connections.
 const BRIDGE_MAX_CONNS: usize = 64;
 /// Per-direction buffer; a chunk is forwarded as soon as it is read.
 const BRIDGE_BUF: usize = 64 * 1024;
 
-fn bridge_listen(port: u16) -> Result<std::net::TcpListener, Error> {
-    sys::loopback_up().map_err(|e| setup("loopback up", e))?;
-    let l = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| setup("bind gateway port", e))?;
-    l.set_nonblocking(true).map_err(|e| setup("gateway nonblocking", e))?;
-    Ok(l)
+/// A loopback listener inside the sandbox netns and the socket it splices to.
+type Listener = (std::net::TcpListener, &'static str);
+
+fn bridge_listeners(plan: &Plan) -> Result<Vec<Listener>, Error> {
+    let mut v = Vec::new();
+    if let Some(port) = plan.gateway_port {
+        v.push((port, crate::GATEWAY_SOCK_PATH));
+    }
+    if plan.proxy_socket.is_some() {
+        v.push((crate::PROXY_LOOPBACK_PORT, crate::PROXY_SOCK_PATH));
+    }
+    if !v.is_empty() {
+        sys::loopback_up().map_err(|e| setup("loopback up", e))?;
+    }
+    v.into_iter()
+        .map(|(port, target)| {
+            let l = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| setup("bind bridge port", e))?;
+            l.set_nonblocking(true).map_err(|e| setup("bridge nonblocking", e))?;
+            Ok((l, target))
+        })
+        .collect()
 }
 
 /// One direction of a bridged connection: bytes read from `from` not yet
@@ -208,7 +249,7 @@ pub const WALL_TIMEOUT_EXIT: i32 = 124;
 /// through a pidfd until it exits or the wall-clock deadline passes. Returns
 /// true on deadline. Threads are impossible here (after `unshare(CLONE_NEWPID)`
 /// the kernel refuses CLONE_THREAD), hence one poll loop.
-fn supervise(l: Option<&std::net::TcpListener>, agent_pid: i32, wall_seconds: u64) -> bool {
+fn supervise(listeners: &[Listener], agent_pid: i32, wall_seconds: u64) -> bool {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use std::os::fd::AsFd as _;
     use std::time::{Duration, Instant};
@@ -223,9 +264,10 @@ fn supervise(l: Option<&std::net::TcpListener>, agent_pid: i32, wall_seconds: u6
             let left = d.saturating_duration_since(Instant::now());
             Timespec { tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX), tv_nsec: i64::from(left.subsec_nanos()) }
         });
-        let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(conns.len().saturating_mul(2).saturating_add(2));
+        let mut fds: Vec<PollFd<'_>> =
+            Vec::with_capacity(conns.len().saturating_mul(2).saturating_add(listeners.len()).saturating_add(1));
         fds.push(PollFd::new(&pidfd, PollFlags::IN));
-        if let Some(l) = l {
+        for (l, _) in listeners {
             fds.push(PollFd::new(l, PollFlags::IN));
         }
         for c in &conns {
@@ -236,7 +278,8 @@ fn supervise(l: Option<&std::net::TcpListener>, agent_pid: i32, wall_seconds: u6
             continue; // EINTR
         }
         let agent_done = fds.first().is_some_and(|f| !f.revents().is_empty());
-        let accept = l.is_some() && fds.get(1).is_some_and(|f| !f.revents().is_empty());
+        // Listener i sits at fds[i + 1] (≤ 2 listeners: gateway, proxy).
+        let ready = [1usize, 2].map(|i| i <= listeners.len() && fds.get(i).is_some_and(|f| !f.revents().is_empty()));
         drop(fds);
         if agent_done {
             return false;
@@ -244,8 +287,8 @@ fn supervise(l: Option<&std::net::TcpListener>, agent_pid: i32, wall_seconds: u6
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return true;
         }
-        if let (true, Some(l)) = (accept, l) {
-            accept_all(l, &mut conns);
+        for ((l, target), _) in listeners.iter().zip(ready).filter(|(_, r)| *r) {
+            accept_all(l, target, &mut conns);
         }
         conns.retain_mut(pump);
     }
@@ -263,12 +306,12 @@ fn interest(read_half: &Half, write_half: &Half) -> rustix::event::PollFlags {
     f
 }
 
-fn accept_all(l: &std::net::TcpListener, conns: &mut Vec<Conn>) {
+fn accept_all(l: &std::net::TcpListener, target: &str, conns: &mut Vec<Conn>) {
     while let Ok((tcp, _)) = l.accept() {
         if conns.len() >= BRIDGE_MAX_CONNS {
             continue; // bounded: refuse (drop) rather than queue
         }
-        let Ok(unix) = std::os::unix::net::UnixStream::connect(crate::GATEWAY_SOCK_PATH) else {
+        let Ok(unix) = std::os::unix::net::UnixStream::connect(target) else {
             continue;
         };
         if tcp.set_nonblocking(true).is_err() || unix.set_nonblocking(true).is_err() {
@@ -363,7 +406,8 @@ fn enter_namespaces(plan: &Plan) -> Result<(), Error> {
             | UnshareFlags::NEWPID
             | UnshareFlags::NEWNET
             | UnshareFlags::NEWIPC
-            | UnshareFlags::NEWUTS,
+            | UnshareFlags::NEWUTS
+            | UnshareFlags::NEWCGROUP,
     )
     .map_err(io("unshare"))?;
 
@@ -437,6 +481,11 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
         let dst = root.join("run/moochy/gateway.sock");
         touch(&dst)?;
         mount_bind_recursive(sock, &dst).map_err(io("bind gateway socket"))?;
+    }
+    if let Some(sock) = &plan.proxy_socket {
+        let dst = root.join(crate::PROXY_SOCK_PATH.trim_start_matches('/'));
+        touch(&dst)?;
+        mount_bind_recursive(sock, &dst).map_err(io("bind proxy socket"))?;
     }
 
     // /proc of the NEW pid namespace, mounted before the host procfs goes away.
@@ -677,12 +726,15 @@ fn landlock_agent(plan: &Plan) -> Result<(), Error> {
         .map_err(ll("scope"))?
         .create()
         .map_err(ll("create"))?;
-    let created = match plan.gateway_port {
-        Some(p) => created
-            .add_rule(NetPort::new(p, AccessNet::ConnectTcp))
-            .map_err(ll("net rule"))?,
-        None => created,
-    };
+    let proxy_port = plan.proxy_socket.as_ref().map(|_| crate::PROXY_LOOPBACK_PORT);
+    let created = created
+        .add_rules(
+            plan.gateway_port
+                .into_iter()
+                .chain(proxy_port)
+                .map(|p| Ok::<_, landlock::RulesetError>(NetPort::new(p, AccessNet::ConnectTcp))),
+        )
+        .map_err(ll("net rule"))?;
     // Read-only: system paths (now at "/..."); read-write: worktree, rw extras,
     // /tmp, home, /run/moochy (gateway + its socket).
     let created = created
@@ -776,6 +828,15 @@ fn build_env(spec: &Spec) -> Vec<(OsString, OsString)> {
         ("USER".into(), "sandbox".into()),
         ("TERM".into(), std::env::var_os("TERM").unwrap_or_else(|| "xterm".into())),
     ];
+    if !spec.allow_hosts.is_empty() && !spec.unsafe_no_sandbox {
+        let url = format!("http://127.0.0.1:{}", crate::PROXY_LOOPBACK_PORT);
+        for k in ["HTTPS_PROXY", "https_proxy"] {
+            env.push((k.into(), url.clone().into()));
+        }
+        for k in ["NO_PROXY", "no_proxy"] {
+            env.push((k.into(), "127.0.0.1,localhost".into()));
+        }
+    }
     for (k, v) in &spec.env {
         env.push((k.clone(), v.clone()));
     }

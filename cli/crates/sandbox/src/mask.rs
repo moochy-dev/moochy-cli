@@ -82,7 +82,7 @@ fn matches_secret(name: &str) -> bool {
     SECRET_PATTERNS.iter().any(|pat| glob1(pat, name))
 }
 
-fn glob1(pat: &str, name: &str) -> bool {
+pub(crate) fn glob1(pat: &str, name: &str) -> bool {
     match (pat.strip_prefix('*'), pat.strip_suffix('*')) {
         (Some(suf), _) if !pat.ends_with('*') => name.ends_with(suf),
         (_, Some(pre)) if !pat.starts_with('*') => name.starts_with(pre),
