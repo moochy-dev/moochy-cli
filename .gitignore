@@ -1,0 +1,7 @@
+/cli/target/
+/relay/bin/
+/e2e/.out/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
