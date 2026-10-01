@@ -29,6 +29,16 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Bound on the opt-in journal text per side.
+const MAX_JOURNAL_TEXT: usize = 64 << 10;
+
+/// `(journal status, model, cost, opt-in (request, response) text)`.
+type Served = (String, String, i64, Option<(Vec<u8>, Vec<u8>)>);
+
+fn clip(b: &[u8]) -> Vec<u8> {
+    b.get(..b.len().min(MAX_JOURNAL_TEXT)).unwrap_or_default().to_vec()
+}
+
 /// 32 MiB body (03 §16) in ≤ 64 KiB chunks, plus slack.
 const MAX_BODY_CHUNKS: u32 = 600;
 const MAX_BODY_LEN: u64 = (crypto::MAX_SEALED as u64).saturating_add(1 << 20);
@@ -250,6 +260,8 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
             status: out.0,
             model: out.1,
             cost_uusd: out.2,
+            request: out.3.as_ref().map(|t| t.0.clone()).unwrap_or_default(),
+            response: out.3.map(|t| t.1).unwrap_or_default(),
             ms: u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX),
             ..JournalEntry::default()
         });
@@ -361,7 +373,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let with_ck = |code: &str, retry: bool, d: Option<String>| (Some(ck.clone()), Failure::new(code, retry, d));
     let mut opener = RequestOpener::new(&ck, &task).map_err(|_| with_ck("bad_envelope", false, None))?;
     for c in body {
-        opener.push(&crate::pb::to_proto(c.clone())).map_err(|_| with_ck("bad_envelope", false, None))?;
+        opener.push(c).map_err(|_| with_ck("bad_envelope", false, None))?;
     }
     if opener.chunks() != assign.body_chunks {
         return Err(with_ck("bad_envelope", false, None));
@@ -480,12 +492,12 @@ async fn serve(
     attempt: u32,
     down: &mut tonic::Streaming<ServeDown>,
     tx: &mpsc::Sender<ServeUp>,
-) -> (String, String, i64) {
+) -> Served {
     let r = crypto::random32().unwrap_or([0; 32]);
     let task16 = task_s.parse::<TaskId>().map_or([0; 16], |t| t.0.0);
     let device = node.device_id().unwrap_or_default().to_owned();
     let refuse = Refuse { tx, r, task: task_s, task16, worker: &device, attempt };
-    let refused = |code: &str| (format!("refused:{code}"), String::new(), 0);
+    let refused = |code: &str| (format!("refused:{code}"), String::new(), 0, None);
     let paused = node.paused.load(Ordering::Relaxed);
     let Some(keys) = node.keys.as_ref().filter(|_| can_serve(node) && !paused && node.worker_busy.load(Ordering::Relaxed) <= slots_max(node)) else {
         let code = if paused { "local_cap" } else { "busy" };
@@ -514,11 +526,11 @@ async fn serve(
 
 /// Steps 6–9: provider call, sealed streaming, receipt.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, r: [u8; 32], t_start: u64, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) -> (String, String, i64) {
+async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, r: [u8; 32], t_start: u64, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) -> Served {
     let tx = refuse.tx;
     let dialect = Dialect::from_wire(a.route.dialect.as_str()).unwrap_or(Dialect::Anthropic);
     let attempt8 = u8::try_from(attempt).unwrap_or(0);
-    let Ok(mut sealer) = ResponseSealer::new(&a.ck, &r, &a.task, &keys.device_id, attempt8) else { return ("failed:internal".into(), String::new(), 0) };
+    let Ok(mut sealer) = ResponseSealer::new(&a.ck, &r, &a.task, &keys.device_id, attempt8) else { return ("failed:internal".into(), String::new(), 0, None) };
     let call = tokio::select! {
         r = a.adapter.send(dialect.worker(), a.prepared.body.clone(), &a.prepared.headers) => Some(r),
         () = wait_cancel(down) => None,
@@ -533,17 +545,18 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
             // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
             let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
             finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
-            return (format!("refused:{code}"), String::new(), 0);
+            return (format!("refused:{code}"), String::new(), 0, None);
         }
         None => {
             let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
             finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
-            return ("cancelled".into(), String::new(), 0);
+            return ("cancelled".into(), String::new(), 0, None);
         }
     };
     let t_started = now_ms();
     let _ = tx.send(up(serve_up::Msg::Started(pb::Started { attempt }))).await;
     let mut parser = StreamParser::new(dialect.worker(), a.route.stream);
+    let mut seen: Vec<u8> = Vec::new();
     let checkpoint = |s: &ResponseSealer| -> Option<pb::Checkpoint> {
         let seq = s.last_seq()?;
         let h = s.running_hash();
@@ -560,10 +573,13 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         match next {
             Ok(Some(b)) => {
                 let tool_ends = parser.feed(&b, &mut |_, _| {}).map_or(0, |c| c.tool_ends);
+                if node.cfg.journal_full_text && seen.len() < MAX_JOURNAL_TEXT {
+                    seen.extend_from_slice(b.get(..b.len().min(MAX_JOURNAL_TEXT.saturating_sub(seen.len()))).unwrap_or_default());
+                }
                 // Seal and send at once (CONTRACT §13); the stream ends with an empty `last` chunk.
                 for part in b.chunks(crypto::MAX_CHUNK) {
                     let Ok(c) = sealer.seal(part, false) else { break };
-                    if tx.send(up(serve_up::Msg::Chunk(crate::pb::from_proto(c)))).await.is_err() {
+                    if tx.send(up(serve_up::Msg::Chunk(c))).await.is_err() {
                         link_ok = false;
                     }
                 }
@@ -588,7 +604,7 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     drop(resp); // aborts the provider request if still running
     if link_ok
         && let Ok(c) = sealer.seal(&[], true)
-        && tx.send(up(serve_up::Msg::Chunk(crate::pb::from_proto(c)))).await.is_ok()
+        && tx.send(up(serve_up::Msg::Chunk(c))).await.is_ok()
         && let Some(cp) = checkpoint(&sealer)
     {
         let _ = tx.send(up(serve_up::Msg::Checkpoint(cp))).await;
@@ -625,7 +641,9 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         ReceiptStatus::Partial => "partial",
         ReceiptStatus::NotStarted => "not_started",
     };
-    (st.into(), model, cost)
+    // Opt-in full text for the donor's own journal (bounded; never sent anywhere).
+    let text = node.cfg.journal_full_text.then(|| (clip(&a.inner.body_b64.0), clip(&seen)));
+    (st.into(), model, cost, text)
 }
 
 struct Ending {

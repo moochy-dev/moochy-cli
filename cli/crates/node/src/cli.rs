@@ -662,11 +662,8 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
     let mut adapters = Vec::new();
     for p in &secrets.providers {
         let Some(provider) = moochy_worker::Provider::parse(&p.provider) else { continue };
-        // `--base-url` replaces the provider *origin* (CONTRACT §6); OpenRouter's API root is `/api`.
-        let base_url = p.base_url.as_ref().map(|u| {
-            let bare = u.split_once("://").is_some_and(|(_, rest)| !rest.trim_end_matches('/').contains('/'));
-            if provider == moochy_worker::Provider::OpenRouter && bare { format!("{}/api", u.trim_end_matches('/')) } else { u.clone() }
-        });
+        // `--base-url` replaces the provider origin only; moochy-worker owns the per-dialect paths.
+        let base_url = p.base_url.clone();
         let cfg = AdapterConfig {
             provider,
             api_key: zeroize::Zeroizing::new(p.key.clone()),

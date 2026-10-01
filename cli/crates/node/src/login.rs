@@ -5,7 +5,7 @@ use crate::keystore::{self, DeviceKeys};
 use crate::link;
 use crate::pb::link::{DevicePollRequest, DeviceStartRequest, DeviceState};
 use crate::tls::Origin;
-use crate::util::{Result, auth, clean, emit, lp, net, now_ms, usage};
+use crate::util::{Result, auth, clean, emit, net, now_ms, usage};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,7 +44,8 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
     let keys = DeviceKeys::generate()?;
     let (sign_pub, enc_pub) = (keys.sign_pub(), keys.enc_pub()?);
     let roles_csv = roles.join(",");
-    let sig = keys.sign(&lp(&[b"moochy/v1/device-start", &sign_pub, &enc_pub, roles_csv.as_bytes(), name.as_bytes(), SUITE.as_bytes()]));
+    let msg = moochy_proto::crypto::device_start_msg(&sign_pub, &enc_pub, &roles_csv, &name, SUITE).map_err(|_| usage("device start message"))?;
+    let sig = keys.sign(&msg);
 
     let (ch, _) = link::dial(ca_file.as_deref(), &origin).await?;
     let mut client = link::client(ch);

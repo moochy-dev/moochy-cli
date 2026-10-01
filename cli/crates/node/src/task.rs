@@ -216,7 +216,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let route = open.route.clone();
     let _ = up_tx.try_send(up(submit_up::Msg::Open(open)));
     for c in sealed.chunks {
-        let _ = up_tx.try_send(up(submit_up::Msg::Body(crate::pb::from_proto(c))));
+        let _ = up_tx.try_send(up(submit_up::Msg::Body(c)));
     }
     // E22: stamp the moment the transport takes the first body chunk.
     let first_tx = Arc::new(AtomicU64::new(0));
@@ -462,7 +462,7 @@ impl Driver {
             return if self.started { retry_fail("bad_envelope", "frames from another attempt") } else { Step::Continue };
         }
         let seq = c.seq;
-        let pt = match a.opener.open(crate::pb::to_proto(c)) {
+        let pt = match a.opener.open(c) {
             Ok(pt) => pt,
             Err(e) => {
                 let why = format!("response failed authentication ({e:?} at seq {seq}); retry");
