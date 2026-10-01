@@ -6,8 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "Moochy wire protocol: encodings, frames, messages, envelopes, signatures, money math"
 
-# Versions are chosen so hpke, ed25519-zebra and our own code share ONE
-# curve25519-dalek (4.x), ONE sha2 (0.10) and ONE chacha20poly1305 (0.10).
+# Versions are chosen so hpke and ed25519-zebra share ONE curve25519-dalek (4.x) and ONE sha2 (0.10).
 [dependencies]
 # Typed wire structs + JSON (serde_json is only fed bytes that passed json::check).
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
@@ -24,8 +23,10 @@ bytes = { version = "1", default-features = false, features = ["std"] }
 # SHA-256 / HKDF-SHA256 (CONTRACT §1).
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 hkdf = { version = "0.12", default-features = false }
-# ChaCha20-Poly1305 chunk AEAD (CONTRACT §1).
-chacha20poly1305 = { version = "0.10", default-features = false }
+# Chunk AEAD (ChaCha20-Poly1305) + running SHA-256 on the hot path: assembly implementations.
+# Measured on this arm64 box: RustCrypto chacha20poly1305 0.10 = ~200 MB/s (portable backend),
+# far below the 800 MB/s target. ring is already in the Node via rustls' ring provider.
+ring = { version = "0.17", default-features = false }
 # HPKE RFC 9180 base mode, X25519/HKDF-SHA256/ChaCha20Poly1305 only.
 hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 # Ed25519 with ZIP-215 verification (CONTRACT §1).

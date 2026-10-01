@@ -8,8 +8,6 @@ use crate::enc::{label, lp, u64be};
 use crate::msg::{InnerPayload, Projection, Receipt};
 use crate::{B, Blob, DeviceId, Error, RepoId, TaskId, json, pb};
 use bytes::{Bytes, BytesMut};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
 use hkdf::Hkdf;
 use hpke::{Deserializable, Kem as _, OpModeR, OpModeS, Serializable};
 use rand_core::{CryptoRng, RngCore, TryRngCore};
@@ -145,11 +143,51 @@ pub const MAX_CHUNK: usize = 65_497;
 /// Request-body chunk kind byte inside the request AAD.
 const KIND_REQUEST: u8 = 0x01;
 
-fn nonce(seq: u32) -> Nonce {
-    let mut n = [0u8; 12];
-    let [.., a, b, c, d] = &mut n;
-    [*a, *b, *c, *d] = seq.to_be_bytes();
-    n.into()
+/// Chunk AEAD = ChaCha20-Poly1305 (RFC 8439) through ring's assembly implementation: same bytes
+/// as any RFC 8439 implementation, ~5–10× faster than the portable one on arm64 (CONTRACT §13).
+/// ring is already in the tree via rustls' ring provider.
+struct ChunkAead(ring::aead::LessSafeKey);
+
+impl ChunkAead {
+    fn new(k: &Secret32) -> Result<Self, Error> {
+        ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, k.expose())
+            .map(|k| Self(ring::aead::LessSafeKey::new(k)))
+            .map_err(|_| Error::Malformed)
+    }
+
+    /// Nonce (12 bytes) = `0x00 * 8 || u32_be(seq)`; unique because each key seals one stream.
+    fn nonce(seq: u32) -> ring::aead::Nonce {
+        let mut n = [0u8; 12];
+        let [.., a, b, c, d] = &mut n;
+        [*a, *b, *c, *d] = seq.to_be_bytes();
+        ring::aead::Nonce::assume_unique_for_key(n)
+    }
+
+    fn seal(&self, seq: u32, aad: &[u8], buf: &mut [u8]) -> Result<[u8; TAG_LEN], Error> {
+        let tag = self.0.seal_in_place_separate_tag(Self::nonce(seq), ring::aead::Aad::from(aad), buf).map_err(|_| Error::Decrypt)?;
+        tag.as_ref().try_into().map_err(|_| Error::Decrypt)
+    }
+
+    /// `buf` = ciphertext || tag; decrypts in place and returns the plaintext length.
+    fn open(&self, seq: u32, aad: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
+        self.0.open_in_place(Self::nonce(seq), ring::aead::Aad::from(aad), buf).map(|p| p.len()).map_err(|_| Error::Decrypt)
+    }
+}
+
+/// Running SHA-256 of a plaintext stream (ring: ARMv8 SHA extensions when present).
+#[derive(Clone)]
+struct Running(ring::digest::Context);
+
+impl Running {
+    fn new() -> Self {
+        Self(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+    fn update(&mut self, b: &[u8]) {
+        self.0.update(b);
+    }
+    fn value(&self) -> [u8; 32] {
+        self.0.clone().finish().as_ref().try_into().unwrap_or([0; 32])
+    }
 }
 
 /// Both AADs end with `lp(.., u32(seq), last_byte)` = `00000004 seq(4) 00000001 last(1)`.
@@ -174,15 +212,12 @@ fn resp_aad(task: &TaskId, attempt: u8, r: &[u8; 32]) -> Result<[u8; 99], Error>
 }
 
 /// Split `buf` = ciphertext || tag and decrypt in place; returns the plaintext length.
-fn open_in_place<const N: usize>(aead: &ChaCha20Poly1305, aad: &mut [u8; N], seq: u32, last: bool, buf: &mut [u8]) -> Result<usize, Error> {
+fn open_in_place<const N: usize>(aead: &ChunkAead, aad: &mut [u8; N], seq: u32, last: bool, buf: &mut [u8]) -> Result<usize, Error> {
     if buf.len() < TAG_LEN || buf.len() > MAX_CHUNK + TAG_LEN {
         return Err(Error::TooLarge);
     }
-    let n = buf.len().saturating_sub(TAG_LEN);
-    let (ct, tag) = buf.split_at_mut(n);
     patch_aad(aad, seq, last);
-    aead.decrypt_in_place_detached(&nonce(seq), aad, ct, Tag::from_slice(tag)).map_err(|_| Error::Decrypt)?;
-    Ok(n)
+    aead.open(seq, aad, buf)
 }
 
 /// zstd level by size (CONTRACT §13): 3 for ordinary bodies, 1 for very large ones.
@@ -214,7 +249,7 @@ pub fn seal_request(ck: &ContentKey, task: &TaskId, payload: &[u8]) -> Result<Se
 pub fn seal_compressed(ck: &ContentKey, task: &TaskId, z: &[u8]) -> Result<SealedRequest, Error> {
     let n = z.len().div_ceil(MAX_CHUNK).max(1);
     let total = n.checked_mul(TAG_LEN).and_then(|t| t.checked_add(z.len())).ok_or(Error::TooLarge)?;
-    let aead = ChaCha20Poly1305::new(k_req(ck, task)?.expose().into());
+    let aead = ChunkAead::new(&k_req(ck, task)?)?;
     let mut aad = req_aad(task)?;
     let mut buf = BytesMut::with_capacity(total);
     let mut chunks = Vec::with_capacity(n);
@@ -224,7 +259,7 @@ pub fn seal_compressed(ck: &ContentKey, task: &TaskId, z: &[u8]) -> Result<Seale
         let last = i.checked_add(1) == Some(n);
         buf.extend_from_slice(part);
         patch_aad(&mut aad, seq, last);
-        let tag = aead.encrypt_in_place_detached(&nonce(seq), &aad, &mut buf).map_err(|_| Error::Decrypt)?;
+        let tag = aead.seal(seq, &aad, &mut buf)?;
         buf.extend_from_slice(&tag);
         chunks.push(pb::Chunk { attempt: 0, seq, last, ct: buf.split().freeze() });
     }
@@ -236,7 +271,7 @@ pub fn seal_compressed(ck: &ContentKey, task: &TaskId, z: &[u8]) -> Result<Seale
 /// the limit, without ever holding more than `MAX_PAYLOAD + 1` bytes. One reusable scratch
 /// buffer: no allocation per chunk.
 pub struct RequestOpener {
-    aead: ChaCha20Poly1305,
+    aead: ChunkAead,
     aad: [u8; 55],
     next: u32,
     sealed: usize,
@@ -254,7 +289,7 @@ impl RequestOpener {
         // 2^25 = 32 MiB: no legitimate payload needs a larger window.
         dctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(25)).map_err(|_| Error::Malformed)?;
         Ok(Self {
-            aead: ChaCha20Poly1305::new(k_req(ck, task)?.expose().into()),
+            aead: ChunkAead::new(&k_req(ck, task)?)?,
             aad: req_aad(task)?,
             next: 0,
             sealed: 0,
@@ -349,24 +384,24 @@ impl RequestOpener {
 /// plaintext (for checkpoints and `resp_commit`). Output comes from one reused arena: once the
 /// previous chunks have been sent and dropped, sealing allocates nothing.
 pub struct ResponseSealer {
-    aead: ChaCha20Poly1305,
+    aead: ChunkAead,
     aad: [u8; 99],
     attempt: u8,
     next: u32,
     done: bool,
-    hash: Sha256,
+    hash: Running,
     arena: BytesMut,
 }
 
 impl ResponseSealer {
     pub fn new(ck: &ContentKey, r: &[u8; 32], task: &TaskId, worker: &DeviceId, attempt: u8) -> Result<Self, Error> {
         Ok(Self {
-            aead: ChaCha20Poly1305::new(rk(ck, r, task, worker, attempt)?.expose().into()),
+            aead: ChunkAead::new(&rk(ck, r, task, worker, attempt)?)?,
             aad: resp_aad(task, attempt, r)?,
             attempt,
             next: 0,
             done: false,
-            hash: Sha256::new(),
+            hash: Running::new(),
             arena: BytesMut::new(),
         })
     }
@@ -385,7 +420,7 @@ impl ResponseSealer {
         out.extend_from_slice(pt);
         patch_aad(&mut self.aad, seq, last);
         let ct = out.get_mut(start..).ok_or(Error::Malformed)?;
-        let tag = self.aead.encrypt_in_place_detached(&nonce(seq), &self.aad, ct).map_err(|_| Error::Decrypt)?;
+        let tag = self.aead.seal(seq, &self.aad, ct)?;
         out.extend_from_slice(&tag);
         self.hash.update(pt);
         self.next = seq.checked_add(1).ok_or(Error::TooLarge)?;
@@ -411,31 +446,31 @@ impl ResponseSealer {
     /// SHA-256 of all plaintext sealed so far.
     #[must_use]
     pub fn running_hash(&self) -> [u8; 32] {
-        self.hash.clone().finalize().into()
+        self.hash.value()
     }
 }
 
 /// Gateway: opens the response chunks of exactly one (task, attempt), strictly in order.
 pub struct ResponseOpener {
-    aead: ChaCha20Poly1305,
+    aead: ChunkAead,
     aad: [u8; 99],
     attempt: u8,
     next: u32,
     done: bool,
     failed: bool,
-    hash: Sha256,
+    hash: Running,
 }
 
 impl ResponseOpener {
     pub fn new(ck: &ContentKey, r: &[u8; 32], task: &TaskId, worker: &DeviceId, attempt: u8) -> Result<Self, Error> {
         Ok(Self {
-            aead: ChaCha20Poly1305::new(rk(ck, r, task, worker, attempt)?.expose().into()),
+            aead: ChunkAead::new(&rk(ck, r, task, worker, attempt)?)?,
             aad: resp_aad(task, attempt, r)?,
             attempt,
             next: 0,
             done: false,
             failed: false,
-            hash: Sha256::new(),
+            hash: Running::new(),
         })
     }
 
@@ -491,7 +526,7 @@ impl ResponseOpener {
 
     #[must_use]
     pub fn running_hash(&self) -> [u8; 32] {
-        self.hash.clone().finalize().into()
+        self.hash.value()
     }
 }
 
