@@ -190,6 +190,20 @@ mod bpf {
         }
     }
 
+    #[test]
+    fn x32_filter_denies_the_x32_range_on_any_host() {
+        let prog = crate::seccomp::x32_filter();
+        let at = |nr: u32| {
+            let mut sd = [0u8; 64];
+            sd[0..4].copy_from_slice(&nr.to_ne_bytes());
+            eval(&prog, &sd)
+        };
+        assert_eq!(at(59), RET_ALLOW);
+        assert_eq!(at(0x3FFF_FFFF), RET_ALLOW);
+        assert_eq!(at(0x4000_0000 | 520), errno(libc::EPERM)); // x32 execve
+        assert_eq!(at(u32::MAX), errno(libc::EPERM));
+    }
+
     /// The kernel's choice among stacked filters: the lowest action value (as
     /// signed, so KILL_PROCESS wins); on a tie the newest (last) filter.
     fn run(progs: &[BpfProgram], data: &[u8; 64]) -> u32 {

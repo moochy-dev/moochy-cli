@@ -156,8 +156,8 @@ pub fn clone3_filter() -> Result<BpfProgram, Error> {
 /// `AUDIT_ARCH_X86_64`, so a deny-list keyed on x86_64 numbers (seccompiler
 /// has no x32 handling) would miss e.g. an x32 `execve`. Refuse the whole x32
 /// range; wrong-arch calls are killed by the stacked seccompiler program.
-#[cfg(target_arch = "x86_64")]
-fn x32_filter() -> BpfProgram {
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // tested on every arch (fuzzing.rs)
+pub(crate) fn x32_filter() -> BpfProgram {
     use seccompiler::sock_filter;
     const LD_W_ABS: u16 = 0x20;
     const JGE_K: u16 = 0x35;
