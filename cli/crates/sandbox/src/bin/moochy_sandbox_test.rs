@@ -50,6 +50,10 @@ fn main() -> ExitCode {
         "donor" => donor_selftest(rest),
         #[cfg(target_os = "linux")]
         "validator" => validator_selftest(rest),
+        #[cfg(target_os = "macos")]
+        "donor" => donor_selftest_macos(rest),
+        #[cfg(target_os = "macos")]
+        "validator" => validator_selftest_macos(rest),
         other => {
             eprintln!("unknown subcommand: {other}");
             ExitCode::from(2)
@@ -541,4 +545,140 @@ fn probe_http(a: &[String]) -> ExitCode {
             no()
         }
     }
+}
+
+/// macOS donor self-test (Seatbelt via `sandbox_init`): `donor <state> <relay_port> <canary> [gw_port]`.
+/// After the lockdown nothing can be spawned, only the state dir is reachable, and
+/// outbound TCP is limited to 443 + the relay port; DNS for providers still works.
+#[cfg(target_os = "macos")]
+fn donor_selftest_macos(a: &[String]) -> ExitCode {
+    use std::net::{TcpListener, TcpStream, ToSocketAddrs as _};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    let state = a.first().cloned().unwrap_or_else(|| "/tmp".into());
+    let relay_port: u16 = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(8443);
+    let canary = a.get(2).cloned().unwrap_or_default();
+    let gw_port: Option<u16> = a.get(3).and_then(|s| s.parse().ok());
+    let copy = format!("{state}/true-copy");
+    let _ = std::fs::copy("/usr/bin/true", &copy);
+    let mut policy = moochy_sandbox::DonorPolicy::new(PathBuf::from(&state), relay_port);
+    policy.gateway_port = gw_port;
+    match moochy_sandbox::lockdown_self(&policy) {
+        Ok(r) => println!("lockdown-ok fs={} net={:?}", r.landlock_fs, r.landlock_net),
+        Err(e) => {
+            println!("lockdown-fail {e}");
+            return ExitCode::from(71);
+        }
+    }
+    for (label, prog) in [("sh", "/bin/sh"), ("env", "/usr/bin/env"), ("copied-binary", copy.as_str())] {
+        match std::process::Command::new(prog).arg("-c").arg("true").status() {
+            Ok(st) => println!("exec-{label} SUCCEEDED (BAD) {st:?}"),
+            Err(e) => println!("exec-{label}-denied {e}"),
+        }
+    }
+    match std::fs::read(&canary) {
+        Ok(_) => println!("canary-read-ok (BAD) {canary}"),
+        Err(e) => println!("canary-read-fail {e}"),
+    }
+    match std::fs::write(format!("{state}/outbox.probe"), b"x") {
+        Ok(()) => println!("state-write-ok"),
+        Err(e) => println!("state-write-fail (BAD) {e}"),
+    }
+    if let Ok(sa) = "127.0.0.1:9".parse() {
+        match TcpStream::connect_timeout(&sa, Duration::from_millis(300)) {
+            Ok(_) => println!("connect9-ok (BAD)"),
+            Err(e) => println!("connect9-fail {e}"),
+        }
+    }
+    match ("api.anthropic.com", 443).to_socket_addrs() {
+        Ok(mut it) => match it.next() {
+            Some(sa) => match TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
+                Ok(_) => println!("dns-ok https-connect-ok"),
+                Err(e) => println!("dns-ok https-connect-fail (BAD) {e}"),
+            },
+            None => println!("dns-empty (BAD)"),
+        },
+        Err(e) => println!("dns-fail (BAD) {e}"),
+    }
+    if let Some(p) = gw_port {
+        match TcpListener::bind(("127.0.0.1", p)) {
+            Ok(_) => println!("gw-bind-ok"),
+            Err(e) => println!("gw-bind-fail (BAD) {e}"),
+        }
+    }
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(_) => println!("bind-other-ok (BAD)"),
+        Err(e) => println!("bind-other-fail {e}"),
+    }
+    ok()
+}
+
+/// macOS validator self-test: `validator echo|open|socket`. The child runs under
+/// the no-file/no-network/no-exec profile; `echo` must round-trip, `open` and
+/// `socket` must be refused (the child reports, then exits 0).
+#[cfg(target_os = "macos")]
+fn validator_selftest_macos(a: &[String]) -> ExitCode {
+    use std::os::unix::io::{FromRawFd as _, RawFd};
+    let mode = a.first().cloned().unwrap_or_else(|| "echo".into());
+    let m2 = mode.clone();
+    let v = moochy_sandbox::spawn_validator(move |fd: RawFd| -> i32 {
+        // SAFETY (test-only): the child owns the inherited socketpair end.
+        let mut sock = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        match m2.as_str() {
+            "open" => {
+                let r = std::fs::File::open("/etc/hosts").is_ok();
+                let _ = sock.write_all(if r { b"OPEN-ALLOWED" } else { b"OPEN-DENIED" });
+                0
+            }
+            "socket" => {
+                let r = std::net::TcpStream::connect("1.1.1.1:443").is_ok();
+                let _ = sock.write_all(if r { b"SOCKET-ALLOWED" } else { b"SOCKET-DENIED" });
+                0
+            }
+            "exec" => {
+                let r = std::process::Command::new("/usr/bin/true").status().is_ok();
+                let _ = sock.write_all(if r { b"EXEC-ALLOWED" } else { b"EXEC-DENIED" });
+                0
+            }
+            _ => {
+                let mut hdr = [0u8; 4];
+                if sock.read_exact(&mut hdr).is_err() {
+                    return 3;
+                }
+                let mut body = vec![0u8; u32::from_be_bytes(hdr) as usize];
+                if sock.read_exact(&mut body).is_err() {
+                    return 4;
+                }
+                let mut seen = std::collections::HashMap::new();
+                for b in &body {
+                    *seen.entry(*b).or_insert(0u32) += 1;
+                }
+                body.reverse();
+                let _ = sock.write_all(&(body.len() as u32).to_be_bytes());
+                let _ = sock.write_all(&body);
+                0
+            }
+        }
+    });
+    let mut v = match v {
+        Ok(v) => v,
+        Err(e) => {
+            println!("validator-spawn-fail {e}");
+            return ExitCode::from(71);
+        }
+    };
+    if mode == "echo" {
+        let req = b"moochy-request";
+        let _ = v.sock.write_all(&(req.len() as u32).to_be_bytes());
+        let _ = v.sock.write_all(req);
+    }
+    let mut out = Vec::new();
+    let _ = v.sock.read_to_end(&mut out);
+    let code = v.wait().unwrap_or(-1);
+    println!("validator-{mode} exit={code} out={:?}", String::from_utf8_lossy(&out));
+    let good = match mode.as_str() {
+        "echo" => code == 0 && out.ends_with(b"tseuqer-yhcoom"),
+        _ => out.ends_with(b"-DENIED"),
+    };
+    if good { ok() } else { no() }
 }
