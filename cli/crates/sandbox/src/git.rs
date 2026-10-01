@@ -14,6 +14,14 @@
 //! - **linked worktree** (`.git` is a file): always read-only — the shared
 //!   commondir and this worktree's own gitdir are visible, other worktrees'
 //!   gitdirs are hidden, and the main worktree's files never enter the view.
+//! - **nested** `.git` (submodules, vendored repos): always read-only.
+//! - **no `.git`**: an empty read-only placeholder dir is mounted, so `git init`
+//!   inside can't plant a repo (and its `core.fsmonitor`) for the host's git;
+//!   removed after the run (git ignores an empty `.git` dir).
+//!
+//! A new `.git` in a subdirectory can't be prevented by mounts; [`snapshot`] +
+//! [`changed`] let `moochy run` print a notice when any git metadata the host
+//! would trust changed during the run (A191).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -25,6 +33,9 @@ pub struct GitView {
     pub read_only: Vec<PathBuf>,
     /// Set for a linked worktree / submodule checkout.
     pub linked: Option<Linked>,
+    /// The empty `.git` dir created because the worktree had none; the caller
+    /// removes it after the run.
+    pub placeholder: Option<PathBuf>,
 }
 
 /// The gitdir layout of a worktree whose `.git` is a file.
@@ -53,9 +64,23 @@ fn looks_like_gitdir(p: &Path) -> bool {
     p.join("HEAD").is_file()
 }
 
-/// Resolve the git view of `worktree` (canonical). Missing or malformed git
-/// metadata yields an empty view (the worktree simply has no usable git).
-pub fn view(worktree: &Path, git_writable: bool) -> GitView {
+/// Resolve the git view of `worktree` (canonical): [`top_view`] plus every
+/// nested `.git` (from [`crate::mask::scan`]) read-only.
+pub fn view(worktree: &Path, git_writable: bool, dotgits: &[PathBuf]) -> Result<GitView, crate::Error> {
+    let top = worktree.join(".git");
+    let mut v = top_view(worktree, git_writable);
+    v.read_only.extend(dotgits.iter().filter(|p| **p != top).cloned());
+    if std::fs::symlink_metadata(&top).is_err() {
+        std::fs::create_dir(&top).map_err(|err| crate::Error::Setup { what: "create .git placeholder", err })?;
+        v.read_only.push(top.clone());
+        v.placeholder = Some(top);
+    }
+    Ok(v)
+}
+
+/// The top-level `.git`. Missing or malformed git metadata yields an empty
+/// view (the worktree simply has no usable git).
+fn top_view(worktree: &Path, git_writable: bool) -> GitView {
     let dotgit = worktree.join(".git");
     let Ok(meta) = std::fs::symlink_metadata(&dotgit) else { return GitView::default() };
     if meta.is_dir() {
@@ -69,7 +94,7 @@ pub fn view(worktree: &Path, git_writable: bool) -> GitView {
         } else {
             vec![dotgit]
         };
-        return GitView { read_only, linked: None };
+        return GitView { read_only, ..GitView::default() };
     }
     if !meta.is_file() {
         return GitView::default();
@@ -81,7 +106,7 @@ pub fn view(worktree: &Path, git_writable: bool) -> GitView {
     };
     let Ok(gitdir) = worktree.join(rel.trim()).canonicalize() else { return GitView::default() };
     if !looks_like_gitdir(&gitdir) {
-        return GitView { read_only: vec![dotgit], linked: None };
+        return GitView { read_only: vec![dotgit], ..GitView::default() };
     }
     let commondir = read_small(&gitdir.join("commondir"))
         .and_then(|c| gitdir.join(c.trim()).canonicalize().ok())
@@ -94,6 +119,79 @@ pub fn view(worktree: &Path, git_writable: bool) -> GitView {
         // The `.git` file itself: rewriting it would redirect the host's git.
         read_only: vec![dotgit],
         linked: Some(Linked { gitdir, commondir, worktrees_dir }),
+        placeholder: None,
+    }
+}
+
+/// What the host's git would trust, per `.git`: its kind, and for a dir the
+/// files that make git run code or redirect (`config`, `config.worktree`,
+/// `commondir`) plus the `hooks/` listing. Sorted by path.
+pub type Snapshot = std::collections::BTreeMap<PathBuf, Vec<u8>>;
+
+const SNAP_MAX: u64 = 64 * 1024;
+
+fn read_capped(p: &Path) -> Vec<u8> {
+    let mut v = Vec::new();
+    if let Ok(f) = std::fs::File::open(p) {
+        let _ = f.take(SNAP_MAX).read_to_end(&mut v);
+    }
+    v
+}
+
+#[must_use]
+pub fn snapshot(dotgits: &[PathBuf]) -> Snapshot {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut s = Snapshot::new();
+    for g in dotgits {
+        let Ok(meta) = std::fs::symlink_metadata(g) else { continue };
+        if !meta.is_dir() {
+            s.insert(g.clone(), read_capped(g));
+            continue;
+        }
+        s.insert(g.clone(), b"dir".to_vec());
+        for f in ["config", "config.worktree", "commondir"] {
+            let p = g.join(f);
+            if p.exists() {
+                s.insert(p.clone(), read_capped(&p));
+            }
+        }
+        let mut hooks: Vec<(std::ffi::OsString, u64, i64, i64)> = std::fs::read_dir(g.join("hooks"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok().map(|m| (e.file_name(), m.size(), m.mtime(), m.mtime_nsec())))
+            .collect();
+        hooks.sort();
+        s.insert(g.join("hooks"), format!("{hooks:?}").into_bytes());
+    }
+    s
+}
+
+/// The first path whose git metadata differs between two snapshots.
+#[must_use]
+pub fn changed(before: &Snapshot, after: &Snapshot) -> Option<PathBuf> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .min()
+        .cloned()
+}
+
+/// Print the A191 notice (one line) when git metadata changed during the run.
+/// The path is agent-chosen: printed escaped (`{:?}`), never raw.
+#[allow(clippy::unnecessary_debug_formatting)] // Debug = escaped: the path is agent-chosen
+pub fn notice_if_changed(worktree: &Path, before: &Snapshot) {
+    let after = crate::mask::dotgits(worktree).map(|d| snapshot(&d));
+    let what = match &after {
+        Ok(after) => changed(before, after),
+        Err(_) => Some(worktree.to_path_buf()),
+    };
+    if let Some(p) = what {
+        let rel = p.strip_prefix(worktree).unwrap_or(&p);
+        eprintln!(
+            "moochy: notice: git metadata changed during the run ({rel:?}); review it before running git in {worktree:?} (hooks/config there run on the host)"
+        );
     }
 }
 
@@ -109,8 +207,26 @@ mod tests {
         std::fs::create_dir_all(root.join("wt")).unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("wt/.git"), "gitdir: ../secret\n").unwrap();
-        let v = view(&root.join("wt").canonicalize().unwrap(), false);
+        let v = top_view(&root.join("wt").canonicalize().unwrap(), false);
         assert!(v.linked.is_none(), "{v:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_sees_new_nested_repo_and_hook_changes() {
+        let root = std::env::temp_dir().join(format!("moochy-gitsnap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        let before = snapshot(&crate::mask::dotgits(&root).unwrap());
+        assert_eq!(changed(&before, &snapshot(&crate::mask::dotgits(&root).unwrap())), None);
+        std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+        let after = snapshot(&crate::mask::dotgits(&root).unwrap());
+        assert_eq!(changed(&before, &after), Some(root.join("sub/.git")));
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join(".git/hooks/pre-commit"), "x").unwrap();
+        let after = snapshot(&crate::mask::dotgits(&root).unwrap());
+        assert_eq!(changed(&before, &after), Some(root.join(".git/hooks")));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
