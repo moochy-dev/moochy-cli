@@ -28,6 +28,7 @@ pub const MAX_LINE: usize = 4 << 20;
 const MAX_PROMPT: usize = 1 << 20;
 const MAX_RESULT: usize = 1 << 20;
 const DEFAULT_MAX_TOKENS: u64 = 4096;
+const MAX_INFLIGHT: usize = 32;
 
 const INSTRUCTIONS: &str = "Moochy runs self-contained sub-tasks on compute donated to this open-source repository. \
 Use moochy_delegate for large reads, reviews of many files, summaries, drafting tests or docs, translations, and \
@@ -425,6 +426,8 @@ pub async fn run_pipe(node: Arc<Node>, slug: String, cwd: PathBuf, mut input: mp
             }
         })
     };
+    // Bounded parallelism per session: a flood of requests waits instead of piling up tasks.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
     let mut buf: Vec<u8> = Vec::new();
     'outer: while let Some(chunk) = input.recv().await {
         buf.extend_from_slice(&chunk);
@@ -438,11 +441,13 @@ pub async fn run_pipe(node: Arc<Node>, slug: String, cwd: PathBuf, mut input: mp
                 let _ = out.send(rpc_err(&Value::Null, -32700, "parse error")).await;
                 continue;
             };
+            let Ok(permit) = slots.clone().acquire_owned().await else { break 'outer };
             let (sess, out) = (sess.clone(), out.clone());
             tokio::spawn(async move {
                 if let Some(r) = sess.handle(msg, Some(out.clone())).await {
                     let _ = out.send(r).await;
                 }
+                drop(permit);
             });
         }
         if buf.len() > MAX_LINE {

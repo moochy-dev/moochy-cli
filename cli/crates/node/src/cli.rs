@@ -129,9 +129,13 @@ fn run() -> Result<()> {
         println!("moochy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if o.has("help") || o.words.is_empty() {
+    if o.has("help") {
         print!("{HELP}");
-        return if o.words.is_empty() && !o.has("help") { Err(usage("missing command")) } else { Ok(()) };
+        return Ok(());
+    }
+    if o.words.is_empty() {
+        eprint!("{HELP}");
+        return Err(usage("missing command"));
     }
     let home = Home::resolve(o.home.clone())?;
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
