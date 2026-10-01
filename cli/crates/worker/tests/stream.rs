@@ -339,3 +339,19 @@ fn xai_go_fake_bodies_report_cost() {
         }
     }
 }
+
+/// T-05-075: a refusal is billed per the provider's usage like any completion (no special
+/// case, nothing estimated), and re-emits canonically.
+#[test]
+fn refusals_are_billed_like_any_completion() {
+    let a = include_bytes!("fixtures/anthropic_refusal.sse");
+    let (o, _) = check_all_chunkings(Dialect::AnthropicMessages, a);
+    assert_eq!(o.usage, Usage { input: 42, output: 9, ..Usage::default() });
+    assert!(o.complete && !o.provider_error && !o.malformed);
+    let o_ = include_bytes!("fixtures/openai_refusal.sse");
+    let (o, _) = check_all_chunkings(Dialect::OpenAiChat, o_);
+    assert_eq!(o.usage, Usage { input: 40, output: 11, ..Usage::default() });
+    assert!(o.complete && !o.provider_error && !o.malformed);
+    assert!(moochy_worker::reemit::reemit(Dialect::AnthropicMessages, true, a).is_ok());
+    assert!(moochy_worker::reemit::reemit(Dialect::OpenAiChat, true, o_).is_ok());
+}

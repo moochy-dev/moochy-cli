@@ -300,7 +300,7 @@ fn fuzz_validator_child_on_mutated_requests() {
 }
 
 const CAT: moochy_worker::firewall::Catalog =
-    moochy_worker::firewall::Catalog { default_effort: moochy_worker::Effort::High, max_output: 1000, max_image_tokens: 0 };
+    moochy_worker::firewall::Catalog { default_effort: moochy_worker::Effort::High, max_output: 1000, max_image_tokens: 0, max_page_tokens: 3000 };
 
 fn b64(b: &[u8]) -> String {
     use base64::Engine as _;

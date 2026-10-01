@@ -560,6 +560,15 @@ pub fn push_str(out: &mut Vec<u8>, s: &str) {
 /// Minified re-serialization of a validated value.
 pub fn write(v: Val<'_>, out: &mut Vec<u8>) {
     match v.kind() {
+        // Integers are re-emitted from their value: `-0` (read as 0 or -0 depending on the
+        // parser) becomes `0`. Other numbers are already grammar- and range-checked.
+        Kind::Num if v.is_int() => match v.as_i64() {
+            Some(n) => {
+                use std::io::Write as _;
+                let _ = write!(out, "{n}");
+            }
+            None => out.extend_from_slice(v.raw().as_bytes()),
+        },
         Kind::Null | Kind::Bool | Kind::Num => out.extend_from_slice(v.raw().as_bytes()),
         Kind::Str => {
             out.push(b'"');
@@ -686,6 +695,7 @@ mod tests {
         assert_eq!(ok(r#" { "a" : [1, -2.5e3, true, null, "x\"y\u00e9"], "b":{} } "#), r#"{"a":[1,-2.5e3,true,null,"x\"y\u00e9"],"b":{}}"#);
         assert_eq!(ok("\"\\ud83d\\ude00\""), "\"\\ud83d\\ude00\"");
         assert_eq!(ok("9223372036854775807"), "9223372036854775807");
+        assert_eq!(ok("[-0,-0.0,0,-5]"), "[0,-0.0,0,-5]", "integer -0 is canonicalised");
     }
 
     #[test]

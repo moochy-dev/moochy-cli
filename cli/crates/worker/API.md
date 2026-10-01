@@ -42,6 +42,8 @@ The only place a stranger's request bytes are parsed: a **single-use child** wit
 - Parent: response ≤ 65 MiB, read as exactly the declared length; every field is checked (sizes, UTF-8, enum values, forwarded header names ∈ {`anthropic-version`, `anthropic-beta`}, header name/value rules, device id format).
 - The parent never waits for the child's exit (it is killed and reaped on drop).
 
+**Custom transports:** `validate_on(stream, &req, deadline)` runs the same exchange over any `AsyncRead + AsyncWrite` (e.g. a socketpair to a zygote-forked, jailed child running `child_main`), and `decode_response(&buf)` is public for fully custom framing.
+
 **Single use:** each child serves exactly one request. The replacement is spawned (via `spawn_blocking`) while the current one works. A dead idle child is discarded; a crash, timeout, non-zero exit or garbage gives `ValidateError::Child` → `("busy", true)`.
 
 **Measured** (release, arm64 dev box, 100 KB agent body, warm pool): about +0.35 ms p50 and +0.42–0.67 ms p99 over in-process validation (≈0.26 ms).
@@ -51,11 +53,13 @@ The only place a stranger's request bytes are parsed: a **single-use child** wit
 
 ### `firewall`
 - `Policy { level: Strict|Paranoid, flags: Flags, max_effort: Effort }` – pledge opt-ins. `Policy::PERMISSIVE` for the Gateway.
-- `Catalog { default_effort, max_output, max_image_tokens }` – the signed-catalog numbers of the route's model.
+- `Catalog { default_effort, max_output, max_image_tokens, max_page_tokens }`: the signed-catalog numbers of the route's model. **mo-node: `engine.rs` `fw_catalog` must pass `max_page_tokens: e.max_page_tokens`** (added for CONTRACT R3).
 - `Request { provider, dialect, body, headers, policy, catalog, provider_model_id, user_pseudonym, max_price }`.
 - `prepare(&Request) -> Result<Prepared, Reject>`: strict JSON (CONTRACT §1), table walk (`tables.rs`), header allowlist, facts, safe mutations re-serialized from the validated tree.
 - `analyze(dialect, body, headers, &policy, &catalog) -> Result<Facts, Reject>`: same checks, no mutation. **The Gateway must build the route header from `analyze(.., &Policy::PERMISSIVE, ..)`** so `est_input_tokens`, `effort`, `cache_ttl`, `flags` match the Worker bit for bit.
-- `Facts { model, max_tokens, effort, est_input_tokens, cache_ttl, stream, flags, text_bytes, images }`, `Facts::check_route(dialect, &Route)`.
+- `Facts { model, max_tokens, effort, est_input_tokens, cache_ttl, stream, flags, text_bytes, images, pages }`, `Facts::check_route(dialect, &Route)`. `effort` is the maximum of the top-level effort (or the catalog default) and every per-turn `output_config.effort`.
+- `pool_compatible(dialect, body, headers) -> PoolRequest { body, headers, stripped }` (**Gateway, before sealing**): strips what a pooled donor refuses but the client can do without, so real clients work through the pool: top-level `safeguards` (Claude Code's billed auto-mode classifier, which also carries the maintainer's local paths), beta values outside the allowlist, and headers other than `anthropic-version`/`anthropic-beta`. Everything else is left to `analyze`. Show `stripped` as a `[moochy]` note.
+- `pdf_pages(bytes) -> Option<u64>`: the deterministic PDF page count used for R3.
 
 Safe mutations: `model` → `provider_model_id`; Anthropic dialect `metadata.user_id` = pseudonym;
 OpenAI dialect with `stream: true` → `stream_options.include_usage: true`; OpenAI: `store: false`,
@@ -138,7 +142,8 @@ Tool-call inputs stay byte-exact (they are executed), so instead `ToolSet::check
 ### `inspect` (Gateway side, 06 §8)
 - `ToolSet::from_request(dialect, body)`, `check_call(name, input_json) -> Verdict::{Allow, Block(reason)}`: name ∈ `tools[]`, input is a strict JSON object, schema subset (`type, enum, const, properties, required, additionalProperties, items, anyOf, oneOf, allOf`; other keywords ignored), then the tripwire.
 - `scan_text(text)` for MCP `moochy_delegate` results.
-- Tripwire rules: `pipe-to-shell`, `credential-path`, `persistence`, `encoded-payload`, `raw-ip-egress`. **A speed bump, not a guarantee.**
+- `TextScanner::new()` and `push(delta) -> Option<rule>` (CONTRACT §15.4, T-C15-021): streaming tripwire over response *text* (prompt injection). A 512-byte carry-over window catches patterns split across deltas; each rule is reported once; Markdown backticks are treated as code spans. It is a flag, not a block: the Gateway adds a visible `[moochy] warning: the response suggests a dangerous command (<rule>)` notice.
+- Tripwire rules: `terminal-control` (ESC/C1/bidi in tool inputs), `pipe-to-shell`, `credential-path`, `persistence`, `encoded-payload`, `raw-ip-egress`. **A speed bump, not a guarantee.**
 
 ### `store`
 One CRC-32-framed append-only log holding the outbox, the served-task set and the
@@ -159,14 +164,39 @@ Reusable by the node for every security/money JSON parse (route header, receipts
 
 ## Decisions on ambiguities (safer/simpler reading)
 
-- **PDFs**: 06 §7.1 says "strict level denies PDFs"; only `strict` and `paranoid` exist, so PDFs are never allowed and `pages = 0` in the estimate. Text documents need the `documents` flag.
+- **PDFs (CONTRACT R3)**:
+  - `strict` accepts base64 PDF `document` blocks (also nested in `tool_result`) only with the `documents` flag, at ≤ 100 pages per request. `paranoid` refuses all documents.
+  - Pages = max(`/Type /Page` objects, largest `/Count`). A PDF whose page tree is only in compressed object streams is refused (it can't be counted); over-counting only raises the reservation.
+  - PDF bytes are excluded from `text_bytes`; the estimate adds `pages × max_page_tokens`.
 - **`text_bytes`** = body length − inline base64 image data (raw JSON bytes, escapes included: over-estimates, never under).
 - **Route `flags`** must equal the body's flags exactly (not a superset).
-- **Beta headers**: static allowlist in `tables.rs` (catalog-versioned list later); `context-1m-*` needs `long_context`; files/code-execution/MCP/web/OAuth/context-management betas refused. `anthropic-version` defaults to `2023-06-01`.
-- **`context_management`** (server-side context editing) refused in v1.
+- **Beta headers**: static allowlist in `tables.rs` (catalog-versioned list later).
+  - `context-1m-*` needs `long_context`.
+  - Files, code-execution, MCP, web, OAuth, `dangerous-tool-use`, `thinking-token-count`, `prompt-caching-scope`, `mid-conversation-tool-changes` and `afk-mode` are refused (`pool_compatible` strips them at the Gateway).
+  - `anthropic-version` defaults to `2023-06-01`.
+- **Real-client widening (T-07-087; needs the second reviewer per 06 §7.3):** observed in Claude Code 2.1.287 traffic (`tests/fixtures/clients/`):
+  - `role: "system"` turns, text only, with optional per-turn `output_config.effort` (max wins);
+  - `context_management` with `clear_thinking_*` / `clear_tool_uses_*` edits only (content removal, no execution);
+  - betas `context-management-2025-06-27`, `mid-conversation-system-2026-04-07`, `per-turn-control-2026-07-01`.
+  - `safeguards` stays refused.
+- **JSON canonical form**: integers are re-emitted from their value (`-0` → `0`), so any parser reads the forwarded body the same way. This is checked against Python's `json` on 459 forwarded documents (`tests/differential.rs`) and against `serde_json` by fuzzing (`fuzz/json_diff`).
 - **Paranoid** level: images and documents refused, `max_tokens ≤ 16384`.
 - **Provider 4xx** (other than 401/403/404/408/429) after the firewall passed: non-retryable `provider_error` with the provider's body.
 - **Estimated output** when usage is missing: max(reported, ⌈delta payload bytes / 4⌉); estimated receipts settle at the reservation anyway (05 §5.2).
+
+## Fuzzing (`fuzz/`, T-02-040 / T-06-064 / T-07-089)
+
+- **Setup:** a standalone libFuzzer + ASan workspace on stable rustc (`RUSTC_BOOTSTRAP`, as in `moochy-proto`); not a workspace member, never shipped. Run with `./run.sh [seconds] [targets]`.
+- **Targets and invariants:**
+  - `firewall`: 5 providers; `pool_compatible` never turns an accepted body into a refused one; mutated bodies are strict JSON with the same facts.
+  - `json`: canonical write is a fixed point.
+  - `json_diff`: the lenient `serde_json` reads the same tree.
+  - `stream`: results independent of chunking.
+  - `reemit`: fixed point, chunking-independent, never introduces malformation.
+  - `validate`: the child on raw and on well-formed wire requests.
+  - `inspect`: tool calls, PDF pages, `clean_text`, `TextScanner`, cost decimals.
+- **Seeds:** every crate fixture, including the recorded client corpus and the Go-fake captures.
+- **This round:** 7 targets, about 19 M executions under ASan. One finding (`-0` integer canonicalisation, fixed); no crash.
 
 ## Measured (release, dev box arm64, one core)
 
