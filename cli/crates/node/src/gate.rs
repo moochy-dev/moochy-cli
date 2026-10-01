@@ -3,6 +3,10 @@
 //! name, schema, tripwire) and releases it only once a verified progress checkpoint covers it;
 //! otherwise the block is replaced by a visible `[moochy]` text. `Invalid` / `Forbidden` stream
 //! events fail the task (fail closed).
+//!
+//! CONTRACT §15.4: valid tool calls are released only to sandboxed sessions (`moochy run` run
+//! token) or to projects that opted in (`allow_unsandboxed_tools`); every other client gets one
+//! `[moochy]` notice in place of each tool call.
 
 use crate::engine::Dialect;
 use bytes::{Bytes, BytesMut};
@@ -10,17 +14,18 @@ use moochy_worker::inspect::{ToolSet, Verdict, response_tool_calls};
 use moochy_worker::stream::{Event, StreamParser};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 enum Out {
     Bytes(Bytes),
-    Tool { seq: u32, bytes: Bytes, index: u32, block: Option<String> },
+    /// `calls`: (index, declared name) of every tool call in the block.
+    Tool { seq: u32, bytes: Bytes, calls: Vec<(u32, String)>, block: Option<String> },
 }
 
 struct Hold {
     start: u64,
     open: u32,
     closing: Option<u64>,
-    first_index: u32,
     calls: Vec<(u32, String, Vec<u8>)>,
 }
 
@@ -43,12 +48,23 @@ pub struct Gate {
     out: VecDeque<Out>,
     last_seq: u32,
     items: Vec<(u64, u64, K)>,
+    /// §15.4: the session may receive tool calls (sandboxed, or the project opted in).
+    release: bool,
 }
 
 const MAX_TOOL_INPUT: usize = 4 << 20;
 
+/// Why a valid tool call is withheld from a client outside `moochy run` (§15.4).
+pub const NOT_SANDBOXED: &str = "this session is not sandboxed; run your agent with `moochy run`, or allow it for the project with `moochy config set allow_unsandboxed_tools owner/name`";
+
+/// One visible notice per withheld call. The name is donor-chosen: escaped and shortened.
+fn notice(name: &str, reason: &str) -> String {
+    let name: String = crate::util::clean(name).chars().take(64).collect();
+    format!("[moochy] tool call `{name}` from a donor's model was withheld: {reason}")
+}
+
 impl Gate {
-    pub fn new(dialect: Dialect, stream: bool, request: &[u8]) -> Self {
+    pub fn new(dialect: Dialect, stream: bool, request: &[u8], release: bool) -> Self {
         Self {
             dialect,
             stream,
@@ -60,10 +76,14 @@ impl Gate {
             out: VecDeque::new(),
             last_seq: 0,
             items: Vec::new(),
+            release,
         }
     }
 
     fn verdict(&self, name: &str, input: &[u8]) -> Option<String> {
+        if !self.release {
+            return Some(NOT_SANDBOXED.into());
+        }
         match self.tools.as_ref().map(|t| t.check_call(name, input)) {
             Some(Verdict::Allow) => None,
             Some(Verdict::Block(r)) => Some(r),
@@ -117,7 +137,7 @@ impl Gate {
                         h.calls.push((index, name, Vec::new()));
                     } else {
                         self.emit_until(start);
-                        self.hold = Some(Hold { start, open: 1, closing: None, first_index: index, calls: vec![(index, name, Vec::new())] });
+                        self.hold = Some(Hold { start, open: 1, closing: None, calls: vec![(index, name, Vec::new())] });
                     }
                 }
                 K::Args(index, frag) => {
@@ -163,23 +183,31 @@ impl Gate {
         let bytes = self.buf.split_to(n).freeze();
         self.base = self.base.saturating_add(n as u64);
         let block = h.calls.iter().find_map(|(_, name, input)| self.verdict(name, input));
-        self.out.push_back(Out::Tool { seq, bytes, index: h.first_index, block });
+        let calls = h.calls.into_iter().map(|(i, n, _)| (i, n)).collect();
+        self.out.push_back(Out::Tool { seq, bytes, calls, block });
     }
 
-    fn replacement(&self, index: u32, reason: &str) -> Bytes {
-        let text = format!("[moochy] a tool call from a donor's model was withheld: {reason}");
-        Bytes::from(match self.dialect {
-            Dialect::Anthropic => format!(
-                "event: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\n",
-                json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
-                json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
-                json!({"type":"content_block_stop","index":index}),
-            ),
-            Dialect::OpenAi => format!(
-                "data: {}\n\n",
-                json!({"id":"moochy","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]})
-            ),
-        })
+    /// One text block (Anthropic, at the call's own index) or content chunk (OpenAI) per call.
+    fn replacement(&self, calls: &[(u32, String)], reason: &str) -> Bytes {
+        let mut out = String::new();
+        for (index, name) in calls {
+            let text = notice(name, reason);
+            let _ = match self.dialect {
+                Dialect::Anthropic => write!(
+                    out,
+                    "event: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\n",
+                    json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                    json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+                    json!({"type":"content_block_stop","index":index}),
+                ),
+                Dialect::OpenAi => write!(
+                    out,
+                    "data: {}\n\n",
+                    json!({"id":"moochy","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"content":format!("{text}\n")},"finish_reason":null}]})
+                ),
+            };
+        }
+        Bytes::from(out)
     }
 
     pub fn is_stream(&self) -> bool {
@@ -203,12 +231,12 @@ impl Gate {
         }
         match self.out.pop_front()? {
             Out::Bytes(b) => Some(b),
-            Out::Tool { seq, bytes, index, block } => {
+            Out::Tool { seq, bytes, calls, block } => {
                 let signed = verified.is_some_and(|v| v >= seq);
                 Some(match (block, signed) {
                     (None, true) => bytes,
-                    (Some(r), _) => self.replacement(index, &r),
-                    (None, false) => self.replacement(index, "no verified donor signature covers it"),
+                    (Some(r), _) => self.replacement(&calls, &r),
+                    (None, false) => self.replacement(&calls, "no verified donor signature covers it"),
                 })
             }
         }
@@ -220,11 +248,10 @@ impl Gate {
         if self.stream {
             if self.hold.is_some() {
                 // A tool block that never ended (truncated stream): never forward it.
-                let index = self.hold.as_ref().map_or(0, |h| h.first_index);
-                self.hold = None;
+                let calls = self.hold.take().map(|h| h.calls.into_iter().map(|(i, n, _)| (i, n)).collect()).unwrap_or_default();
                 self.buf.clear();
                 let seq = self.last_seq;
-                self.out.push_back(Out::Tool { seq, bytes: Bytes::new(), index, block: Some("incomplete tool call".into()) });
+                self.out.push_back(Out::Tool { seq, bytes: Bytes::new(), calls, block: Some("incomplete tool call".into()) });
             } else {
                 let end = self.base.saturating_add(self.buf.len() as u64);
                 self.emit_until(end);
@@ -239,7 +266,7 @@ impl Gate {
         }
         let blocked: Vec<Option<String>> = calls
             .iter()
-            .map(|(n, i)| self.verdict(n, i).or_else(|| (!verified_all).then(|| "no verified donor signature covers it".into())))
+            .map(|(n, i)| self.verdict(n, i).or_else(|| (!verified_all).then(|| "no verified donor signature covers it".into())).map(|r| notice(n, &r)))
             .collect();
         if blocked.iter().all(Option::is_none) {
             self.out.push_back(Out::Bytes(body));
@@ -254,7 +281,7 @@ impl Gate {
 /// Replace blocked tool calls of a non-streamed body with a visible `[moochy]` text.
 fn rewrite_body(d: Dialect, body: &[u8], blocked: &[Option<String>]) -> Option<Bytes> {
     let mut v = crate::json::parse(body).ok()?;
-    let note = |r: &str| format!("[moochy] a tool call from a donor's model was withheld: {r}");
+    let note = |r: &str| r.to_owned();
     let mut i = 0usize;
     match d {
         Dialect::Anthropic => {
@@ -313,7 +340,11 @@ mod tests {
     }
 
     fn run(tool: &str, input: &str, verified: Option<u32>) -> String {
-        let mut g = Gate::new(Dialect::Anthropic, true, REQ);
+        run_with(tool, input, verified, true)
+    }
+
+    fn run_with(tool: &str, input: &str, verified: Option<u32>, release: bool) -> String {
+        let mut g = Gate::new(Dialect::Anthropic, true, REQ, release);
         let mut out = Vec::new();
         for (i, c) in stream(tool, input).iter().enumerate() {
             g.push(u32::try_from(i).unwrap(), c.as_bytes()).unwrap();
@@ -330,7 +361,7 @@ mod tests {
 
     #[test]
     fn text_streams_immediately_tool_waits_for_checkpoint() {
-        let mut g = Gate::new(Dialect::Anthropic, true, REQ);
+        let mut g = Gate::new(Dialect::Anthropic, true, REQ, true);
         let ev = stream("get_weather", r#"{"city":"Paris"}"#);
         g.push(0, ev[0].as_bytes()).unwrap();
         assert_eq!(g.pop(None, false).unwrap(), ev[0].as_bytes(), "text forwarded at once");
@@ -360,14 +391,23 @@ mod tests {
 
     #[test]
     fn invalid_event_fails_closed() {
-        let mut g = Gate::new(Dialect::Anthropic, true, REQ);
+        let mut g = Gate::new(Dialect::Anthropic, true, REQ, true);
         assert!(g.push(0, b"event: content_block_delta\ndata: {\"a\":1,\"a\":2}\n\n").is_err());
+    }
+
+    #[test]
+    fn unsandboxed_session_gets_a_notice_per_call() {
+        let o = run_with("get_weather", r#"{"city":"Oslo"}"#, Some(99), false);
+        assert!(!o.contains(r#""type":"tool_use""#), "valid call must not reach an unsandboxed client: {o}");
+        assert!(o.contains("[moochy] tool call `get_weather`") && o.contains("not sandboxed"), "{o}");
+        let ok = run_with("get_weather", r#"{"city":"Oslo"}"#, Some(99), true);
+        assert!(ok.contains(r#""type":"tool_use""#), "released to a sandboxed session: {ok}");
     }
 
     #[test]
     fn non_stream_rewrite() {
         let body = br#"{"id":"m","type":"message","role":"assistant","model":"x","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"t","name":"rm","input":{}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        let mut g = Gate::new(Dialect::Anthropic, false, REQ);
+        let mut g = Gate::new(Dialect::Anthropic, false, REQ, true);
         g.push(0, body).unwrap();
         g.finish(true).unwrap();
         let o = String::from_utf8(g.pop(Some(0), true).unwrap().to_vec()).unwrap();

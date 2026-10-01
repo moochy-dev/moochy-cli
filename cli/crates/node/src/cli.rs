@@ -35,6 +35,9 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
+  run [--repo OWNER/NAME] -- <command> [args]
+                                  Run your coding agent in a sandbox wired to Moochy. Tool calls
+                                  from donated tokens reach only sandboxed agents
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
@@ -42,7 +45,9 @@ COMMANDS:
   config set <KEY> <VALUE> | config show
                                   monthly_limit (dollars, e.g. 20), slots_max (1-64),
                                   gateway_addr, journal_full_text, auto_cache,
-                                  firewall_level (safety checks: strict or paranoid)
+                                  firewall_level (safety checks: strict or paranoid),
+                                  allow_unsandboxed_tools (owner/name list: tool calls reach
+                                  agents outside `moochy run`; warned at every start)
   connect <client> [--repo OWNER/NAME] [--write]
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
@@ -137,7 +142,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-sandbox"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -208,6 +213,7 @@ fn run() -> Result<()> {
         }),
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
+        ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
         ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
@@ -316,6 +322,26 @@ fn detect_repo() -> Option<String> {
     let owner = parts.next()?;
     let slug = format!("{owner}/{name}");
     valid_slug(&slug).then_some(slug)
+}
+
+/// `moochy run -- <cmd…>` (CONTRACT §15.1). Fails closed until `moochy-sandbox` is in the build.
+fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
+    if !o.has("unsafe-no-sandbox") {
+        return Err(usage(
+            "moochy run needs the built-in sandbox, which this version does not include yet, and it never runs a command unsandboxed. Use `moochy env` for a plain setup (tool calls stay withheld), or --unsafe-no-sandbox for debugging",
+        ));
+    }
+    let slug = slug_or_detect(o)?;
+    let r = rt_small()?
+        .block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            c.env(EnvRequest { repo: slug.clone(), rotate: false }).await.map_err(|s| internal(clean(s.message()).into_owned()))
+        })?
+        .into_inner();
+    let env = crate::run::gateway_env(&r.anthropic_base_url, &r.openai_base_url, &r.mcp_url, &r.token);
+    let cmd: Vec<String> = cmd.iter().map(|s| (*s).to_owned()).collect();
+    let st = crate::run::run_unsandboxed(&env, &cmd)?;
+    std::process::exit(st.code().unwrap_or(1));
 }
 
 fn env(home: &Home, o: &Opts) -> Result<()> {
@@ -729,6 +755,10 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));
+    if let Some(p) = node.cfg.allow_unsandboxed_tools.as_deref() {
+        eprintln!("WARNING: tool calls from donated tokens reach agents outside `moochy run` for: {}. A donor's model can make such an agent run commands on this machine.", clean(p));
+        log("warn", "allow_unsandboxed_tools is set: tool calls reach unsandboxed clients", &json!({"projects": p}));
+    }
     tokio::spawn(crate::ctl::serve(node.clone(), sock, sock_path.clone()));
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));

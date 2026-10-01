@@ -74,6 +74,9 @@ pub fn native_error(d: Dialect, f: &Failure) -> Resp {
 
 /// Accept loop. The listener is bound to loopback by the caller.
 pub async fn serve(node: Arc<Node>, listener: TcpListener) {
+    if let Err(e) = crate::run::init_key(&node.home.state_dir()) {
+        crate::util::log("error", "no run key: `moochy run` cannot get a sandboxed session", &json!({"error": e.msg}));
+    }
     let port = listener.local_addr().map_or(0, |a| a.port());
     let allowed: Arc<[String; 3]> = Arc::new([format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")]);
     let conns = Arc::new(Semaphore::new(MAX_CONNS));
@@ -144,8 +147,9 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         r.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
         return r;
     }
-    // 4. Repo-scoped local token.
-    let Some(slug) = token(req.headers()).and_then(|t| node.check_token(t)) else {
+    // 4. A live sandboxed run token (§15.4), else a repo-scoped local token.
+    let caller = token(req.headers()).and_then(|t| crate::run::check(t).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
+    let Some((slug, sandboxed)) = caller else {
         if path == "/mcp" {
             let mut r = json_resp(401, &json!({"error": "unauthorized"}));
             r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -153,15 +157,21 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         }
         return native_error(dialect, &Failure::new("unauthorized", false, "moochy: invalid local token (see `moochy env`)".to_owned()));
     };
+    // Tool calls are released only to sandboxed sessions or projects that opted in (§15.4).
+    let release = sandboxed || node.cfg.unsandboxed_tools_allowed(&slug);
     match (req.method(), path.as_str()) {
+        (&Method::POST, "/moochy/run") if !sandboxed => {
+            let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
+            crate::run::open(slug, key)
+        }
         (_, "/mcp") => crate::mcp::http(node, slug, req).await,
         (&Method::GET, "/v1/models") => {
             node.settle_pool(&slug, |p| !p.models().is_empty()).await;
             models(&node, &slug)
         }
-        (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false).await,
-        (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true).await,
-        (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false).await,
+        (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false, release).await,
+        (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true, release).await,
+        (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false, release).await,
         _ => native_error(dialect, &Failure::new("not_found", false, format!("moochy: no route for {path}"))),
     }
 }
@@ -248,7 +258,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
-    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx })
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false })
 }
 
 fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
@@ -272,7 +282,7 @@ fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::Catalo
     })
 }
 
-async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool) -> Resp {
+async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: bool) -> Resp {
     let t_rx = crate::task::now_us();
     let headers: Vec<(String, String)> = ["anthropic-version", "anthropic-beta"]
         .iter()
@@ -298,7 +308,7 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         };
     }
     let treq = match prepare(&node, slug, dialect, raw, headers, t_rx) {
-        Ok(t) => t,
+        Ok(t) => TaskReq { release_tools: release, ..t },
         Err(f) => return native_error(dialect, &f),
     };
     let stream = treq.facts.stream;

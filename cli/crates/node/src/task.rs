@@ -39,6 +39,8 @@ pub struct TaskReq {
     pub headers: Vec<(String, String)>,
     /// Unix µs when the client request was received (E22 timing).
     pub t_client_rx: u64,
+    /// §15.4: tool calls may reach this client (sandboxed run token or project opt-in).
+    pub release_tools: bool,
 }
 
 pub enum TaskEv {
@@ -245,7 +247,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         body: req.body.clone(),
         repo_id: pool.repo_id.clone(),
         route,
-        gate: Gate::new(req.dialect, req.facts.stream, &req.body),
+        gate: Gate::new(req.dialect, req.facts.stream, &req.body, req.release_tools),
         pool,
         tx,
         up: up_tx,
