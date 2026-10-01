@@ -35,7 +35,7 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
-  run [--repo OWNER/NAME] [--worktree DIR] [--unsafe-no-sandbox] -- <command> [args]
+  run [--repo OWNER/NAME] [--worktree DIR] [--allow-host HOST]... [--unsafe-no-sandbox] -- <cmd>
                                   Run your coding agent in a sandbox wired to Moochy: it sees only
                                   this repository (secrets hidden) and reaches only Moochy. Tool
                                   calls from donated tokens reach only sandboxed agents
@@ -116,6 +116,7 @@ struct Opts {
     reason: Option<String>,
     from_file: Option<PathBuf>,
     worktree: Option<PathBuf>,
+    allow_hosts: Vec<String>,
     config: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
@@ -142,6 +143,7 @@ fn parse() -> Result<Opts> {
             Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
@@ -352,6 +354,9 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
         let env = crate::run::gateway_env(&r.anthropic_base_url, &r.openai_base_url, &r.mcp_url, &r.token);
         let st = crate::run::run_unsandboxed(&env, &cmd)?;
         std::process::exit(st.code().unwrap_or(1));
+    }
+    if !o.allow_hosts.is_empty() {
+        return Err(usage("--allow-host needs the sandbox's CONNECT proxy, which this version does not include yet; nothing ran"));
     }
     let gw = crate::run::GatewayInfo { anthropic: r.anthropic_base_url, openai: r.openai_base_url, mcp: r.mcp_url, repo_token: r.token, state_dir: home.state_dir() };
     let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;

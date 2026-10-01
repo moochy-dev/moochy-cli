@@ -92,11 +92,12 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
-                conn(&node, &allowed, &conns, stream);
+                conn(&node, &allowed, &conns, stream, None);
             }
             r = async { unix.as_ref()?.accept().await.ok() }, if unix.is_some() => {
                 if let Some((stream, _)) = r {
-                    conn(&node, &allowed, &conns, stream);
+                    let peer = stream.peer_cred().ok().map(|c| crate::run::Peer { uid: c.uid(), pid: c.pid() });
+                    conn(&node, &allowed, &conns, stream, peer);
                 }
             }
             _ = shutdown.changed() => return,
@@ -118,7 +119,8 @@ fn gateway_socket(node: &Node) -> Option<tokio::net::UnixListener> {
     Some(l)
 }
 
-fn conn<S>(node: &Arc<Node>, allowed: &Arc<[String; 3]>, conns: &Arc<Semaphore>, stream: S)
+/// `peer`: the Unix-socket peer's credentials (A201); `None` over TCP.
+fn conn<S>(node: &Arc<Node>, allowed: &Arc<[String; 3]>, conns: &Arc<Semaphore>, stream: S, peer: Option<crate::run::Peer>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -129,7 +131,7 @@ where
         let svc = hyper::service::service_fn(move |req| {
             let node = node.clone();
             let allowed = allowed.clone();
-            async move { Ok::<_, Infallible>(handle(node, &allowed, req).await) }
+            async move { Ok::<_, Infallible>(handle(node, &allowed, req, peer).await) }
         });
         let _ = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
@@ -150,7 +152,7 @@ fn token(h: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
 }
 
-async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) -> Resp {
+async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, peer: Option<crate::run::Peer>) -> Resp {
     let path = req.uri().path().to_owned();
     let dialect = if path.ends_with("/chat/completions") || (path.ends_with("/models") && req.headers().get("anthropic-version").is_none()) {
         Dialect::OpenAi
@@ -206,7 +208,7 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
     match (req.method(), path.as_str()) {
         (&Method::POST, "/moochy/run") if !sandboxed => {
             let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
-            crate::run::open(slug, key)
+            crate::run::open(slug, key, peer, &node.home.state_dir())
         }
         (_, "/mcp") => crate::mcp::http(node, slug, req).await,
         (&Method::GET, "/v1/models") => {
