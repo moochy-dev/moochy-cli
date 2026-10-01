@@ -218,7 +218,7 @@ impl Gate {
                 Dialect::OpenAi => write!(
                     out,
                     "data: {}\n\n",
-                    json!({"id":"moochy","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"content":format!("{text}\n")},"finish_reason":null}]})
+                    json!({"id":"moochy","object":"chat.completion.chunk","created":0,"model":"moochy","choices":[{"index":0,"delta":{"content":format!("{text}\n")},"finish_reason":null}]})
                 ),
             };
         }
@@ -297,22 +297,25 @@ impl Gate {
 }
 
 /// Canonical re-emission (CONTRACT §15.4, A162): every byte for the client passes through here
-/// (`task.rs` flush), so no donor byte reaches the agent's parser verbatim.
-/// ponytail: identity until `moochy_worker::reemit::Reemitter` is on main; then `push` feeds it
-/// and returns its canonical output, `finish` flushes it, and an error fails the attempt.
-pub struct Canon;
+/// (`task.rs` flush) and is re-written from its parsed, typed form by `moochy_worker::reemit`,
+/// so no donor byte reaches the agent's parser verbatim. An error fails the attempt.
+pub struct Canon(moochy_worker::reemit::Reemitter);
 
 impl Canon {
-    pub fn new(_dialect: Dialect, _stream: bool) -> Self {
-        Self
+    pub fn new(dialect: Dialect, stream: bool) -> Self {
+        Self(moochy_worker::reemit::Reemitter::new(dialect.worker(), stream))
     }
 
-    pub fn push(&mut self, b: Bytes) -> Result<Bytes, &'static str> {
-        Ok(b)
+    pub fn push(&mut self, b: &[u8]) -> Result<Bytes, &'static str> {
+        let mut out = Vec::with_capacity(b.len());
+        self.0.push(b, &mut out).map_err(|e| e.0)?;
+        Ok(Bytes::from(out))
     }
 
     pub fn finish(&mut self) -> Result<Bytes, &'static str> {
-        Ok(Bytes::new())
+        let mut out = Vec::new();
+        self.0.finish(&mut out).map_err(|e| e.0)?;
+        Ok(Bytes::from(out))
     }
 }
 

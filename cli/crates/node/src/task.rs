@@ -647,7 +647,7 @@ impl Driver {
 
     async fn flush(&mut self, finale: bool) -> Step {
         while let Some(b) = self.gate.pop(self.verified, finale) {
-            let b = match self.canon.push(b) {
+            let b = match self.canon.push(&b) {
                 Ok(b) => b,
                 Err(why) => return retry_fail("provider_error", why),
             };
