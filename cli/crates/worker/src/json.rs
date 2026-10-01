@@ -14,6 +14,9 @@ use std::fmt;
 
 /// Maximum container nesting (root container = depth 1).
 pub const MAX_DEPTH: u32 = 64;
+/// Maximum values per document: bounds tape memory (12 B/value ⇒ 24 MiB) whatever the
+/// byte size, so `[0,0,0,…]` cannot amplify a 32 MiB body into hundreds of MiB.
+pub const MAX_VALUES: usize = 2 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -104,6 +107,9 @@ impl Parser<'_, '_> {
     }
 
     fn value(&mut self, depth: u32) -> Result<(), Error> {
+        if self.tape.len() >= MAX_VALUES {
+            return self.err("too many JSON values");
+        }
         match self.peek() {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
@@ -703,6 +709,8 @@ mod tests {
         assert_eq!(bad(b""), "unexpected end of input");
         let deep = "[".repeat(65) + &"]".repeat(65);
         assert_eq!(bad(deep.as_bytes()), "nesting deeper than 64");
+        let many = format!("[{}0]", "0,".repeat(MAX_VALUES));
+        assert_eq!(bad(many.as_bytes()), "too many JSON values");
         let ok64 = "[".repeat(64) + &"]".repeat(64);
         assert_eq!(ok(&ok64), ok64);
     }
