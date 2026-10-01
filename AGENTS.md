@@ -17,7 +17,7 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 ## 3. Rust (`cli/`): aggressive, lean, fast, safe
 
-- `#![forbid(unsafe_code)]` in every crate. `clippy -D warnings` with `clippy::pedantic` on; deny `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `arithmetic_side_effects` outside tests. Integer money math is checked (`checked_*`), never wrapping.
+- `#![forbid(unsafe_code)]` in every crate (sole exception: the documented syscall module of `moochy-sandbox`, CONTRACT §15). `clippy -D warnings` with `clippy::pedantic` on; deny `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `arithmetic_side_effects` outside tests. Integer money math is checked (`checked_*`), never wrapping.
 - Release profile (workspace root, already set): `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip=true`.
 - Hot path: zero-copy (`bytes::Bytes`), no per-chunk allocation you can avoid, no `String` building in the data plane, bounded channels everywhere, no blocking calls on the runtime.
 - gRPC: `tonic` (no default TLS features; our own `tokio-rustls` connector for channel binding) + `prost`; generated code committed, never built from `.proto` at compile time.
