@@ -62,6 +62,9 @@ pub enum Provider {
     OpenAi,
     /// xAI (Grok): OpenAI-compatible chat completions only.
     XAi,
+    /// A donor's own OpenAI-compatible inference server (Ollama, LM Studio, vLLM, llama.cpp
+    /// server) on loopback or the LAN: free, goals counted in tokens (see `API.md`).
+    Local,
 }
 
 impl Provider {
@@ -72,6 +75,7 @@ impl Provider {
             "deepseek" => Some(Self::DeepSeek),
             "openai" => Some(Self::OpenAi),
             "xai" => Some(Self::XAi),
+            "local" => Some(Self::Local),
             _ => None,
         }
     }
@@ -83,6 +87,7 @@ impl Provider {
             Self::DeepSeek => "deepseek",
             Self::OpenAi => "openai",
             Self::XAi => "xai",
+            Self::Local => "local",
         }
     }
 

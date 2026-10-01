@@ -46,6 +46,14 @@ pub struct Limits {
     pub max_error_body: usize,
 }
 
+impl Limits {
+    /// For [`Provider::Local`]: a local server may load the model on the first request and
+    /// process a long prompt before the first byte (headers 300 s, idle 300 s).
+    pub fn local() -> Self {
+        Self { headers: Duration::from_secs(300), idle: Duration::from_secs(300), ..Self::default() }
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -227,6 +235,9 @@ impl AdapterDef {
             // OpenAI-compatible root `https://api.x.ai/v1` (global endpoint; the US regional
             // host costs +10% and is not allowlisted). No Anthropic-compatible endpoint.
             Provider::XAi => Self { host: "api.x.ai", messages: None, chat: Some("/v1/chat/completions") },
+            // The donor's own server (Ollama :11434, LM Studio :1234, vLLM :8000, llama.cpp
+            // :8080): no official host; the base URL comes from `check_local_base_url`.
+            Provider::Local => Self { host: "", messages: None, chat: Some("/v1/chat/completions") },
         }
     }
 
@@ -252,9 +263,16 @@ fn real_target(p: Provider) -> Target {
     Target { tls: true, host: host.to_owned(), port: 443, authority: host.to_owned() }
 }
 
-/// Parse a dev base URL: an **origin** only (`http(s)://loopback-ip[:port]`, optional
-/// trailing `/`). A path is refused rather than interpreted: the adapter owns the paths.
-fn dev_target(url: &str) -> Result<Target, ConfigError> {
+/// `scheme://host[:port][/]`: an origin only (a path is refused rather than interpreted:
+/// the adapter owns the paths).
+struct Origin<'a> {
+    tls: bool,
+    host: &'a str,
+    port: u16,
+    authority: &'a str,
+}
+
+fn parse_origin(url: &str) -> Result<Origin<'_>, ConfigError> {
     let (tls, rest) = if let Some(r) = url.strip_prefix("http://") {
         (false, r)
     } else if let Some(r) = url.strip_prefix("https://") {
@@ -263,14 +281,17 @@ fn dev_target(url: &str) -> Result<Target, ConfigError> {
         return Err(ConfigError("base URL must be http:// or https://"));
     };
     if rest.contains(['?', '#', '@', '\\']) || rest.bytes().any(|b| b.is_ascii_control() || b == b' ') {
-        return Err(ConfigError("base URL must be scheme://loopback-ip[:port]"));
+        return Err(ConfigError("base URL must be scheme://host[:port]"));
     }
     let authority = rest.strip_suffix('/').unwrap_or(rest);
     if authority.contains('/') {
-        return Err(ConfigError("base URL must be an origin (scheme://loopback-ip[:port]); request paths are fixed per adapter"));
+        return Err(ConfigError("base URL must be an origin (scheme://host[:port]); request paths are fixed per adapter"));
     }
     let (host, port) = if let Some(r) = authority.strip_prefix('[') {
         let (h, p) = r.split_once(']').ok_or(ConfigError("bad IPv6 literal"))?;
+        if !(p.is_empty() || p.starts_with(':')) {
+            return Err(ConfigError("bad IPv6 literal"));
+        }
         (h, p.strip_prefix(':'))
     } else {
         match authority.rsplit_once(':') {
@@ -278,16 +299,99 @@ fn dev_target(url: &str) -> Result<Target, ConfigError> {
             None => (authority, None),
         }
     };
-    let ip: IpAddr = host.parse().map_err(|_| ConfigError("base URL host must be a loopback IP literal"))?;
-    if !ip.is_loopback() {
-        return Err(ConfigError("base URL host must be loopback"));
+    if host.is_empty() {
+        return Err(ConfigError("base URL has no host"));
     }
     let port = match port {
-        Some(p) => p.parse().map_err(|_| ConfigError("bad port"))?,
+        Some(p) => p.parse().ok().filter(|p| *p != 0).ok_or(ConfigError("bad port"))?,
         None if tls => 443,
         None => 80,
     };
-    Ok(Target { tls, host: ip.to_string(), port, authority: authority.to_owned() })
+    Ok(Origin { tls, host, port, authority })
+}
+
+/// Parse a dev base URL for a hosted provider: loopback IP literals only (CONTRACT §6).
+fn dev_target(url: &str) -> Result<Target, ConfigError> {
+    let o = parse_origin(url)?;
+    let ip: IpAddr = o.host.parse().map_err(|_| ConfigError("base URL host must be a loopback IP literal"))?;
+    if !ip.is_loopback() {
+        return Err(ConfigError("base URL host must be loopback"));
+    }
+    Ok(Target { tls: o.tls, host: ip.to_string(), port: o.port, authority: o.authority.to_owned() })
+}
+
+/// Where a local inference server may live. Vetted: loopback, private LAN (RFC 1918, IPv6
+/// ULA) and CGNAT/Tailscale (100.64.0.0/10) IP literals. Never: link-local (cloud metadata
+/// 169.254.169.254, fe80::/10), unspecified, multicast, broadcast. Public IPs and host names
+/// (DNS can rebind them) only with `allow_unvetted_host` (`--allow-unvetted-host`, dev).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalHost {
+    Loopback,
+    Lan,
+    Unvetted,
+}
+
+fn vet_ip(ip: IpAddr) -> Result<LocalHost, ConfigError> {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 @ IpAddr::V4(_) => v4,
+    };
+    if ip.is_unspecified() || ip.is_multicast() {
+        return Err(ConfigError("local host must not be unspecified or multicast"));
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            if v4.is_link_local() || v4.is_broadcast() {
+                return Err(ConfigError("local host must not be link-local (cloud metadata) or broadcast"));
+            }
+            if v4.is_loopback() {
+                Ok(LocalHost::Loopback)
+            } else if v4.is_private() || (a == 100 && (64..=127).contains(&b)) {
+                Ok(LocalHost::Lan)
+            } else {
+                Ok(LocalHost::Unvetted)
+            }
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments().first().copied().unwrap_or(0);
+            if first & 0xffc0 == 0xfe80 {
+                return Err(ConfigError("local host must not be link-local"));
+            }
+            if v6.is_loopback() {
+                Ok(LocalHost::Loopback)
+            } else if first & 0xfe00 == 0xfc00 {
+                Ok(LocalHost::Lan)
+            } else {
+                Ok(LocalHost::Unvetted)
+            }
+        }
+    }
+}
+
+/// Vet a local inference server's base URL (`moochy keys add local --base-url …`): returns its
+/// class, or why it is refused. Origin only; the path is always `/v1/chat/completions`.
+pub fn check_local_base_url(url: &str, allow_unvetted_host: bool) -> Result<LocalHost, ConfigError> {
+    local_target(url, allow_unvetted_host).map(|(_, c)| c)
+}
+
+fn local_target(url: &str, allow_unvetted: bool) -> Result<(Target, LocalHost), ConfigError> {
+    let o = parse_origin(url)?;
+    let class = match o.host.parse::<IpAddr>() {
+        Ok(ip) => vet_ip(ip)?,
+        Err(_) => {
+            let ok = o.host.len() <= 253 && o.host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') && !o.host.starts_with(['-', '.']);
+            if !ok {
+                return Err(ConfigError("local host must be an IP literal or a DNS name"));
+            }
+            LocalHost::Unvetted
+        }
+    };
+    if class == LocalHost::Unvetted && !allow_unvetted {
+        return Err(ConfigError("local host must be a loopback or LAN IP literal (public IPs and host names need --allow-unvetted-host)"));
+    }
+    let host = o.host.parse::<IpAddr>().map_or_else(|_| o.host.to_ascii_lowercase(), |ip| ip.to_string());
+    Ok((Target { tls: o.tls, host, port: o.port, authority: o.authority.to_owned() }, class))
 }
 
 fn tls_config(dev_root: Option<&CertificateDer<'static>>) -> Result<Arc<rustls::ClientConfig>, ConfigError> {
@@ -320,7 +424,7 @@ pub struct Adapter {
     provider: Provider,
     target: Target,
     auth_name: &'static str,
-    auth: HeaderValue,
+    auth: Option<HeaderValue>,
     tls: Option<TlsConnector>,
     h2: Mutex<Option<H2>>,
     /// Idle HTTP/1.1 keep-alive connections (`http://` loopback dev targets only).
@@ -336,7 +440,20 @@ impl std::fmt::Debug for Adapter {
 
 impl Adapter {
     pub fn new(cfg: &AdapterConfig) -> Result<Self, ConfigError> {
+        Self::build(cfg, false)
+    }
+
+    /// [`Adapter::new`] for [`Provider::Local`] with the dev-only `--allow-unvetted-host`
+    /// switch (public IPs and host names; the node prints a warning at every start).
+    pub fn new_local(cfg: &AdapterConfig, allow_unvetted_host: bool) -> Result<Self, ConfigError> {
+        Self::build(cfg, allow_unvetted_host)
+    }
+
+    fn build(cfg: &AdapterConfig, allow_unvetted_host: bool) -> Result<Self, ConfigError> {
+        let local = cfg.provider == Provider::Local;
         let target = match &cfg.base_url {
+            None if local => return Err(ConfigError("a local provider needs its server's base URL")),
+            Some(u) if local => local_target(u, allow_unvetted_host)?.0,
             None => real_target(cfg.provider),
             Some(_) if !cfg.insecure_dev => return Err(ConfigError("base URL override needs MOOCHY_INSECURE_DEV=1")),
             Some(u) => dev_target(u)?,
@@ -345,16 +462,23 @@ impl Adapter {
             return Err(ConfigError("a dev trust root is only accepted with a loopback dev base URL"));
         }
         let key = cfg.api_key.trim();
-        if key.is_empty() || key.len() > 512 || !key.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(ConfigError("API key must be 1..512 visible ASCII characters"));
-        }
-        let (auth_name, value) = match cfg.provider {
-            Provider::Anthropic => ("x-api-key", Zeroizing::new(key.to_owned())),
-            _ => ("authorization", Zeroizing::new(format!("Bearer {key}"))),
+        // Local servers usually take no key (Ollama/LM Studio ignore it): empty = no auth header.
+        let auth = if local && key.is_empty() {
+            None
+        } else {
+            if key.is_empty() || key.len() > 512 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(ConfigError("API key must be 1..512 visible ASCII characters"));
+            }
+            let value = match cfg.provider {
+                Provider::Anthropic => Zeroizing::new(key.to_owned()),
+                _ => Zeroizing::new(format!("Bearer {key}")),
+            };
+            // ponytail: the HeaderValue copy cannot be zeroized (http crate); it lives as long as the adapter.
+            let mut v = HeaderValue::from_str(&value).map_err(|_| ConfigError("API key is not a valid header value"))?;
+            v.set_sensitive(true);
+            Some(v)
         };
-        // ponytail: the HeaderValue copy cannot be zeroized (http crate); it lives as long as the adapter.
-        let mut auth = HeaderValue::from_str(&value).map_err(|_| ConfigError("API key is not a valid header value"))?;
-        auth.set_sensitive(true);
+        let auth_name = if cfg.provider == Provider::Anthropic { "x-api-key" } else { "authorization" };
         let tls = if target.tls { Some(TlsConnector::from(tls_config(cfg.dev_root.as_ref())?)) } else { None };
         Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, h2: Mutex::new(None), h1_idle: Arc::default(), limits: cfg.limits })
     }
@@ -480,8 +604,10 @@ impl Adapter {
         };
         let mut b = hyper::Request::post(uri)
             .header("content-type", "application/json")
-            .header("user-agent", USER_AGENT)
-            .header(self.auth_name, self.auth.clone());
+            .header("user-agent", USER_AGENT);
+        if let Some(a) = &self.auth {
+            b = b.header(self.auth_name, a.clone());
+        }
         if !t.tls {
             b = b.header("host", t.authority.as_str());
         }

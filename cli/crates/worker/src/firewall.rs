@@ -317,6 +317,9 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
     if req.provider_model_id.is_empty() || req.provider_model_id.len() > MAX_MODEL_LEN {
         return Err(Reject::new(RejectCode::Unsupported, "", "has no catalog mapping for this provider"));
     }
+    if req.provider == Provider::Local && is_cloud_routed(req.provider_model_id) {
+        return Err(Reject::new(RejectCode::Unsupported, "", "maps to a cloud-routed model (e.g. Ollama `*-cloud`): a local donor serves local models only"));
+    }
     let mut tape = Vec::new();
     let (facts, headers, root) = check(req.dialect, req.body, req.headers, *req.policy, req.catalog, &mut tape)?;
     // Fields the shared dialect table allows but this provider's API does not have.
@@ -350,7 +353,8 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
                 }
                 // xAI documents `safety_identifier` for end-user attribution.
                 Provider::XAi => patches.push(Patch { path: &["safety_identifier"], json: &user }),
-                Provider::DeepSeek | Provider::Anthropic => {}
+                // Local servers: no end-user id (nothing to attribute abuse to on the donor's own box).
+                Provider::DeepSeek | Provider::Anthropic | Provider::Local => {}
             }
         }
     }
@@ -367,6 +371,14 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
     let mut out = Vec::with_capacity(req.body.len().saturating_add(256));
     json::write_patched(root, &patches, &mut out);
     Ok(Prepared { facts, body: Bytes::from(out), headers })
+}
+
+/// A model id a "local" server would forward to a remote service: Ollama routes tags such as
+/// `gpt-oss:120b-cloud` / `model:cloud` to ollama.com (content leaves the machine, billed to the
+/// donor's account). Refused for [`Provider::Local`].
+pub fn is_cloud_routed(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    m.rsplit_once(':').is_some_and(|(_, tag)| tag == "cloud" || tag.ends_with("-cloud")) || m.ends_with("-cloud")
 }
 
 /// µ$ per million tokens → a JSON decimal in dollars per million tokens.
