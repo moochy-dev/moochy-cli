@@ -120,6 +120,8 @@ pub struct Node {
     pub token_gen: AtomicU64,
     pub paused: AtomicBool,
     pub worker_busy: AtomicU32,
+    /// Provider rate-limit headroom per served model: (percent, expiry ms) (E31).
+    pub rl_headroom: Mutex<HashMap<String, (u8, u64)>>,
     pub gateway_tasks: AtomicU32,
     pub journal: Mutex<VecDeque<JournalEntry>>,
     pub journal_tx: broadcast::Sender<JournalEntry>,
@@ -162,6 +164,7 @@ impl Node {
             token_gen,
             paused: AtomicBool::new(false),
             worker_busy: AtomicU32::new(0),
+            rl_headroom: Mutex::new(HashMap::new()),
             gateway_tasks: AtomicU32::new(0),
             journal: Mutex::new(VecDeque::new()),
             journal_tx: broadcast::channel(64).0,

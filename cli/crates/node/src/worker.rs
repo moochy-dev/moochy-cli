@@ -82,9 +82,23 @@ async fn with_store<T: Send + 'static>(node: &Node, f: impl FnOnce(&mut Store) -
     tokio::task::spawn_blocking(move || f(&mut lock(&st))).await.ok()
 }
 
+/// How long a provider's rate-limit reading steers the offer; then it decays back to 100 %.
+const RL_TTL_MS: u64 = 60_000;
+
+/// Record the provider's rate-limit headroom for `model` (sent with the next offer).
+fn note_headroom(node: &Node, model: &str, rl: &moochy_worker::provider::RateLimit) {
+    if let Some(p) = rl.headroom_pct() {
+        lock(&node.rl_headroom).insert(model.to_owned(), (p, now_ms().saturating_add(RL_TTL_MS)));
+    }
+}
+
 pub fn offer(node: &Node) -> pb::NodeMsg {
     let paused = node.paused.load(Ordering::Relaxed);
-    let models = served_models(node).into_iter().map(|(d, m)| pb::ModelOffer { dialect: d.wire().into(), model: m, rl_headroom: 100 }).collect();
+    let now = now_ms();
+    let rl = lock(&node.rl_headroom);
+    let headroom = |m: &str| rl.get(m).filter(|(_, exp)| *exp > now).map_or(100, |(p, _)| u32::from(*p));
+    let models = served_models(node).into_iter().map(|(d, m)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m }).collect();
+    drop(rl);
     let free = if paused { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
     let cap = device_cap(node).unwrap_or(0);
     let left = node.store.as_ref().map_or(0, |s| lock(s).device_left(cap, now_ms()));
@@ -536,8 +550,14 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         () = wait_cancel(down) => None,
     };
     let mut resp = match call {
-        Some(Ok(resp)) => resp,
+        Some(Ok(resp)) => {
+            note_headroom(node, &a.route.model, &resp.rate_limit);
+            resp
+        }
         Some(Err(f)) => {
+            if let Some(rl) = &f.rate_limit {
+                note_headroom(node, &a.route.model, rl);
+            }
             let (code, retry) = f.nack();
             let mut fl = Failure::new(code, retry, Some(String::from_utf8_lossy(&f.body).into_owned()));
             fl.retry_after_ms = f.retry_after_ms;
