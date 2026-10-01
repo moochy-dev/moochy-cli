@@ -12,6 +12,12 @@ fn main() {
             if p.is_dir() { stack.push(p) } else { files.push(p) }
         }
     }
+    let urls = ["http://127.0.0.1:11434", "http://[::1]:8000/", "http://192.168.1.20:1234", "http://100.64.0.1:8080", "http://[fd00::1]:11434", "http://169.254.169.254", "http://[::ffff:10.0.0.1]:80", "https://gpu.local:443", "http://8.8.8.8"];
+    for (i, u) in urls.iter().enumerate() {
+        let d = Path::new(&dir).join("local_url");
+        std::fs::create_dir_all(&d).expect("mkdir");
+        std::fs::write(d.join(format!("url{i}")), u).expect("write");
+    }
     for (i, f) in files.iter().enumerate() {
         let b = std::fs::read(f).expect("read");
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("x");

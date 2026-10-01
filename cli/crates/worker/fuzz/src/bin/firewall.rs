@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     let ph: Vec<(&str, &str)> = pooled.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let again = firewall::analyze(d, &pooled.body, &ph, &policy, &CAT).expect("normalised body must stay accepted");
     assert_eq!((again.model, again.max_tokens, again.effort, again.stream, again.flags), (facts.model.clone(), facts.max_tokens, facts.effort, facts.stream, facts.flags));
-    for p in [Provider::Anthropic, Provider::OpenRouter, Provider::DeepSeek, Provider::OpenAi, Provider::XAi] {
+    for p in [Provider::Anthropic, Provider::OpenRouter, Provider::DeepSeek, Provider::OpenAi, Provider::XAi, Provider::Local] {
         let r = Request {
             provider: p,
             dialect: d,
