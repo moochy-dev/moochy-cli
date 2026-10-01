@@ -8,7 +8,8 @@ out. No dependency on `moochy-proto`: the node does sealing, signing and the gRP
 | Step | Call |
 |---|---|
 | 2. never served before, ±10 min | `Store::check_served(gateway_device, task_id, ulid_ts_ms, now_ms)` → `Stale`/`Replay` = NACK `unauthorized_task` |
-| 3. firewall + route/body consistency | `firewall::prepare(&Request{..})` → `Prepared{facts, body, headers}`; then `prepared.facts.check_route(dialect, &Route{..})`. `Reject::code.nack()` gives `("firewall", false)`, `("route_mismatch", false)` or `("model_unavailable", true)`; `reject.to_string()` is the sealed detail |
+| 1+3. decompress + inner payload + firewall + route (**in the validator child**, CONTRACT §15.2) | `validator.validate(&ValidateRequest{..}).await` → `Validated` (inner fields, original body, `prepared`); then the parent verifies `body_sha256`/`task_sig` and computes `req_commit` from `validated.body`. `ValidateError::nack()`: refusals as below, `bad_envelope`, or `("busy", true)` for any child failure. Never call `firewall::prepare` on a stranger's bytes in the donor process |
+| 3. (in-child) firewall + route/body consistency | `firewall::prepare(&Request{..})` → `Prepared{facts, body, headers}`; then `prepared.facts.check_route(dialect, &Route{..})`. `Reject::code.nack()` gives `("firewall", false)`, `("route_mismatch", false)` or `("model_unavailable", true)`; `reject.to_string()` is the sealed detail |
 | 4. local reservation | `Store::reserve(&Reservation{..})` → `Cap(_)` = NACK `local_cap` (retryable). In memory + written, **no fsync** (CONTRACT §13) |
 | 6. call the provider | `Adapter::send(dialect, prepared.body, &prepared.headers)` → `Response` once headers arrive (= `task.started`), or `Failure` (`failure.nack()`; `failure.body` = native error to seal) |
 | 7. stream | loop `response.next()` → forward each `Bytes` **as-is, immediately** (seal + send per chunk); `parser.feed(&chunk, sink)?.tool_ends > 0` → sign a progress checkpoint after this chunk |
@@ -23,6 +24,30 @@ Call `Store::compact(now)` daily (also done on `open`). Call `Adapter::warm()` a
 key add, and about every minute (h2 PINGs keep the connection alive in between).
 
 ## Modules
+
+### `validate` (donor side, CONTRACT §15.2)
+
+The only place a stranger's request bytes are parsed: a **single-use child** with no files, no network and no keys (seccomp read/write/memory/exit, applied by moochy-sandbox).
+
+**Wiring (mo-node):**
+1. `moochy __validate` = `std::process::exit(moochy_worker::validate::child_main(std::io::stdin().lock(), std::io::stdout().lock()))`. This must be the first thing the subcommand does: no config, no keystore, no logging to files. `src/bin/moochy-validate.rs` is the same entry for tests.
+2. Build one `Validator::new(spawner, ValidatorLimits { deadline: 5 s, warm: 2 })` at donor start and call `prewarm()`. `spawner` is an `Arc<dyn Fn() -> io::Result<tokio::process::Child>>` that spawns `moochy __validate` inside the moochy-sandbox lockdown with `stdin(piped)`, `stdout(piped)`, `stderr(null)`, `kill_on_drop(true)`, a clean environment and rlimits. Suggested limits: address space 512 MiB, CPU 5 s, no files beyond the inherited pipes.
+3. Per task, after AEAD-opening the chunks **without decompressing** (mo-proto: decrypt-only opener), call `validate(&ValidateRequest { provider, dialect, policy, catalog, provider_model_id, user_pseudonym, max_price, route, payload })`. `route` comes from the parent's strict route-header parse; `payload` is the opened zstd bytes.
+4. With the `Validated` result, build proto's `InnerPayload { body_b64: validated.body, body_sha256, headers, s, gateway_device, task_sig }`, run `verify` (body hash + `task_sig`), compute `req_commit` from `validated.body`, then send `validated.prepared.body` with `validated.prepared.headers`.
+
+**Protocol:** parent → child is one versioned codec message (context + payload), then stdin is closed. Child → parent is `u32_be len || versioned response`: OK (S, gateway_device, task_sig, body_sha256, sorted headers, original body, facts, forwarded headers, canonical body), REFUSED (code, path, reason) or BAD_ENVELOPE (reason).
+
+**Hard limits:**
+- Child: request ≤ 33 MiB; one zstd frame, window ≤ 32 MiB, output ≤ 32 MiB, no trailing bytes; JSON depth ≤ 64 and ≤ 2 Mi values.
+- Parent: response ≤ 65 MiB, read as exactly the declared length; every field is checked (sizes, UTF-8, enum values, forwarded header names ∈ {`anthropic-version`, `anthropic-beta`}, header name/value rules, device id format).
+- The parent never waits for the child's exit (it is killed and reaped on drop).
+
+**Single use:** each child serves exactly one request. The replacement is spawned (via `spawn_blocking`) while the current one works. A dead idle child is discarded; a crash, timeout, non-zero exit or garbage gives `ValidateError::Child` → `("busy", true)`.
+
+**Measured** (release, arm64 dev box, 100 KB agent body, warm pool): about +0.35 ms p50 and +0.42–0.67 ms p99 over in-process validation (≈0.26 ms).
+
+**Trust note:** the child's verdict *is* the firewall. Isolation protects the donor's keys, files and network from a parser exploit; it cannot make a compromised child's firewall decision trustworthy. The parent still checks `body_sha256` and `task_sig` itself.
+
 
 ### `firewall`
 - `Policy { level: Strict|Paranoid, flags: Flags, max_effort: Effort }` – pledge opt-ins. `Policy::PERMISSIVE` for the Gateway.

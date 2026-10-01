@@ -21,6 +21,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::codec::{Rd, W};
+
 pub const RECEIPT_RETENTION_MS: u64 = 7 * 24 * 3600 * 1000;
 pub const TASK_WINDOW_MS: u64 = 10 * 60 * 1000;
 pub const STALE_RESERVATION_MS: u64 = 24 * 3600 * 1000;
@@ -426,53 +428,17 @@ fn apply(body: &[u8], st: &mut State) -> Option<()> {
         }
         _ => return None,
     }
-    r.0.is_empty().then_some(())
+    r.is_empty().then_some(())
 }
 
-struct W(Vec<u8>);
-
-impl W {
-    fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    fn bytes(&mut self, b: &[u8]) {
-        self.0.extend_from_slice(&u32::try_from(b.len()).unwrap_or(u32::MAX).to_be_bytes());
-        self.0.extend_from_slice(b);
-    }
-}
-
-fn frame(kind: u8, f: impl FnOnce(&mut W)) -> Vec<u8> {
-    let mut w = W(vec![kind]);
-    f(&mut w);
-    let body = w.0;
+fn frame(kind: u8, f: impl FnOnce(&mut W<'_>)) -> Vec<u8> {
+    let mut body = vec![kind];
+    f(&mut W(&mut body));
     let mut out = Vec::with_capacity(body.len().saturating_add(8));
     out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_be_bytes());
     out.extend_from_slice(&crc32(&body).to_be_bytes());
     out.extend_from_slice(&body);
     out
-}
-
-struct Rd<'a>(&'a [u8]);
-
-impl<'a> Rd<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        if n > self.0.len() {
-            return None;
-        }
-        let (a, b) = self.0.split_at(n);
-        self.0 = b;
-        Some(a)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1)?.first().copied()
-    }
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
-    }
-    fn bytes(&mut self) -> Option<&'a [u8]> {
-        let n = u32::from_be_bytes(self.take(4)?.try_into().ok()?);
-        self.take(n as usize)
-    }
 }
 
 /// CRC-32 (IEEE 802.3, reflected), bitwise: records are small and written once.
