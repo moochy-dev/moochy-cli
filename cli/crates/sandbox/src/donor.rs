@@ -55,10 +55,7 @@ pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
 
 fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
     let abi = ABI_CEIL;
-    let mut report = LockdownReport {
-        abi: abi as i32,
-        ..Default::default()
-    };
+    let mut report = LockdownReport::default();
 
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
@@ -117,6 +114,13 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         .map_err(|e| ll("landlock restrict_self", e))?;
 
     report.no_new_privs = status.no_new_privs;
+    // Report the kernel's real ABI (what `moochy doctor` shows), not our ceiling.
+    report.abi = match status.landlock {
+        landlock::LandlockStatus::Available { effective_abi, kernel_abi } => {
+            kernel_abi.unwrap_or(effective_abi as i32)
+        }
+        _ => 0,
+    };
     report.landlock_fs = status.ruleset != RulesetStatus::NotEnforced;
     report.landlock_net = if report.landlock_fs {
         Some(status.ruleset == RulesetStatus::FullyEnforced)

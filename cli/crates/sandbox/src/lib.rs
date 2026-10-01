@@ -163,6 +163,9 @@ impl Spec {
     ///
     /// Fails closed: any setup error aborts before the command runs.
     pub fn run(&self, program: &std::ffi::OsStr, args: &[OsString]) -> Result<i32, Error> {
+        if self.gateway_loopback_port.is_some() && self.gateway_socket.is_none() {
+            return Err(Error::Unsupported("gateway_loopback_port requires gateway_socket"));
+        }
         #[cfg(target_os = "linux")]
         {
             linux::run(self, program, args)
