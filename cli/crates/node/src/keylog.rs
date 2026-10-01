@@ -28,16 +28,39 @@ const TILE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANCHOR_EVERY: Duration = Duration::from_secs(3600);
 
 pub struct KeyLog {
-    view: View,
+    view: Mutex<View>,
     /// Taken by [`KeyLog::start`].
     monitor: Mutex<Option<Monitor>>,
+    cfg: monitor::Config,
+    state: std::path::PathBuf,
     /// Newest checkpoint note served by the relay (latest wins).
     notes: watch::Sender<Option<Vec<u8>>>,
+    /// Reopen the monitor (new own keys) at the next point between two checkpoints.
+    reopen: Arc<tokio::sync::Notify>,
+}
+
+/// Own keys created while the node runs (`<state>/owner_keys`, `<state>/device_keys`): one
+/// base64url key per line, deduplicated.
+fn read_keys(path: &std::path::Path) -> Vec<[u8; 32]> {
+    let mut v: Vec<[u8; 32]> = std::fs::read_to_string(path).map(|s| s.lines().filter_map(|l| crate::util::b64d32(l.trim())).take(64).collect()).unwrap_or_default();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+fn add_key(path: &std::path::Path, k: &[u8; 32]) {
+    if read_keys(path).contains(k) {
+        return;
+    }
+    let mut all = std::fs::read_to_string(path).unwrap_or_default();
+    all.push_str(&crate::util::b64e(k));
+    all.push('\n');
+    let _ = crate::config::write_private(path, all.as_bytes());
 }
 
 impl KeyLog {
     /// `None` when no log key is configured (or it is unusable): nothing is trusted then.
-    pub fn open(home: &Home, cfg: &Config, sign_pub: Option<[u8; 32]>, owner_keys: Vec<[u8; 32]>) -> Option<Arc<Self>> {
+    pub fn open(home: &Home, cfg: &Config, sign_pub: Option<[u8; 32]>) -> Option<Arc<Self>> {
         let key = match NoteKey::parse(cfg.log_key.as_deref()?) {
             Ok(k) => k,
             Err(e) => {
@@ -47,8 +70,13 @@ impl KeyLog {
         };
         let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
         let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
+        let state = home.state_dir();
         let me = match (cfg.pseudonym.clone(), sign_pub) {
-            (Some(pseudonym), Some(pk)) => Some(Me { pseudonym, known_keys: vec![pk] }),
+            (Some(pseudonym), Some(pk)) => {
+                let mut known_keys = read_keys(&state.join("device_keys"));
+                known_keys.push(pk);
+                Some(Me { pseudonym, known_keys })
+            }
             _ => None,
         };
         let mc = monitor::Config {
@@ -56,12 +84,19 @@ impl KeyLog {
             key,
             dir: Some(home.state_dir().join(format!("keylog-{tag}"))),
             me,
-            known_owner_keys: owner_keys,
+            known_owner_keys: read_keys(&state.join("owner_keys")),
             witnesses: Vec::new(),
             min_cosignatures: 0,
         };
-        match Monitor::open(mc) {
-            Ok(m) => Some(Arc::new(Self { view: m.view(), monitor: Mutex::new(Some(m)), notes: watch::channel(None).0 })),
+        match Monitor::open(mc.clone()) {
+            Ok(m) => Some(Arc::new(Self {
+                view: Mutex::new(m.view()),
+                monitor: Mutex::new(Some(m)),
+                cfg: mc,
+                state,
+                notes: watch::channel(None).0,
+                reopen: Arc::new(tokio::sync::Notify::new()),
+            })),
             Err(e) => {
                 log("error", "key log disabled: mirror cannot be opened", &json!({"error": e.to_string()}));
                 None
@@ -72,17 +107,57 @@ impl KeyLog {
     /// Run the monitor for the node's lifetime (once).
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
-        let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now() };
+        let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now(), reopen: self.reopen.clone() };
+        let me = self.clone();
+        let node = node.clone();
         tokio::spawn(async move {
-            m.run(&mut link, |e| {
-                let (level, mut fields) = event_fields(e);
-                if let Some(o) = fields.as_object_mut() {
-                    o.insert("keylog".into(), json!(e.message()));
+            loop {
+                m.run(&mut link, |e| {
+                    let (level, msg, mut fields) = event_fields(e);
+                    if let Some(o) = fields.as_object_mut() {
+                        o.insert("keylog".into(), json!(e.message()));
+                    }
+                    log(level, &msg, &fields);
+                })
+                .await;
+                if *node.shutdown.borrow() {
+                    return;
                 }
-                log(level, "key log", &fields);
-            })
-            .await;
+                // Reopen with the own keys acknowledged meanwhile (restored from disk, no network).
+                let mut cfg = me.cfg.clone();
+                cfg.known_owner_keys = read_keys(&me.state.join("owner_keys"));
+                if let Some(mine) = cfg.me.as_mut() {
+                    for k in read_keys(&me.state.join("device_keys")) {
+                        if !mine.known_keys.contains(&k) {
+                            mine.known_keys.push(k);
+                        }
+                    }
+                }
+                match Monitor::open(cfg) {
+                    Ok(n) => {
+                        *lock(&me.view) = n.view();
+                        m = n;
+                    }
+                    Err(e) => log("error", "key log monitor could not reopen", &json!({"error": e.to_string()})),
+                }
+            }
         });
+    }
+
+    /// A key this user just created (owner key, or a rotated device key), relayed by this node:
+    /// remember it so the monitor does not report it as someone else's (`unknown_*`).
+    pub fn acknowledge(&self, owner_key: Option<&[u8; 32]>, device_key: Option<&[u8; 32]>) {
+        if let Some(k) = owner_key {
+            add_key(&self.state.join("owner_keys"), k);
+        }
+        if let Some(k) = device_key {
+            add_key(&self.state.join("device_keys"), k);
+        }
+        self.reopen.notify_one();
+    }
+
+    fn view(&self) -> View {
+        lock(&self.view).clone()
     }
 
     /// A checkpoint note from the relay (`Hello.log_checkpoint` or a push).
@@ -94,12 +169,12 @@ impl KeyLog {
 
     /// A fresh verified checkpoint exists: the log, not the relay, decides trust.
     pub fn verified(&self) -> bool {
-        matches!(self.view.gate(), Gate::Verified { .. })
+        matches!(self.view().gate(), Gate::Verified { .. })
     }
 
     /// Wording of the sealing gate (status, logs).
     pub fn gate_name(&self) -> &'static str {
-        match self.view.gate() {
+        match self.view().gate() {
             Gate::NoCheckpoint => "no_checkpoint",
             Gate::Verified { .. } => "verified",
             Gate::Stale { .. } => "stale_log",
@@ -113,7 +188,7 @@ impl KeyLog {
         if !self.verified() {
             return None;
         }
-        self.view.gateway_allowed(device, repo_id).ok().map(|d| d.sign_pub)
+        self.view().gateway_allowed(device, repo_id).ok().map(|d| d.sign_pub)
     }
 
     /// Gateway sealing rule (CONTRACT §15.4, A174, A184): the gate is verified, the worker is
@@ -121,8 +196,9 @@ impl KeyLog {
     /// relay-advertised keys are the logged ones. Returns the LOGGED signing key (receipts and
     /// progress checkpoints are verified with it, never with a relay-supplied one).
     pub fn seal(&self, repo_id: &str, w: &PoolWorker) -> Result<[u8; 32], Code> {
-        let s = self.view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index)?;
-        let sign_pub = self.view.state(|st| st.device(&w.worker_device).map(|d| d.sign_pub))?.ok_or(Code::UnknownDevice)?;
+        let view = self.view();
+        let s = view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index)?;
+        let sign_pub = view.state(|st| st.device(&w.worker_device).map(|d| d.sign_pub))?.ok_or(Code::UnknownDevice)?;
         let same_sign = w.sign_pub.is_none_or(|p| crate::util::ct_eq(&p, &sign_pub));
         if !crate::util::ct_eq(&s.enc_pub, &w.enc_pub) || !same_sign {
             return Err(Code::IndexMismatch);
@@ -133,16 +209,25 @@ impl KeyLog {
 
 /// Log level + stable machine fields of a monitor event (the message carries the keywords
 /// `unknown_key`, `rogue`, `unsigned`, `fork`, `stale`, `rollback` that tooling greps).
-fn event_fields(e: &Event) -> (&'static str, serde_json::Value) {
+/// Messages: `key log` (routine), `key log alert` (monitor rules; `detail` names the rule and
+/// its ids, e.g. `UnknownKey { idx, device_id }`, all validated ASCII), `KEY LOG FORK: …`.
+fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
+    let routine = |v| ("info", "key log".to_owned(), v);
     match e {
-        Event::Synced { size } => ("info", json!({"event": "synced", "size": size})),
-        Event::AnchorConsistent { size } => ("info", json!({"event": "anchor_consistent", "size": size})),
-        Event::Error(_) => ("warn", json!({"event": "error"})),
-        Event::Alert(a) => ("error", alert_fields(a)),
-        Event::Fork { size, .. } => ("error", json!({"event": "fork", "size": size})),
-        Event::Stale { served, mirrored } => ("error", json!({"event": "stale", "served": served, "mirrored": mirrored})),
-        Event::Rollback { anchored, served } => ("error", json!({"event": "rollback", "anchored": anchored, "served": served})),
-        Event::Unwitnessed { size, cosignatures } => ("error", json!({"event": "unwitnessed", "size": size, "cosignatures": cosignatures})),
+        Event::Synced { size } => routine(json!({"event": "synced", "size": size})),
+        Event::AnchorConsistent { size } => routine(json!({"event": "anchor_consistent", "size": size})),
+        Event::Error(_) => ("warn", "key log".into(), json!({"event": "error"})),
+        Event::Alert(a) => {
+            let mut f = alert_fields(a);
+            if let Some(o) = f.as_object_mut() {
+                o.insert("detail".into(), json!(format!("{a:?}")));
+            }
+            ("error", "key log alert".into(), f)
+        }
+        Event::Fork { size, .. } => ("error", format!("KEY LOG FORK: {}", e.message()), json!({"event": "fork", "size": size})),
+        Event::Stale { served, mirrored } => ("error", "key log alert".into(), json!({"event": "stale", "served": served, "mirrored": mirrored})),
+        Event::Rollback { anchored, served } => ("error", "KEY LOG FORK: rollback vs the public anchor".into(), json!({"event": "rollback", "anchored": anchored, "served": served})),
+        Event::Unwitnessed { size, cosignatures } => ("error", "key log alert".into(), json!({"event": "unwitnessed", "size": size, "cosignatures": cosignatures})),
     }
 }
 
@@ -165,6 +250,7 @@ struct Link {
     node: Arc<Node>,
     notes: watch::Receiver<Option<Vec<u8>>>,
     anchor_due: Instant,
+    reopen: Arc<tokio::sync::Notify>,
 }
 
 impl moochy_keylog::LogLink for Link {
@@ -193,6 +279,8 @@ impl moochy_keylog::LogLink for Link {
                         return Some(n);
                     }
                 }
+                // Between two checkpoints: a clean point to end `run` and reopen.
+                () = self.reopen.notified() => return None,
                 r = stop.changed() => {
                     if r.is_err() || *stop.borrow() {
                         return None;

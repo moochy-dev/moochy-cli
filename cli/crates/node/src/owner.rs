@@ -20,12 +20,6 @@ use zeroize::Zeroizing;
 
 const AAD: &[u8] = b"moochy/owner-key/v1";
 
-/// Public halves of this user's owner keys, written by `moochy owner init|rotate`
-/// (`<state>/owner_keys`: one base64url key per line).
-pub fn public_keys(home: &Home) -> Vec<[u8; 32]> {
-    std::fs::read_to_string(home.state_dir().join("owner_keys")).map(|s| s.lines().filter_map(|l| crate::util::b64d32(l.trim())).take(16).collect()).unwrap_or_default()
-}
-
 fn key_path(home: &Home, relay: Option<&str>) -> std::path::PathBuf {
     home.keystore_path(relay).with_extension("owner")
 }
@@ -60,11 +54,16 @@ fn ask(prompt: &str, hidden: bool) -> Result<Zeroizing<String>> {
 }
 
 fn passphrase(new: bool) -> Result<Zeroizing<String>> {
-    if let Ok(p) = std::env::var("MOOCHY_OWNER_PASSPHRASE") {
-        let p = Zeroizing::new(p);
-        if !p.is_empty() {
-            return Ok(p);
-        }
+    let env = |k: &str| std::env::var(k).ok().map(Zeroizing::new).filter(|p| !p.is_empty());
+    if let Some(p) = env("MOOCHY_OWNER_PASSPHRASE") {
+        return Ok(p);
+    }
+    // Tests and development only: the keystore passphrase stands in when there is no terminal.
+    if std::env::var("MOOCHY_INSECURE_DEV").as_deref() == Ok("1") && tty().is_err()
+        && let Some(p) = env("MOOCHY_PASSPHRASE")
+    {
+        eprintln!("moochy: WARNING owner key protected by the keystore passphrase (MOOCHY_INSECURE_DEV only)");
+        return Ok(p);
     }
     let p = ask("Owner key passphrase: ", true)?;
     if new {
@@ -113,31 +112,61 @@ async fn submit(home: &Home, req: SubmitEntryRequest) -> Result<SignResponse> {
     c.submit_entry(req).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
 }
 
+/// Create an owner key, register it in the key log (OWNER_KEY_ADDED, signed by the new key and,
+/// on rotation, by `prev`), and keep it encrypted only once the log accepted it.
+fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -> Result<SignKey> {
+    let cfg = home.load()?;
+    let pseudonym = cfg.pseudonym.clone().ok_or_else(|| auth("not logged in: run `moochy login` first"))?;
+    let new = SignKey::from_seed(&Zeroizing::new(crate::util::rand_bytes::<32>()?));
+    let pass = passphrase(true)?;
+    let body = owner_key_body(&pseudonym, &new.public(), prev.map(SignKey::public).as_ref(), now_ms());
+    let msg = sig_message(Kind::OwnerKeyAdded, &body);
+    let mut sigs = vec![new.sign(&msg).to_vec()];
+    sigs.extend(prev.map(|p| p.sign(&msg).to_vec()));
+    let r = rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs }))?;
+    store(home, cfg.relay.as_deref(), &new, &pass)?;
+    crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": owner_key_id(&new.public()), "log_index": r.log_index}));
+    Ok(new)
+}
+
 /// `moochy owner init` (first key) / `moochy owner rotate` (new key, the current one signs too).
 pub fn init(home: &Home, rotate: bool) -> Result<()> {
     let cfg = home.load()?;
     let relay = cfg.relay.as_deref();
-    let pseudonym = cfg.pseudonym.clone().ok_or_else(|| auth("not logged in: run `moochy login` first"))?;
-    let path = key_path(home, relay);
     let prev = if rotate {
         Some(load(home, relay)?)
     } else {
-        if path.exists() {
+        if key_path(home, relay).exists() {
             return Err(usage("this device already has an owner key (`moochy owner rotate` replaces it)"));
         }
         None
     };
-    let new = SignKey::from_seed(&Zeroizing::new(crate::util::rand_bytes::<32>()?));
-    let pass = passphrase(true)?;
-    let body = owner_key_body(&pseudonym, &new.public(), prev.as_ref().map(SignKey::public).as_ref(), now_ms());
-    let msg = sig_message(Kind::OwnerKeyAdded, &body);
-    let mut sigs = vec![new.sign(&msg).to_vec()];
-    sigs.extend(prev.as_ref().map(|p| p.sign(&msg).to_vec()));
-    // Keep the key only once the log accepted it.
-    let r = rt()?.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs }))?;
-    store(home, relay, &new, &pass)?;
-    crate::util::emit(&json!({"event": if rotate { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": owner_key_id(&new.public()), "log_index": r.log_index}));
-    Ok(())
+    register(home, &rt()?, prev.as_ref()).map(drop)
+}
+
+/// Build the owner-signed body for a previewed request and hand it to the Node.
+fn sign_one(home: &Home, rt: &tokio::runtime::Runtime, key: &SignKey, me: Option<&str>, preview: &SignResponse) -> Result<SignResponse> {
+    let kind = Kind::from_name(&preview.kind).ok_or_else(|| internal("unknown entry kind"))?;
+    let signer = owner_key_id(&key.public());
+    let now = now_ms();
+    let body = if kind == Kind::RepoClaimed {
+        let Ok(Body::Claim { repo_id, provider, provider_repo_id, owner, .. }) = parse_body(kind, &preview.body_to_sign) else {
+            return Err(internal("claim request is malformed"));
+        };
+        if me != Some(owner) || repo_id != preview.repo_id {
+            return Err(usage("this claim names another account or repository"));
+        }
+        claim_body(repo_id, provider, provider_repo_id, owner, &signer, now)
+    } else {
+        grant_body(&preview.repo_id, &preview.subject, &signer, now)
+    };
+    let sig = key.sign(&sig_message(kind, &body));
+    rt.block_on(submit(home, SubmitEntryRequest { request_id: preview.request_id.clone(), kind: preview.kind.clone(), body, sigs: vec![sig.to_vec()] }))
+}
+
+fn emit_signed(done: &SignResponse) {
+    crate::util::emit(&json!({"request_id": done.request_id, "kind": done.kind, "repo": done.repo_slug, "repo_id": done.repo_id, "subject": done.subject,
+        "subject_username": done.subject_username, "signer": done.signer, "issued_at_ms": done.issued_at_ms, "signed": done.signed, "log_index": done.log_index}));
 }
 
 /// `moochy approve|members|claim`: preview what the relay asks, show it, get an explicit yes and
@@ -167,39 +196,34 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
         Kind::MemberRemoved => "may no longer use the donated tokens of",
         _ => "is the owner of",
     };
-    eprintln!(
-        "You are about to sign {} with your owner key:\n  {} ({}) {meaning} {} ({})",
-        preview.kind,
-        clean(&preview.subject_username),
-        clean(&preview.subject),
-        clean(&preview.repo_slug),
-        clean(&preview.repo_id)
-    );
+    // Approvals need an owner key and an owner-signed claim of the repo (KEYLOG §5): both are
+    // done here, under the same confirmation, when they are still missing.
+    let claim = (kind != Kind::RepoClaimed)
+        .then(|| rt.block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
+            c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await.ok().map(tonic::Response::into_inner)
+        }))
+        .flatten();
+    let has_key = key_path(home, cfg.relay.as_deref()).exists();
+    eprintln!("You are about to sign {} with your owner key:", preview.kind);
+    eprintln!("  {} ({}) {meaning} {} ({})", clean(&preview.subject_username), clean(&preview.subject), clean(&preview.repo_slug), clean(&preview.repo_id));
+    if claim.is_some() {
+        eprintln!("  and first: you are the owner of {} (REPO_CLAIMED)", clean(&preview.repo_slug));
+    }
+    if !has_key {
+        eprintln!("  and first: create your owner key (a separate key with its own passphrase)");
+    }
     if !yes && !matches!(ask("Type yes to sign: ", false)?.as_str(), "yes" | "y") {
         return Err(usage("not signed"));
     }
-    if yes && std::env::var_os("MOOCHY_OWNER_PASSPHRASE").is_none() && tty().is_err() {
-        return Err(usage("--yes without a terminal needs MOOCHY_OWNER_PASSPHRASE (CI only)"));
+    let key = if has_key { load(home, cfg.relay.as_deref())? } else { register(home, &rt, None)? };
+    let me = cfg.pseudonym.as_deref();
+    if let Some(c) = &claim {
+        emit_signed(&sign_one(home, &rt, &key, me, c)?);
     }
-    let key = load(home, cfg.relay.as_deref())?;
-    let signer = owner_key_id(&key.public());
-    let now = now_ms();
-    let body = if kind == Kind::RepoClaimed {
-        let Ok(Body::Claim { repo_id, provider, provider_repo_id, owner, .. }) = parse_body(kind, &preview.body_to_sign) else {
-            return Err(internal("claim request is malformed"));
-        };
-        if cfg.pseudonym.as_deref() != Some(owner) || repo_id != preview.repo_id {
-            return Err(usage("this claim names another account or repository"));
-        }
-        claim_body(repo_id, provider, provider_repo_id, owner, &signer, now)
-    } else {
-        grant_body(&preview.repo_id, &preview.subject, &signer, now)
-    };
-    let sig = key.sign(&sig_message(kind, &body));
+    let done = sign_one(home, &rt, &key, me, &preview)?;
     drop(key);
-    let done = rt.block_on(submit(home, SubmitEntryRequest { request_id: preview.request_id.clone(), kind: preview.kind.clone(), body, sigs: vec![sig.to_vec()] }))?;
-    crate::util::emit(&json!({"request_id": done.request_id, "kind": done.kind, "repo": done.repo_slug, "repo_id": done.repo_id, "subject": done.subject,
-        "subject_username": done.subject_username, "signer": done.signer, "issued_at_ms": done.issued_at_ms, "signed": done.signed, "log_index": done.log_index}));
+    emit_signed(&done);
     Ok(())
 }
 

@@ -128,6 +128,14 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
         out.repo_slug = clean(&q.repo_slug).into_owned();
         out.subject_username = clean(&q.subject_username).into_owned();
     }
+    // Our own new key: acknowledged before the relay logs it, so the monitor never flags it.
+    if let Some(l) = &node.keylog {
+        match body {
+            Body::OwnerKey { owner_pub, .. } => l.acknowledge(Some(owner_pub), None),
+            Body::Key { sign_pub, .. } => l.acknowledge(None, Some(sign_pub)),
+            _ => {}
+        }
+    }
     let id = if r.request_id.is_empty() { format!("{}-{}", r.kind, now_ms()) } else { r.request_id.clone() };
     let ack = submit_entry(node, &id, &r.kind, Bytes::from(r.body), r.sigs.into_iter().map(Bytes::from).collect(), Duration::from_secs(15)).await?;
     if !ack.error.is_empty() {
