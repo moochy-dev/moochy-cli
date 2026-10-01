@@ -49,8 +49,11 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .worktree
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
-    let masks = mask::collect(&worktree)?;
-    let git = crate::git::view(&worktree, spec.git_writable);
+    let scan = mask::scan(&worktree)?;
+    let git_before = crate::git::snapshot(&scan.dotgits);
+    let git = crate::git::view(&worktree, spec.git_writable, &scan.dotgits)?;
+    let _placeholder = git.placeholder.clone().map(RmdirOnDrop);
+    let masks = scan.masks;
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
     let mut proxy = if spec.allow_hosts.is_empty() {
         None
@@ -66,7 +69,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
 
     let plan = Plan {
         base: base.path().to_path_buf(),
-        worktree,
+        worktree: worktree.clone(),
         ro_paths: spec.ro_paths.iter().filter_map(|p| Bind::resolve(p)).collect(),
         rw_paths: spec.rw_paths.iter().filter_map(|p| Bind::resolve(p)).collect(),
         gateway_socket: match &spec.gateway_socket {
@@ -101,15 +104,17 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     // `_exit`s without returning. See module + sys.rs docs.
     sys::set_pre_exec(&mut cmd, move || child_main(&plan, &agent_filter));
 
-    let mut child = cmd.spawn().map_err(Error::Exec)?;
-    if let Some(p) = proxy.as_mut() {
-        p.start();
-    }
-    let status = child.wait().map_err(Error::Exec)?;
+    let status = cmd.spawn().and_then(|mut child| {
+        if let Some(p) = proxy.as_mut() {
+            p.start();
+        }
+        child.wait()
+    });
     drop(proxy);
     drop(cgroup);
     drop(base);
-    Ok(exit_code(status))
+    crate::git::notice_if_changed(&worktree, &git_before);
+    Ok(exit_code(status.map_err(Error::Exec)?))
 }
 
 fn exit_code(s: std::process::ExitStatus) -> i32 {
@@ -258,6 +263,8 @@ fn supervise(listeners: &[Listener], agent_pid: i32, wall_seconds: u64) -> bool 
         return false; // fall back to a plain waitpid in the caller
     };
     let deadline = (wall_seconds > 0).then(|| Instant::now().checked_add(Duration::from_secs(wall_seconds))).flatten();
+    // Best-effort: without it the agent only misses terminal resizes.
+    let winch = sys::winch_signalfd().ok();
     let mut conns: Vec<Conn> = Vec::new();
     loop {
         let timeout = deadline.map(|d| {
@@ -274,13 +281,22 @@ fn supervise(listeners: &[Listener], agent_pid: i32, wall_seconds: u64) -> bool 
             fds.push(PollFd::from_borrowed_fd(c.tcp.as_fd(), interest(&c.up, &c.down)));
             fds.push(PollFd::from_borrowed_fd(c.unix.as_fd(), interest(&c.down, &c.up)));
         }
+        if let Some(w) = &winch {
+            fds.push(PollFd::new(w, PollFlags::IN)); // last
+        }
         if poll(&mut fds, timeout.as_ref()).is_err() {
             continue; // EINTR
         }
         let agent_done = fds.first().is_some_and(|f| !f.revents().is_empty());
         // Listener i sits at fds[i + 1] (≤ 2 listeners: gateway, proxy).
         let ready = [1usize, 2].map(|i| i <= listeners.len() && fds.get(i).is_some_and(|f| !f.revents().is_empty()));
+        let resized = winch.is_some() && fds.last().is_some_and(|f| !f.revents().is_empty());
         drop(fds);
+        if let (true, Some(w)) = (resized, &winch) {
+            let mut buf = [0u8; 128]; // one signalfd_siginfo
+            while rustix::io::read(w, &mut buf).is_ok_and(|n| n > 0) {}
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::WINCH);
+        }
         if agent_done {
             return false;
         }
@@ -674,20 +690,20 @@ fn chdir_into_worktree(plan: &Plan) -> Result<(), Error> {
     Ok(())
 }
 
+/// Every requested limit is applied or the run fails (A202). 0 = unlimited
+/// for memory/CPU; cores are always capped (0 = none).
 fn apply_rlimits(l: &crate::Limits) -> Result<(), Error> {
     use rustix::process::{Resource, Rlimit, setrlimit};
-    let set = |res, v: u64| {
-        if v > 0 {
-            let _ = setrlimit(res, Rlimit { current: Some(v), maximum: Some(v) });
-        }
-    };
-    set(Resource::As, l.memory_bytes);
-    set(Resource::Cpu, l.cpu_seconds);
-    setrlimit(Resource::Nofile, Rlimit { current: Some(l.open_files), maximum: Some(l.open_files) })
-        .map_err(io("rlimit nofile"))?;
-    setrlimit(Resource::Nproc, Rlimit { current: Some(l.processes), maximum: Some(l.processes) })
-        .map_err(io("rlimit nproc"))?;
-    set(Resource::Core, l.core_bytes);
+    let set = |res, v: u64, what| setrlimit(res, Rlimit { current: Some(v), maximum: Some(v) }).map_err(io(what));
+    if l.memory_bytes > 0 {
+        set(Resource::As, l.memory_bytes, "rlimit as")?;
+    }
+    if l.cpu_seconds > 0 {
+        set(Resource::Cpu, l.cpu_seconds, "rlimit cpu")?;
+    }
+    set(Resource::Nofile, l.open_files, "rlimit nofile")?;
+    set(Resource::Nproc, l.processes, "rlimit nproc")?;
+    set(Resource::Core, l.core_bytes, "rlimit core")?;
     Ok(())
 }
 
@@ -879,6 +895,15 @@ fn touch(p: &Path) -> Result<(), Error> {
     ) {
         Ok(_) | Err(rustix::io::Errno::EXIST) => Ok(()),
         Err(e) => Err(setup("touch", e.into())),
+    }
+}
+
+/// The `.git` placeholder, removed (only if still empty) when the run ends on
+/// any path.
+struct RmdirOnDrop(PathBuf);
+impl Drop for RmdirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
     }
 }
 

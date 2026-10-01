@@ -88,6 +88,10 @@ pub struct Spec {
     /// launcher's CONNECT proxy (`HTTPS_PROXY` inside). Empty (default) = no
     /// proxy, no network but the gateway. Linux only for now.
     pub allow_hosts: Vec<String>,
+    /// Directories no visible path may be or contain (A197): a worktree, `ro_paths`
+    /// or `rw_paths` entry that is `/` or an ancestor of one of these is
+    /// refused. Default: the real `$HOME`. mo-node adds the Moochy home.
+    pub protected: Vec<PathBuf>,
     /// Resource limits. Defaults are generous but finite (fork-bomb / OOM safe).
     pub limits: Limits,
     /// Let the agent write `.git` (commit inside). `hooks/`, `config` and
@@ -187,6 +191,7 @@ impl Spec {
             run_token: None,
             git_writable: false,
             allow_hosts: Vec::new(),
+            protected: std::env::var_os("HOME").map(PathBuf::from).into_iter().collect(),
             limits: Limits::default(),
             unsafe_no_sandbox: false,
         }
@@ -200,6 +205,9 @@ impl Spec {
     pub fn run(&self, program: &std::ffi::OsStr, args: &[OsString]) -> Result<i32, Error> {
         if self.gateway_loopback_port.is_some() && self.gateway_socket.is_none() {
             return Err(Error::Unsupported("gateway_loopback_port requires gateway_socket"));
+        }
+        if !self.unsafe_no_sandbox {
+            self.check_exposure()?;
         }
         if !self.allow_hosts.is_empty() {
             if cfg!(not(target_os = "linux")) {
@@ -224,6 +232,28 @@ impl Spec {
                 "sandboxing is implemented only on Linux and macOS (Windows: later phase)",
             ))
         }
+    }
+}
+
+impl Spec {
+    /// A197: refuse a view that would expose `/`, the real home or the Moochy
+    /// home (keystore, run key, other repos) inside the sandbox.
+    fn check_exposure(&self) -> Result<(), Error> {
+        let protected: Vec<PathBuf> = self.protected.iter().filter_map(|p| p.canonicalize().ok()).collect();
+        let visible = std::iter::once(&self.worktree).chain(&self.rw_paths).chain(&self.ro_paths);
+        for p in visible.filter_map(|p| p.canonicalize().ok()) {
+            let hit = if p.parent().is_none() { Some(p.clone()) } else { protected.iter().find(|q| q.starts_with(&p)).cloned() };
+            if let Some(q) = hit {
+                return Err(Error::Setup {
+                    what: "sandbox view check",
+                    err: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{} would expose {} inside the sandbox; use a project directory", p.display(), q.display()),
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 

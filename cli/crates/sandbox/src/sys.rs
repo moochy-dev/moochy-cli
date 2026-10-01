@@ -165,3 +165,25 @@ pub fn channel_stream() -> std::os::unix::net::UnixStream {
     // and nothing else in this process owns it.
     unsafe { std::os::unix::net::UnixStream::from_raw_fd(CHANNEL_FD) }
 }
+
+/// Reaper: block `SIGWINCH` and return a signalfd for it, so terminal resizes
+/// can be forwarded to the agent's session (the agent runs `setsid`, without a
+/// controlling terminal, so the tty never signals it directly; A192).
+pub fn winch_signalfd() -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: sigset_t is plain data initialised by sigemptyset; sigprocmask and
+    // signalfd only read `set`. The returned fd is fresh and owned by nobody else.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGWINCH);
+        if libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = libc::signalfd(-1, &raw const set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(std::os::fd::OwnedFd::from_raw_fd(fd))
+    }
+}

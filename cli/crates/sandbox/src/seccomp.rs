@@ -113,6 +113,11 @@ fn deny_common() -> Result<BTreeMap<i64, Vec<SeccompRule>>, Error> {
         libc::SYS_quotactl,
         libc::SYS_settimeofday,
         libc::SYS_clock_settime,
+        // io_uring: large kernel attack surface, and its ops bypass the
+        // per-syscall filter (A195).
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ];
     for nr in unconditional {
         m.insert(nr, Vec::new());
@@ -209,6 +214,9 @@ pub fn validator_filter() -> Result<BpfProgram, Error> {
         libc::SYS_writev,
         libc::SYS_close,
         libc::SYS_munmap,
+        // Vec growth past the mmap threshold reallocs via mremap (A200); it
+        // cannot change protections.
+        libc::SYS_mremap,
         libc::SYS_brk,
         libc::SYS_futex,
         libc::SYS_exit,

@@ -2,8 +2,8 @@
 //! `cfg(fuzzing)`, never shipped). `fuzz/` targets feed them arbitrary bytes;
 //! the unit tests below feed them a fixed corpus plus pseudo-random inputs.
 //!
-//! - [`mask_glob`]: `mask::glob1` agrees with the plain definition of a
-//!   one-star glob.
+//! - [`mask_glob`]: `mask::glob1` agrees with the recursive definition of a
+//!   `*` glob.
 //! - [`seccomp_tables`]: the compiled BPF of each profile, run by a small cBPF
 //!   interpreter on an arbitrary `seccomp_data`, returns exactly what the
 //!   policy (restated here, independently of `seccomp.rs`) says.
@@ -17,19 +17,23 @@
     clippy::cast_sign_loss
 )]
 
-/// `data` = pattern `\0` name. Patterns with more than one `*` are out of scope
-/// (`SECRET_PATTERNS` has at most one).
+/// `data` = pattern `\0` name; the linear matcher must agree with the
+/// recursive definition of a `*` glob.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn mask_glob(data: &[u8]) {
+    fn reference(p: &[u8], n: &[u8]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => (0..=n.len()).any(|i| reference(rest, &n[i..])),
+            Some((c, rest)) => n.first() == Some(c) && reference(rest, &n[1..]),
+        }
+    }
     let text = String::from_utf8_lossy(data);
     let (pat, name) = text.split_once('\0').unwrap_or((&text, ""));
-    if pat.matches('*').count() > 1 {
-        return;
+    if pat.len() > 24 || name.len() > 64 || pat.matches('*').count() > 4 {
+        return; // keeps the exponential reference cheap
     }
-    let want = match pat.split_once('*') {
-        None => pat == name,
-        Some((a, b)) => name.len() >= a.len() + b.len() && name.starts_with(a) && name.ends_with(b),
-    };
+    let want = reference(pat.as_bytes(), name.as_bytes());
     assert_eq!(crate::mask::glob1(pat, name), want, "glob {pat:?} vs {name:?}");
 }
 
@@ -90,6 +94,9 @@ mod bpf {
         libc::SYS_quotactl,
         libc::SYS_settimeofday,
         libc::SYS_clock_settime,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ];
 
     /// Policy: the validator's unconditional allowlist.
@@ -102,6 +109,7 @@ mod bpf {
         libc::SYS_writev,
         libc::SYS_close,
         libc::SYS_munmap,
+        libc::SYS_mremap,
         libc::SYS_brk,
         libc::SYS_futex,
         libc::SYS_exit,
@@ -277,7 +285,7 @@ mod tests {
                 super::mask_glob(format!("{pat}\0{name}").as_bytes());
             }
         }
-        for c in ["*\0", "a*\0a", "*a\0a", "a*a\0a", "a*a\0aa", "ab*ba\0aba", "*.key\0.key", "x\0x"] {
+        for c in ["*\0", "a*\0a", "*a\0a", "a*a\0a", "a*a\0aa", "ab*ba\0aba", "*.key\0.key", "x\0x", "**\0", "*a*\0bab", "*.t.*\0x.t.y", "a**b\0ab"] {
             super::mask_glob(c.as_bytes());
         }
         let mut seed = 0x9E37_79B9_7F4A_7C15;
