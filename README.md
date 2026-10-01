@@ -4,6 +4,8 @@ Donate tokens to open-source projects from your own LLM API account, with a mont
 
 Donors can use Anthropic, OpenAI, OpenRouter, DeepSeek, or xAI (Grok) API keys.
 
+A donor's machine only makes the inference call: it never runs a command, and the app locks itself down so it cannot. Maintainers run their coding agent with `moochy run`, a built-in sandbox that can touch the project and nothing else, so a bad tool call in a response cannot reach their files, keys, or network.
+
 **Open-source client (Apache-2.0) · 100% free.** No fees, no commission, no paid tier. The relay and web app are closed source.
 
 This development monorepo is internal. At release, the open-source parts (`cli/`, `spec/proto`, `spec/vectors`, `spec/protocol.md`, `docs/guides`) are exported to the public `moochy-cli` repository; everything else stays in the private `moochy-core` repository (see `spec/CONTRACT.md` §0a).
