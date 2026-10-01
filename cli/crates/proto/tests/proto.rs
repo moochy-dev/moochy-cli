@@ -82,6 +82,37 @@ fn request_roundtrip_multi_chunk() {
     assert_eq!(one.chunks.len(), 1);
 }
 
+/// Production split (CONTRACT §15.2): parent decrypts only, validator child inflates + parses.
+#[test]
+fn decrypt_only_then_inflate() {
+    let t = task();
+    let mut payload = vec![0u8; 3 * MAX_CHUNK];
+    crypto::fill_random(&mut payload).unwrap();
+    let s = crypto::seal_request(&ck(), &t, &payload).unwrap();
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    s.chunks.iter().for_each(|c| d.push(c).unwrap());
+    assert_eq!(d.chunks() as usize, s.chunks.len());
+    let z = d.finish().unwrap();
+    assert_eq!(z.len() as u64, s.body_len - (s.chunks.len() * TAG_LEN) as u64, "exactly the compressed bytes");
+    assert_eq!(moochy_proto::inflate::inflate_all(&z, crypto::MAX_PAYLOAD).unwrap(), payload);
+    // Same refusals as the all-in-one opener: order, attempt, truncation, tamper (buffer untouched).
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    assert_eq!(d.push(&s.chunks[1]), Err(Error::Sequence));
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    d.push(&s.chunks[0]).unwrap();
+    assert_eq!(d.finish(), Err(Error::Sequence), "last chunk missing");
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    let mut out = b"keep".to_vec();
+    assert_eq!(d.push_into(&flip(&s.chunks[0], 3, 1), &mut out), Err(Error::Decrypt));
+    assert_eq!(out, b"keep");
+    assert_eq!(d.push_into(&s.chunks[0], &mut out), Err(Error::Sequence), "poisoned");
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    assert_eq!(d.push(&pb::Chunk { attempt: 2, ..s.chunks[0].clone() }), Err(Error::Sequence));
+    // The child refuses a bomb exactly like the streaming path.
+    let bomb = zstd::bulk::compress(&vec![b' '; crypto::MAX_PAYLOAD + 1], 3).unwrap();
+    assert_eq!(moochy_proto::inflate::inflate_all(&bomb, crypto::MAX_PAYLOAD), Err(Error::TooLarge));
+}
+
 #[test]
 fn request_negatives() {
     let t = task();

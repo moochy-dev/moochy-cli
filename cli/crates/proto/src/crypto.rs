@@ -268,42 +268,74 @@ pub fn seal_compressed(ck: &ContentKey, task: &TaskId, z: &[u8]) -> Result<Seale
     Ok(SealedRequest { chunks, body_len: u64::try_from(total).map_err(|_| Error::TooLarge)? })
 }
 
-/// Worker: decrypts request chunks in order and decompresses as they arrive. The zstd window is
-/// capped and the output is a hard 32 MiB: a decompression bomb fails on the chunk that crosses
-/// the limit, without ever holding more than `MAX_PAYLOAD + 1` bytes. One reusable scratch
-/// buffer: no allocation per chunk.
-pub struct RequestOpener {
+/// Worker, parent process (PRODUCTION path, CONTRACT §15.2): verifies and decrypts the request
+/// chunks in order and returns the still-COMPRESSED inner payload. Chunk order, attempt 0, the
+/// last flag and the sealed-size cap are enforced here; decompression (ruzstd, 32 MiB cap) and
+/// the strict JSON parse happen in the single-use validator child (`worker::validate`, which
+/// calls [`crate::inflate::inflate_all`] then [`crate::msg::InnerPayload::parse`]).
+/// Each chunk is decrypted in place inside the output buffer: no per-chunk allocation beyond
+/// its growth, no extra copy.
+pub struct RequestDecryptor {
     aead: ChunkAead,
     aad: [u8; 55],
     next: u32,
+    /// Sealed bytes accepted so far (≤ MAX_SEALED).
     sealed: usize,
     last_seen: bool,
     failed: bool,
-    inflater: crate::inflate::Inflater,
-    scratch: Vec<u8>,
+    out: Vec<u8>,
 }
 
-impl RequestOpener {
+impl RequestDecryptor {
     pub fn new(ck: &ContentKey, task: &TaskId) -> Result<Self, Error> {
-        Ok(Self {
-            aead: ChunkAead::new(&k_req(ck, task)?)?,
-            aad: req_aad(task)?,
-            next: 0,
-            sealed: 0,
-            last_seen: false,
-            failed: false,
-            inflater: crate::inflate::Inflater::new(MAX_PAYLOAD),
-            scratch: Vec::with_capacity(MAX_CHUNK + TAG_LEN),
-        })
+        Ok(Self { aead: ChunkAead::new(&k_req(ck, task)?)?, aad: req_aad(task)?, next: 0, sealed: 0, last_seen: false, failed: false, out: Vec::new() })
     }
 
-    /// Feed the next body chunk. Any error poisons the opener: every later call fails too.
+    /// Verify and decrypt the next chunk. Any error poisons the decryptor.
     pub fn push(&mut self, c: &pb::Chunk) -> Result<(), Error> {
-        let r = self.push_inner(c);
+        let mut out = std::mem::take(&mut self.out);
+        let r = self.push_into(c, &mut out);
+        self.out = out;
+        r
+    }
+
+    /// Like [`Self::push`] but appends the decrypted bytes to a caller-owned buffer (on error
+    /// the buffer is left exactly as it was).
+    pub fn push_into(&mut self, c: &pb::Chunk, out: &mut Vec<u8>) -> Result<(), Error> {
+        let r = self.push_inner(c, out);
         if r.is_err() {
             self.failed = true;
         }
         r
+    }
+
+    fn push_inner(&mut self, c: &pb::Chunk, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.failed || self.last_seen || c.attempt != 0 || c.seq != self.next {
+            return Err(Error::Sequence);
+        }
+        if self.sealed.saturating_add(c.ct.len()) > MAX_SEALED {
+            return Err(Error::TooLarge);
+        }
+        let start = out.len();
+        out.extend_from_slice(&c.ct);
+        let r = match out.get_mut(start..) {
+            Some(tail) => open_in_place(&self.aead, &mut self.aad, c.seq, c.last, tail),
+            None => Err(Error::Malformed),
+        };
+        match r {
+            Ok(n) => {
+                out.truncate(start.saturating_add(n));
+                self.sealed = self.sealed.saturating_add(c.ct.len());
+                self.next = c.seq.checked_add(1).ok_or(Error::TooLarge)?;
+                self.last_seen = c.last;
+                Ok(())
+            }
+            Err(e) => {
+                out.get_mut(start..).into_iter().for_each(Zeroize::zeroize);
+                out.truncate(start);
+                Err(e)
+            }
+        }
     }
 
     /// Chunks accepted so far (compare with `Assign.body_chunks`).
@@ -312,34 +344,53 @@ impl RequestOpener {
         self.next
     }
 
-    fn push_inner(&mut self, c: &pb::Chunk) -> Result<(), Error> {
-        if self.failed || self.last_seen {
+    /// The compressed inner payload (hand it to the validator child). Requires the last chunk.
+    pub fn finish(self) -> Result<Vec<u8>, Error> {
+        if self.failed || !self.last_seen {
             return Err(Error::Sequence);
         }
-        if c.attempt != 0 || c.seq != self.next {
-            return Err(Error::Sequence);
+        Ok(self.out)
+    }
+}
+
+/// All-in-one opener: [`RequestDecryptor`] + streaming [`crate::inflate::Inflater`] in one
+/// process. Used by tests, vectors and single-process tools; production Workers use
+/// [`RequestDecryptor`] and inflate in the validator child.
+pub struct RequestOpener {
+    dec: RequestDecryptor,
+    inflater: crate::inflate::Inflater,
+    scratch: Vec<u8>,
+}
+
+impl RequestOpener {
+    pub fn new(ck: &ContentKey, task: &TaskId) -> Result<Self, Error> {
+        Ok(Self {
+            dec: RequestDecryptor::new(ck, task)?,
+            inflater: crate::inflate::Inflater::new(MAX_PAYLOAD),
+            scratch: Vec::with_capacity(MAX_CHUNK + TAG_LEN),
+        })
+    }
+
+    /// Feed the next body chunk. Any error poisons the opener: every later call fails too.
+    pub fn push(&mut self, c: &pb::Chunk) -> Result<(), Error> {
+        self.scratch.clear();
+        let r = self.dec.push_into(c, &mut self.scratch).and_then(|()| self.inflater.push(&self.scratch));
+        self.scratch.zeroize();
+        if r.is_err() {
+            self.dec.failed = true;
         }
-        self.sealed = self.sealed.saturating_add(c.ct.len());
-        if self.sealed > MAX_SEALED {
-            return Err(Error::TooLarge);
-        }
-        let mut buf = std::mem::take(&mut self.scratch);
-        buf.clear();
-        buf.extend_from_slice(&c.ct);
-        let r = open_in_place(&self.aead, &mut self.aad, c.seq, c.last, &mut buf).and_then(|n| {
-            self.next = c.seq.checked_add(1).ok_or(Error::TooLarge)?;
-            self.last_seen = c.last;
-            // Pure-Rust decoder on the stranger's bytes (CONTRACT §15.2).
-            self.inflater.push(buf.get(..n).unwrap_or_default())
-        });
-        buf.zeroize();
-        self.scratch = buf;
         r
+    }
+
+    /// Chunks accepted so far (compare with `Assign.body_chunks`).
+    #[must_use]
+    pub fn chunks(&self) -> u32 {
+        self.dec.next
     }
 
     /// The decompressed inner payload. Requires the last chunk and one complete zstd frame.
     pub fn finish(self) -> Result<Vec<u8>, Error> {
-        if self.failed || !self.last_seen {
+        if self.dec.failed || !self.dec.last_seen {
             return Err(Error::Sequence);
         }
         self.inflater.finish()
