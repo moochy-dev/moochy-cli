@@ -557,6 +557,11 @@ fn signatures() -> Value {
         t_end: 1_790_000_005_000,
     };
     let (rbytes, rsig) = crypto::sign_receipt(&k, &receipt).unwrap();
+    let owner = SignKey::from_seed(&det32("owner-key"));
+    let owner_msg = crypto::owner_key_msg("ps_K7Q2M9XDRB4TWN8E", &owner.public(), &dev(W1), 1_790_000_000_000).unwrap();
+    let binding = crypto::sign_owner_key(&owner, &k, "ps_K7Q2M9XDRB4TWN8E", &dev(W1), 1_790_000_000_000).unwrap();
+    crypto::verify_owner_key(&owner.public(), &pk, "ps_K7Q2M9XDRB4TWN8E", &dev(W1), 1_790_000_000_000, &binding).unwrap();
+    let approval_sig = crypto::sign_approval(&owner, 4, b"donor-approved-body").unwrap();
     assert_eq!(crypto::open_receipt(&pk, &rbytes, &rsig).unwrap(), receipt);
     let projection = Projection {
         v: 1,
@@ -577,7 +582,7 @@ fn signatures() -> Value {
     let s_pid = crypto::salt(&s_seed, SaltName::Pid).unwrap();
     let resp_plain = b"event: message_stop\n\n";
     json!({
-        "_schema": "Ed25519 (RFC 8032 signing, ZIP-215 verification). signer.seed → signer.public. cases[]: msg = the exact lp(...) byte string named by `name` (inputs listed), sig over msg; flipping the last byte of msg MUST fail. receipt/projection: *_text = exact signed JSON bytes, signature over lp(label, bytes); a receipt signature MUST NOT verify as a projection. headers_sha256 = SHA-256(headers_lp) where headers_lp = lp(name1, value1, name2, value2, …) over lowercase names sorted ascending by bytes (inputs.headers_lp pins the exact bytes); checkpoint_fields pins every field and width of the progress-signature message (u64 attempt, u64 seq); commitments: req_commit = SHA-256(lp('moochy/v1/req-commit', S_req, body)); resp_commit = SHA-256(lp('moochy/v1/resp-commit', S_resp, SHA-256(response plaintext))); provider_req_hash = SHA-256(lp('moochy/v1/provider-req', S_pid, request_id)).",
+        "_schema": "Ed25519 (RFC 8032 signing, ZIP-215 verification). signer.seed → signer.public. cases[]: msg = the exact lp(...) byte string named by `name` (inputs listed), sig over msg; flipping the last byte of msg MUST fail. owner_key (PENDING, CONTRACT §15.4): msg = lp('moochy/v1/owner-key', pseudonym, owner_public, signer_device, u64(issued_at_ms)); owner_pop = Ed25519(owner key, msg), device_sig = Ed25519(device key of the same user, msg); approval: owner-key signature over lp('moochy/v1/keylog-sig', u32(kind), body), kinds 3-7. receipt/projection: *_text = exact signed JSON bytes, signature over lp(label, bytes); a receipt signature MUST NOT verify as a projection. headers_sha256 = SHA-256(headers_lp) where headers_lp = lp(name1, value1, name2, value2, …) over lowercase names sorted ascending by bytes (inputs.headers_lp pins the exact bytes); checkpoint_fields pins every field and width of the progress-signature message (u64 attempt, u64 seq); commitments: req_commit = SHA-256(lp('moochy/v1/req-commit', S_req, body)); resp_commit = SHA-256(lp('moochy/v1/resp-commit', S_resp, SHA-256(response plaintext))); provider_req_hash = SHA-256(lp('moochy/v1/provider-req', S_pid, request_id)).",
         "signer": {"seed": hex(&det32("device-sign")), "public": hex(&pk)},
         "inputs": {
             "nonce": hex(&nonce), "dialed_origin_text": origin, "tls_exporter": hex(&exporter), "device_id": W1,
@@ -595,6 +600,17 @@ fn signatures() -> Value {
             sig_case("checkpoint = lp('moochy/v1/resp-progress', task, u64(attempt), R, u64(seq), running_sha256)", crypto::checkpoint_msg(&t, 1, &det32("R-1"), 7, &det32("running")).unwrap()),
             sig_case("dispute = lp('moochy/v1/dispute', task, u64(attempt), code)", crypto::dispute_msg(&t, 1, "resp_commit").unwrap()),
         ],
+        "owner_key": {
+            "status": "PENDING: format proposed by mo-proto for CONTRACT §15.4; spec/KEYLOG.md does not define the owner-key entry yet",
+            "owner_seed": hex(&det32("owner-key")), "owner_public": hex(&owner.public()),
+            "device_seed": hex(&det32("device-sign")), "device_public": hex(&pk),
+            "pseudonym_text": "ps_K7Q2M9XDRB4TWN8E", "signer_device": W1, "issued_at_ms": 1_790_000_000_000u64,
+            "msg": hex(&owner_msg), "owner_pop": hex(&binding.owner_pop), "device_sig": hex(&binding.device_sig),
+        },
+        "approval": {
+            "rule": "owner key signs lp('moochy/v1/keylog-sig', u32(kind), body) for kinds 3-7 only (spec/KEYLOG.md §2); same message as today, the signer becomes the owner key (PENDING)",
+            "kind": 4, "body": hex(b"donor-approved-body"), "msg": hex(&crypto::keylog_sig_msg(4, b"donor-approved-body").unwrap()), "sig": hex(&approval_sig),
+        },
         "receipt": {"text": String::from_utf8(rbytes.clone()).unwrap(), "msg": hex(&crypto::receipt_msg(&rbytes).unwrap()), "sig": hex(&rsig)},
         "projection": {"text": String::from_utf8(pbytes.clone()).unwrap(), "msg": hex(&crypto::projection_msg(&pbytes).unwrap()), "sig": hex(&psig)},
         "commitments": {
@@ -826,9 +842,12 @@ fn money_vectors() -> Value {
 // ------------------------------------------------------------------ usernames
 
 fn usernames() -> Value {
-    let taken = ["alice", "bob-smith", "x9"];
-    let tombstoned = ["old-name", "carol"];
-    let inputs: [(&str, &str); 40] = [
+    // Look-alike targets (CONTRACT §11 skeletons) are part of the same global lists so every
+    // consumer runs them with one store: alilce, ange-s, vvendy, mary, ma; tombstone rnary
+    // shares mary's skeleton to pin "taken is reported before tombstoned".
+    let taken = ["alice", "bob-smith", "x9", "alilce", "ange-s", "vvendy", "mary", "ma"];
+    let tombstoned = ["old-name", "carol", "rnary"];
+    let inputs: [(&str, &str); 62] = [
         ("valid", "abc"),
         ("valid", "alice2"),
         ("valid", "a-b"),
@@ -852,6 +871,28 @@ fn usernames() -> Value {
         ("reserved", "logout"),
         ("reserved", "Events"),
         ("invalid (too short, also reserved)", "u"),
+        ("look-alike of reserved moochy (rn→m)", "rnoochy"),
+        ("look-alike of reserved moochy (0→o)", "m00chy"),
+        ("look-alike of reserved admin (rn→m)", "adrnin"),
+        ("look-alike of reserved root (0→o)", "r00t"),
+        ("look-alike of reserved api (hyphens)", "a-p-i"),
+        ("look-alike of reserved v1 (hyphen)", "v-1"),
+        ("look-alike of reserved device (hyphen)", "dev-ice"),
+        ("not a look-alike: 1→l gives devlce", "dev1ce"),
+        ("not a look-alike: 5→s is not a rule", "5upport"),
+        ("look-alike of taken alice (1→l)", "a1ice"),
+        ("look-alike of taken alice, uppercase", "A1ICE"),
+        ("look-alike of taken alilce", "ali1ce"),
+        ("look-alike of taken ange-s (hyphen)", "anges"),
+        ("look-alike of taken bob-smith", "bobsmith"),
+        ("look-alike of taken bob-smith (0→o)", "b0b-smith"),
+        ("look-alike of taken x9 (hyphen)", "x-9"),
+        ("look-alike of taken vvendy (vv→w)", "wendy"),
+        ("look-alike of taken mary; also tombstoned rnary: taken wins", "rnary"),
+        ("look-alike of tombstone old-name", "oldname"),
+        ("look-alike of tombstone old-name (1→l)", "o1d-name"),
+        ("look-alike of tombstone carol (1→l)", "caro1"),
+        ("hyphens go last: r-n-a → rna, not ma", "r-n-a"),
         ("invalid", "ab"),
         ("invalid", "x9"),
         ("invalid", "abcdefghijklmnopqrstuvwxyz0123456"),
@@ -873,13 +914,18 @@ fn usernames() -> Value {
     let cases: Vec<Value> = inputs
         .iter()
         .map(|(kind, s)| {
-            let v = username::verdict(s, |h| taken.contains(&h), |h| tombstoned.contains(&h));
+            let v = username::verdict(s, |k| taken.iter().any(|t| username::skeleton(t) == k), |k| tombstoned.iter().any(|t| username::skeleton(t) == k));
             json!({"note": kind, "input": s, "canonical": username::canonical(s).ok(), "verdict": v.as_str()})
         })
         .collect();
+    let skeleton_rows: Vec<Value> = ["moochy", "rnoochy", "m00chy", "RNOOCHY", "ange-s", "ali1ce", "vvalt", "rnrn", "rrn", "rnn", "vvv", "r-n", "v-v", "r0n", "a-b-c", "x9", "1o1"]
+        .iter()
+        .map(|i| json!({"input": i, "skeleton": username::skeleton(i)}))
+        .collect();
     json!({
-        "_schema": "Usernames (CONTRACT §11). Format: {cases:[{input, verdict, canonical, note}], taken, tombstoned, reserved}. reserved is THE reserved-handle list (CONTRACT R7): Rust and Go embed a copy and test it against this array. canonical(input): reject any non-ASCII byte (confusables, zero-width, bidi) → ASCII-lowercase → ^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$ with no '--' → not in reserved. verdict(input) = first of: invalid | reserved | taken (canonical ∈ taken) | tombstoned (canonical ∈ tombstoned) | ok. canonical is null when refused before the lookups; note is descriptive only.",
+        "_schema": "Usernames (CONTRACT §11). Format: {cases:[{input, verdict, canonical, note}], taken, tombstoned, reserved, skeletons:[{input, skeleton}]}. skeleton(h) = ASCII-lowercase, then rn→m, vv→w, 0→o, 1→l, then '-' removed (each a left-to-right replace-all, in that order). Reserved words, taken and tombstoned handles all compare on skeletons: reserved iff skeleton(canonical) = skeleton(some reserved word); taken iff it equals skeleton(some taken handle); tombstoned likewise. reserved is THE reserved-handle list (CONTRACT R7): Rust and Go embed a copy and test it against this array. canonical(input): reject any non-ASCII byte (confusables, zero-width, bidi) → ASCII-lowercase → ^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$ with no '--' → not in reserved. verdict(input) = first of: invalid | reserved | taken | tombstoned | ok. canonical is null when refused before the lookups; note is descriptive only.",
         "reserved": username::RESERVED,
+        "skeletons": skeleton_rows,
         "taken": taken,
         "tombstoned": tombstoned,
         "cases": cases,

@@ -82,6 +82,37 @@ fn request_roundtrip_multi_chunk() {
     assert_eq!(one.chunks.len(), 1);
 }
 
+/// Production split (CONTRACT §15.2): parent decrypts only, validator child inflates + parses.
+#[test]
+fn decrypt_only_then_inflate() {
+    let t = task();
+    let mut payload = vec![0u8; 3 * MAX_CHUNK];
+    crypto::fill_random(&mut payload).unwrap();
+    let s = crypto::seal_request(&ck(), &t, &payload).unwrap();
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    s.chunks.iter().for_each(|c| d.push(c).unwrap());
+    assert_eq!(d.chunks() as usize, s.chunks.len());
+    let z = d.finish().unwrap();
+    assert_eq!(z.len() as u64, s.body_len - (s.chunks.len() * TAG_LEN) as u64, "exactly the compressed bytes");
+    assert_eq!(moochy_proto::inflate::inflate_all(&z, crypto::MAX_PAYLOAD).unwrap(), payload);
+    // Same refusals as the all-in-one opener: order, attempt, truncation, tamper (buffer untouched).
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    assert_eq!(d.push(&s.chunks[1]), Err(Error::Sequence));
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    d.push(&s.chunks[0]).unwrap();
+    assert_eq!(d.finish(), Err(Error::Sequence), "last chunk missing");
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    let mut out = b"keep".to_vec();
+    assert_eq!(d.push_into(&flip(&s.chunks[0], 3, 1), &mut out), Err(Error::Decrypt));
+    assert_eq!(out, b"keep");
+    assert_eq!(d.push_into(&s.chunks[0], &mut out), Err(Error::Sequence), "poisoned");
+    let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+    assert_eq!(d.push(&pb::Chunk { attempt: 2, ..s.chunks[0].clone() }), Err(Error::Sequence));
+    // The child refuses a bomb exactly like the streaming path.
+    let bomb = zstd::bulk::compress(&vec![b' '; crypto::MAX_PAYLOAD + 1], 3).unwrap();
+    assert_eq!(moochy_proto::inflate::inflate_all(&bomb, crypto::MAX_PAYLOAD), Err(Error::TooLarge));
+}
+
 #[test]
 fn request_negatives() {
     let t = task();
@@ -244,6 +275,35 @@ fn sealed_detail() {
     assert_eq!(crypto::seal_detail(&ck(), &r, &task(), &w, 1, "firewall", &"x".repeat(1025)).err(), Some(Error::TooLarge));
     assert!(crypto::seal_detail(&ck(), &r, &task(), &w, 1, "firewall", &"x".repeat(1024)).is_ok());
     assert_eq!(moochy_proto::b64(&crypto::sha256(b"abc")), "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", "SHA-256 KAT");
+}
+
+#[test]
+fn owner_key_and_approvals() {
+    let owner = SignKey::from_seed(&[0x51; 32]);
+    let device = SignKey::from_seed(&[0x52; 32]);
+    let dv = dev("d_01K6A0000000000000000000G1");
+    let ps = "ps_K7Q2M9XDRB4TWN8E";
+    let b = crypto::sign_owner_key(&owner, &device, ps, &dv, 1_790_000_000_000).unwrap();
+    crypto::verify_owner_key(&owner.public(), &device.public(), ps, &dv, 1_790_000_000_000, &b).unwrap();
+    // Every bound field matters; swapped roles and same-key bindings fail.
+    assert!(crypto::verify_owner_key(&owner.public(), &device.public(), "ps_K7Q2M9XDRB4TWN8F", &dv, 1_790_000_000_000, &b).is_err());
+    assert!(crypto::verify_owner_key(&owner.public(), &device.public(), ps, &dv, 1_790_000_000_001, &b).is_err());
+    assert!(crypto::verify_owner_key(&device.public(), &owner.public(), ps, &dv, 1_790_000_000_000, &b).is_err());
+    assert_eq!(crypto::verify_owner_key(&owner.public(), &owner.public(), ps, &dv, 1_790_000_000_000, &b), Err(Error::BadSignature));
+    assert_eq!(crypto::sign_owner_key(&owner, &owner, ps, &dv, 1).err(), Some(Error::Malformed));
+    for bad in ["ps_short", "pu_K7Q2M9XDRB4TWN8E", "ps_K7Q2M9XDRB4TWN8-", "ps_K7Q2M9XDRB4TWN8EX"] {
+        assert_eq!(crypto::owner_key_msg(bad, &owner.public(), &dv, 1).err(), Some(Error::Malformed), "{bad}");
+    }
+    assert_eq!(crypto::owner_key_msg(ps, &owner.public(), &dv, 0).err(), Some(Error::Malformed));
+    // Approvals: owner key over lp("moochy/v1/keylog-sig", u32(kind), body); kinds 3–7 only.
+    let body = b"approval body";
+    let sig = crypto::sign_approval(&owner, 4, body).unwrap();
+    crypto::verify_approval(&owner.public(), 4, body, &sig).unwrap();
+    assert!(crypto::verify_approval(&owner.public(), 5, body, &sig).is_err(), "kind is bound");
+    assert!(crypto::verify_approval(&device.public(), 4, body, &sig).is_err(), "device keys cannot approve");
+    for k in [0, 1, 2, 8, 9] {
+        assert_eq!(crypto::sign_approval(&owner, k, body).err(), Some(Error::Malformed), "kind {k}");
+    }
 }
 
 #[test]

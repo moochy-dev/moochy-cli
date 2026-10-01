@@ -32,10 +32,14 @@ fn reserved_list_matches_vector_file() {
     }
     for c in v["cases"].as_array().unwrap() {
         let input = c["input"].as_str().unwrap();
-        let taken = |h: &str| v["taken"].as_array().unwrap().iter().any(|x| x == h);
-        let tomb = |h: &str| v["tombstoned"].as_array().unwrap().iter().any(|x| x == h);
+        let sk = moochy_proto::username::skeleton;
+        let taken = |k: &str| v["taken"].as_array().unwrap().iter().any(|x| sk(x.as_str().unwrap()) == k);
+        let tomb = |k: &str| v["tombstoned"].as_array().unwrap().iter().any(|x| sk(x.as_str().unwrap()) == k);
         assert_eq!(moochy_proto::username::verdict(input, taken, tomb).as_str(), c["verdict"], "{input:?}");
         assert_eq!(moochy_proto::username::canonical(input).ok().as_deref(), c["canonical"].as_str(), "{input:?}");
+    }
+    for c in v["skeletons"].as_array().unwrap() {
+        assert_eq!(moochy_proto::username::skeleton(c["input"].as_str().unwrap()), c["skeleton"].as_str().unwrap());
     }
 }
 
