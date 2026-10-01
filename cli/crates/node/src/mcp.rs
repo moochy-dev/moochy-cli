@@ -294,7 +294,7 @@ impl Session {
             }
         }
         let headers = if dialect == Dialect::Anthropic { vec![("anthropic-version".to_owned(), "2023-06-01".to_owned())] } else { Vec::new() };
-        let req = crate::gateway::prepare(&self.node, self.slug.clone(), dialect, Bytes::from(body.to_string()), headers, crate::task::now_us()).map_err(|f| fail_text(&f))?;
+        let req = crate::gateway::prepare(&self.node, self.slug.clone(), dialect, Bytes::from(body.to_string()), &headers, crate::task::now_us()).map_err(|f| fail_text(&f))?;
         let mut rx = submit(&self.node, req).await.map_err(|f| fail_text(&f))?;
 
         let mut sse = SseText::default();

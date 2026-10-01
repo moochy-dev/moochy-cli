@@ -242,10 +242,19 @@ pub async fn read_body(b: Incoming, limit: usize) -> Result<Bytes, Failure> {
 }
 
 /// Validate + scrub a provider-dialect body into a task request.
-pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: Vec<(String, String)>, t_client_rx: u64) -> Result<TaskReq, Failure> {
+pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: &[(String, String)], t_client_rx: u64) -> Result<TaskReq, Failure> {
     use moochy_worker::json::{self as wj, Kind, Val};
     let bad = |m: String| Failure::new("invalid_request", false, m);
-    let mut body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
+    let body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
+    // Drop what a pooled donor refuses but the client can do without (Claude Code `safeguards`,
+    // unknown betas, extra headers) before anything else; the client is told (x-moochy-note).
+    let hdr: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let pool = moochy_worker::firewall::pool_compatible(dialect.worker(), &body, &hdr).map_err(|r| Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)")))?;
+    drop(hdr);
+    if !pool.stripped.is_empty() {
+        crate::util::log("info", "removed what donors refuse", &json!({"stripped": pool.stripped}));
+    }
+    let (mut body, headers, stripped) = (Bytes::from(pool.body), pool.headers, pool.stripped);
     // Strict tape parse (no tree allocation): this is the per-request hot path (CONTRACT §13).
     let mut tape = Vec::new();
     let (inject_max, auto_cache) = {
@@ -291,7 +300,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
-    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false })
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, stripped })
 }
 
 fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
@@ -315,6 +324,7 @@ fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::Catalo
     })
 }
 
+#[allow(clippy::too_many_lines, reason = "one request: read, prepare, submit, stream or buffer, headers")]
 async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: bool) -> Resp {
     let t_rx = crate::task::now_us();
     let headers: Vec<(String, String)> = ["anthropic-version", "anthropic-beta"]
@@ -340,11 +350,12 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
             Err(f) => native_error(dialect, &f),
         };
     }
-    let treq = match prepare(&node, slug, dialect, raw, headers, t_rx) {
+    let treq = match prepare(&node, slug, dialect, raw, &headers, t_rx) {
         Ok(t) => TaskReq { release_tools: release, ..t },
         Err(f) => return native_error(dialect, &f),
     };
     let stream = treq.facts.stream;
+    let note = (!treq.stripped.is_empty()).then(|| format!("[moochy] removed before sending to donors: {}", treq.stripped.join(", ")));
     let mut rx = match submit(&node, treq).await {
         Ok(rx) => rx,
         Err(f) => return native_error(dialect, &f),
@@ -411,6 +422,9 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
     }
     if let Ok(v) = HeaderValue::from_str(&donor) {
         h.insert("x-moochy-donor", v);
+    }
+    if let Some(v) = note.and_then(|n| HeaderValue::from_str(&crate::util::clean(&n)).ok()) {
+        h.insert("x-moochy-note", v);
     }
     resp
 }

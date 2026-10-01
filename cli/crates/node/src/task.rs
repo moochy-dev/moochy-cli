@@ -41,6 +41,8 @@ pub struct TaskReq {
     pub t_client_rx: u64,
     /// §15.4: tool calls may reach this client (sandboxed run token or project opt-in).
     pub release_tools: bool,
+    /// What `firewall::pool_compatible` removed (shown to the client as a `[moochy]` note).
+    pub stripped: Vec<String>,
 }
 
 pub enum TaskEv {
