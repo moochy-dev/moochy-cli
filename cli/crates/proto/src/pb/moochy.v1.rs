@@ -121,6 +121,9 @@ pub struct PoolSync {
     /// "github" | "gitlab"
     #[prost(string, tag = "6")]
     pub repo_provider: ::prost::alloc::string::String,
+    /// repo setting: Gateway adds top-level automatic caching to multi-turn Anthropic requests (plan 07 §4.2)
+    #[prost(bool, tag = "7")]
+    pub auto_cache: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PoolWorker {
