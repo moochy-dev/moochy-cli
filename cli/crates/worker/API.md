@@ -40,16 +40,17 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 
 ### `provider`
 - `Adapter::new(&AdapterConfig{provider, api_key: Zeroizing<String>, base_url, insecure_dev, dev_root, limits})`.
-- Real hosts only: `api.anthropic.com`, `api.openai.com`, `openrouter.ai/api`, `api.deepseek.com` (Anthropic shape under `/anthropic`).
-- `base_url` override (CONTRACT §6): refused unless `insecure_dev` **and** the host is a loopback **IP literal** (`localhost` refused: name resolution is attackable). `http://` → HTTP/1.1 (e2e fakes), `https://` → HTTP/2 (+ `dev_root` trust anchor, tests only). The override replaces the provider *root*; paths below it are fixed:
+- **Adapter definitions** (`provider::AdapterDef::of(provider)`): the official origin and the **full path for each dialect**. `Provider::serves` is derived from this table.
 
-| provider | anthropic.messages | openai.chat |
-|---|---|---|
-| anthropic | `/v1/messages` | — |
-| openai | — | `/v1/chat/completions` |
-| openrouter (root `/api`) | `/v1/messages` | `/v1/chat/completions` |
-| deepseek | `/anthropic/v1/messages` | `/v1/chat/completions` |
+| provider | origin | anthropic.messages | openai.chat |
+|---|---|---|---|
+| anthropic | `https://api.anthropic.com` | `/v1/messages` | — |
+| openai | `https://api.openai.com` | — | `/v1/chat/completions` |
+| openrouter | `https://openrouter.ai` | `/api/v1/messages` (Anthropic-compatible root `/api`) | `/api/v1/chat/completions` (OpenAI-compatible root `/api/v1`) |
+| deepseek | `https://api.deepseek.com` | `/anthropic/v1/messages` (Anthropic-compatible root `/anthropic`) | `/chat/completions` |
 
+- **Base URL = origin, never a root.** The `base_url` override (CONTRACT §6) replaces only `scheme://host:port`; the path always comes from the table above, so the e2e fakes (`e2e/fake`) serve exactly the real paths. Accepted only with `insecure_dev` **and** a loopback **IP literal** (`localhost` refused: name resolution is attackable). A trailing `/` is fine; **any path is refused** (`http://127.0.0.1:P/api` → error "base URL must be an origin"), so nobody has to guess whether a prefix is an origin or an API root. `http://` → HTTP/1.1 (e2e fakes), `https://` → HTTP/2 (+ `dev_root` trust anchor, tests only).
+- Verified against the real Go fakes for all six provider × dialect pairs (`tests/provider.rs::against_e2e_fakes`, opt-in via `MOOCHY_E2E_FAKES`).
 - Auth: Anthropic `x-api-key`; others `Authorization: Bearer`.
 - Transport: one warm HTTP/2 connection per adapter (multiplexed, re-dialed when closed), ALPN `h2` required, rustls/ring, Mozilla roots, `TCP_NODELAY`, stream window 2 MiB, connection window 8 MiB, keep-alive PING 20 s.
 - `Limits` (defaults): connect 5 s, headers 30 s, idle between chunks 120 s, total 1 h, response 128 MiB, error body 64 KiB.

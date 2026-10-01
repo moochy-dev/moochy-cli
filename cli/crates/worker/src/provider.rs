@@ -139,6 +139,45 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+/// One adapter definition (07 §6.2): the official origin and the **full request path for
+/// each dialect it serves**. Paths are fixed per adapter: a configured base URL (loopback
+/// dev override only) replaces the *origin* and never the path, so the e2e fakes serve
+/// exactly the real paths and nothing is guessed from a URL prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdapterDef {
+    pub host: &'static str,
+    /// Anthropic Messages endpoint path, if served.
+    pub messages: Option<&'static str>,
+    /// OpenAI chat-completions endpoint path, if served.
+    pub chat: Option<&'static str>,
+}
+
+impl AdapterDef {
+    pub const fn of(p: Provider) -> Self {
+        match p {
+            Provider::Anthropic => Self { host: "api.anthropic.com", messages: Some("/v1/messages"), chat: None },
+            Provider::OpenAi => Self { host: "api.openai.com", messages: None, chat: Some("/v1/chat/completions") },
+            // OpenAI-compatible root `https://openrouter.ai/api/v1`; Anthropic-compatible root
+            // `https://openrouter.ai/api` (+ `/v1/messages`).
+            Provider::OpenRouter => {
+                Self { host: "openrouter.ai", messages: Some("/api/v1/messages"), chat: Some("/api/v1/chat/completions") }
+            }
+            // OpenAI-compatible root `https://api.deepseek.com`; Anthropic-compatible root
+            // `https://api.deepseek.com/anthropic` (+ `/v1/messages`).
+            Provider::DeepSeek => {
+                Self { host: "api.deepseek.com", messages: Some("/anthropic/v1/messages"), chat: Some("/chat/completions") }
+            }
+        }
+    }
+
+    pub const fn path(&self, d: Dialect) -> Option<&'static str> {
+        match d {
+            Dialect::AnthropicMessages => self.messages,
+            Dialect::OpenAiChat => self.chat,
+        }
+    }
+}
+
 struct Target {
     tls: bool,
     /// Host to dial (DNS name or IP literal).
@@ -146,29 +185,15 @@ struct Target {
     port: u16,
     /// `host[:port]` for the URI authority.
     authority: String,
-    /// Path prefix before the per-dialect path (e.g. `/api` for OpenRouter).
-    root: String,
 }
 
 fn real_target(p: Provider) -> Target {
-    let (host, root) = match p {
-        Provider::Anthropic => ("api.anthropic.com", ""),
-        Provider::OpenAi => ("api.openai.com", ""),
-        Provider::OpenRouter => ("openrouter.ai", "/api"),
-        Provider::DeepSeek => ("api.deepseek.com", ""),
-    };
-    Target { tls: true, host: host.to_owned(), port: 443, authority: host.to_owned(), root: root.to_owned() }
+    let host = AdapterDef::of(p).host;
+    Target { tls: true, host: host.to_owned(), port: 443, authority: host.to_owned() }
 }
 
-/// Path below the root. DeepSeek's Anthropic-compatible API lives under `/anthropic`.
-fn path(p: Provider, d: Dialect) -> &'static str {
-    match (p, d) {
-        (Provider::DeepSeek, Dialect::AnthropicMessages) => "/anthropic/v1/messages",
-        (_, Dialect::AnthropicMessages) => "/v1/messages",
-        (_, Dialect::OpenAiChat) => "/v1/chat/completions",
-    }
-}
-
+/// Parse a dev base URL: an **origin** only (`http(s)://loopback-ip[:port]`, optional
+/// trailing `/`). A path is refused rather than interpreted: the adapter owns the paths.
 fn dev_target(url: &str) -> Result<Target, ConfigError> {
     let (tls, rest) = if let Some(r) = url.strip_prefix("http://") {
         (false, r)
@@ -178,9 +203,12 @@ fn dev_target(url: &str) -> Result<Target, ConfigError> {
         return Err(ConfigError("base URL must be http:// or https://"));
     };
     if rest.contains(['?', '#', '@', '\\']) || rest.bytes().any(|b| b.is_ascii_control() || b == b' ') {
-        return Err(ConfigError("base URL must be scheme://loopback-ip[:port][/path]"));
+        return Err(ConfigError("base URL must be scheme://loopback-ip[:port]"));
     }
-    let (authority, root) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.contains('/') {
+        return Err(ConfigError("base URL must be an origin (scheme://loopback-ip[:port]); request paths are fixed per adapter"));
+    }
     let (host, port) = if let Some(r) = authority.strip_prefix('[') {
         let (h, p) = r.split_once(']').ok_or(ConfigError("bad IPv6 literal"))?;
         (h, p.strip_prefix(':'))
@@ -199,7 +227,7 @@ fn dev_target(url: &str) -> Result<Target, ConfigError> {
         None if tls => 443,
         None => 80,
     };
-    Ok(Target { tls, host: ip.to_string(), port, authority: authority.to_owned(), root: root.trim_end_matches('/').to_owned() })
+    Ok(Target { tls, host: ip.to_string(), port, authority: authority.to_owned() })
 }
 
 fn tls_config(dev_root: Option<&CertificateDer<'static>>) -> Result<Arc<rustls::ClientConfig>, ConfigError> {
@@ -337,15 +365,15 @@ impl Adapter {
     /// arrive (= `task.started`) with a 2xx; any other status is a [`Failure`] carrying the
     /// provider's bounded error body. Drop the [`Response`] to abort the provider request.
     pub async fn send(&self, dialect: Dialect, body: Bytes, headers: &[(&'static str, String)]) -> Result<Response, Failure> {
-        if !self.provider.serves(dialect) {
+        let Some(path) = AdapterDef::of(self.provider).path(dialect) else {
             return Err(Failure::new(FailKind::Unsupported, "dialect not served by this provider"));
-        }
+        };
         let t = &self.target;
         // h2 needs the absolute URI (:scheme/:authority); HTTP/1.1 wants origin-form + Host.
         let uri = if t.tls {
-            format!("https://{}{}{}", t.authority, t.root, path(self.provider, dialect))
+            format!("https://{}{path}", t.authority)
         } else {
-            format!("{}{}", t.root, path(self.provider, dialect))
+            path.to_owned()
         };
         let mut b = hyper::Request::post(uri)
             .header("content-type", "application/json")
@@ -511,9 +539,9 @@ mod tests {
     #[test]
     fn dev_urls() {
         let t = dev_target("http://127.0.0.1:8080").unwrap();
-        assert_eq!((t.tls, t.host.as_str(), t.port, t.root.as_str()), (false, "127.0.0.1", 8080, ""));
-        let t = dev_target("http://[::1]:9/prefix/").unwrap();
-        assert_eq!((t.host.as_str(), t.port, t.root.as_str(), t.authority.as_str()), ("::1", 9, "/prefix", "[::1]:9"));
+        assert_eq!((t.tls, t.host.as_str(), t.port, t.authority.as_str()), (false, "127.0.0.1", 8080, "127.0.0.1:8080"));
+        let t = dev_target("https://[::1]:9/").unwrap();
+        assert_eq!((t.tls, t.host.as_str(), t.port, t.authority.as_str()), (true, "::1", 9, "[::1]:9"));
         for bad in [
             "http://localhost:1",
             "http://10.0.0.1:1",
@@ -522,6 +550,9 @@ mod tests {
             "http://127.0.0.1@evil.com",
             "http://127.0.0.1:1?x",
             "http://127.0.0.1:99999",
+            "http://127.0.0.1:8080/api",
+            "http://127.0.0.1:8080/anthropic/",
+            "http://127.0.0.1:8080//",
         ] {
             assert!(dev_target(bad).is_err(), "{bad}");
         }
@@ -548,8 +579,22 @@ mod tests {
 
     #[test]
     fn paths() {
-        assert_eq!(path(Provider::DeepSeek, Dialect::AnthropicMessages), "/anthropic/v1/messages");
-        assert_eq!(path(Provider::OpenRouter, Dialect::OpenAiChat), "/v1/chat/completions");
-        assert_eq!(real_target(Provider::OpenRouter).root, "/api");
+        let full = |p: Provider, d: Dialect| AdapterDef::of(p).path(d).map(|path| format!("https://{}{path}", AdapterDef::of(p).host));
+        let a = Dialect::AnthropicMessages;
+        let o = Dialect::OpenAiChat;
+        let want = [
+            (Provider::Anthropic, a, Some("https://api.anthropic.com/v1/messages")),
+            (Provider::Anthropic, o, None),
+            (Provider::OpenAi, a, None),
+            (Provider::OpenAi, o, Some("https://api.openai.com/v1/chat/completions")),
+            (Provider::OpenRouter, a, Some("https://openrouter.ai/api/v1/messages")),
+            (Provider::OpenRouter, o, Some("https://openrouter.ai/api/v1/chat/completions")),
+            (Provider::DeepSeek, a, Some("https://api.deepseek.com/anthropic/v1/messages")),
+            (Provider::DeepSeek, o, Some("https://api.deepseek.com/chat/completions")),
+        ];
+        for (p, d, url) in want {
+            assert_eq!(full(p, d).as_deref(), url, "{p:?} {d:?}");
+            assert_eq!(p.serves(d), url.is_some(), "Provider::serves agrees with the adapter table");
+        }
     }
 }
