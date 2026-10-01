@@ -94,16 +94,9 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
         record(home, &json!({"locked": false, "reason": "gateway-only: pending file-sharing move"}));
         return Ok(());
     }
-    let dev = dev_ports(&boot.secrets);
-    if !dev.is_empty() && !unsafe_no_lockdown {
-        // ponytail: needs DonorPolicy.connect_ports (requested from mo-sandbox); until then a
-        // dev provider on another port than 443 cannot be reached from a locked process.
-        let msg = "moochy: WARNING lockdown skipped: a development provider URL uses a port this build cannot allow (MOOCHY_INSECURE_DEV only)";
-        eprintln!("{msg}");
-        log("warn", "lockdown skipped for a development provider port", &json!({"ports": dev}));
-        record(home, &json!({"locked": false, "reason": "insecure dev: provider port"}));
-        return Ok(());
-    }
+    // Development provider overrides (`keys add --base-url`, MOOCHY_INSECURE_DEV only) on other
+    // ports than 443.
+    p.connect_ports = dev_ports(&boot.secrets);
     let r = lockdown_self(&p).map_err(|e| internal(format!("cannot lock the background process down ({e}); run `moochy doctor`, or `moochy up --unsafe-no-lockdown` for debugging only")))?;
     let rep = json!({
         "locked": !unsafe_no_lockdown,
@@ -112,6 +105,7 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
         "landlock_fs": r.landlock_fs,
         "landlock_net": r.landlock_net,
         "landlock_abi": r.abi,
+        "all_threads": r.all_threads,
     });
     log(if unsafe_no_lockdown { "error" } else { "info" }, if unsafe_no_lockdown { "UNSAFE: background process NOT locked down (--unsafe-no-lockdown)" } else { "background process locked down" }, &rep);
     if r.landlock_net == Some(false) || (r.landlock_fs && r.landlock_net.is_none()) {
