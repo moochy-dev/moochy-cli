@@ -1,0 +1,71 @@
+[package]
+name = "moochy"
+version = "0.1.0"
+description = "Moochy node: gateway (API + MCP doors), worker, relay link"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "moochy_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "moochy"
+path = "src/main.rs"
+
+[features]
+default = []
+# OS keychain keystore backend (macOS Keychain, Secret Service, Credential Manager).
+keychain = ["dep:keyring"]
+
+[dependencies]
+tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal", "process", "fs"] }
+hyper = { version = "1.7", default-features = false, features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1.17", default-features = false, features = ["tokio", "service"] }
+http-body-util = { version = "0.1", default-features = false }
+bytes = { version = "1", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = { version = "1", default-features = false }
+# gRPC link (CONTRACT §12): client channel + codegen only (no axum router, no tonic TLS: our own
+# rustls connector captures the RFC 9266 exporter). LocalControl is served with hyper's h2 server.
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen"] }
+tonic-prost = { version = "0.14", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
+tokio-stream = { version = "0.1", default-features = false }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+lexopt = "0.3"
+scrypt = { version = "0.11", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+getrandom = { version = "0.3", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
+subtle = { version = "2", default-features = false }
+keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Naming/doc-only pedantic lints (same set as moochy-proto).
+similar_names = "allow"
+many_single_char_names = "allow"
+doc_markdown = "allow"
