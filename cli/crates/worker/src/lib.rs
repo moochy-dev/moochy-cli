@@ -10,6 +10,7 @@
 //! - [`store`]: outbox, served-task set, local reservation counters (one crash-safe log).
 #![forbid(unsafe_code)]
 
+mod codec;
 pub mod firewall;
 pub mod inspect;
 pub mod json;
