@@ -12,7 +12,7 @@ This development monorepo is internal. At release, the open-source parts (`cli/`
 
 | Path | What |
 |---|---|
-| `cli/` | Rust: the `moochy` binary (gateway, MCP server, worker) |
-| `relay/` | Go: the self-hostable relay and web app |
-| `e2e/` | End-to-end tests with fake providers |
-| `spec/` | Contract and cross-language test vectors |
+| `cli/` | Rust: the `moochy` binary — gateway, MCP server, worker (open source, Apache-2.0) |
+| `relay/` | Go: the relay and web app (closed source) |
+| `e2e/` | End-to-end and attack tests with fake providers (closed source) |
+| `spec/` | Internal contract (closed) + public protocol: `proto/`, `vectors/`, `protocol.md` (open source) |
