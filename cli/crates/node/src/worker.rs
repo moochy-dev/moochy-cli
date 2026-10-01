@@ -34,8 +34,14 @@ const MAX_BODY_CHUNKS: u32 = 600;
 const MAX_BODY_LEN: u64 = (crypto::MAX_SEALED as u64).saturating_add(1 << 20);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The donor's device cap (07 §6.4: required at setup). Unset → the worker stays idle, except in
+/// insecure dev mode (tests), where it means no device cap.
+fn device_cap(node: &Node) -> Option<u64> {
+    node.cfg.device_monthly_cap_uusd.or_else(|| node.insecure_dev.then_some(u64::MAX))
+}
+
 fn can_serve(node: &Node) -> bool {
-    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && node.cfg.device_monthly_cap_uusd.is_some() && !node.adapters.is_empty()
+    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && device_cap(node).is_some() && !node.adapters.is_empty()
 }
 
 fn slots_max(node: &Node) -> u32 {
@@ -69,7 +75,7 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
     let paused = node.paused.load(Ordering::Relaxed);
     let models = served_models(node).into_iter().map(|(d, m)| pb::ModelOffer { dialect: d.wire().into(), model: m, rl_headroom: 100 }).collect();
     let free = if paused { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
-    let cap = node.cfg.device_monthly_cap_uusd.unwrap_or(0);
+    let cap = device_cap(node).unwrap_or(0);
     let left = node.store.as_ref().map_or(0, |s| lock(s).device_left(cap, now_ms()));
     let local_cap_left_uusd = i64::try_from(left).unwrap_or(i64::MAX);
     pb::NodeMsg { msg: Some(pb::node_msg::Msg::Offer(pb::WorkerOffer { slots_free: free, models, pledges: Vec::new(), window_open: !paused, local_cap_left_uusd })) }
@@ -93,7 +99,7 @@ fn attempt_key(task: &str, attempt: u32) -> Vec<u8> {
 /// After Welcome: what we have in flight / in the outbox, outbox replay, then the offer.
 pub fn on_welcome(node: &Arc<Node>) {
     if !can_serve(node) {
-        log("info", "worker role idle (needs provider keys, device_monthly_cap_uusd and a catalog entry for them)", &json!({}));
+        log("info", "worker role idle (needs provider keys and `moochy config set device_monthly_cap_uusd`)", &json!({}));
         return;
     }
     let node = node.clone();
@@ -375,7 +381,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     // 4. Local reservation (device cap; pledge numbers are relay-side until Assign carries them).
     let amount = money::reserve_for_route(&entry, &route).ok().and_then(|a| u64::try_from(a).ok()).ok_or_else(|| with_ck("local_cap", true, None))?;
     let key = attempt_key(&task.text(), u32::from(attempt));
-    let (k2, p2, cap) = (key.clone(), pledge.text(), node.cfg.device_monthly_cap_uusd.unwrap_or(0));
+    let (k2, p2, cap) = (key.clone(), pledge.text(), device_cap(node).unwrap_or(0));
     let reserved = with_store(node, move |s| {
         s.reserve(&Reservation {
             key: &k2,

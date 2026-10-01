@@ -244,6 +244,7 @@ impl Node {
         if changed {
             self.pool_gen.send_modify(|g| *g = g.wrapping_add(1));
         }
+        crate::util::log("info", "pool sync", &serde_json::json!({"repo_id": v.repo_id, "full": v.full, "workers": v.workers.len(), "models_changed": changed}));
     }
 
     pub fn session_worker(&self, key: &[u8; 16]) -> Option<String> {

@@ -97,6 +97,24 @@ impl Session {
         })
     }
 
+    /// Right after `moochy up` the relay may not have pushed the donors yet (it throttles pool
+    /// updates): wait up to 2 s for a non-empty pool, only during the first seconds of the node.
+    async fn settle_pool(&self) {
+        let young = crate::util::now_ms().saturating_sub(self.node.boot_ms) < 5_000;
+        if !young || !self.pool_models().is_empty() {
+            return;
+        }
+        let mut rx = self.node.pool_gen.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.changed().await.is_ok() {
+                if !self.pool_models().is_empty() {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+
     fn pool_models(&self) -> Vec<(String, Vec<String>)> {
         self.node.pool_for(&self.slug).map(|p| p.models()).unwrap_or_default()
     }
@@ -161,7 +179,10 @@ impl Session {
                     "serverInfo":{"name":"moochy","version":env!("CARGO_PKG_VERSION")},"instructions":INSTRUCTIONS}))
             }
             "ping" => rpc_ok(&id, &json!({})),
-            "tools/list" => rpc_ok(&id, &self.tools()),
+            "tools/list" => {
+                self.settle_pool().await;
+                rpc_ok(&id, &self.tools())
+            }
             "tools/call" => self.call(&id, &params, progress).await,
             _ => rpc_err(&id, -32601, "method not found"),
         })
@@ -250,6 +271,7 @@ impl Session {
         if prompt.len() > MAX_PROMPT {
             return Err("`prompt` is larger than 1 MiB".into());
         }
+        self.settle_pool().await;
         let models = self.pool_models();
         let model = match s("model") {
             Some(m) => m.to_owned(),
