@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 
 const ANTH: &str = include_str!("fixtures/anthropic_tool.sse");
 const OAI: &str = include_str!("fixtures/openai_tool.sse");
+const XAI: &str = include_str!("fixtures/xai.sse");
 
 #[derive(Clone)]
 enum Mode {
@@ -96,7 +97,7 @@ async fn fake(mode: Mode) -> Fake {
                 let Some(r) = read_request(&mut s).await else { return };
                 rtx.send(r).unwrap();
                 // One request per connection, so say so (the adapter pools keep-alive connections).
-                const SSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n";
+                const SSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\nx-ratelimit-limit-requests: 480\r\nx-ratelimit-remaining-requests: 120\r\nx-ratelimit-limit-tokens: 2000000\r\nx-ratelimit-remaining-tokens: 1000000\r\ntransfer-encoding: chunked\r\n\r\n";
                 match mode {
                     Mode::Status(code, extra, body) => {
                         let resp = format!("HTTP/1.1 {code} X\r\ncontent-type: application/json\r\nconnection: close\r\n{extra}content-length: {}\r\n\r\n{body}", body.len());
@@ -210,17 +211,24 @@ async fn provider_paths_and_auth() {
         (Provider::OpenRouter, Dialect::OpenAiChat, "POST /api/v1/chat/completions ", OBODY, OAI),
         (Provider::OpenRouter, Dialect::AnthropicMessages, "POST /api/v1/messages ", ABODY, ANTH),
         (Provider::OpenAi, Dialect::OpenAiChat, "POST /v1/chat/completions ", OBODY, OAI),
+        (Provider::XAi, Dialect::OpenAiChat, "POST /v1/chat/completions ", OBODY, XAI),
     ] {
         let mut f = fake(Mode::Sse(sse)).await;
         let base = if p == Provider::OpenAi { format!("http://{}/", f.addr) } else { format!("http://{}", f.addr) };
         let a = adapter(p, base, Limits::default());
         let prep = prepare(p, d, body);
+        a.warm().await.unwrap();
         let mut resp = a.send(d, prep.body, &prep.headers).await.unwrap();
+        assert_eq!(resp.rate_limit.headroom_pct(), Some(25), "{p:?}: {:?}", resp.rate_limit);
         let mut parser = StreamParser::new(d, true);
         while let Some(c) = resp.next().await.unwrap() {
             parser.feed(&c, &mut |_, _| {}).unwrap();
         }
-        assert!(!parser.finish().usage.estimated);
+        let o = parser.finish();
+        assert!(!o.usage.estimated, "{p:?} {o:?}");
+        if p == Provider::XAi {
+            assert_eq!((o.usage.output, o.usage.provider_cost_uusd), (280, Some(1235)));
+        }
         let r = f.reqs.recv().await.unwrap();
         assert!(r.head.starts_with(want), "{p:?} {}", r.head);
         assert!(r.head.to_ascii_lowercase().contains("authorization: bearer sk-test-123\r\n"), "{p:?}");
