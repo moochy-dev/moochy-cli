@@ -143,6 +143,17 @@ impl Inflater {
     }
 }
 
+/// One-shot: decompress a whole compressed buffer (the validator child's entry point for the
+/// output of [`crate::crypto::RequestDecryptor`]). Same rules and cap as [`Inflater`].
+pub fn inflate_all(z: &[u8], cap: usize) -> Result<Vec<u8>, Error> {
+    let mut i = Inflater::new(cap);
+    // Feed in chunk-sized pieces so `pending` stays bounded exactly as in streaming use.
+    for piece in z.chunks(crate::crypto::MAX_CHUNK) {
+        i.push(piece)?;
+    }
+    i.finish()
+}
+
 /// Parse a frame header from the front of `p`: `Ok(None)` = need more bytes.
 fn parse_header(p: &[u8], cap: usize) -> Result<Option<(Frame, usize)>, Error> {
     let Some(&[m0, m1, m2, m3, d]) = p.first_chunk::<5>() else { return Ok(None) };
