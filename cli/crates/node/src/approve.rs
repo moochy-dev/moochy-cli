@@ -101,9 +101,14 @@ pub fn preview(node: &Node, kind: &str, repo: &str, subject: Option<&str>, dry_r
 /// relay and every monitor verify the signatures); an answer to a pending request must keep its
 /// kind, repository and subject.
 pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, Status> {
-    let kind = Kind::from_name(&r.kind).filter(|k| kind_num(k.name()).is_some() || *k == Kind::OwnerKeyAdded).ok_or_else(|| Status::invalid_argument("entry kind not accepted here"))?;
-    let max_sigs = if kind == Kind::OwnerKeyAdded { 2 } else { 1 };
-    if r.body.len() > 1024 || r.sigs.is_empty() || r.sigs.len() > max_sigs || r.sigs.iter().any(|s| s.len() != 64) {
+    let kind = Kind::from_name(&r.kind).filter(|k| kind_num(k.name()).is_some() || matches!(k, Kind::OwnerKeyAdded | Kind::KeyAdded)).ok_or_else(|| Status::invalid_argument("entry kind not accepted here"))?;
+    // KEY_ADDED = device-key rotation (`moochy keys rotate`): successor PoP + current device.
+    let sigs_ok = match kind {
+        Kind::KeyAdded => r.sigs.len() == 2,
+        Kind::OwnerKeyAdded => (1..=2).contains(&r.sigs.len()),
+        _ => r.sigs.len() == 1,
+    };
+    if r.body.len() > 1024 || !sigs_ok || r.sigs.iter().any(|s| s.len() != 64) {
         return Err(Status::invalid_argument("malformed entry"));
     }
     let body = parse_body(kind, &r.body).map_err(|_| Status::invalid_argument("body is not the expected key-log format"))?;
@@ -112,9 +117,10 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
         Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (out.repo_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), owner.into(), signer.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
         Body::Grant { repo_id, subject, signer, issued_at_ms } => (out.repo_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), subject.into(), signer.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
         Body::OwnerKey { pseudonym, issued_at_ms, .. } => (out.subject, out.issued_at_ms) = (pseudonym.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
+        Body::Key { device_id, pseudonym, .. } if Some(pseudonym) == node.cfg.pseudonym.as_deref() => (out.subject, out.signer) = (device_id.into(), node.device_id().unwrap_or_default().into()),
         _ => return Err(Status::invalid_argument("body does not match its kind")),
     }
-    if kind != Kind::OwnerKeyAdded {
+    if !matches!(kind, Kind::OwnerKeyAdded | Kind::KeyAdded) {
         let q = lock(&node.approvals).iter().find(|q| q.request_id == r.request_id).cloned().ok_or_else(|| Status::not_found("no such pending request"))?;
         if q.kind != r.kind || q.repo_id != out.repo_id || (kind != Kind::RepoClaimed && q.subject_pseudonym != out.subject) {
             return Err(Status::failed_precondition("entry does not answer the pending request"));

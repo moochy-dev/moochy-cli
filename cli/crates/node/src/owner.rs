@@ -202,3 +202,36 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
         "subject_username": done.subject_username, "signer": done.signer, "issued_at_ms": done.issued_at_ms, "signed": done.signed, "log_index": done.log_index}));
     Ok(())
 }
+
+/// `moochy keys rotate` (06 §4, E73): a new device key pair under a new device id, logged as a
+/// KEY_ADDED signed by the new key (proof of possession) and by the current device key over
+/// `lp("moochy/v1/key-rotate", body)`. The relay revokes the old key after a 24 h grace; the
+/// running app keeps its session until it restarts with the new key.
+pub fn rotate_device(home: &Home) -> Result<()> {
+    use crate::keystore::{self, DeviceKeys};
+    let mut cfg = home.load()?;
+    let mut sec = keystore::load(home, &cfg)?.ok_or_else(|| auth("no keystore: run `moochy login` first"))?;
+    let old = sec.device.as_ref().ok_or_else(|| auth("not logged in: run `moochy login` first"))?.sign_key();
+    let pseudonym = cfg.pseudonym.clone().ok_or_else(|| auth("not logged in: run `moochy login` first"))?;
+    let new = DeviceKeys::generate()?;
+    let (sign_pub, enc_pub) = (new.sign_key().public(), new.enc_key()?.public());
+    let id = format!("d_{}", crate::util::ulid()?);
+    let roles = match (cfg.has_role("gateway"), cfg.has_role("worker")) {
+        (true, true) => "gateway,worker",
+        (false, true) => "worker",
+        _ => "gateway",
+    };
+    // ponytail: repo-scoped (CI) devices keep their scope only once it is read back from the log;
+    // the relay refuses a scope change (subject_mismatch) rather than widening it.
+    let suite = crate::login::SUITE;
+    let body = moochy_keylog::entry::lp(&[id.as_bytes(), pseudonym.as_bytes(), &sign_pub, &enc_pub, suite.as_bytes(), roles.as_bytes(), b""]);
+    let pop = new.sign_key().sign(&moochy_keylog::entry::pop_message(&sign_pub, &enc_pub, suite));
+    let endorse = old.sign(&moochy_keylog::entry::lp(&[b"moochy/v1/key-rotate", &body]));
+    let r = rt()?.block_on(submit(home, SubmitEntryRequest { request_id: format!("rotate-{id}"), kind: "KEY_ADDED".into(), body, sigs: vec![pop.to_vec(), endorse.to_vec()] }))?;
+    sec.device = Some(new);
+    keystore::save(home, &cfg, &sec)?;
+    cfg.device_id = Some(id.clone());
+    home.save(&cfg)?;
+    crate::util::emit(&json!({"event": "key_rotated", "device_id": id, "log_index": r.log_index, "note": "restart the app (`moochy down && moochy up`) within 24 h to use the new key"}));
+    Ok(())
+}

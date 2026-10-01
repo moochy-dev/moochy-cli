@@ -41,7 +41,9 @@ COMMANDS:
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
-  keys list | keys remove <provider>
+  keys list | keys remove <provider> | keys rotate
+                                  rotate = new device keys for this machine (the old ones stop
+                                  working 24 h later)
   config set <KEY> <VALUE> | config show
                                   monthly_limit (dollars, e.g. 20), slots_max (1-64),
                                   gateway_addr, journal_full_text, auto_cache,
@@ -191,9 +193,7 @@ fn run() -> Result<()> {
         ["report", task] => report(&home, &o, task),
         ["doctor"] => doctor(&home),
         ["update"] => update(&o),
-        ["keys", "rotate"] => Err(internal(
-            "key rotation is not available yet: the server cannot accept a rotation signed by the current device",
-        )),
+        ["keys", "rotate"] => crate::owner::rotate_device(&home),
         ["up"] => {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
@@ -591,6 +591,8 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     sec.providers.retain(|p| p.provider != provider);
     sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone() });
     keystore::save(home, &cfg, &sec)?;
+    // CONTRACT §15.2 "bounded worst case": a dedicated key with a spend limit at the provider.
+    eprintln!("Tip: use a key made only for Moochy, with a monthly spend limit set at {provider}: the most it can ever cost you is that limit.");
     emit(&json!({"event": "key_added", "provider": provider}));
     Ok(())
 }
