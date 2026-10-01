@@ -168,6 +168,10 @@ pub fn donor_profile(policy: &DonorPolicy) -> String {
         "(allow network-outbound (remote tcp \"*:443\") (remote tcp \"*:{}\"))",
         policy.relay_port
     );
+    // Dev/e2e only: fake providers on loopback ports (empty in production).
+    for port in &policy.connect_ports {
+        let _ = writeln!(p, "(allow network-outbound (remote tcp \"*:{port}\"))");
+    }
     if let Some(gw) = policy.gateway_port {
         let _ = writeln!(p, 
             "(allow network-inbound (local tcp \"localhost:{gw}\"))"
@@ -190,6 +194,7 @@ pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         landlock_fs: true, // Seatbelt FS cage applied
         landlock_net: Some(true),
         no_new_privs: true,
+        all_threads: true, // Seatbelt applies to the whole process
         abi: 0,
     })
 }
@@ -214,9 +219,14 @@ where
         }
         crate::sys_macos::Fork::Child => {
             drop(parent_sock);
-            let code = match crate::sys_macos::apply_profile(VALIDATOR_PROFILE) {
-                Ok(()) => run(child_fd),
-                Err(_) => 71,
+            // Drop every inherited fd first; only the channel survives (fd 3).
+            let code = if crate::sys_macos::isolate_fds(child_fd).is_err() {
+                71
+            } else {
+                match crate::sys_macos::apply_profile(VALIDATOR_PROFILE) {
+                    Ok(()) => run(crate::sys_macos::CHANNEL_FD),
+                    Err(_) => 71,
+                }
             };
             crate::sys_macos::exit_immediately(code);
         }

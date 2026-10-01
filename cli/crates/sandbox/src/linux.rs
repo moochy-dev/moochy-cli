@@ -557,6 +557,8 @@ fn harden_agent(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> Result<(), E
         .map_err(io("pdeathsig"))?;
     let _ = rustix::process::setsid();
 
+    // Nothing the launcher held may leak into the agent across execve.
+    sys::cloexec_from_3().map_err(|e| setup("cloexec fds", e))?;
     drop_all_caps();
     landlock_agent(plan)?;
     rustix::thread::set_no_new_privs(true).map_err(io("no_new_privs"))?;

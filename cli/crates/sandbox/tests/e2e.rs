@@ -271,7 +271,7 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     let f = Fixture::new("e96");
     let state = f.root.join("state");
     std::fs::create_dir_all(&state).unwrap();
-    let o = run_bin(&["donor", state.to_str().unwrap(), "8443", &f.path("outside/canary")]);
+    let o = run_bin(&["donor", state.to_str().unwrap(), "8443", &f.path("outside/canary"), "18796"]);
     if has(&o, "lockdown-fail") {
         eprintln!("SKIP pending: {}", o.stdout.trim());
         return;
@@ -286,6 +286,16 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     assert!(has(&o, "canary-read-fail"), "{}", o.stdout);
     assert!(has(&o, "state-write-ok"), "{}", o.stdout);
     assert!(has(&o, "connect9-fail"), "{}", o.stdout);
+    // The loopback gateway port may be bound; any other port may not.
+    assert!(has(&o, "gw-bind-ok"), "{}", o.stdout);
+    assert!(has(&o, "bind-other-fail"), "{}", o.stdout);
+    // After lockdown the donor still resolves provider hosts and reaches :443.
+    use std::net::ToSocketAddrs as _;
+    if ("api.anthropic.com", 443).to_socket_addrs().is_ok() {
+        assert!(has(&o, "dns-ok https-connect-ok"), "{}", o.stdout);
+    } else {
+        eprintln!("SKIP pending: host has no DNS/Internet; DNS-after-lockdown not checked");
+    }
 }
 
 #[test]
@@ -296,6 +306,11 @@ fn e96_validator_parses_but_cannot_open_files_or_sockets() {
         return;
     }
     assert_eq!(o.code, 0, "echo: {}{}", o.stdout, o.stderr);
+    // No parent fd survives into the child; the safe stream API works.
+    for mode in ["fds", "stream"] {
+        let o = run_bin(&["validator", mode]);
+        assert_eq!(o.code, 0, "{mode}: {}{}", o.stdout, o.stderr);
+    }
     for mode in ["open", "socket"] {
         let o = run_bin(&["validator", mode]);
         // Killed by seccomp (SIGSYS = 31 → 159) before writing anything.
