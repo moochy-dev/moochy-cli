@@ -3,6 +3,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::fmt;
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Process exit codes (CONTRACT §6).
@@ -61,7 +62,7 @@ pub fn rand_bytes<const N: usize>() -> Result<[u8; N]> {
 
 /// Uniform-ish random u64 (for jitter only, not for secrets).
 pub fn rand_u64() -> u64 {
-    rand_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0)
+    rand_bytes::<8>().map_or(0, u64::from_le_bytes)
 }
 
 pub fn b64e(b: &[u8]) -> String {
@@ -134,23 +135,54 @@ pub fn ulid_from_bytes(b: &[u8; 16]) -> String {
     ulid_encode(u128::from_be_bytes(*b))
 }
 
-/// Print one JSON event line to stdout.
+fn bad_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+}
+
+/// Escape control, bidi and zero-width characters in a server-provided string (CONTRACT §11).
+pub fn clean(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(bad_char) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut o = String::with_capacity(s.len().saturating_add(16));
+    for c in s.chars() {
+        if bad_char(c) {
+            let _ = write!(o, "\\u{{{:x}}}", u32::from(c));
+        } else {
+            o.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(o)
+}
+
+/// [`clean`] every string (keys included) of a JSON value.
+pub fn clean_value(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(clean(s).into_owned()),
+        Value::Array(a) => Value::Array(a.iter().map(clean_value).collect()),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (clean(k).into_owned(), clean_value(v))).collect()),
+        x => x.clone(),
+    }
+}
+
+/// Print one JSON event line to stdout (strings sanitized).
 pub fn emit(v: &serde_json::Value) {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{v}");
+    let _ = writeln!(out, "{}", clean_value(v));
     let _ = out.flush();
 }
 
 /// Structured log line to stderr (never content: callers pass codes and ids only).
 pub fn log(level: &str, msg: &str, fields: &serde_json::Value) {
-    let mut line = serde_json::json!({"level": level, "msg": msg});
+    let mut line = serde_json::json!({"level": level, "msg": msg, "t_ms": now_ms()});
     if let (Some(obj), Some(extra)) = (line.as_object_mut(), fields.as_object()) {
         for (k, v) in extra {
             obj.insert(k.clone(), v.clone());
         }
     }
-    eprintln!("{line}");
+    eprintln!("{}", clean_value(&line));
 }
 
 #[cfg(test)]
@@ -166,6 +198,13 @@ mod tests {
         assert!(ulid_bytes("8ZZZZZZZZZZZZZZZZZZZZZZZZZ").is_none());
         assert!(ulid_bytes("01ARZ3NDEKTSV4RRFFQ69G5FAU").is_none()); // 'U' excluded
         assert_eq!(ulid_from_bytes(&ulid_bytes("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
+
+    #[test]
+    fn cleans_terminal_escapes() {
+        assert_eq!(clean("alice"), "alice");
+        assert_eq!(clean("a\u{1b}[31mb"), "a\\u{1b}[31mb");
+        assert_eq!(clean("x\u{9b}y\u{202e}z"), "x\\u{9b}y\\u{202e}z");
     }
 
     #[test]

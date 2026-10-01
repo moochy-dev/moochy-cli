@@ -51,15 +51,14 @@ pub struct Home {
 
 impl Home {
     pub fn resolve(flag: Option<PathBuf>) -> Result<Self> {
-        let dir = match flag.or_else(|| std::env::var_os("MOOCHY_HOME").map(PathBuf::from)) {
-            Some(d) => d,
-            None => {
-                let base = std::env::var_os("XDG_CONFIG_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-                    .ok_or_else(|| usage("cannot find a home directory; pass --home"))?;
-                base.join("moochy")
-            }
+        let dir = if let Some(d) = flag.or_else(|| std::env::var_os("MOOCHY_HOME").map(PathBuf::from)) {
+            d
+        } else {
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+                .ok_or_else(|| usage("cannot find a home directory; pass --home"))?;
+            base.join("moochy")
         };
         let dir = std::path::absolute(&dir).ctx("home path")?;
         Ok(Self { dir })

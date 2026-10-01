@@ -128,7 +128,10 @@ pub fn scrub(b: &[u8]) -> Option<Vec<u8>> {
     let mut i = 0usize;
     while i < b.len() {
         let c = at(b, i);
-        let boundary = i == 0 || !tok(at(b, i.saturating_sub(1)));
+        // A JSON escape (`\n`, `\t`, `\r`) right before also counts as a word boundary.
+        let prev = at(b, i.saturating_sub(1));
+        let escaped = i >= 2 && at(b, i.saturating_sub(2)) == b'\\' && matches!(prev, b'n' | b't' | b'r');
+        let boundary = i == 0 || !tok(prev) || escaped;
         let hit = if c == b'=' {
             env_value(b, i).map(|(s, e)| (s, e, "env_secret"))
         } else if boundary && matches!(c, b'-' | b'e' | b's' | b'g' | b'x' | b'A') {

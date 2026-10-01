@@ -95,11 +95,11 @@ mod tests {
     fn strict_rules() {
         assert!(parse(br#"{"a":1,"b":[true,null,"x",1.5]}"#).is_ok());
         assert!(parse(br#"{"a":1,"a":2}"#).is_err());
-        assert!(parse(br#"{"a":1,"a":2}"#).is_err(), "escaped duplicate");
+        assert!(parse(b"{\"a\":1,\"\\u0061\":2}").is_err(), "escaped duplicate");
         assert!(parse(br#"{"x":{"a":1,"a":1}}"#).is_err(), "nested duplicate");
         assert!(parse(br#""\ud800""#).is_err(), "lone surrogate");
         assert!(parse(br#""\udc00x""#).is_err(), "lone trailing surrogate");
-        assert!(parse(br#""😀""#).is_ok(), "valid pair");
+        assert!(parse(b"\"\\ud83d\\ude00\"").is_ok(), "valid pair");
         assert!(parse(b"\"\xff\"").is_err(), "invalid utf-8");
         assert!(parse(b"9223372036854775807").is_ok());
         assert!(parse(b"9223372036854775808").is_err());

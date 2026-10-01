@@ -1,29 +1,31 @@
-//! Relay link: TLS 1.3 + WebSocket (`moochy.v1`), channel-bound auth, reconnect with full
-//! jitter, keepalive, and the frame mux that routes task traffic to bounded per-task queues.
+//! Relay link over gRPC (`moochy.v1.NodeLink`, CONTRACT §12).
+//!
+//! One TLS connection = one tonic `Channel` = one authenticated session. Our own `tokio-rustls`
+//! connector captures the RFC 9266 exporter for the Auth signature and is single-use: if the
+//! connection dies, the channel cannot silently redial an unauthenticated connection; the session
+//! loop rebuilds and re-authenticates with full-jitter backoff instead.
 
-use crate::node::{LinkState, Node, Side, TaskIn, lock};
+use crate::node::{LinkHandle, LinkState, Node, lock};
+use crate::pb::link::{
+    Auth, NodeMsg, Ping, RelayMsg, Role, node_link_client::NodeLinkClient, node_msg, relay_msg,
+};
 use crate::tls::{self, Origin};
-use crate::util::{Result, auth, b64d, b64e, log, lp, net, now_ms, rand_u64, ulid_bytes};
-use bytes::Bytes;
-use futures_util::{SinkExt as _, StreamExt as _};
-use serde_json::{Value, json};
-use std::sync::Arc;
+use crate::util::{Result, auth, clean, log, lp, net, now_ms, rand_u64};
+use hyper_util::rt::TokioIo;
+use serde_json::json;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval, sleep, timeout};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Channel, Endpoint};
 
-pub const SUBPROTOCOL: &str = "moochy.v1";
-pub const FRAME_HEADER: usize = 23;
-pub const MAX_FRAME: usize = 64 * 1024;
+/// gRPC message cap (a chunk is ≤ 64 KiB; CONTRACT §12).
+pub const MAX_MSG: usize = 128 * 1024;
 const PING_EVERY: Duration = Duration::from_secs(15);
 const DEAD_AFTER: Duration = Duration::from_secs(31);
 const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_CAP_MS: u64 = 30_000;
-const OUT_QUEUE: usize = 256;
 
 enum End {
     /// Clean close or drain: reconnect after the given delay.
@@ -35,7 +37,49 @@ enum End {
 /// Full-jitter exponential backoff (03 §14): uniform in `[0, min(cap, base·2^n)]`.
 pub fn backoff_ms(attempt: u32) -> u64 {
     let ceil = BACKOFF_BASE_MS.checked_shl(attempt.min(20)).unwrap_or(BACKOFF_CAP_MS).min(BACKOFF_CAP_MS);
-    rand_u64() % ceil.saturating_add(1)
+    rand_u64().checked_rem(ceil.saturating_add(1)).unwrap_or(0)
+}
+
+/// Dial one TLS 1.3 + h2 connection and wrap it in a single-use tonic channel.
+/// Returns the channel and the connection's RFC 9266 exporter.
+pub async fn dial(ca_file: Option<&std::path::Path>, origin: &Origin) -> Result<(Channel, [u8; 32])> {
+    let cfg = tls::client_config(ca_file)?;
+    let stream = tls::connect(&cfg, origin).await?;
+    if stream.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+        return Err(net("relay did not negotiate HTTP/2 (ALPN h2)"));
+    }
+    let exporter = tls::exporter(&stream)?;
+    let slot = Arc::new(Mutex::new(Some(stream)));
+    let connector = tower::service_fn(move |_| {
+        let s = lock(&slot).take();
+        async move { s.map(TokioIo::new).ok_or_else(|| std::io::Error::other("relay connection closed; session must re-authenticate")) }
+    });
+    let ep = Endpoint::from_shared(origin.url())
+        .map_err(|e| net(format!("relay url: {e}")))?
+        .initial_stream_window_size(Some(1 << 20))
+        .initial_connection_window_size(Some(4 << 20))
+        .http2_keep_alive_interval(PING_EVERY)
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .http2_max_header_list_size(16 * 1024)
+        .connect_timeout(tls::IO_TIMEOUT);
+    let ch = ep.connect_with_connector(connector).await.map_err(|e| net(format!("relay h2: {e}")))?;
+    Ok((ch, exporter))
+}
+
+pub fn client(ch: Channel) -> NodeLinkClient<Channel> {
+    NodeLinkClient::new(ch).max_decoding_message_size(MAX_MSG).max_encoding_message_size(MAX_MSG)
+}
+
+pub fn roles(cfg_roles: &[String]) -> Vec<i32> {
+    cfg_roles
+        .iter()
+        .filter_map(|r| match r.as_str() {
+            "gateway" => Some(Role::Gateway as i32),
+            "worker" => Some(Role::Worker as i32),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Run forever: connect, authenticate, serve, reconnect.
@@ -48,9 +92,8 @@ pub async fn run(node: Arc<Node>) {
             e = session(&node, &relay) => e,
             _ = shutdown.changed() => return,
         };
-        *lock(&node.link_out) = None;
-        // Dropping every registered sender fails in-flight tasks (no stream resume in v1).
-        lock(&node.tasks).clear();
+        // Dropping the handle drops the channel: every Submit/Serve stream on it fails.
+        *lock(&node.link) = None;
         let delay = match end {
             End::Reconnect(ms) => {
                 attempt = 0;
@@ -76,13 +119,27 @@ pub async fn run(node: Arc<Node>) {
     }
 }
 
-fn text(v: &Value) -> Message {
-    Message::Text(Utf8Bytes::from(v.to_string()))
-}
-
 async fn session(node: &Arc<Node>, relay: &str) -> End {
     match session_inner(node, relay).await {
         Ok(e) | Err(e) => e,
+    }
+}
+
+fn status_end(s: &tonic::Status) -> End {
+    let msg = format!("{:?}: {}", s.code(), clean(s.message()));
+    match s.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => End::Refused(msg),
+        _ => End::Net(msg),
+    }
+}
+
+async fn next(down: &mut tonic::Streaming<RelayMsg>) -> std::result::Result<relay_msg::Msg, End> {
+    match timeout(tls::IO_TIMEOUT, down.message()).await {
+        Err(_) => Err(End::Net("relay handshake timeout".into())),
+        Ok(Err(s)) => Err(status_end(&s)),
+        Ok(Ok(None)) => Err(End::Net("relay closed the session during handshake".into())),
+        Ok(Ok(Some(RelayMsg { msg: None }))) => Err(End::Refused("empty relay message".into())),
+        Ok(Ok(Some(RelayMsg { msg: Some(m) }))) => Ok(m),
     }
 }
 
@@ -91,55 +148,38 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     let (Some(device_id), Some(keys)) = (node.device_id(), node.secrets.device.as_ref()) else {
         return Err(End::Refused("not logged in".into()));
     };
-    let cfg = tls::client_config(node.cfg.ca_file.as_deref()).map_err(|e| End::Refused(e.msg))?;
-    let stream = tls::connect(&cfg, &origin).await.map_err(|e| End::Net(e.msg))?;
-    let exporter = tls::exporter(&stream).map_err(|e| End::Net(e.msg))?;
-
-    let mut req = format!("{}/v1/node", origin.wss()).into_client_request().map_err(|e| End::Refused(e.to_string()))?;
-    req.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
-    req.headers_mut().insert("x-moochy-client", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
-    let wscfg = WebSocketConfig::default().max_message_size(Some(1 << 20)).max_frame_size(Some(1 << 20));
-    let (ws, resp) = timeout(tls::IO_TIMEOUT, tokio_tungstenite::client_async_with_config(req, stream, Some(wscfg)))
+    let (ch, exporter) = dial(node.cfg.ca_file.as_deref(), &origin).await.map_err(|e| End::Net(e.msg))?;
+    let mut client = client(ch);
+    let (up, up_rx) = mpsc::channel::<NodeMsg>(64);
+    let resp = timeout(tls::IO_TIMEOUT, client.session(ReceiverStream::new(up_rx)))
         .await
-        .map_err(|_| End::Net("websocket handshake timeout".into()))?
-        .map_err(|e| End::Net(format!("websocket: {e}")))?;
-    if resp.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()) != Some(SUBPROTOCOL) {
-        return Err(End::Refused("relay did not select subprotocol moochy.v1".into()));
-    }
-    let (mut sink, mut stream) = ws.split();
+        .map_err(|_| End::Net("relay session timeout".into()))?
+        .map_err(|s| status_end(&s))?;
+    let mut down = resp.into_inner();
 
-    // hello → auth → welcome
-    let hello = next_json(&mut stream).await?;
-    if hello.get("t").and_then(Value::as_str) != Some("hello") {
-        return Err(End::Refused(format!("expected hello, got {}", hello.get("t").unwrap_or(&Value::Null))));
+    // Hello → Auth → Welcome
+    let relay_msg::Msg::Hello(hello) = next(&mut down).await? else {
+        return Err(End::Refused("expected Hello".into()));
+    };
+    if hello.nonce.len() != 32 {
+        return Err(End::Refused("Hello without a 32-byte nonce".into()));
     }
-    let nonce = hello.get("nonce").and_then(Value::as_str).and_then(b64d).filter(|n| n.len() == 32);
-    let nonce = nonce.ok_or_else(|| End::Refused("hello without a 32-byte nonce".into()))?;
-    if let Some(st) = hello.get("server_time").and_then(Value::as_u64) {
-        if st.abs_diff(now_ms()) > 300_000 {
-            log("warn", "clock skew larger than 5 minutes vs relay", &json!({}));
-        }
+    if u64::try_from(hello.server_time_ms).unwrap_or(0).abs_diff(now_ms()) > 300_000 {
+        log("warn", "clock skew larger than 5 minutes vs relay", &json!({}));
     }
-    let origin_s = origin.wss();
-    let sig = keys.sign(&lp(&[b"moochy/v1/auth", &nonce, origin_s.as_bytes(), &exporter, device_id.as_bytes()]));
-    let roles = &node.cfg.roles;
-    sink.send(text(&json!({"t":"auth","device_id":device_id,"roles":roles,"sig":b64e(&sig)})))
-        .await
-        .map_err(|e| End::Net(e.to_string()))?;
-    let welcome = next_json(&mut stream).await?;
-    match welcome.get("t").and_then(Value::as_str) {
-        Some("welcome") => {}
-        Some("error") => {
-            let code = welcome.get("code").and_then(Value::as_str).unwrap_or("auth_failed");
-            return Err(End::Refused(code.to_owned()));
-        }
-        other => return Err(End::Refused(format!("expected welcome, got {other:?}"))),
-    }
-
-    let (tx, mut rx) = mpsc::channel::<Message>(OUT_QUEUE);
-    *lock(&node.link_out) = Some(tx);
+    let origin_s = origin.url();
+    let sig = keys.sign(&lp(&[b"moochy/v1/auth", &hello.nonce, origin_s.as_bytes(), &exporter, device_id.as_bytes()]));
+    let auth_msg = Auth { device_id: device_id.to_owned(), roles: roles(&node.cfg.roles), sig: sig.to_vec(), client_version: env!("CARGO_PKG_VERSION").into() };
+    up.send(NodeMsg { msg: Some(node_msg::Msg::Auth(auth_msg)) }).await.map_err(|_| End::Net("session closed".into()))?;
+    let welcome = match next(&mut down).await? {
+        relay_msg::Msg::Welcome(w) => w,
+        relay_msg::Msg::Error(e) => return Err(End::Refused(clean(&e.code).into_owned())),
+        _ => return Err(End::Refused("expected Welcome".into())),
+    };
+    let session = welcome.session_id.parse().map_err(|_| End::Refused("bad session id".into()))?;
+    *lock(&node.link) = Some(LinkHandle { client, session, up: up.clone() });
     node.link_state.send_replace(LinkState::Up);
-    log("info", "relay link up", &json!({"session": welcome.get("session_id")}));
+    log("info", "relay link up", &json!({"session": welcome.session_id}));
     if node.cfg.has_role("worker") {
         crate::worker::on_welcome(node);
     }
@@ -149,116 +189,31 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     let mut last_pong = Instant::now();
     loop {
         tokio::select! {
-            m = stream.next() => match m {
-                Some(Ok(Message::Text(t))) => {
-                    if let Some(delay) = on_text(node, t.as_bytes()) {
-                        let _ = sink.close().await;
-                        return Ok(End::Reconnect(delay));
-                    }
-                }
-                Some(Ok(Message::Binary(b))) => on_binary(node, b),
-                Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
-                Some(Ok(Message::Close(_))) | None => return Ok(End::Reconnect(0)),
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(End::Net(e.to_string())),
+            m = down.message() => match m {
+                Ok(Some(RelayMsg { msg: Some(m) })) => match m {
+                    relay_msg::Msg::PoolSync(p) => node.apply_pool_sync(&p),
+                    relay_msg::Msg::Assign(a) => crate::worker::on_assign(node, a.task, a.attempt),
+                    relay_msg::Msg::Draining(d) => return Ok(End::Reconnect(u64::from(d.reconnect_after_ms).min(BACKOFF_CAP_MS))),
+                    relay_msg::Msg::Pong(_) => last_pong = Instant::now(),
+                    relay_msg::Msg::Error(e) => log("warn", "relay error", &json!({"code": e.code, "message": e.message, "task": e.task})),
+                    // Outbox replay / acks belong to moochy-worker; checkpoints and catalog to the monitor.
+                    _ => {}
+                },
+                Ok(Some(RelayMsg { msg: None })) => {}
+                Ok(None) => return Ok(End::Reconnect(0)),
+                Err(s) => return Err(status_end(&s)),
             },
-            m = rx.recv() => {
-                let Some(m) = m else { return Err(End::Net("outbound queue closed".into())) };
-                sink.send(m).await.map_err(|e| End::Net(e.to_string()))?;
-            }
             _ = ping.tick() => {
                 if last_pong.elapsed() > DEAD_AFTER {
                     return Err(End::Net("relay missed 2 pongs".into()));
                 }
-                sink.send(Message::Ping(Bytes::new())).await.map_err(|e| End::Net(e.to_string()))?;
+                let t_ms = i64::try_from(now_ms()).unwrap_or(0);
+                if up.try_send(NodeMsg { msg: Some(node_msg::Msg::Ping(Ping { t_ms })) }).is_err() {
+                    return Err(End::Net("session send queue full".into()));
+                }
             }
         }
     }
-}
-
-async fn next_json<S>(stream: &mut S) -> std::result::Result<Value, End>
-where
-    S: futures_util::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        match timeout(tls::IO_TIMEOUT, stream.next()).await {
-            Err(_) => return Err(End::Net("relay handshake timeout".into())),
-            Ok(Some(Ok(Message::Text(t)))) => return crate::json::parse(t.as_bytes()).map_err(|e| End::Refused(format!("bad JSON from relay: {e}"))),
-            Ok(Some(Ok(Message::Close(c)))) => {
-                return Err(End::Refused(c.map_or_else(|| "closed during handshake".into(), |c| c.reason.to_string())));
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(e))) => return Err(End::Net(e.to_string())),
-            Ok(None) => return Err(End::Net("closed during handshake".into())),
-        }
-    }
-}
-
-/// Which side of a task a message type belongs to.
-fn side_of(t: &str) -> Option<Side> {
-    match t {
-        "task.accepted" | "task.started" | "task.checkpoint" | "task.end" | "task.failed" | "task.need_wraps" => Some(Side::Gateway),
-        "task.assign" | "task.cancel" | "receipt.ack" => Some(Side::Worker),
-        _ => None,
-    }
-}
-
-/// Handle one text frame; `Some(delay)` asks the caller to reconnect (drain).
-fn on_text(node: &Arc<Node>, raw: &[u8]) -> Option<u64> {
-    let Ok(v) = crate::json::parse(raw) else {
-        log("warn", "relay sent invalid JSON", &json!({}));
-        return None;
-    };
-    let t = v.get("t").and_then(Value::as_str).unwrap_or("");
-    if let Some(side) = side_of(t) {
-        let Some(id) = v.get("task").and_then(Value::as_str).and_then(ulid_bytes) else { return None };
-        if t == "task.assign" {
-            crate::worker::on_assign(node, id, v);
-            return None;
-        }
-        deliver(node, (id, side), TaskIn::Text(v));
-        return None;
-    }
-    match t {
-        "pool.sync" => node.apply_pool_sync(&v),
-        "relay.draining" => {
-            let ms = v.get("reconnect_after_ms").and_then(Value::as_u64).unwrap_or(0).min(BACKOFF_CAP_MS);
-            return Some(ms);
-        }
-        "error" => log("warn", "relay error", &json!({"code": v.get("code"), "task": v.get("task")})),
-        "receipt.replay_since" | "log.checkpoint" | "catalog.update" | "welcome" => {}
-        _ => {
-            node.try_send(text(&json!({"t":"error","code":"unknown_type","message":t})));
-        }
-    }
-    None
-}
-
-fn on_binary(node: &Arc<Node>, b: Bytes) {
-    if b.len() < FRAME_HEADER || b.len() > MAX_FRAME {
-        return;
-    }
-    let (Some(kind), Some(id)) = (b.first(), b.get(1..17).and_then(|s| <[u8; 16]>::try_from(s).ok())) else { return };
-    let side = match kind {
-        0x01 => Side::Worker,
-        0x02 => Side::Gateway,
-        _ => return,
-    };
-    deliver(node, (id, side), TaskIn::Frame(b));
-}
-
-/// Route to a task's bounded queue. A task that cannot keep up is dropped (its driver sees the
-/// channel close and fails the task) rather than buffering without bound.
-fn deliver(node: &Node, key: crate::node::TaskKey, m: TaskIn) {
-    let mut tasks = lock(&node.tasks);
-    let Some(tx) = tasks.get(&key) else { return };
-    if tx.try_send(m).is_err() {
-        tasks.remove(&key);
-    }
-}
-
-pub fn text_msg(v: &Value) -> Message {
-    text(v)
 }
 
 /// Wait for the first link outcome (up / refused), at most `wait`.
@@ -272,6 +227,13 @@ pub async fn wait_first(node: &Node, wait: Duration) -> Result<()> {
         },
         _ => Err(net("relay not reachable yet")),
     }
+}
+
+/// Attach `x-moochy-session` to a per-task stream request.
+pub fn with_session<T>(h: &LinkHandle, msg: T) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(msg);
+    r.metadata_mut().insert("x-moochy-session", h.session.clone());
+    r
 }
 
 #[cfg(test)]

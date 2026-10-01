@@ -1,21 +1,22 @@
 //! Gateway task pipeline shared by the API door and the MCP door (07 §4.2).
 //!
-//! `submit` turns a validated request into a stream of [`TaskEv`]: through the relay
-//! (route header → sign + seal via [`Sealer`] → `task.submit` → decrypt accepted attempt only →
-//! tool-call gate held until a verified checkpoint → receipt check) or, offline, straight to the
-//! local executor. Dropping the receiver cancels the task.
+//! `submit` turns a validated request into a stream of [`TaskEv`]: through the relay (route header
+//! → sign + seal via [`crate::engine::Sealer`] → one gRPC `Submit` stream → decrypt the accepted
+//! attempt only → tool-call gate held until a verified checkpoint → receipt check) or, offline,
+//! straight to the local executor. Dropping the receiver cancels the task (stream reset).
 
 use crate::engine::{Dialect, ExecEvent, ExecRequest, Failure, GateEvent, GatewayCtx, Recipient, RouteFacts, SealInput, ToolGate};
-use crate::link::text_msg;
-use crate::node::{Node, PoolWorker, RepoPool, Side, TaskIn};
-use crate::util::{b64d, b64e, log, ulid, ulid_bytes};
+use crate::node::{Busy, Node, PoolWorker, RepoPool};
+use crate::pb::link::{self as pb, SubmitDown, SubmitUp, submit_down, submit_up};
+use crate::pb::local::JournalEntry;
+use crate::util::{b64e, clean, log, now_ms, ulid};
 use bytes::Bytes;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_stream::wrappers::ReceiverStream;
 
 pub struct TaskReq {
     pub slug: String,
@@ -36,20 +37,32 @@ pub enum TaskEv {
 }
 
 const MAX_WRAPS: usize = 8;
-const CLIENT_CLOSED: &str = "client_closed";
 
 pub async fn submit(node: &Arc<Node>, req: TaskReq) -> Result<mpsc::Receiver<TaskEv>, Failure> {
     let pool = node.pool_for(&req.slug);
-    if let Some(p) = &pool {
-        if !p.models().iter().any(|(m, ds)| *m == req.facts.model && ds.iter().any(|d| d == req.dialect.wire())) {
-            return Err(Failure::new("model_not_in_pool", false, format!("model `{}` is not offered by this repo's donor pool", req.facts.model)));
-        }
+    if let Some(p) = &pool
+        && !p.models().iter().any(|(m, ds)| *m == req.facts.model && ds.iter().any(|d| d == req.dialect.wire()))
+    {
+        return Err(Failure::new("model_not_in_pool", false, format!("model `{}` is not offered by this repo's donor pool", req.facts.model)));
     }
     if node.offline {
         return Ok(run_local(node, req));
     }
-    let pool = pool.ok_or_else(|| Failure::new("no_pool", true, format!("no donor pool synced yet for {}", req.slug)))?;
+    let pool = pool.ok_or_else(|| Failure::new("no_pool", true, format!("moochy: no donor pool synced yet for {}", req.slug)))?;
     run_relay(node, req, pool).await
+}
+
+fn journal(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64) {
+    node.journal(JournalEntry {
+        t_ms: i64::try_from(t0).unwrap_or(0),
+        role: "gateway".into(),
+        task: task.into(),
+        repo: slug.into(),
+        model: model.into(),
+        status: status.into(),
+        cost_uusd: cost.and_then(|c| i64::try_from(c).ok()).unwrap_or(0),
+        ms: u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX),
+    });
 }
 
 fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
@@ -57,11 +70,14 @@ fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
     let task_id = ulid().unwrap_or_default();
     let route = json!({"model": req.facts.model, "stream": req.facts.stream});
     let mut ex = node.executor.execute(ExecRequest { task_id: task_id.clone(), dialect: req.dialect, route, body: req.body, headers: req.headers, pledge: None });
+    let node = node.clone();
+    let (slug, model, t0) = (req.slug, req.facts.model, now_ms());
     tokio::spawn(async move {
-        loop {
+        let _busy = Busy::new(&node.gateway_tasks);
+        let status = loop {
             let ev = tokio::select! {
                 ev = ex.recv() => ev,
-                () = tx.closed() => return,
+                () = tx.closed() => break "cancelled".to_owned(),
             };
             let out = match ev {
                 Some(ExecEvent::Started) => TaskEv::Started { task_id: task_id.clone(), donor: "local".into() },
@@ -71,11 +87,19 @@ fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
                 Some(ExecEvent::Checkpoint | ExecEvent::Ready) => continue,
                 None => TaskEv::Failed(Failure::new("provider_error", true, "executor stopped".to_owned())),
             };
-            let terminal = matches!(out, TaskEv::End { .. } | TaskEv::Failed(_));
-            if tx.send(out).await.is_err() || terminal {
-                return;
+            let status = match &out {
+                TaskEv::End { .. } => Some("ok".to_owned()),
+                TaskEv::Failed(f) => Some(format!("failed:{}", f.code)),
+                _ => None,
+            };
+            if tx.send(out).await.is_err() {
+                break "cancelled".to_owned();
             }
-        }
+            if let Some(s) = status {
+                break s;
+            }
+        };
+        journal(&node, &task_id, &slug, &model, &status, None, t0);
     });
     rx
 }
@@ -114,8 +138,8 @@ fn recipients(ws: &[PoolWorker]) -> Vec<Recipient> {
     ws.iter().map(|w| Recipient { worker_device: w.worker_device.clone(), enc_pub: w.enc_pub }).collect()
 }
 
-fn wraps_json(w: &[(String, Vec<u8>)]) -> Value {
-    w.iter().map(|(d, x)| json!({"worker_device": d, "wrap": b64e(x)})).collect()
+fn up(m: submit_up::Msg) -> SubmitUp {
+    SubmitUp { msg: Some(m) }
 }
 
 async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mpsc::Receiver<TaskEv>, Failure> {
@@ -123,14 +147,15 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let (Some(device), Some(keys)) = (node.device_id(), node.secrets.device.as_ref()) else {
         return Err(Failure::new("not_logged_in", false, "moochy: run `moochy login` first".to_owned()));
     };
+    let link = node.link().ok_or_else(|| Failure::new("overloaded", true, "moochy: relay link is down".to_owned()))?;
+    let t0 = now_ms();
     let (route, affinity) = route_header(node, &req, &pool.repo_id);
     let sticky = node.session_worker(&affinity);
     let chosen = pick(&pool, req.dialect, &req.facts.model, sticky.as_deref());
     if chosen.is_empty() {
-        return Err(Failure::new("model_not_in_pool", false, format!("no donor offers `{}` for {}", req.facts.model, req.slug)));
+        return Err(Failure::new("model_not_in_pool", false, format!("moochy: no donor offers `{}` for {}", req.facts.model, req.slug)));
     }
     let task_id = ulid().map_err(|e| Failure::new("internal", true, e.msg))?;
-    let id = ulid_bytes(&task_id).ok_or_else(|| Failure::new("internal", true, "ulid".to_owned()))?;
     let input = SealInput {
         task_id: &task_id,
         repo_id: &pool.repo_id,
@@ -142,26 +167,52 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         recipients: &recipients(&chosen),
     };
     let (sealed, ctx) = sealer.seal(&input).map_err(|e| Failure::new("internal", true, e))?;
-    let key = (id, Side::Gateway);
-    let rx_in = node.register(key).ok_or_else(|| Failure::new("internal", true, "task id collision".to_owned()))?;
-    let submit = json!({"t":"task.submit","task":task_id,"route_b64":b64e(&route),"wraps":wraps_json(&sealed.wraps),
-        "body_len":sealed.body_len,"body_chunks":sealed.frames.len()});
-    let mut ok = node.send(text_msg(&submit)).await;
-    for f in sealed.frames {
-        ok = ok && node.send(Message::Binary(f)).await;
+    // Body chunks are queued before the RPC starts, so they go out with the first flush.
+    let n = sealed.chunks.len();
+    let (up_tx, up_rx) = mpsc::channel::<SubmitUp>(n.saturating_add(4));
+    let open = pb::SubmitOpen {
+        task: task_id.clone(),
+        route,
+        wraps: sealed.wraps,
+        body_len: sealed.body_len,
+        body_chunks: u32::try_from(n).unwrap_or(u32::MAX),
+    };
+    let _ = up_tx.try_send(up(submit_up::Msg::Open(open)));
+    for c in sealed.chunks {
+        let _ = up_tx.try_send(up(submit_up::Msg::Body(c)));
     }
-    if !ok {
-        node.unregister(&key);
-        return Err(Failure::new("overloaded", true, "moochy: relay link is down".to_owned()));
-    }
+    let mut client = link.client.clone();
+    let down = client
+        .submit(crate::link::with_session(&link, ReceiverStream::new(up_rx)))
+        .await
+        .map_err(|s| Failure::new("overloaded", true, format!("moochy: relay refused the task ({:?})", s.code())))?
+        .into_inner();
     let (tx, rx) = mpsc::channel(16);
     let gate = node.executor.tool_gate(req.dialect, &req.parsed);
     let ttl = if req.facts.cache_ttl == "1h" { 3_600_000 } else { 300_000 };
-    let drv = Driver { node: node.clone(), task_id, pool, ctx, gate, tx, accepted: None, started: false, hasher: Sha256::new(), hashes: VecDeque::new(), verified: None, pending: VecDeque::new() };
+    let drv = Driver {
+        node: node.clone(),
+        task_id,
+        pool,
+        ctx,
+        gate,
+        tx,
+        up: up_tx,
+        accepted: None,
+        started: false,
+        hasher: Sha256::new(),
+        hashes: VecDeque::new(),
+        verified: None,
+        pending: VecDeque::new(),
+        cost: None,
+    };
+    let (slug, model) = (req.slug, req.facts.model);
     tokio::spawn(async move {
         let node = drv.node.clone();
-        drv.run(rx_in, affinity, ttl).await;
-        node.unregister(&key);
+        let _busy = Busy::new(&node.gateway_tasks);
+        let task_id = drv.task_id.clone();
+        let (status, cost) = drv.run(down, affinity, ttl).await;
+        journal(&node, &task_id, &slug, &model, &status, cost, t0);
     });
     Ok(rx)
 }
@@ -178,168 +229,168 @@ struct Driver {
     ctx: Box<dyn GatewayCtx>,
     gate: Box<dyn ToolGate>,
     tx: mpsc::Sender<TaskEv>,
-    accepted: Option<(u8, PoolWorker)>,
+    /// Kept open for `Wraps` / `Cancel`; dropping it half-closes the stream.
+    up: mpsc::Sender<SubmitUp>,
+    accepted: Option<(u32, PoolWorker)>,
     started: bool,
     hasher: Sha256,
     /// Running hash after each chunk, for checkpoint verification (bounded).
     hashes: VecDeque<(u32, [u8; 32])>,
     verified: Option<u32>,
     pending: VecDeque<Pending>,
+    cost: Option<u64>,
 }
 
 enum Step {
     Continue,
     Done,
     Fail(Failure),
+    /// The client went away: cancel upstream.
+    Gone,
 }
 
 impl Driver {
-    async fn run(mut self, mut rx: mpsc::Receiver<TaskIn>, affinity: [u8; 16], ttl: u64) {
+    /// Returns `(journal status, cost)`.
+    async fn run(mut self, mut down: tonic::Streaming<SubmitDown>, affinity: [u8; 16], ttl: u64) -> (String, Option<u64>) {
         let step = loop {
             let m = tokio::select! {
-                m = rx.recv() => m,
-                () = self.tx.closed() => {
-                    let _ = self.node.send(text_msg(&json!({"t":"task.cancel","task":self.task_id,"reason":"client_closed"}))).await;
-                    return;
-                }
+                m = down.message() => m,
+                () = self.tx.closed() => break Step::Gone,
             };
             let step = match m {
-                None => Step::Fail(Failure::new("overloaded", true, "moochy: relay link lost".to_owned())),
-                Some(TaskIn::Frame(b)) => self.on_frame(&b).await,
-                Some(TaskIn::Text(v)) => self.on_text(&v).await,
+                Ok(Some(SubmitDown { msg: Some(m) })) => self.on_msg(m).await,
+                Ok(Some(SubmitDown { msg: None })) => Step::Continue,
+                Ok(None) | Err(_) => Step::Fail(Failure::new("overloaded", true, "moochy: relay link lost".to_owned())),
             };
             if !matches!(step, Step::Continue) {
                 break step;
             }
         };
-        if let Step::Fail(f) = step {
-            if f.code == CLIENT_CLOSED {
-                let _ = self.node.send(text_msg(&json!({"t":"task.cancel","task":self.task_id,"reason":"client_closed"}))).await;
-                return;
+        match step {
+            Step::Gone => {
+                let _ = self.up.try_send(up(submit_up::Msg::Cancel(pb::Cancel { reason: "client_closed".into() })));
+                ("cancelled".into(), None)
             }
-            if f.code == "bad_envelope" {
-                log("error", "bad_envelope", &json!({"task": self.task_id}));
-                let _ = self.node.send(text_msg(&json!({"t":"task.cancel","task":self.task_id,"reason":"bad_envelope"}))).await;
+            Step::Fail(f) => {
+                if f.code == "bad_envelope" {
+                    log("error", "bad_envelope", &json!({"task": self.task_id}));
+                    let _ = self.up.try_send(up(submit_up::Msg::Cancel(pb::Cancel { reason: "bad_envelope".into() })));
+                }
+                let status = format!("failed:{}", f.code);
+                let _ = self.tx.send(TaskEv::Failed(f)).await;
+                (status, None)
             }
-            let _ = self.tx.send(TaskEv::Failed(f)).await;
-        } else if let Some((_, w)) = &self.accepted {
-            self.node.session_set(affinity, w.worker_device.clone(), ttl);
+            Step::Done | Step::Continue => {
+                if let Some((_, w)) = &self.accepted {
+                    self.node.session_set(affinity, w.worker_device.clone(), ttl);
+                }
+                ("ok".into(), self.cost)
+            }
         }
     }
 
-    async fn on_text(&mut self, v: &Value) -> Step {
-        let attempt = v.get("attempt").and_then(Value::as_u64).and_then(|a| u8::try_from(a).ok());
+    async fn on_msg(&mut self, m: submit_down::Msg) -> Step {
         let current = self.accepted.as_ref().map(|(a, _)| *a);
-        match v.get("t").and_then(Value::as_str).unwrap_or("") {
-            "task.need_wraps" => {
-                let want: Vec<&str> = v.get("workers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-                let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| want.contains(&w.worker_device.as_str())).cloned().collect();
+        match m {
+            submit_down::Msg::NeedWraps(n) => {
+                let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
                 match self.ctx.wrap_more(&recipients(&ws)) {
-                    Ok(w) => {
-                        let _ = self.node.send(text_msg(&json!({"t":"task.wraps","task":self.task_id,"wraps":wraps_json(&w)}))).await;
+                    Ok(wraps) => {
+                        let _ = self.up.send(up(submit_up::Msg::Wraps(pb::Wraps { wraps }))).await;
                         Step::Continue
                     }
                     Err(e) => Step::Fail(Failure::new("internal", true, e)),
                 }
             }
-            "task.accepted" => {
-                let dev = v.get("worker_device").and_then(Value::as_str).unwrap_or("");
-                let (Some(a), Some(r), Some(w)) = (attempt, v.get("R").and_then(Value::as_str).and_then(b64d), self.pool.workers.iter().find(|w| w.worker_device == dev)) else {
+            submit_down::Msg::Accepted(a) => {
+                let Some(w) = self.pool.workers.iter().find(|w| w.worker_device == a.worker_device) else {
                     return Step::Fail(Failure::new("unauthorized_task", true, "moochy: relay accepted the task for an unknown worker".to_owned()));
                 };
                 if self.started {
                     // A second attempt after start is only possible through a relay bug or attack (03 §6.3).
                     return Step::Fail(Failure::new("bad_envelope", true, "moochy: second attempt after start".to_owned()));
                 }
-                if let Err(e) = self.ctx.accept(a, dev, &r) {
+                if let Err(e) = self.ctx.accept(a.attempt, &a.worker_device, &a.r) {
                     return Step::Fail(Failure::new("bad_envelope", true, e));
                 }
-                self.accepted = Some((a, w.clone()));
+                self.accepted = Some((a.attempt, w.clone()));
                 Step::Continue
             }
-            "task.started" if attempt.is_some() && attempt == current => {
+            submit_down::Msg::Started(s) if Some(s.attempt) == current => {
                 self.started = true;
                 let donor = self.accepted.as_ref().map(|(_, w)| w.donor.clone()).unwrap_or_default();
-                self.emit(TaskEv::Started { task_id: self.task_id.clone(), donor }).await
+                emit(&self.tx, TaskEv::Started { task_id: self.task_id.clone(), donor }).await
             }
-            "task.checkpoint" if attempt.is_some() && attempt == current => self.on_checkpoint(v).await,
-            "task.end" if attempt.is_some() && attempt == current => self.on_end(v).await,
-            "task.failed" => {
-                let code = v.get("code").and_then(Value::as_str).unwrap_or("provider_error");
-                let mut f = Failure::new(code, v.get("retryable").and_then(Value::as_bool).unwrap_or(false), None);
-                f.retry_after_ms = v.get("retry_after_ms").and_then(Value::as_u64);
-                Step::Fail(f)
+            submit_down::Msg::Chunk(c) => self.on_chunk(&c).await,
+            submit_down::Msg::Checkpoint(c) if Some(c.attempt) == current => self.on_checkpoint(&c).await,
+            submit_down::Msg::End(r) if Some(r.attempt) == current => self.on_end(&r).await,
+            submit_down::Msg::Failed(f) => {
+                let mut fl = Failure::new(&clean(&f.code), f.retryable, None);
+                fl.retry_after_ms = (f.retry_after_ms > 0).then_some(u64::from(f.retry_after_ms));
+                Step::Fail(fl)
             }
             _ => Step::Continue,
         }
     }
 
-    async fn on_frame(&mut self, b: &[u8]) -> Step {
+    async fn on_chunk(&mut self, c: &pb::Chunk) -> Step {
         let Some((attempt, _)) = &self.accepted else { return Step::Continue };
-        if b.get(17) != Some(attempt) {
+        if c.attempt != *attempt {
             return if self.started { Step::Fail(Failure::new("bad_envelope", true, "moochy: frames from a second attempt".to_owned())) } else { Step::Continue };
         }
-        let chunk = match self.ctx.open_chunk(b) {
-            Ok(c) => c,
-            Err(_) => return Step::Fail(Failure::new("bad_envelope", true, "moochy: response failed authentication".to_owned())),
+        let Ok(plain) = self.ctx.open_chunk(c) else {
+            return Step::Fail(Failure::new("bad_envelope", true, "moochy: response failed authentication; retry".to_owned()));
         };
-        self.hasher.update(&chunk.plaintext);
+        self.hasher.update(&plain);
         if self.hashes.len() >= 1024 {
             self.hashes.pop_front();
         }
-        self.hashes.push_back((chunk.seq, self.hasher.clone().finalize().into()));
+        self.hashes.push_back((c.seq, self.hasher.clone().finalize().into()));
         let mut out = Vec::new();
-        self.gate.push(chunk.plaintext, &mut out);
-        if chunk.last {
+        self.gate.push(plain, &mut out);
+        if c.last {
             self.gate.finish(&mut out);
         }
         for ev in out {
             self.pending.push_back(match ev {
                 GateEvent::Pass(b) => Pending::Bytes(b),
-                GateEvent::Tool { bytes, ok, replacement } => Pending::Tool { seq: chunk.seq, bytes, ok, replacement },
+                GateEvent::Tool { bytes, ok, replacement } => Pending::Tool { seq: c.seq, bytes, ok, replacement },
             });
         }
         self.flush(false).await
     }
 
-    async fn on_checkpoint(&mut self, v: &Value) -> Step {
-        let Some((_, w)) = &self.accepted else { return Step::Continue };
-        let seq = v.get("seq").and_then(Value::as_u64).and_then(|s| u32::try_from(s).ok());
-        let (Some(seq), Some(rh), Some(sig), Some(pk)) = (
-            seq,
-            v.get("running_hash").and_then(Value::as_str).and_then(b64d),
-            v.get("sig").and_then(Value::as_str).and_then(b64d),
-            w.sign_pub,
-        ) else {
-            return Step::Continue;
-        };
-        let ours = self.hashes.iter().find(|(s, _)| *s == seq).map(|(_, h)| h);
-        if ours.is_some_and(|h| h.as_slice() == rh.as_slice()) && self.ctx.verify_checkpoint(seq, &rh, &sig, &pk) {
-            self.verified = Some(self.verified.map_or(seq, |v| v.max(seq)));
+    async fn on_checkpoint(&mut self, c: &pb::Checkpoint) -> Step {
+        let Some(pk) = self.accepted.as_ref().and_then(|(_, w)| w.sign_pub) else { return Step::Continue };
+        let ours = self.hashes.iter().find(|(s, _)| *s == c.seq).map(|(_, h)| h);
+        if ours.is_some_and(|h| h.as_slice() == c.running_hash.as_slice()) && self.ctx.verify_checkpoint(c, &pk) {
+            self.verified = Some(self.verified.map_or(c.seq, |v| v.max(c.seq)));
             return self.flush(false).await;
         }
         log("warn", "checkpoint rejected", &json!({"task": self.task_id}));
         Step::Continue
     }
 
-    async fn on_end(&mut self, v: &Value) -> Step {
+    async fn on_end(&mut self, r: &pb::SignedReceipt) -> Step {
         let flushed = self.flush(true).await;
         if !matches!(flushed, Step::Continue) {
             return flushed;
         }
         let pk = self.accepted.as_ref().and_then(|(_, w)| w.sign_pub).unwrap_or([0; 32]);
-        let info = match self.ctx.check_receipt(v, &pk) {
+        let info = match self.ctx.check_receipt(r, &pk) {
             Ok(i) => Some(i),
             Err((code, info)) => {
-                let sig = self.ctx.dispute_sig(&code);
-                let attempt = self.accepted.as_ref().map_or(0, |(a, _)| *a);
-                let d = json!({"t":"receipt.dispute","task":self.task_id,"attempt":attempt,"code":code,"gateway_sig":b64e(&sig)});
-                let _ = self.node.send(text_msg(&d)).await;
+                let gateway_sig = self.ctx.dispute_sig(&code);
+                let d = pb::ReceiptDispute { task: self.task_id.clone(), attempt: r.attempt, code: code.clone(), gateway_sig };
+                if let Some(l) = self.node.link() {
+                    let _ = l.up.try_send(pb::NodeMsg { msg: Some(pb::node_msg::Msg::Dispute(d)) });
+                }
                 log("warn", "receipt disputed", &json!({"task": self.task_id, "code": code}));
                 info
             }
         };
-        let _ = self.tx.send(TaskEv::End { cost_uusd: info.as_ref().map(|i| i.cost_uusd), model: info.map(|i| i.model_reported) }).await;
+        self.cost = info.as_ref().map(|i| i.cost_uusd);
+        let _ = self.tx.send(TaskEv::End { cost_uusd: self.cost, model: info.map(|i| i.model_reported) }).await;
         Step::Done
     }
 
@@ -361,7 +412,7 @@ impl Driver {
                 }
                 None => break,
             };
-            let s = self.emit(TaskEv::Bytes(b)).await;
+            let s = emit(&self.tx, TaskEv::Bytes(b)).await;
             if !matches!(s, Step::Continue) {
                 return s;
             }
@@ -369,7 +420,8 @@ impl Driver {
         Step::Continue
     }
 
-    async fn emit(&self, ev: TaskEv) -> Step {
-        if self.tx.send(ev).await.is_err() { Step::Fail(Failure::new(CLIENT_CLOSED, false, None)) } else { Step::Continue }
-    }
+}
+
+async fn emit(tx: &mpsc::Sender<TaskEv>, ev: TaskEv) -> Step {
+    if tx.send(ev).await.is_err() { Step::Gone } else { Step::Continue }
 }

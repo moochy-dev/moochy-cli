@@ -9,6 +9,7 @@
 //! Until the real crates are wired, [`StubExecutor`] serves canned responses and no `Sealer`
 //! exists: relay-routed tasks fail closed.
 
+use crate::pb::link as pb;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -84,17 +85,11 @@ pub struct SealInput<'a> {
 }
 
 pub struct Sealed {
-    /// `(worker_device, wrap)`; wrap = HPKE enc || ct (80 bytes).
-    pub wraps: Vec<(String, Vec<u8>)>,
-    /// Complete binary `0x01` frames (23-byte header + AEAD ciphertext).
-    pub frames: Vec<Bytes>,
+    /// One HPKE wrap (80 bytes) per recipient.
+    pub wraps: Vec<pb::Wrap>,
+    /// Request body ciphertext chunks (`attempt = 0`).
+    pub chunks: Vec<pb::Chunk>,
     pub body_len: u64,
-}
-
-pub struct Chunk {
-    pub seq: u32,
-    pub last: bool,
-    pub plaintext: Bytes,
 }
 
 /// What the Gateway learned from a verified receipt.
@@ -105,17 +100,17 @@ pub struct ReceiptInfo {
 
 /// Per-task Gateway crypto state (holds CK and S; zeroized by the implementation on drop).
 pub trait GatewayCtx: Send {
-    fn wrap_more(&self, recipients: &[Recipient]) -> Result<Vec<(String, Vec<u8>)>, String>;
-    /// `task.accepted`: select the attempt whose stream will be decrypted.
-    fn accept(&mut self, attempt: u8, worker_device: &str, r: &[u8]) -> Result<(), String>;
-    /// Decrypt one complete binary `0x02` frame of the accepted attempt. `Err` = `bad_envelope`.
-    fn open_chunk(&mut self, frame: &[u8]) -> Result<Chunk, String>;
-    /// Verify a `task.checkpoint` against the worker's signing key and the Gateway's own
-    /// running SHA-256 of the plaintext up to and including `seq`.
-    fn verify_checkpoint(&self, seq: u32, running_hash: &[u8], sig: &[u8], worker_sign_pub: &[u8; 32]) -> bool;
-    /// Check a `task.end` receipt against what was sent/received. `Err(code)` = dispute.
-    fn check_receipt(&self, end: &Value, worker_sign_pub: &[u8; 32]) -> Result<ReceiptInfo, (String, Option<ReceiptInfo>)>;
-    /// `receipt.dispute` signature over `lp("moochy/v1/dispute", task_id, attempt, code)`.
+    fn wrap_more(&self, recipients: &[Recipient]) -> Result<Vec<pb::Wrap>, String>;
+    /// `Accepted`: select the attempt whose stream will be decrypted.
+    fn accept(&mut self, attempt: u32, worker_device: &str, r: &[u8]) -> Result<(), String>;
+    /// Decrypt one response chunk of the accepted attempt (in order). `Err` = `bad_envelope`.
+    fn open_chunk(&mut self, c: &pb::Chunk) -> Result<Bytes, String>;
+    /// Verify a checkpoint signature with the worker's key. The node separately checks that
+    /// `running_hash` equals its own SHA-256 of the plaintext up to `seq`.
+    fn verify_checkpoint(&self, c: &pb::Checkpoint, worker_sign_pub: &[u8; 32]) -> bool;
+    /// Check the receipt against what was sent/received. `Err((code, info))` = dispute.
+    fn check_receipt(&self, end: &pb::SignedReceipt, worker_sign_pub: &[u8; 32]) -> Result<ReceiptInfo, (String, Option<ReceiptInfo>)>;
+    /// Dispute signature over `lp("moochy/v1/dispute", task_id, u64(attempt), code)`.
     fn dispute_sig(&self, code: &str) -> Vec<u8>;
 }
 
@@ -123,20 +118,19 @@ pub trait GatewayCtx: Send {
 pub trait WorkerCtx: Send {
     /// Response salt `R` drawn for this attempt.
     fn r(&self) -> [u8; 32];
-    /// Seal one plaintext response chunk into a complete binary `0x02` frame.
-    fn seal_chunk(&mut self, plaintext: &[u8], last: bool) -> Result<Bytes, String>;
-    /// `task.checkpoint` fields for everything sealed so far: `(seq, running_hash, sig)`.
-    fn checkpoint(&self) -> (u32, Vec<u8>, Vec<u8>);
-    /// Build and sign the receipt + projection → the `task.end` message fields.
-    fn finish(&mut self, outcome: &ExecOutcome) -> Result<Value, String>;
+    /// Seal one plaintext response chunk (≤ 65,497 bytes).
+    fn seal_chunk(&mut self, plaintext: &[u8], last: bool) -> Result<pb::Chunk, String>;
+    /// Progress checkpoint over everything sealed so far.
+    fn checkpoint(&self) -> pb::Checkpoint;
+    /// Build and sign receipt + projection (and persist to the outbox before returning).
+    fn finish(&mut self, outcome: &ExecOutcome) -> Result<pb::SignedReceipt, String>;
 }
 
-/// An opened `task.assign`.
+/// An opened assignment.
 pub struct Opened {
     pub body: Bytes,
     pub headers: Vec<(String, String)>,
     pub gateway_device: String,
-    pub route: Value,
 }
 
 pub trait Sealer: Send + Sync {
@@ -145,8 +139,8 @@ pub trait Sealer: Send + Sync {
     /// `Err(code)` is a NACK code (`bad_envelope`, `unauthorized_task`, …).
     fn open(
         &self,
-        assign: &Value,
-        frames: &[Bytes],
+        assign: &pb::Assign,
+        body: &[pb::Chunk],
         worker_device: &str,
         keys: &crate::keystore::DeviceKeys,
     ) -> Result<(Opened, Box<dyn WorkerCtx>), String>;
