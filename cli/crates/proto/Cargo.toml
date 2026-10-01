@@ -33,7 +33,13 @@ hpke = { version = "0.13", default-features = false, features = ["alloc", "x2551
 ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
 # OS randomness (rand_core 0.9 is what hpke 0.13 takes).
 rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
-# zstd body compression; default features off = no legacy formats, no dict builder.
+# Decompression of ANOTHER party's bytes (CONTRACT §15.2: no C code on hostile input): pure Rust,
+# MIT, no transitive deps with these features (its only unsafe is a ring buffer, fuzzed under
+# ASan by fuzz/); "std" only for io traits, no hash/dict_builder
+# (content checksums are refused; the AEAD authenticates every byte).
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+# Compression of our OWN data only (C zstd kept: ruzstd's encoder has only a "Fastest" level,
+# ratio 2.5 vs 3.6-3.8 and ~3x slower, measured). Default features off = no legacy formats.
 zstd = { version = "0.14", default-features = false }
 zeroize = { version = "1", default-features = false, features = ["std", "zeroize_derive"] }
 subtle = { version = "2", default-features = false, features = ["std"] }
