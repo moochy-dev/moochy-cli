@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
 };
 use rustix::fs::{Mode, OFlags};
 use rustix::mount::{
@@ -58,10 +58,12 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         ro_paths: spec.ro_paths.iter().filter(|p| p.exists()).cloned().collect(),
         rw_paths: spec.rw_paths.clone(),
         gateway_socket: spec.gateway_socket.clone(),
+        gateway_port: spec.gateway_loopback_port,
         masks,
         uid_raw: uid.as_raw(),
         gid_raw: gid.as_raw(),
         limits: spec.limits,
+        launcher_pid: std::process::id(),
     };
 
     let mut cmd = Command::new(program);
@@ -104,16 +106,25 @@ struct Plan {
     ro_paths: Vec<PathBuf>,
     rw_paths: Vec<PathBuf>,
     gateway_socket: Option<PathBuf>,
+    gateway_port: Option<u16>,
     masks: Vec<PathBuf>,
     uid_raw: u32,
     gid_raw: u32,
     limits: crate::Limits,
+    /// Launcher pid, to close the PDEATHSIG race (parent died before prctl).
+    launcher_pid: u32,
 }
 
 /// The pre_exec closure. Returns `Ok(())` only in the agent branch (std then
 /// execs). Any error aborts the spawn (fail closed).
 fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Result<()> {
     enter_namespaces(plan).map_err(to_io)?;
+    // Inside the new (empty) netns: `lo` up and the gateway listener bound before
+    // the agent exists, so the agent can never squat the port.
+    let listener = match plan.gateway_port {
+        Some(port) => Some(bridge_listen(port).map_err(to_io)?),
+        None => None,
+    };
 
     // Fork: the child becomes PID 1 in the new PID namespace (it is the agent);
     // the current process stays outside and reaps it. Both branches reach execve
@@ -121,15 +132,175 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
     // happen before seccomp, in a child that is single-threaded here.
     match sys::fork()? {
         sys::Fork::Parent(agent_pid) => {
-            // Reaper: wait for the agent, propagate its code. Never returns.
+            // Reaper: serve the gateway bridge, wait for the agent, propagate its
+            // code. Never returns.
+            if let Some(l) = listener {
+                bridge_serve(&l, agent_pid);
+            }
             let code = crate::donor::wait_raw(agent_pid).unwrap_or(-1);
             sys::exit_immediately(code);
         }
         sys::Fork::Child => {
+            drop(listener);
             build_view(plan).map_err(to_io)?;
             harden_agent(plan, filter).map_err(to_io)?;
             Ok(()) // → std performs execve(program, argv, envp)
         }
+    }
+}
+
+// ───────────────────────── gateway bridge ─────────────────────────
+//
+// Agents speak HTTP to `127.0.0.1:<port>`. The reaper lives in the sandbox netns
+// (but outside its PID namespace and seccomp/Landlock cage) and splices every
+// loopback connection to the gateway Unix socket bind-mounted at
+// GATEWAY_SOCK_PATH. pivot_root moved the reaper's root along with the agent's,
+// so that path resolves in the sandbox view. No other route exists.
+
+/// Max concurrent bridged connections.
+const BRIDGE_MAX_CONNS: usize = 64;
+/// Per-direction buffer; a chunk is forwarded as soon as it is read.
+const BRIDGE_BUF: usize = 64 * 1024;
+
+fn bridge_listen(port: u16) -> Result<std::net::TcpListener, Error> {
+    sys::loopback_up().map_err(|e| setup("loopback up", e))?;
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| setup("bind gateway port", e))?;
+    l.set_nonblocking(true).map_err(|e| setup("gateway nonblocking", e))?;
+    Ok(l)
+}
+
+/// One direction of a bridged connection: bytes read from `from` not yet
+/// written to `to`.
+struct Half {
+    buf: Box<[u8]>,
+    len: usize,
+    off: usize,
+    eof: bool,
+}
+
+struct Conn {
+    tcp: std::net::TcpStream,
+    unix: std::os::unix::net::UnixStream,
+    up: Half,   // tcp → unix
+    down: Half, // unix → tcp
+}
+
+/// Single-threaded bridge (threads are impossible here: after
+/// `unshare(CLONE_NEWPID)` the kernel refuses CLONE_THREAD). Polls the listener,
+/// every connection and a pidfd for the agent; returns when the agent exits.
+fn bridge_serve(l: &std::net::TcpListener, agent_pid: i32) {
+    use rustix::event::{PollFd, PollFlags, poll};
+    use std::os::fd::AsFd as _;
+    let Some(pid) = rustix::process::Pid::from_raw(agent_pid) else { return };
+    let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) else {
+        return;
+    };
+    let mut conns: Vec<Conn> = Vec::new();
+    loop {
+        let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(conns.len().saturating_mul(2).saturating_add(2));
+        fds.push(PollFd::new(&pidfd, PollFlags::IN));
+        fds.push(PollFd::new(l, PollFlags::IN));
+        for c in &conns {
+            fds.push(PollFd::from_borrowed_fd(c.tcp.as_fd(), interest(&c.up, &c.down)));
+            fds.push(PollFd::from_borrowed_fd(c.unix.as_fd(), interest(&c.down, &c.up)));
+        }
+        if poll(&mut fds, None).is_err() {
+            continue; // EINTR
+        }
+        let agent_done = fds.first().is_some_and(|f| !f.revents().is_empty());
+        let accept = fds.get(1).is_some_and(|f| !f.revents().is_empty());
+        drop(fds);
+        if agent_done {
+            return;
+        }
+        if accept {
+            accept_all(l, &mut conns);
+        }
+        conns.retain_mut(pump);
+    }
+}
+
+fn interest(read_half: &Half, write_half: &Half) -> rustix::event::PollFlags {
+    use rustix::event::PollFlags;
+    let mut f = PollFlags::empty();
+    if !read_half.eof && read_half.len == 0 {
+        f |= PollFlags::IN;
+    }
+    if write_half.len > write_half.off {
+        f |= PollFlags::OUT;
+    }
+    f
+}
+
+fn accept_all(l: &std::net::TcpListener, conns: &mut Vec<Conn>) {
+    while let Ok((tcp, _)) = l.accept() {
+        if conns.len() >= BRIDGE_MAX_CONNS {
+            continue; // bounded: refuse (drop) rather than queue
+        }
+        let Ok(unix) = std::os::unix::net::UnixStream::connect(crate::GATEWAY_SOCK_PATH) else {
+            continue;
+        };
+        if tcp.set_nonblocking(true).is_err() || unix.set_nonblocking(true).is_err() {
+            continue;
+        }
+        let _ = tcp.set_nodelay(true);
+        let half = || Half { buf: vec![0u8; BRIDGE_BUF].into_boxed_slice(), len: 0, off: 0, eof: false };
+        conns.push(Conn { tcp, unix, up: half(), down: half() });
+    }
+}
+
+/// Move bytes both ways without blocking; false = connection finished.
+fn pump(c: &mut Conn) -> bool {
+    let a = step(&mut c.up, &mut c.tcp, &mut c.unix);
+    let b = step(&mut c.down, &mut c.unix, &mut c.tcp);
+    match (a, b) {
+        (Ok(()), Ok(())) => !(c.up.eof && c.down.eof && c.up.len == 0 && c.down.len == 0),
+        _ => false,
+    }
+}
+
+fn step(h: &mut Half, from: &mut impl std::io::Read, to: &mut impl Shut) -> std::io::Result<()> {
+    use std::io::ErrorKind::{Interrupted, WouldBlock};
+    if h.len == 0 && !h.eof {
+        match from.read(&mut h.buf) {
+            Ok(0) => {
+                h.eof = true;
+                let _ = to.shut();
+            }
+            Ok(n) => {
+                h.len = n;
+                h.off = 0;
+            }
+            Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    while h.off < h.len {
+        let pending = h.buf.get(h.off..h.len).unwrap_or(&[]);
+        match to.write(pending) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => h.off = h.off.saturating_add(n),
+            Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    h.len = 0;
+    h.off = 0;
+    Ok(())
+}
+
+/// Write side that can be half-closed once its source hits EOF.
+trait Shut: std::io::Write {
+    fn shut(&mut self) -> std::io::Result<()>;
+}
+impl Shut for std::net::TcpStream {
+    fn shut(&mut self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+impl Shut for std::os::unix::net::UnixStream {
+    fn shut(&mut self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
     }
 }
 
@@ -147,6 +318,14 @@ fn to_io(e: Error) -> std::io::Error {
 /// Child, pre-fork: new namespaces, uid/gid maps, the pivoted minimal view.
 /// Reaper, pre-fork: new namespaces, uid/gid maps, hostname.
 fn enter_namespaces(plan: &Plan) -> Result<(), Error> {
+    // Die with the launcher (`moochy run`); its death then cascades: reaper →
+    // PID 1 (its own PDEATHSIG) → the whole PID namespace.
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(io("reaper pdeathsig"))?;
+    let ppid = rustix::process::getppid().map_or(0, |p| p.as_raw_nonzero().get().unsigned_abs());
+    if ppid != plan.launcher_pid {
+        return Err(Error::Unsupported("launcher exited during sandbox setup"));
+    }
     sys::unshare(
         UnshareFlags::NEWUSER
             | UnshareFlags::NEWNS
@@ -381,12 +560,25 @@ fn unsafe_prctl_capbset_drop(cap: u32) -> bool {
 
 fn landlock_agent(plan: &Plan) -> Result<(), Error> {
     let abi = ABI_CEIL;
+    // Network (ABI >= 4): TCP connect only to the gateway bridge port; the empty
+    // netns is the first layer. Scope (ABI >= 6): no abstract-socket or signal
+    // reach outside the sandbox domain. Both best-effort on older kernels.
     let created = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
         .map_err(ll("fs handle"))?
+        .handle_access(AccessNet::ConnectTcp)
+        .map_err(ll("net handle"))?
+        .scope(Scope::AbstractUnixSocket | Scope::Signal)
+        .map_err(ll("scope"))?
         .create()
         .map_err(ll("create"))?;
+    let created = match plan.gateway_port {
+        Some(p) => created
+            .add_rule(NetPort::new(p, AccessNet::ConnectTcp))
+            .map_err(ll("net rule"))?,
+        None => created,
+    };
     // Read-only: system paths (now at "/..."); read-write: worktree, rw extras,
     // /tmp, home, /run/moochy (gateway + its socket).
     let created = created

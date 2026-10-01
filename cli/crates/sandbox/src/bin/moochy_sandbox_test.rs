@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         "write" => probe_write(rest),
         "stat" => probe_stat(rest),
         "connect" => probe_connect(rest),
+        "http" => probe_http(rest),
         "exec" => probe_exec(rest),
         "hardlink" => probe_hardlink(rest),
         "symlink" => probe_symlink(rest),
@@ -502,5 +503,28 @@ fn probe_ptrace(a: &[String]) -> ExitCode {
     } else {
         println!("ptrace-fail {pid} {}", std::io::Error::last_os_error());
         no()
+    }
+}
+
+/// `http <ip:port>`: one HTTP/1.0 GET; prints the status line and body length.
+fn probe_http(a: &[String]) -> ExitCode {
+    let Some(addr) = a.first() else { return ExitCode::from(2) };
+    let res = (|| -> std::io::Result<String> {
+        let sa = addr.parse().map_err(|_| std::io::Error::other("bad addr"))?;
+        let mut s = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2))?;
+        s.write_all(b"GET /v1/models HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")?;
+        let mut out = String::new();
+        s.read_to_string(&mut out)?;
+        Ok(out)
+    })();
+    match res {
+        Ok(body) => {
+            println!("http-ok {addr} {}", body.lines().next().unwrap_or("").trim());
+            ok()
+        }
+        Err(e) => {
+            println!("http-fail {addr} {e}");
+            no()
+        }
     }
 }

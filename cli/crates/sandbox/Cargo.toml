@@ -19,7 +19,7 @@ path = "src/bin/moochy_sandbox_test.rs"
 # pivot_root, capabilities, prctl (no_new_privs / pdeathsig), rlimits, setsid,
 # socketpair. Everything here is memory-safe; see src/sys.rs for the only unsafe.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "mount", "process", "thread", "net", "pipe", "runtime", "system"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "mount", "process", "thread", "net", "pipe", "runtime", "system", "event"] }
 # Safe Landlock LSM wrapper (best-effort ABI negotiation). Second FS/NET layer.
 landlock = { version = "0.4", default-features = false }
 # Safe seccomp-bpf compiler (from Firecracker). Deny-list + arch guard.
