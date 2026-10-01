@@ -125,7 +125,7 @@ impl Catalog {
 
 /// The firewall's view of a catalog entry; `None` when the entry is unusable (fail closed).
 pub fn fw_catalog(e: &CatalogEntry) -> Option<firewall::Catalog> {
-    Some(firewall::Catalog { default_effort: Effort::parse(&e.default_effort)?, max_output: e.max_output.into(), max_image_tokens: e.max_image_tokens })
+    Some(firewall::Catalog { default_effort: Effort::parse(&e.default_effort)?, max_output: e.max_output.into(), max_image_tokens: e.max_image_tokens, max_page_tokens: e.max_page_tokens })
 }
 
 pub fn cache_ttl(t: firewall::CacheTtl) -> msg::CacheTtl {
