@@ -88,6 +88,10 @@ struct Opts {
     repo: Option<String>,
     base_url: Option<String>,
     cap: Option<i64>,
+    out: Option<PathBuf>,
+    reason: Option<String>,
+    from_file: Option<PathBuf>,
+    config: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
 
@@ -110,6 +114,10 @@ fn parse() -> Result<Opts> {
             Long("name") => o.name = Some(s(p.value().map_err(err)?)?),
             Long("repo") => o.repo = Some(s(p.value().map_err(err)?)?),
             Long("base-url") => o.base_url = Some(s(p.value().map_err(err)?)?),
+            Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
+            Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("cap") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap must be an integer"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
@@ -157,7 +165,13 @@ fn run() -> Result<()> {
             let name = o.name.clone().unwrap_or_else(crate::login::default_name);
             rt_small()?.block_on(crate::login::login(&home, relay, o.ca_file.clone(), roles, name))
         }
-        ["logout"] => logout(&home),
+        ["logout"] => logout(&home, &o),
+        ["report", task] => report(&home, &o, task),
+        ["doctor"] => doctor(&home),
+        ["update"] => update(&o),
+        ["keys", "rotate"] => Err(internal(
+            "key rotation needs relay support for a rotation request signed by the current device (KEY_ADDED with a 24 h grace); not available on this relay yet",
+        )),
         ["up"] => {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
@@ -181,22 +195,7 @@ fn run() -> Result<()> {
         ["env"] => env(&home, &o),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
-        ["keys", "list"] => {
-            let cfg = home.load()?;
-            let sec = keystore::load(&home, &cfg)?.unwrap_or_default();
-            for p in &sec.providers {
-                emit(&json!({"provider": p.provider, "base_url": p.base_url, "key": format!("…{}", p.key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>())}));
-            }
-            Ok(())
-        }
-        ["keys", "remove", provider] => {
-            let mut cfg = home.load()?;
-            let mut sec = keystore::load_or_init(&home, &mut cfg)?;
-            sec.providers.retain(|p| p.provider != *provider);
-            keystore::save(&home, &cfg, &sec)?;
-            emit(&json!({"event": "key_removed", "provider": provider}));
-            Ok(())
-        }
+        ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
         ["config", "set", key, value] => {
             let mut cfg = home.load()?;
             cfg.set(key, value)?;
@@ -227,7 +226,48 @@ fn run() -> Result<()> {
     }
 }
 
-fn logout(home: &Home) -> Result<()> {
+fn keys_cmd(home: &Home, w: &[&str]) -> Result<()> {
+    match w {
+        ["keys", "list"] => {
+            let cfg = home.load()?;
+            let sec = keystore::load(home, &cfg)?.unwrap_or_default();
+            for p in &sec.providers {
+                emit(&json!({"provider": p.provider, "base_url": p.base_url, "key": format!("…{}", p.key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>())}));
+            }
+            Ok(())
+        }
+        ["keys", "remove", provider] => {
+            let mut cfg = home.load()?;
+            let mut sec = keystore::load_or_init(home, &mut cfg)?;
+            sec.providers.retain(|p| p.provider != *provider);
+            keystore::save(home, &cfg, &sec)?;
+            emit(&json!({"event": "key_removed", "provider": provider}));
+            Ok(())
+        }
+        _ => Err(usage("keys add|list|remove|rotate")),
+    }
+}
+
+/// Ask the running node to request `KEY_REVOKED` and stop, then wipe the device keys locally.
+fn logout(home: &Home, o: &Opts) -> Result<()> {
+    let reason = o.reason.clone().unwrap_or_else(|| "logout".into());
+    let told = rt_small()?.block_on(async {
+        let Ok(mut c) = crate::ctl::connect(&home.socket_path()).await else { return None };
+        let r = c.logout(crate::pb::local::LogoutRequest { reason }).await.ok()?.into_inner();
+        // Wait (bounded) for the node to stop so it cannot reconnect with the old keys.
+        for _ in 0..100 {
+            if crate::ctl::connect(&home.socket_path()).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Some(r)
+    });
+    match &told {
+        Some(r) if r.revoked => {}
+        Some(r) => eprintln!("warning: the relay did not confirm the revocation ({}); revoke this device on the web too", clean(&r.detail)),
+        None => eprintln!("warning: the node is not running, so the relay was not told; revoke this device on the web too"),
+    }
     let mut cfg = home.load()?;
     if let Some(mut sec) = keystore::load(home, &cfg)? {
         sec.device = None;
@@ -235,7 +275,7 @@ fn logout(home: &Home) -> Result<()> {
     }
     cfg.device_id = None;
     home.save(&cfg)?;
-    emit(&json!({"event": "logged_out"}));
+    emit(&json!({"event": "logged_out", "revoked": told.is_some_and(|r| r.revoked)}));
     Ok(())
 }
 
@@ -386,10 +426,75 @@ fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     })
 }
 
-fn connect(home: &Home, o: &Opts, client: &str) -> Result<()> {
-    if o.has("write") {
-        return Err(usage("--write is not supported yet: paste the printed snippet into your client's user-level config"));
+/// `moochy report <task> [--out file] [--reason text]`: evidence bundle (06 §9).
+fn report(home: &Home, o: &Opts, task: &str) -> Result<()> {
+    let reason = o.reason.clone().unwrap_or_default();
+    let r = rt_small()?.block_on(async {
+        let mut c = crate::ctl::connect(&home.socket_path()).await?;
+        c.report(crate::pb::local::ReportRequest { task: task.into(), reason }).await.map_err(|s| usage(clean(s.message()).into_owned()))
+    })?;
+    let bundle = r.into_inner().bundle;
+    match &o.out {
+        Some(p) => {
+            crate::config::write_private(p, &bundle)?;
+            emit(&json!({"event": "report", "task": task, "out": p.display().to_string()}));
+        }
+        None => println!("{}", String::from_utf8_lossy(&bundle)),
     }
+    Ok(())
+}
+
+/// `moochy doctor`: keystore, relay, clock, provider keys, firewall, control socket.
+fn doctor(home: &Home) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let cfg = home.load()?;
+    let mut bad = 0u32;
+    let mut line = |ok: bool, what: &str, detail: String| {
+        if !ok {
+            bad = bad.saturating_add(1);
+        }
+        println!("{} {what:<9} {}", if ok { "ok  " } else { "FAIL" }, clean(&detail));
+    };
+    match keystore::load(home, &cfg) {
+        Ok(Some(s)) => line(true, "keystore", format!("unlocks ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" })),
+        Ok(None) => line(false, "keystore", "no keystore: run `moochy login`".into()),
+        Err(e) => line(false, "keystore", e.msg),
+    }
+    let st = rt_small()?.block_on(async {
+        let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
+        c.status(StatusRequest {}).await.ok().map(tonic::Response::into_inner)
+    });
+    if let Some(s) = &st {
+        line(s.link_state == "up" || s.link_state == "offline", "relay", format!("{} ({})", s.relay, s.link_state));
+        let skew = s.clock_skew_ms.unsigned_abs();
+        line(skew <= 300_000, "clock", format!("skew vs relay {} ms (limit ±5 min)", s.clock_skew_ms));
+        line(true, "providers", format!("{} key(s), {} warm adapter(s), catalog v{}", s.provider_keys, s.warm_adapters, s.catalog_version));
+    } else {
+        line(false, "relay", "node not running (start it with `moochy up`)".into());
+        line(false, "clock", "unknown: the node measures skew at connect".into());
+    }
+    line(true, "firewall", format!("level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
+    let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
+    match std::fs::metadata(home.socket_path()) {
+        Ok(m) => line(Some(m.uid()) == me && m.mode() & 0o777 == 0o600, "socket", format!("node.sock uid {} mode {:o}", m.uid(), m.mode() & 0o777)),
+        Err(_) => line(st.is_none(), "socket", "no node.sock".into()),
+    }
+    if bad > 0 && st.is_some() {
+        return Err(Error { exit: crate::util::Exit::Internal, msg: format!("{bad} check(s) failed") });
+    }
+    Ok(())
+}
+
+/// `moochy update --from-file <binary>`: replaces nothing unless the release signature verifies.
+fn update(o: &Opts) -> Result<()> {
+    let Some(f) = &o.from_file else {
+        return Err(usage("update --from-file <binary> (a signed release; verify provenance with `gh attestation verify` or `cosign verify-blob`)"));
+    };
+    // ponytail: no release-signing key is pinned yet, so every candidate is refused (fail closed).
+    Err(auth(format!("refusing {}: no valid release signature (unsigned or unknown key)", f.display())))
+}
+
+fn connect(home: &Home, o: &Opts, client: &str) -> Result<()> {
     let slug = slug_or_detect(o)?;
     let (url, models) = rt_small()?.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
@@ -397,11 +502,78 @@ fn connect(home: &Home, o: &Opts, client: &str) -> Result<()> {
         let models: Vec<String> = st.pools.iter().find(|p| p.slug.eq_ignore_ascii_case(&slug)).map(|p| p.models.clone()).unwrap_or_default();
         Ok::<_, Error>((st.gateway_url, models))
     })?;
-    let main = models.first().map_or("MODEL", String::as_str);
-    let small = models.get(1).map_or(main, String::as_str);
-    let s = crate::connect::snippet(client, &url, &slug, &clean(main), &clean(small)).ok_or_else(|| usage(format!("unknown client; one of: {}", crate::connect::CLIENTS.join(", "))))?;
-    print!("{s}");
+    let main = clean(models.first().map_or("MODEL", String::as_str)).into_owned();
+    let small = clean(models.get(1).map_or(main.as_str(), String::as_str)).into_owned();
+    if !o.has("write") {
+        let s = crate::connect::snippet(client, &url, &slug, &main, &small).ok_or_else(|| usage(format!("unknown client; one of: {}", crate::connect::CLIENTS.join(", "))))?;
+        print!("{s}");
+        return Ok(());
+    }
+    connect_write(o, client, &url, &slug, &main, &small)
+}
+
+/// `connect --write`: merge into the client's user-scoped config after showing a diff (06 §13:
+/// never into a git-tracked file, never a token).
+fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, small: &str) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let user_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| usage("HOME is not set"))?;
+    let (default_path, plan) = crate::connect::write_plan(client, &user_home, slug, url, main, small)
+        .ok_or_else(|| usage(format!("--write is not supported for {client} (YAML/env based): paste the snippet from `moochy connect {client}`")))?;
+    let path = o.config.clone().unwrap_or(default_path);
+    let path = std::path::absolute(&path).ctx("config path")?;
+    if git_tracked(&path) {
+        return Err(usage(format!("refusing to write {}: the file is tracked by git (tokens and machine paths do not belong in a repository)", path.display())));
+    }
+    let old = match std::fs::read(&path) {
+        Ok(b) => String::from_utf8(b).map_err(|_| usage("config file is not UTF-8"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(internal(format!("read {}: {e}", path.display()))),
+    };
+    let mut v = if old.trim().is_empty() {
+        json!({})
+    } else {
+        crate::json::parse(old.as_bytes()).map_err(|e| usage(format!("{} is not plain JSON ({e}); edit it by hand with the snippet", path.display())))?
+    };
+    if !crate::connect::merge(&mut v, &plan) {
+        return Err(usage(format!("{} does not have the expected JSON shape", path.display())));
+    }
+    let new = serde_json::to_string_pretty(&v).ctx("encode config")?;
+    let pretty_old = if old.trim().is_empty() { String::new() } else { serde_json::to_string_pretty(&crate::json::parse(old.as_bytes()).unwrap_or_default()).unwrap_or_default() };
+    if pretty_old == new {
+        emit(&json!({"event": "connect", "client": client, "path": path.display().to_string(), "changed": false}));
+        return Ok(());
+    }
+    print!("--- {0}\n+++ {0}\n{1}", path.display(), crate::connect::diff(&pretty_old, &new));
+    if !o.has("yes") {
+        if std::io::stdin().is_terminal() {
+            eprint!("Write these changes? [y/N] ");
+        }
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            return Err(usage("not written"));
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ctx("create config dir")?;
+    }
+    crate::config::write_private(&path, format!("{new}\n").as_bytes())?;
+    emit(&json!({"event": "connect", "client": client, "path": path.display().to_string(), "changed": true}));
     Ok(())
+}
+
+/// Is `path` tracked by git (in whatever repository contains it)?
+fn git_tracked(path: &std::path::Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
@@ -412,7 +584,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
         return Err(usage("pass the key on stdin with --key-stdin (never as an argument)"));
     }
     if let Some(u) = &o.base_url {
-        check_base_url(u)?;
+        crate::keycheck::check_base_url(u, dev_mode())?;
     }
     let mut raw = zeroize::Zeroizing::new(Vec::new());
     std::io::Read::read_to_end(&mut std::io::Read::take(std::io::stdin(), 4097), &mut raw).ctx("read stdin")?;
@@ -423,6 +595,9 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if key.is_empty() || !key.bytes().all(|c| c.is_ascii_graphic()) {
         return Err(usage("key must be non-empty printable ASCII"));
     }
+    crate::keycheck::refuse_consumer_credential(provider, &key)?;
+    // Validated with a free models call before anything is stored (06 §4.2).
+    rt_small()?.block_on(crate::keycheck::validate(provider, &key, o.base_url.as_deref()))?;
     let mut cfg = home.load()?;
     let mut sec = keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != provider);
@@ -432,25 +607,14 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     Ok(())
 }
 
-/// `--base-url` only for loopback hosts and only with `MOOCHY_INSECURE_DEV=1` (CONTRACT §6).
-fn check_base_url(u: &str) -> Result<()> {
-    if !dev_mode() {
-        return Err(usage("--base-url is only accepted with MOOCHY_INSECURE_DEV=1"));
-    }
-    let rest = u.strip_prefix("http://").or_else(|| u.strip_prefix("https://")).ok_or_else(|| usage("--base-url must be http(s)://"))?;
-    let auth_part = rest.split('/').next().unwrap_or("");
-    if auth_part.contains('@') {
-        return Err(usage("--base-url must not carry credentials"));
-    }
-    let host = if let Some(v6) = auth_part.strip_prefix('[') { v6.split(']').next().unwrap_or("") } else { auth_part.rsplit_once(':').map_or(auth_part, |(h, _)| h) };
-    let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    if !loopback {
-        return Err(usage("--base-url must point to a loopback host"));
-    }
+fn up_background(home: &Home, o: &Opts) -> Result<()> {
+    let line = start_node(home, o.has("offline"))?;
+    print!("{line}");
     Ok(())
 }
 
-fn up_background(home: &Home, o: &Opts) -> Result<()> {
+/// Start `up --foreground` detached and wait for its ready line (returned, not printed).
+fn start_node(home: &Home, offline: bool) -> Result<String> {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt as _;
     home.ensure()?;
@@ -458,7 +622,7 @@ fn up_background(home: &Home, o: &Opts) -> Result<()> {
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]);
-    if o.has("offline") {
+    if offline {
         cmd.arg("--offline");
     }
     let mut child = cmd
@@ -472,8 +636,7 @@ fn up_background(home: &Home, o: &Opts) -> Result<()> {
     let mut line = String::new();
     let _ = std::io::BufReader::new(out).read_line(&mut line);
     if line.contains("\"ready\"") {
-        print!("{line}");
-        return Ok(());
+        return Ok(line);
     }
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(10);
     Err(Error {
@@ -555,6 +718,13 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));
     }
+    match (&node.keylog, node.cfg.log_anchor_url.clone()) {
+        (Some(l), Some(u)) => {
+            tokio::spawn(l.clone().anchor_loop(u, node.shutdown.subscribe()));
+        }
+        (None, _) if !offline => log("warn", "no key-log key pinned (log_key): approvals and memberships are relay-asserted", &json!({})),
+        _ => {}
+    }
     if !offline {
         tokio::spawn(crate::link::run(node.clone()));
         match crate::link::wait_first(&node, Duration::from_secs(5)).await {
@@ -596,6 +766,10 @@ async fn up(home: Home, offline: bool) -> Result<()> {
 fn mcp(home: &Home, o: &Opts) -> Result<()> {
     let slug = slug_or_detect(o)?;
     let cwd = std::env::current_dir().ctx("cwd")?.to_string_lossy().into_owned();
+    // The shim starts the node when none is running (07 §5); stdout stays the MCP channel.
+    if rt_small()?.block_on(crate::ctl::connect(&home.socket_path())).is_err() {
+        start_node(home, false)?;
+    }
     rt_small()?.block_on(async move {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<McpUp>(32);
@@ -625,11 +799,3 @@ fn mcp(home: &Home, o: &Opts) -> Result<()> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn base_url_rules_without_dev() {
-        // MOOCHY_INSECURE_DEV is not set in unit tests: everything is refused.
-        assert!(super::check_base_url("http://127.0.0.1:9").is_err());
-    }
-}

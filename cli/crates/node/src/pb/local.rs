@@ -31,6 +31,15 @@ pub struct StatusResponse {
     pub pools: ::prost::alloc::vec::Vec<PoolSummary>,
     #[prost(uint32, tag = "13")]
     pub pid: u32,
+    /// relay server_time − node clock at the last Hello (0 = unknown)
+    #[prost(int64, tag = "14")]
+    pub clock_skew_ms: i64,
+    #[prost(uint32, tag = "15")]
+    pub provider_keys: u32,
+    #[prost(uint32, tag = "16")]
+    pub warm_adapters: u32,
+    #[prost(uint64, tag = "17")]
+    pub catalog_version: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PoolSummary {
@@ -211,6 +220,12 @@ pub struct JournalEntry {
     /// duration
     #[prost(uint32, tag = "8")]
     pub ms: u32,
+    /// only with `journal_full_text` (opt-in), bounded
+    #[prost(bytes = "vec", tag = "9")]
+    pub request: ::prost::alloc::vec::Vec<u8>,
+    /// only with `journal_full_text` (opt-in), bounded
+    #[prost(bytes = "vec", tag = "10")]
+    pub response: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct McpOpen {
@@ -245,6 +260,33 @@ pub struct McpDown {
 pub struct ShutdownRequest {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShutdownResponse {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LogoutRequest {
+    /// \[a-z0-9.\_-\]{1,32}
+    #[prost(string, tag = "1")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LogoutResponse {
+    /// the relay acknowledged the KEY_REVOKED request
+    #[prost(bool, tag = "1")]
+    pub revoked: bool,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReportRequest {
+    #[prost(string, tag = "1")]
+    pub task: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReportResponse {
+    /// JSON evidence bundle
+    #[prost(bytes = "vec", tag = "1")]
+    pub bundle: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod local_control_client {
     #![allow(
@@ -578,6 +620,51 @@ pub mod local_control_client {
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "Shutdown"));
             self.inner.unary(req, path, codec).await
         }
+        /// `moochy logout`: ask the relay to revoke this device (KEY_REVOKED), then stop.
+        pub async fn logout(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LogoutRequest>,
+        ) -> std::result::Result<tonic::Response<super::LogoutResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/Logout",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "Logout"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `moochy report <task>`: evidence bundle for a task this Gateway consumed (06 §9): receipt,
+        /// checkpoints, response bytes and only S_resp (never the request).
+        pub async fn report(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReportResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/Report",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "Report"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -662,6 +749,17 @@ pub mod local_control_server {
             tonic::Response<super::ShutdownResponse>,
             tonic::Status,
         >;
+        /// `moochy logout`: ask the relay to revoke this device (KEY_REVOKED), then stop.
+        async fn logout(
+            &self,
+            request: tonic::Request<super::LogoutRequest>,
+        ) -> std::result::Result<tonic::Response<super::LogoutResponse>, tonic::Status>;
+        /// `moochy report <task>`: evidence bundle for a task this Gateway consumed (06 §9): receipt,
+        /// checkpoints, response bytes and only S_resp (never the request).
+        async fn report(
+            &self,
+            request: tonic::Request<super::ReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReportResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct LocalControlServer<T> {
@@ -1214,6 +1312,96 @@ pub mod local_control_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ShutdownSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/Logout" => {
+                    #[allow(non_camel_case_types)]
+                    struct LogoutSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::LogoutRequest>
+                    for LogoutSvc<T> {
+                        type Response = super::LogoutResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LogoutRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::logout(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LogoutSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/Report" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReportSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::ReportRequest>
+                    for ReportSvc<T> {
+                        type Response = super::ReportResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReportRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::report(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReportSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -55,6 +55,8 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
         name,
         suite: SUITE.into(),
         sig: bytes::Bytes::copy_from_slice(&sig),
+        // Key-log proof of possession that goes into KEY_ADDED (CONTRACT R8, spec/KEYLOG.md).
+        pop_sig: bytes::Bytes::copy_from_slice(&keys.sign(&moochy_keylog::entry::pop_message(&sign_pub, &enc_pub, SUITE))),
     };
     let r = tokio::time::timeout(crate::tls::IO_TIMEOUT, client.device_start(start))
         .await
@@ -94,7 +96,12 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
             }
         };
         match DeviceState::try_from(p.state) {
-            Ok(DeviceState::Approved) => break p.device_id,
+            Ok(DeviceState::Approved) => {
+                if moochy_keylog::entry::is_pseudonym(&p.user_pseudonym) {
+                    cfg.pseudonym = Some(p.user_pseudonym.clone());
+                }
+                break p.device_id;
+            }
             Ok(DeviceState::Denied) => return Err(auth("device approval denied")),
             Ok(DeviceState::Expired) => return Err(auth("device code expired")),
             _ => {}

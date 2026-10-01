@@ -11,14 +11,14 @@ use crate::gate::Gate;
 use crate::node::{Busy, Keys, Node, PoolWorker, RepoPool};
 use crate::pb::link::{self as pb, SubmitDown, SubmitUp, submit_down, submit_up};
 use crate::pb::local::JournalEntry;
-use crate::util::{clean, log, now_ms};
+use crate::util::{b64e, clean, log, now_ms};
 use bytes::Bytes;
 use moochy_proto::crypto::{self, ContentKey, ResponseOpener, SaltName};
 use moochy_proto::money::CatalogEntry;
 use moochy_proto::msg::{InnerPayload, ReceiptStatus};
 use moochy_proto::{DeviceId, TaskId};
 use moochy_worker::firewall::Facts;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,8 +71,61 @@ pub async fn submit(node: &Arc<Node>, req: TaskReq) -> Result<mpsc::Receiver<Tas
     run_relay(node, req, pool).await
 }
 
+/// Bound on the plaintext kept per task (evidence bundle, opt-in journal text).
+const MAX_EVIDENCE: usize = 1 << 20;
+const MAX_JOURNAL_TEXT: usize = 64 << 10;
+
+/// What `moochy report` packages for a consumed task (06 §9): never the request.
+pub struct Evidence {
+    pub task: String,
+    pub attempt: u32,
+    pub worker_device: String,
+    pub receipt: pb::SignedReceipt,
+    pub checkpoints: Vec<pb::Checkpoint>,
+    pub response: Vec<Bytes>,
+    pub truncated: bool,
+    pub s_resp: [u8; 32],
+}
+
+impl Evidence {
+    pub fn bundle(&self, reason: &str) -> Value {
+        let resp: Vec<u8> = self.response.iter().flat_map(|b| b.iter().copied()).collect();
+        json!({
+            "v": 1, "kind": "moochy.evidence", "reason": crate::util::clean(reason), "task": self.task, "attempt": self.attempt,
+            "worker_device": self.worker_device,
+            "receipt": {"receipt_b64": b64e(&self.receipt.receipt), "donor_sig": b64e(&self.receipt.donor_sig),
+                "projection_b64": b64e(&self.receipt.projection), "projection_sig": b64e(&self.receipt.projection_sig)},
+            "checkpoints": self.checkpoints.iter().map(|c| json!({"attempt": c.attempt, "seq": c.seq, "running_hash": b64e(&c.running_hash), "sig": b64e(&c.sig)})).collect::<Vec<_>>(),
+            "response_b64": b64e(&resp), "response_truncated": self.truncated,
+            // Only the response salt: it opens resp_commit and reveals nothing about the request.
+            "S_resp": b64e(&self.s_resp),
+        })
+    }
+}
+
+fn clip(parts: &[Bytes]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for p in parts {
+        let room = MAX_JOURNAL_TEXT.saturating_sub(v.len());
+        v.extend_from_slice(p.get(..room.min(p.len())).unwrap_or_default());
+    }
+    v
+}
+
 fn journal(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64) {
+    journal_text(node, task, slug, model, status, cost, t0, None);
+}
+
+/// Journal entry; `text` = (request, response) only when `journal_full_text` is on (opt-in).
+#[allow(clippy::too_many_arguments)]
+fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64, text: Option<(&Bytes, &[Bytes])>) {
+    let (request, response) = match text.filter(|_| node.cfg.journal_full_text) {
+        Some((rq, rs)) => (clip(std::slice::from_ref(rq)), clip(rs)),
+        None => (Vec::new(), Vec::new()),
+    };
     node.journal(JournalEntry {
+        request,
+        response,
         t_ms: i64::try_from(t0).unwrap_or(0),
         role: "gateway".into(),
         task: task.into(),
@@ -203,18 +256,26 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         cost: None,
         model: None,
         closed: false,
+        resp: Vec::new(),
+        resp_len: 0,
+        truncated: false,
+        checkpoints: Vec::new(),
+        receipt: None,
     };
-    let (slug, model, t_rx) = (req.slug, req.entry.model, req.t_client_rx);
+    let (slug, model, t_rx, req_body) = (req.slug, req.entry.model, req.t_client_rx, req.body);
     tokio::spawn(async move {
         let node = drv.node.clone();
         let _busy = Busy::new(&node.gateway_tasks);
         let task_id = drv.task_text.clone();
-        let (status, cost) = drv.run(down, aff, ttl).await;
+        let (status, cost, ev) = drv.run(down, aff, ttl).await;
         log("info", "timing", &json!({"task": task_id, "t_client_rx": t_rx, "t_first_sealed_tx": first_tx.load(Ordering::Relaxed)}));
         if status != "ok" {
             log("warn", "task failed", &json!({"task": task_id, "code": status}));
         }
-        journal(&node, &task_id, &slug, &model, &status, cost, t0);
+        journal_text(&node, &task_id, &slug, &model, &status, cost, t0, Some((&req_body, ev.as_ref().map_or(&[][..], |e| e.response.as_slice()))));
+        if let Some(e) = ev {
+            node.keep_evidence(e);
+        }
     });
     Ok(rx)
 }
@@ -250,6 +311,12 @@ struct Driver {
     model: Option<String>,
     /// The client stream was already completed (last chunk in, nothing held).
     closed: bool,
+    /// Evidence for `moochy report`: plaintext chunks (refcounted, bounded), checkpoints, receipt.
+    resp: Vec<Bytes>,
+    resp_len: usize,
+    truncated: bool,
+    checkpoints: Vec<pb::Checkpoint>,
+    receipt: Option<pb::SignedReceipt>,
 }
 
 enum Step {
@@ -265,8 +332,8 @@ fn retry_fail(code: &str, msg: &str) -> Step {
 }
 
 impl Driver {
-    /// Returns `(journal status, cost)`.
-    async fn run(mut self, mut down: tonic::Streaming<SubmitDown>, aff: [u8; 16], ttl: u64) -> (String, Option<u64>) {
+    /// Returns `(journal status, cost, evidence)`.
+    async fn run(mut self, mut down: tonic::Streaming<SubmitDown>, aff: [u8; 16], ttl: u64) -> (String, Option<u64>, Option<Evidence>) {
         let step = loop {
             let m = tokio::select! {
                 m = down.message() => m,
@@ -284,7 +351,7 @@ impl Driver {
         match step {
             Step::Gone => {
                 let _ = self.up.try_send(up(submit_up::Msg::Cancel(pb::Cancel { reason: "client_closed".into() })));
-                ("cancelled".into(), None)
+                ("cancelled".into(), None, None)
             }
             Step::Fail(f) => {
                 if f.code == "bad_envelope" {
@@ -293,15 +360,32 @@ impl Driver {
                 }
                 let status = format!("failed:{}", f.code);
                 let _ = self.tx.send(TaskEv::Failed(f)).await;
-                (status, None)
+                (status, None, None)
             }
             Step::Done | Step::Continue => {
                 if let Some(a) = &self.acc {
                     self.node.session_set(aff, a.worker.worker_device.clone(), ttl);
                 }
-                ("ok".into(), self.cost)
+                let ev = self.evidence();
+                ("ok".into(), self.cost, ev)
             }
         }
+    }
+
+    fn evidence(&mut self) -> Option<Evidence> {
+        let receipt = self.receipt.take()?;
+        let a = self.acc.as_ref()?;
+        let s_resp = *crypto::salt(&self.s, SaltName::Resp).ok()?.expose();
+        Some(Evidence {
+            task: self.task_text.clone(),
+            attempt: u32::from(a.attempt),
+            worker_device: a.worker.worker_device.clone(),
+            receipt,
+            checkpoints: std::mem::take(&mut self.checkpoints),
+            response: std::mem::take(&mut self.resp),
+            truncated: self.truncated,
+            s_resp,
+        })
     }
 
     async fn on_msg(&mut self, m: submit_down::Msg) -> Step {
@@ -324,11 +408,21 @@ impl Driver {
             submit_down::Msg::End(r) if Some(r.attempt) == current => self.on_end(&r).await,
             submit_down::Msg::Failed(f) => {
                 let code = clean(&f.code).into_owned();
-                let detail = self.acc.as_ref().and_then(|a| {
-                    let t16 = self.task.0.0;
-                    let c = DetailCtx { ck: self.ck.expose(), r: &a.r, task: &self.task_text, task16: &t16, worker: &a.worker.worker_device, attempt: u32::from(a.attempt) };
-                    engine::open_detail(&c, &code, &f.sealed_detail)
-                });
+                // The relay names the refusing attempt (worker + R): derive K_det for it (CONTRACT §3).
+                let t16 = self.task.0.0;
+                let detail = <[u8; 32]>::try_from(f.r.as_ref())
+                    .ok()
+                    .filter(|_| f.attempt > 0 && !f.worker_device.is_empty())
+                    .and_then(|r| {
+                        let c = DetailCtx { ck: self.ck.expose(), r: &r, task: &self.task_text, task16: &t16, worker: &f.worker_device, attempt: f.attempt };
+                        engine::open_detail(&c, &code, &f.sealed_detail)
+                    })
+                    .or_else(|| {
+                        self.acc.as_ref().and_then(|a| {
+                            let c = DetailCtx { ck: self.ck.expose(), r: &a.r, task: &self.task_text, task16: &t16, worker: &a.worker.worker_device, attempt: u32::from(a.attempt) };
+                            engine::open_detail(&c, &code, &f.sealed_detail)
+                        })
+                    });
                 let mut fl = Failure::new(&code, f.retryable, detail);
                 fl.retry_after_ms = (f.retry_after_ms > 0).then_some(u64::from(f.retry_after_ms));
                 Step::Fail(fl)
@@ -380,6 +474,12 @@ impl Driver {
         }
         self.hashes.push_back((seq, a.opener.running_hash()));
         self.last_seq = Some(seq);
+        if self.resp_len.saturating_add(pt.len()) <= MAX_EVIDENCE {
+            self.resp_len = self.resp_len.saturating_add(pt.len());
+            self.resp.push(pt.clone());
+        } else {
+            self.truncated = true;
+        }
         if let Err(why) = self.gate.push(seq, &pt) {
             return retry_fail("provider_error", why);
         }
@@ -392,7 +492,8 @@ impl Driver {
     async fn try_close(&mut self) -> Step {
         let complete = self.acc.as_ref().is_some_and(|a| a.opener.is_complete());
         let covered = self.last_seq.is_some() && self.verified >= self.last_seq;
-        if self.closed || !complete || (self.gate.holds_tools() && !covered) {
+        // Non-streamed responses wait for the receipt: it carries x-moochy-cost-uusd.
+        if self.closed || !self.gate.is_stream() || !complete || (self.gate.holds_tools() && !covered) {
             return Step::Continue;
         }
         if let Err(why) = self.gate.finish(covered) {
@@ -418,6 +519,9 @@ impl Driver {
             return Step::Continue;
         }
         self.verified = Some(self.verified.map_or(c.seq, |v| v.max(c.seq)));
+        if self.checkpoints.len() < 4096 {
+            self.checkpoints.push(c.clone());
+        }
         let s = self.flush(false).await;
         if matches!(s, Step::Continue) { self.try_close().await } else { s }
     }
@@ -466,6 +570,7 @@ impl Driver {
                 return flushed;
             }
         }
+        self.receipt = Some(r.clone());
         match self.check_receipt(r) {
             Ok((cost, model)) => {
                 self.cost = Some(cost);

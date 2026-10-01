@@ -165,8 +165,10 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     if hello.nonce.len() != 32 {
         return Err(End::Refused("Hello without a 32-byte nonce".into()));
     }
+    let skew = hello.server_time_ms.saturating_sub(i64::try_from(now_ms()).unwrap_or(i64::MAX));
+    node.clock_skew_ms.store(skew, std::sync::atomic::Ordering::Relaxed);
     if u64::try_from(hello.server_time_ms).unwrap_or(0).abs_diff(now_ms()) > 300_000 {
-        log("warn", "clock skew larger than 5 minutes vs relay", &json!({}));
+        log("warn", "clock skew larger than 5 minutes vs relay: task ids from other nodes may be refused", &json!({"skew_ms": i128::from(hello.server_time_ms).saturating_sub(i128::from(now_ms()))}));
     }
     let origin_s = origin.url();
     let sig = keys.sign(&lp(&[b"moochy/v1/auth", &hello.nonce, origin_s.as_bytes(), &exporter, device_id.as_bytes()]));
@@ -184,6 +186,12 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     if node.cfg.has_role("worker") {
         crate::worker::on_welcome(node);
     }
+    if let (Some(l), false) = (node.keylog.clone(), hello.log_checkpoint.is_empty()) {
+        let c = node.link().map(|h| h.client);
+        if let Some(c) = c {
+            tokio::spawn(async move { l.sync(c, hello.log_checkpoint.to_vec()).await });
+        }
+    }
 
     let mut ping = interval(PING_EVERY);
     ping.tick().await;
@@ -194,6 +202,11 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                 Ok(Some(RelayMsg { msg: Some(m) })) => match m {
                     relay_msg::Msg::PoolSync(p) => node.apply_pool_sync(&p),
                     relay_msg::Msg::Assign(a) => crate::worker::on_assign(node, a.task, a.attempt),
+                    relay_msg::Msg::LogCheckpoint(c) => {
+                        if let (Some(l), Some(h)) = (node.keylog.clone(), node.link()) {
+                            tokio::spawn(async move { l.sync(h.client, c.note.to_vec()).await });
+                        }
+                    }
                     relay_msg::Msg::Draining(d) => return Ok(End::Reconnect(u64::from(d.reconnect_after_ms).min(BACKOFF_CAP_MS))),
                     relay_msg::Msg::Pong(_) => last_pong = Instant::now(),
                     relay_msg::Msg::Error(e) => log("warn", "relay error", &json!({"code": e.code, "message": e.message, "task": e.task})),

@@ -7,7 +7,7 @@ use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
     ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
-    PauseResponse, PendingRequest, PendingResponse, PoolSummary, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest,
+    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest,
     StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
@@ -125,6 +125,10 @@ impl LocalControl for Ctl {
             gateway_tasks: n.gateway_tasks.load(Ordering::Relaxed),
             pools,
             pid: std::process::id(),
+            clock_skew_ms: n.clock_skew_ms.load(Ordering::Relaxed),
+            provider_keys: u32::try_from(n.secrets.providers.len()).unwrap_or(u32::MAX),
+            warm_adapters: u32::try_from(n.adapters.len()).unwrap_or(u32::MAX),
+            catalog_version: n.catalog().version,
         }))
     }
 
@@ -255,6 +259,30 @@ impl LocalControl for Ctl {
         });
         tokio::spawn(crate::mcp::run_pipe(self.node.clone(), open.repo, cwd, in_rx, out_tx));
         Ok(Response::new(ReceiverStream::new(down_rx)))
+    }
+
+    async fn logout(&self, r: Request<LogoutRequest>) -> std::result::Result<Response<LogoutResponse>, Status> {
+        let reason = r.into_inner().reason;
+        let reason = if !reason.is_empty() && reason.len() <= 32 && reason.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(&c)) { reason } else { "logout".into() };
+        let res = crate::approve::revoke_self(&self.node, &reason).await;
+        // Stop either way: the session closes, so the relay drops the device at once.
+        let stop = self.node.shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop.send_replace(true);
+        });
+        Ok(Response::new(match res {
+            Ok(a) if a.error.is_empty() => LogoutResponse { revoked: true, detail: format!("KEY_REVOKED at log index {}", a.index) },
+            Ok(a) => LogoutResponse { revoked: false, detail: crate::util::clean(&a.error).into_owned() },
+            Err(s) => LogoutResponse { revoked: false, detail: crate::util::clean(s.message()).into_owned() },
+        }))
+    }
+
+    async fn report(&self, r: Request<ReportRequest>) -> std::result::Result<Response<ReportResponse>, Status> {
+        let r = r.into_inner();
+        let ev = lock(&self.node.evidence);
+        let e = ev.iter().find(|e| e.task == r.task).ok_or_else(|| Status::not_found("no evidence kept for that task (only the last 32 consumed tasks, while the node runs)"))?;
+        Ok(Response::new(ReportResponse { bundle: e.bundle(&r.reason).to_string().into_bytes() }))
     }
 
     async fn shutdown(&self, _: Request<ShutdownRequest>) -> std::result::Result<Response<ShutdownResponse>, Status> {

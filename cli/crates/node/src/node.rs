@@ -122,6 +122,12 @@ pub struct Node {
     pub journal: Mutex<VecDeque<JournalEntry>>,
     pub journal_tx: broadcast::Sender<JournalEntry>,
     pub shutdown: watch::Sender<bool>,
+    /// Relay server_time − node clock at the last Hello.
+    pub clock_skew_ms: std::sync::atomic::AtomicI64,
+    /// Evidence of the last consumed tasks, for `moochy report` (bounded).
+    pub evidence: Mutex<VecDeque<crate::task::Evidence>>,
+    /// Key-log mirror (None = no pinned log key: relay-asserted trust).
+    pub keylog: Option<Arc<crate::keylog::LogMirror>>,
 }
 
 const MAX_SESSIONS: usize = 4096;
@@ -129,6 +135,7 @@ const JOURNAL_KEEP: usize = 512;
 
 impl Node {
     pub fn new(home: Home, cfg: Config, secrets: Secrets, keys: Option<Keys>, w: WorkerParts, offline: bool) -> Arc<Self> {
+        let keylog = crate::keylog::LogMirror::open(&home, &cfg, keys.as_ref().map(|k| k.sign.public()));
         let token_gen = AtomicU64::new(cfg.token_gen);
         Arc::new(Self {
             home,
@@ -157,6 +164,9 @@ impl Node {
             journal: Mutex::new(VecDeque::new()),
             journal_tx: broadcast::channel(64).0,
             shutdown: watch::channel(false).0,
+            clock_skew_ms: std::sync::atomic::AtomicI64::new(0),
+            evidence: Mutex::new(VecDeque::new()),
+            keylog,
         })
     }
 
@@ -249,9 +259,12 @@ impl Node {
 
     /// Key-log hook (06 §10): a Gateway seals only to worker keys that are logged, unrevoked, and
     /// belong to a donor with an owner-signed `DONOR_APPROVED` for the repo. Until the
-    /// `moochy-keylog` mirror is wired this accepts the relay's pool (relay-asserted, like D14).
-    fn worker_approved(_repo_id: &str, _worker_device: &str, _sign_pub: Option<&[u8; 32]>) -> bool {
-        true
+    /// key-log mirror has a verified checkpoint, the relay's pool is accepted as-is (D14).
+    fn worker_approved(&self, repo_id: &str, worker_device: &str, enc_pub: &[u8; 32]) -> bool {
+        match self.keylog.as_ref().filter(|l| l.active()) {
+            Some(l) => l.sealable(worker_device, repo_id).is_some_and(|k| crate::util::ct_eq(&k, enc_pub)),
+            None => true,
+        }
     }
 
     pub fn apply_pool_sync(&self, v: &PoolSync) {
@@ -272,7 +285,7 @@ impl Node {
             for w in v.workers.iter().take(4096) {
                 let Ok(enc_pub) = <[u8; 32]>::try_from(w.enc_pub.as_ref()) else { continue };
                 let sign_pub = <[u8; 32]>::try_from(w.sign_pub.as_ref()).ok();
-                if !Self::worker_approved(&v.repo_id, &w.worker_device, sign_pub.as_ref()) {
+                if !self.worker_approved(&v.repo_id, &w.worker_device, &enc_pub) {
                     continue;
                 }
                 p.workers.retain(|x| x.worker_device != w.worker_device);
@@ -310,6 +323,14 @@ impl Node {
             }
         }
         s.insert(key, (worker, now_ms().saturating_add(ttl_ms)));
+    }
+
+    pub fn keep_evidence(&self, e: crate::task::Evidence) {
+        let mut v = lock(&self.evidence);
+        if v.len() >= 32 {
+            v.pop_front();
+        }
+        v.push_back(e);
     }
 
     /// Record a finished task in the local journal (metadata only, never content).
