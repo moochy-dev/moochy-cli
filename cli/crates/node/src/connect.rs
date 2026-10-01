@@ -64,7 +64,7 @@ pub fn snippet(client: &str, url: &str, repo: &str, main: &str, small: &str) -> 
         "generic-anthropic" => format!("{token}base_url: {url}\napi_key: $MOOCHY_TOKEN   (x-api-key or Authorization: Bearer)\nmodel: {main}\n"),
         _ => return None,
     };
-    Some(format!("{s}\n# Keep command approval on in your agent when it uses pooled compute.\n"))
+    Some(format!("{s}\n# Models are the ones donated to this project (Claude, GPT, DeepSeek, Grok and others): `moochy status` lists them.\n# Keep command approval on in your agent when it uses donated tokens.\n"))
 }
 
 #[cfg(test)]

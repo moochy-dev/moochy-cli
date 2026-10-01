@@ -171,8 +171,12 @@ impl Config {
     /// `moochy config set <key> <value>`.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
+            "monthly_limit" => {
+                self.device_monthly_cap_uusd = Some(crate::util::parse_dollars(value.trim_start_matches('$')).ok_or_else(|| usage("monthly_limit is a dollar amount, e.g. 20 or 12.50"))?);
+            }
+            // Machine form of `monthly_limit` (millionths of a dollar), kept for scripts.
             "device_monthly_cap_uusd" => {
-                self.device_monthly_cap_uusd = Some(value.parse().map_err(|_| usage("expected an integer µ$ amount"))?);
+                self.device_monthly_cap_uusd = Some(value.parse().map_err(|_| usage("device_monthly_cap_uusd is a whole number; use `monthly_limit 20` for $20"))?);
             }
             "slots_max" => {
                 let n: u32 = value.parse().map_err(|_| usage("expected an integer"))?;
@@ -192,7 +196,7 @@ impl Config {
             "auto_cache" => self.auto_cache = Some(parse_bool(key, value)?),
             "firewall_level" => {
                 if !matches!(value, "strict" | "paranoid") {
-                    return Err(usage("firewall_level is strict or paranoid"));
+                    return Err(usage("firewall_level (safety checks) is strict or paranoid"));
                 }
                 self.firewall_level = Some(value.into());
             }
@@ -209,7 +213,7 @@ impl Config {
             "models_override" => self.models_override = Some(value.into()).filter(|v: &String| !v.is_empty()),
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, log_key, log_anchor_url)"
+                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, log_key, log_anchor_url)"
                 )));
             }
         }

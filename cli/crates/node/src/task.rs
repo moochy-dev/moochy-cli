@@ -62,12 +62,12 @@ pub async fn submit(node: &Arc<Node>, req: TaskReq) -> Result<mpsc::Receiver<Tas
     if let Some(p) = &pool
         && !p.models().iter().any(|(m, ds)| *m == req.entry.model && ds.iter().any(|d| d == req.dialect.wire()))
     {
-        return Err(Failure::new("model_not_in_pool", false, format!("moochy: model `{}` is not offered by this repo's donor pool", req.entry.model)));
+        return Err(Failure::new("model_not_in_pool", false, format!("moochy: no donor offers model `{}` to this project (model_not_in_pool)", req.entry.model)));
     }
     if node.offline {
         return Ok(run_local(node, req));
     }
-    let pool = pool.ok_or_else(|| Failure::new("no_pool", true, format!("moochy: no donor pool synced yet for {}", req.slug)))?;
+    let pool = pool.ok_or_else(|| Failure::new("no_pool", true, format!("moochy: no donations loaded yet for {}; retry in a moment", req.slug)))?;
     run_relay(node, req, pool).await
 }
 
@@ -180,7 +180,7 @@ fn internal(e: impl std::fmt::Debug) -> Failure {
 #[allow(clippy::too_many_lines, reason = "one linear submit sequence; splitting it hides the order")]
 async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mpsc::Receiver<TaskEv>, Failure> {
     let keys = node.keys.as_ref().ok_or_else(|| Failure::new("not_logged_in", false, "moochy: run `moochy login` first".to_owned()))?;
-    let link = node.link_now(std::time::Duration::from_secs(3)).await.ok_or_else(|| Failure::new("overloaded", true, "moochy: relay link is down".to_owned()))?;
+    let link = node.link_now(std::time::Duration::from_secs(3)).await.ok_or_else(|| Failure::new("overloaded", true, "moochy: not connected; retry in a moment".to_owned()))?;
     let t0 = now_ms();
     let aff = req.affinity;
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
@@ -232,7 +232,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let down = client
         .submit(crate::link::with_session(&link, outbound))
         .await
-        .map_err(|s| Failure::new("overloaded", true, format!("moochy: relay refused the task ({:?})", s.code())))?
+        .map_err(|s| Failure::new("overloaded", true, format!("moochy: the server refused the request ({:?})", s.code())))?
         .into_inner();
     let (tx, rx) = mpsc::channel(16);
     let ttl = if req.facts.cache_ttl == moochy_worker::firewall::CacheTtl::H1 { 3_600_000 } else { 300_000 };

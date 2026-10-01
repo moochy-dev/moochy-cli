@@ -167,7 +167,7 @@ impl Gate {
     }
 
     fn replacement(&self, index: u32, reason: &str) -> Bytes {
-        let text = format!("[moochy] a tool call from pooled compute was withheld: {reason}");
+        let text = format!("[moochy] a tool call from a donor's model was withheld: {reason}");
         Bytes::from(match self.dialect {
             Dialect::Anthropic => format!(
                 "event: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\n",
@@ -254,7 +254,7 @@ impl Gate {
 /// Replace blocked tool calls of a non-streamed body with a visible `[moochy]` text.
 fn rewrite_body(d: Dialect, body: &[u8], blocked: &[Option<String>]) -> Option<Bytes> {
     let mut v = crate::json::parse(body).ok()?;
-    let note = |r: &str| format!("[moochy] a tool call from pooled compute was withheld: {r}");
+    let note = |r: &str| format!("[moochy] a tool call from a donor's model was withheld: {r}");
     let mut i = 0usize;
     match d {
         Dialect::Anthropic => {

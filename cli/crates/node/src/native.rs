@@ -24,11 +24,11 @@ fn message(f: &Failure) -> String {
         return d.clone();
     }
     match f.code.as_str() {
-        "over_task_cap" => "moochy: this request's worst-case cost exceeds the donors' per-task cap".into(),
-        "quota_exceeded" => "moochy: this repo's member quota or pool budget is exhausted".into(),
-        "firewall" => "moochy: request refused by the donor pool's firewall".into(),
+        "over_task_cap" => "moochy: this request could cost more than the donors' limit per request; lower max_tokens".into(),
+        "quota_exceeded" => "moochy: your monthly limit for this project, or its donations for the month, are used up".into(),
+        "firewall" => "moochy: request refused by the safety checks".into(),
         "route_mismatch" => "moochy: route header does not match the request body".into(),
-        "rate_limited" => "moochy: donor rate limited, retry later".into(),
+        "rate_limited" => "moochy: the donor's provider is rate limited; retry later".into(),
         "bad_envelope" => "moochy: response failed authentication (possible tampering); retry".into(),
         code => format!("moochy: {code}"),
     }
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(error_body(Dialect::Anthropic, &f("bad_envelope", true)).0, 500);
         let (_, b) = error_body(Dialect::Anthropic, &f("over_task_cap", false));
         assert_eq!(b["error"]["type"], "invalid_request_error");
-        assert!(b["error"]["message"].as_str().unwrap().contains("per-task cap"));
+        assert!(b["error"]["message"].as_str().unwrap().contains("limit per request"));
         assert!(sse_error(Dialect::Anthropic, &f("overloaded", true)).starts_with(b"event: error\n"));
     }
 }

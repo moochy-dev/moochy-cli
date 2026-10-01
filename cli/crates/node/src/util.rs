@@ -95,6 +95,32 @@ pub fn lp(fields: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// `--cap`: `$20` / `$12.50` is dollars (what people type); a bare integer is already µ$
+/// (machine callers). Never guessed from the digit count.
+pub fn parse_limit(s: &str) -> Option<u64> {
+    match s.trim().strip_prefix('$') {
+        Some(d) => parse_dollars(d),
+        None => s.trim().parse().ok(),
+    }
+}
+
+/// `12.5` → 12_500_000 µ$ (at most 6 decimals; checked math).
+pub fn parse_dollars(s: &str) -> Option<u64> {
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if whole.is_empty() || frac.len() > 6 || !whole.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let f: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<6}").parse().ok()? };
+    whole.parse::<u64>().ok()?.checked_mul(1_000_000)?.checked_add(f)
+}
+
+/// µ$ → `$0.0012` (at least two decimals, trailing zeros trimmed).
+pub fn fmt_dollars(uusd: u64) -> String {
+    let frac = format!("{:06}", uusd % 1_000_000);
+    let frac = frac.trim_end_matches('0');
+    format!("${}.{frac:0<2}", uusd / 1_000_000)
+}
+
 /// Dev/test clock offset (`MOOCHY_DEV_CLOCK_SKEW_MS`, honoured only with `MOOCHY_INSECURE_DEV=1`).
 static SKEW_MS: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
     if std::env::var("MOOCHY_INSECURE_DEV").as_deref() != Ok("1") {
@@ -251,6 +277,21 @@ mod tests {
         }
         assert!(s.contains("\nB\tC"), "newline and tab kept");
         assert_eq!(sanitize_text("plain\ntext"), "plain\ntext");
+    }
+
+    #[test]
+    fn dollars() {
+        assert_eq!(parse_limit("$20"), Some(20_000_000));
+        assert_eq!(parse_limit("$12.50"), Some(12_500_000));
+        assert_eq!(parse_limit("1000"), Some(1000), "bare integer = µ$");
+        assert_eq!(parse_limit("$0.000001"), Some(1));
+        assert_eq!(parse_limit("$1.0000001"), None);
+        assert_eq!(parse_limit("$-3"), None);
+        assert_eq!(parse_dollars("20"), Some(20_000_000));
+        assert_eq!(parse_limit("99999999999999999999"), None);
+        assert_eq!(fmt_dollars(1_234), "$0.001234");
+        assert_eq!(fmt_dollars(20_000_000), "$20.00");
+        assert_eq!(fmt_dollars(12_500_000), "$12.50");
     }
 
     #[test]

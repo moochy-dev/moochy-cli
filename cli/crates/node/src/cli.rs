@@ -16,38 +16,48 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-const HELP: &str = "moochy — donate and use pooled LLM compute for open source (open-source client, Apache-2.0 · 100% free)
+pub(crate) const HELP: &str = "moochy: donate tokens to open source, and use tokens donated to your projects.
+Open-source client (Apache-2.0) · 100% free
 
 USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
 
 COMMANDS:
   login [--relay URL] [--ca-file PEM] [--roles gateway,worker] [--name NAME] [--headless]
-                                  Default relay https://relay.moochy.dev:8443; another relay
-                                  needs MOOCHY_INSECURE_DEV=1 and gets its own keystore
-  logout                          Revoke this device at the relay (KEY_REVOKED), wipe its keys
-  up [--foreground]               Start the node (gateway + MCP doors, relay link, worker)
-  down                            Stop the running node
-  status [--json]                 Node state
-  pause | resume                  Local kill switch for the worker role
-  journal [--follow]              Recent tasks (metadata only)
+                                  Add this device to your account. Roles: gateway uses donated
+                                  tokens, worker donates yours. Only the default server unless
+                                  MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
+  logout                          Remove this device: revoke its keys, then delete them here
+  up [--foreground]               Start the Moochy app on this machine
+  down                            Stop it
+  status [--json]                 Connection, slots in use, donations available to your projects
+  pause | resume                  Stop or restart donating from this device (works offline)
+  journal [--follow]              Recent requests (never prompts or outputs)
   env [--repo OWNER/NAME] [--json] [--rotate]
-                                  Base URLs + repo-scoped local token for tools
-  mcp [--repo OWNER/NAME]         stdio MCP server (shim to the running node)
-  keys add <anthropic|openrouter|deepseek|openai> --key-stdin [--base-url URL]
+                                  Base URLs and a project token for your tools
+  mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
+  keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
+                                  Add a provider API key (xai = Grok). It is checked with the
+                                  provider's free models call and never leaves this machine
   keys list | keys remove <provider>
-  config set <device_monthly_cap_uusd|slots_max|gateway_addr|journal_full_text|auto_cache|firewall_level> <VALUE> | config show
+  config set <KEY> <VALUE> | config show
+                                  monthly_limit (dollars, e.g. 20), slots_max (1-64),
+                                  gateway_addr, journal_full_text, auto_cache,
+                                  firewall_level (safety checks: strict or paranoid)
   connect <client> [--repo OWNER/NAME] [--write]
-                                  Print (or merge into the client's config) the MCP / base-URL
-                                  setup for a client (see `connect list`)
-  report <task> [--reason TEXT]   Write a signed evidence bundle for a task's response
-  doctor                          Check keystore, relay link, provider keys and doors
-  update --from-file BINARY       Install a signed release (unsigned candidates are refused)
-  pending                         Requests waiting for your signature (repo owners)
+                                  Show the setup for a coding tool, or merge it into the
+                                  tool's config with --write (`connect list` shows the tools)
+  report <task> [--reason TEXT]   Save signed evidence about a bad response
+  doctor                          Check the keystore, connection, clock, provider keys and socket
+  update --from-file BINARY       Install a signed release (unsigned files are refused)
+  pending                         Requests waiting for your signature (maintainers)
   approve <donor> --repo OWNER/NAME [--revoke] [--yes]
-  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap UUSD] [--yes]
-  claim --repo OWNER/NAME [--yes] Confirm a repo claim with this device's signature
+                                  Accept a donor for your project (--revoke removes them)
+  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N] [--yes]
+                                  Let a person (or a CI device) use your project's donations,
+                                  up to $N a month
+  claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by this device
 
-ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (dev only)
+ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (development only)
 ";
 
 pub fn main() -> ExitCode {
@@ -123,7 +133,7 @@ fn parse() -> Result<Opts> {
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
-            Long("cap") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap must be an integer"))?),
+            Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
@@ -162,9 +172,9 @@ fn run() -> Result<()> {
             if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
                 // A135: a lookalike relay could harvest a login; only for development and tests.
                 if !dev_mode() {
-                    return Err(usage("a non-default relay requires MOOCHY_INSECURE_DEV=1 (development and tests only)"));
+                    return Err(usage("another server than the default needs MOOCHY_INSECURE_DEV=1 (development and tests only)"));
                 }
-                eprintln!("WARNING: logging in to a non-default relay ({}); this device gets a separate keystore for it.", clean(relay));
+                eprintln!("Warning: signing in to a server that is not the default ({}). This device gets a separate keystore for it.", clean(relay));
             }
             let roles: Vec<String> = o.roles.as_deref().unwrap_or("gateway").split(',').map(|r| r.trim().to_owned()).collect();
             let name = o.name.clone().unwrap_or_else(crate::login::default_name);
@@ -175,7 +185,7 @@ fn run() -> Result<()> {
         ["doctor"] => doctor(&home),
         ["update"] => update(&o),
         ["keys", "rotate"] => Err(internal(
-            "key rotation needs relay support for a rotation request signed by the current device (KEY_ADDED with a 24 h grace); not available on this relay yet",
+            "key rotation is not available yet: the server cannot accept a rotation signed by the current device",
         )),
         ["up"] => {
             if o.has("offline") && !dev_mode() {
@@ -270,8 +280,8 @@ fn logout(home: &Home, o: &Opts) -> Result<()> {
     });
     match &told {
         Some(r) if r.revoked => {}
-        Some(r) => eprintln!("warning: the relay did not confirm the revocation ({}); revoke this device on the web too", clean(&r.detail)),
-        None => eprintln!("warning: the node is not running, so the relay was not told; revoke this device on the web too"),
+        Some(r) => eprintln!("Warning: the server did not confirm that this device is revoked ({}). Remove it on the web as well.", clean(&r.detail)),
+        None => eprintln!("Warning: the Moochy app is not running, so the server was not told. Remove this device on the web as well."),
     }
     let mut cfg = home.load()?;
     if let Some(mut sec) = keystore::load(home, &cfg)? {
@@ -349,7 +359,7 @@ fn status(home: &Home, as_json: bool) -> Result<()> {
         emit(&v);
     } else {
         println!(
-            "device   {}\nrelay    {} ({})\ngateway  {}\nmcp      {}\nworker   {} slots busy of {}{}\ntasks    {} in flight",
+            "device      {}\nserver      {} ({})\nlocal API   {}\nMCP         {}\ndonating    {} of {} slots in use{}\nusing       {} requests in progress",
             clean(&r.device_id),
             clean(&r.relay),
             clean(&r.link_state),
@@ -357,11 +367,11 @@ fn status(home: &Home, as_json: bool) -> Result<()> {
             r.mcp_url,
             r.slots_busy,
             r.slots_max,
-            if r.paused { " (paused)" } else { "" },
+            if r.paused { ", paused" } else { "" },
             r.gateway_tasks
         );
         for p in &r.pools {
-            println!("pool     {} {}: {} donors, models {}", clean(&p.slug), clean(&p.repo_id), p.workers, clean(&p.models.join(", ")));
+            println!("project     {}: {} donor device(s), models {}", clean(&p.slug), p.workers, clean(&p.models.join(", ")));
         }
     }
     Ok(())
@@ -411,7 +421,7 @@ fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
         };
         let preview = call(&mut c, true).await?;
         eprintln!(
-            "You are about to sign {} for {} ({}):\n  subject {} ({})\n  signer  {} (this device)\n  issued  {} ms",
+            "You are about to sign {} for {} ({}):\n  for     {} ({})\n  signer  {} (this device)\n  issued  {} ms",
             preview.kind, preview.repo_slug, preview.repo_id, preview.subject, preview.subject_username, preview.signer, preview.issued_at_ms
         );
         if !o.has("yes") {
@@ -461,7 +471,7 @@ fn doctor(home: &Home) -> Result<()> {
         println!("{} {what:<9} {}", if ok { "ok  " } else { "FAIL" }, clean(&detail));
     };
     match keystore::load(home, &cfg) {
-        Ok(Some(s)) => line(true, "keystore", format!("unlocks ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" })),
+        Ok(Some(s)) => line(true, "keystore", format!("opens ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" })),
         Ok(None) => line(false, "keystore", "no keystore: run `moochy login`".into()),
         Err(e) => line(false, "keystore", e.msg),
     }
@@ -475,10 +485,10 @@ fn doctor(home: &Home) -> Result<()> {
         line(skew <= 300_000, "clock", format!("skew vs relay {} ms (limit ±5 min)", s.clock_skew_ms));
         line(true, "providers", format!("{} key(s), {} warm adapter(s), catalog v{}", s.provider_keys, s.warm_adapters, s.catalog_version));
     } else {
-        line(false, "relay", "node not running (start it with `moochy up`)".into());
-        line(false, "clock", "unknown: the node measures skew at connect".into());
+        line(false, "relay", "the Moochy app is not running (start it with `moochy up`)".into());
+        line(false, "clock", "unknown: measured when the app connects".into());
     }
-    line(true, "firewall", format!("level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
+    line(true, "safety", format!("checks level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
     let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
     match std::fs::metadata(home.socket_path()) {
         Ok(m) => line(Some(m.uid()) == me && m.mode() & 0o777 == 0o600, "socket", format!("node.sock uid {} mode {:o}", m.uid(), m.mode() & 0o777)),
@@ -493,7 +503,7 @@ fn doctor(home: &Home) -> Result<()> {
 /// `moochy update --from-file <binary>`: replaces nothing unless the release signature verifies.
 fn update(o: &Opts) -> Result<()> {
     let Some(f) = &o.from_file else {
-        return Err(usage("update --from-file <binary> (a signed release; verify provenance with `gh attestation verify` or `cosign verify-blob`)"));
+        return Err(usage("update --from-file <binary>: a signed release (check where it came from with `gh attestation verify` or `cosign verify-blob`)"));
     };
     // ponytail: no release-signing key is pinned yet, so every candidate is refused (fail closed).
     Err(auth(format!("refusing {}: no valid release signature (unsigned or unknown key)", f.display())))
@@ -582,8 +592,8 @@ fn git_tracked(path: &std::path::Path) -> bool {
 }
 
 fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
-    if !matches!(provider, "anthropic" | "openrouter" | "deepseek" | "openai") {
-        return Err(usage("provider must be anthropic, openrouter, deepseek or openai"));
+    if !crate::keycheck::PROVIDERS.contains(&provider) {
+        return Err(usage(format!("provider must be one of: {}", crate::keycheck::PROVIDERS.join(", "))));
     }
     if !o.has("key-stdin") {
         return Err(usage("pass the key on stdin with --key-stdin (never as an argument)"));
@@ -666,7 +676,10 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
     use moochy_worker::provider::{Adapter, AdapterConfig, Limits};
     let mut adapters = Vec::new();
     for p in &secrets.providers {
-        let Some(provider) = moochy_worker::Provider::parse(&p.provider) else { continue };
+        let Some(provider) = moochy_worker::Provider::parse(&p.provider) else {
+            log("warn", "this version cannot donate with this provider yet; update moochy", &json!({"provider": p.provider}));
+            continue;
+        };
         // `--base-url` replaces the provider origin only; moochy-worker owns the per-dialect paths.
         let base_url = p.base_url.clone();
         let cfg = AdapterConfig {

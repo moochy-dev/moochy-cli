@@ -69,7 +69,7 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
         return Err(net("relay sent a malformed device code"));
     }
     emit(&json!({"event": "device_code", "user_code": r.user_code}));
-    eprintln!("Approve this device in your browser (relay {}): code {}", origin.url(), r.user_code);
+    eprintln!("To add this device, sign in to Moochy in your browser and enter the code {} ({}).", r.user_code, origin.url());
 
     let interval = Duration::from_millis(u64::from(r.poll_interval_ms).clamp(200, 5000));
     let deadline = u64::try_from(r.expires_at_ms).ok().filter(|t| *t > now_ms()).unwrap_or_else(|| now_ms().saturating_add(MAX_WAIT_MS)).min(now_ms().saturating_add(MAX_WAIT_MS));

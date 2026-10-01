@@ -124,7 +124,7 @@ fn attempt_key(task: &str, attempt: u32) -> Vec<u8> {
 /// After Welcome: what we have in flight / in the outbox, outbox replay, then the offer.
 pub fn on_welcome(node: &Arc<Node>) {
     if !can_serve(node) {
-        log("info", "worker role idle (needs provider keys and `moochy config set device_monthly_cap_uusd`)", &json!({}));
+        log("info", "not donating: add a provider key (`moochy keys add`) and a monthly limit (`moochy config set monthly_limit 20`)", &json!({}));
         return;
     }
     let node = node.clone();
@@ -333,22 +333,22 @@ fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<Policy,
         // Older relay without the field: no opt-in flags, effort unbounded by the pledge.
         return Ok(Policy { level, flags: moochy_worker::Flags::NONE, max_effort: Effort::Max });
     }
-    let v = crate::json::parse_object(raw).map_err(|e| format!("pledge policy: {e}"))?;
+    let v = crate::json::parse_object(raw).map_err(|e| format!("donation settings: {e}"))?;
     let strs = |k: &str| -> Vec<&str> { v.get(k).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).collect() };
     let models = strs("models");
     let model_ok = models.is_empty() || models.iter().any(|m| *m == route.model || m.strip_suffix('*').is_some_and(|p| route.model.starts_with(p)));
     if !model_ok {
-        return Err(format!("model `{}` is not in the pledge policy", route.model));
+        return Err(format!("model `{}` is not allowed by this donation", route.model));
     }
     let dialects = strs("dialects");
     if !dialects.is_empty() && !dialects.contains(&route.dialect.as_str()) {
-        return Err("dialect is not in the pledge policy".into());
+        return Err("this API format is not allowed by this donation".into());
     }
     let max_effort = match v.get("max_effort").and_then(serde_json::Value::as_str).filter(|e| !e.is_empty()) {
-        Some(e) => Effort::parse(e).ok_or("unknown max_effort in the pledge policy")?,
+        Some(e) => Effort::parse(e).ok_or("unknown maximum reasoning effort in the donation settings")?,
         None => Effort::Max,
     };
-    let flags = moochy_worker::Flags::parse(strs("flags")).map_err(|e| format!("pledge policy: {e}"))?;
+    let flags = moochy_worker::Flags::parse(strs("flags")).map_err(|e| format!("donation settings: {e}"))?;
     Ok(Policy { level, flags, max_effort })
 }
 
@@ -398,7 +398,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let route = RouteHeader::parse(&assign.route).map_err(|_| with_ck("bad_envelope", false, None))?;
     // 2. Task authenticity (03 §7.2).
     if route.repo_id.text() != assign.repo_id {
-        return Err(with_ck("unauthorized_task", false, Some("route repo differs from the assigned pledge's repo".into())));
+        return Err(with_ck("unauthorized_task", false, Some("the request is for another project than this donation".into())));
     }
     let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
     match gateway_key(node, &inner.gateway_device.text(), &assign.repo_id) {
@@ -422,7 +422,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         Some(Err(StoreError::Stale | StoreError::Replay)) => return Err(with_ck("unauthorized_task", false, Some("task already served".into()))),
         _ => return Err(with_ck("busy", true, None)),
     }
-    let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no pledge".into())))?;
+    let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
     // 3. Adapter + catalog entry, firewall, route/body consistency.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
     let cat = node.catalog();
@@ -474,7 +474,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let positive = |v: i64| u64::try_from(v).ok().filter(|v| *v > 0);
     let task_cap = positive(assign.per_task_cap_uusd).unwrap_or(u64::MAX);
     if positive(assign.pledge_headroom_uusd).is_some_and(|h| amount > h) && assign.pledge_headroom_uusd != 0 {
-        return Err(with_ck("local_cap", true, Some("pledge headroom".into())));
+        return Err(with_ck("local_cap", true, Some("this donation's monthly limit is reached".into())));
     }
     let key = attempt_key(&task.text(), u32::from(attempt));
     let (k2, p2, cap) = (key.clone(), pledge.text(), device_cap(node).unwrap_or(0));

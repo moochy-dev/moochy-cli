@@ -33,7 +33,7 @@ pub fn on_requests(node: &Node, r: ApprovalRequests) {
     let mut reqs = r.requests;
     reqs.retain(|q| kind_num(&q.kind).is_some() && q.body_to_sign.len() <= 1024);
     reqs.truncate(MAX_PENDING);
-    log("info", "approval requests pending (sign with moochy approve / members / claim)", &json!({"count": reqs.len()}));
+    log("info", "requests waiting for your signature (moochy pending)", &json!({"count": reqs.len()}));
     *lock(&node.approvals) = reqs;
 }
 

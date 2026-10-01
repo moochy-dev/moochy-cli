@@ -257,7 +257,7 @@ fn raw_of(v: Option<moochy_worker::json::Val<'_>>) -> &[u8] {
 fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::CatalogEntry, Failure> {
     let cat = node.catalog();
     cat.resolve(model).cloned().ok_or_else(|| {
-        let why = if cat.version == 0 { "moochy: no price catalog from the relay yet".to_owned() } else { format!("moochy: model `{}` is not in the catalog", crate::util::clean(model)) };
+        let why = if cat.version == 0 { "moochy: prices not loaded yet; retry in a moment".to_owned() } else { format!("moochy: model `{}` is not in the catalog", crate::util::clean(model)) };
         Failure::new("model_not_in_pool", false, why)
     })
 }
