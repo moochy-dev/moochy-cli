@@ -1,6 +1,6 @@
 //! `keylog-check`: sync a mirror from a relay's tile endpoints, run the monitor rules,
 //! and compare with the Git anchor. Used by the Go fork test (relay/internal/tlog) and
-//! handy for operators. Prints one JSON line; exit 0 = consistent, 1 = fork, 2 = error.
+//! handy for operators. Prints one JSON line; exit 0 = consistent, 1 = fork or rollback, 2 = error.
 //!
 //! keylog-check --base URL --origin O --vkey VKEY [--anchor FILE] [--state DIR]
 //!              [--me PSEUDONYM --known HEX32[,HEX32…]]
@@ -116,9 +116,10 @@ fn main() -> ExitCode {
     };
     let alerts: Vec<String> = alerts.iter().map(|x| format!("{x:?}")).collect();
     let root: String = cp.root.iter().map(|b| format!("{b:02x}")).collect();
-    let fork = anchor == "fork";
+    // "behind" after a full sync: the relay serves less than it published (rollback).
+    let bad = !matches!(anchor, "consistent" | "none");
     report(
-        &json!({"size": cp.size, "root": root, "alerts": alerts, "anchor": anchor, "fork": fork}),
-        u8::from(fork),
+        &json!({"size": cp.size, "root": root, "alerts": alerts, "anchor": anchor, "fork": anchor == "fork"}),
+        u8::from(bad),
     )
 }
