@@ -78,3 +78,48 @@ pub fn wait_raw(pid: i32) -> io::Result<i32> {
         }
     }
 }
+
+/// The fd the validator child talks on after [`isolate_fds`].
+pub const CHANNEL_FD: i32 = 3;
+
+/// See the Linux twin: keep only `keep` (moved to fd 3), stdio to /dev/null,
+/// close every other inherited fd. macOS has no close_range: close up to the
+/// soft RLIMIT_NOFILE (capped at 65536).
+pub fn isolate_fds(keep: i32) -> io::Result<()> {
+    // SAFETY: plain fd syscalls on integers; single-threaded forked child.
+    unsafe {
+        let parked = libc::fcntl(keep, libc::F_DUPFD_CLOEXEC, 10);
+        if parked < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+        if null < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for std_fd in 0..=2 {
+            if libc::dup2(null, std_fd) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if libc::dup2(parked, CHANNEL_FD) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) == 0 {
+            i32::try_from(lim.rlim_cur.min(65_536)).unwrap_or(65_536)
+        } else {
+            65_536
+        };
+        for fd in (CHANNEL_FD + 1)..max {
+            libc::close(fd);
+        }
+    }
+    Ok(())
+}
+
+/// Take ownership of [`CHANNEL_FD`] as a `UnixStream` in the validator child.
+pub fn channel_stream() -> std::os::unix::net::UnixStream {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: after `isolate_fds`, CHANNEL_FD is open and owned by nobody else.
+    unsafe { std::os::unix::net::UnixStream::from_raw_fd(CHANNEL_FD) }
+}

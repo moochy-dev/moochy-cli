@@ -151,6 +151,33 @@ fn e93_worktree_rw_secrets_and_outside_invisible() {
     assert!(!Path::new(&f.path("outside/new")).exists());
 }
 
+#[test]
+fn e93_symlinked_paths_and_private_tmp() {
+    require_sandbox!();
+    let f = Fixture::new("e93link");
+    std::fs::create_dir_all(f.root.join("real-rw")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("real-rw"), f.root.join("link-rw")).unwrap();
+    // A listed rw path that is a symlink: the real dir is mounted, the link works.
+    let o = sandboxed(&f, &["--rw", &f.path("link-rw")], &["write", &f.path("link-rw/a")]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(std::fs::read(f.root.join("real-rw/a")).unwrap(), b"moochy");
+
+    // /tmp inside is private: the host's /tmp files are invisible and nothing
+    // written there reaches the host.
+    let host_tmp = std::env::temp_dir().join(format!("moochy-hosttmp-{}", std::process::id()));
+    std::fs::write(&host_tmp, b"host").unwrap();
+    let o = sandboxed(&f, &[], &["read", host_tmp.to_str().unwrap()]);
+    assert_ne!(o.code, 0, "host /tmp visible inside: {}", o.stdout);
+    let inner = format!("/tmp/moochy-inner-{}", std::process::id());
+    let o = sandboxed(&f, &[], &["write", &inner]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(!Path::new(&inner).exists(), "write to /tmp inside reached the host");
+    let _ = std::fs::remove_file(&host_tmp);
+    // /dev/shm exists and is writable (private).
+    let o = sandboxed(&f, &[], &["write", "/dev/shm/moochy-probe"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+}
+
 // ───────────────────────────── E94: network ─────────────────────────────
 
 /// Host-side stand-in for the gateway on a Unix socket: replies 200 to anything.
@@ -271,7 +298,7 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     let f = Fixture::new("e96");
     let state = f.root.join("state");
     std::fs::create_dir_all(&state).unwrap();
-    let o = run_bin(&["donor", state.to_str().unwrap(), "8443", &f.path("outside/canary")]);
+    let o = run_bin(&["donor", state.to_str().unwrap(), "8443", &f.path("outside/canary"), "18796"]);
     if has(&o, "lockdown-fail") {
         eprintln!("SKIP pending: {}", o.stdout.trim());
         return;
@@ -286,6 +313,16 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     assert!(has(&o, "canary-read-fail"), "{}", o.stdout);
     assert!(has(&o, "state-write-ok"), "{}", o.stdout);
     assert!(has(&o, "connect9-fail"), "{}", o.stdout);
+    // The loopback gateway port may be bound; any other port may not.
+    assert!(has(&o, "gw-bind-ok"), "{}", o.stdout);
+    assert!(has(&o, "bind-other-fail"), "{}", o.stdout);
+    // After lockdown the donor still resolves provider hosts and reaches :443.
+    use std::net::ToSocketAddrs as _;
+    if ("api.anthropic.com", 443).to_socket_addrs().is_ok() {
+        assert!(has(&o, "dns-ok https-connect-ok"), "{}", o.stdout);
+    } else {
+        eprintln!("SKIP pending: host has no DNS/Internet; DNS-after-lockdown not checked");
+    }
 }
 
 #[test]
@@ -296,6 +333,11 @@ fn e96_validator_parses_but_cannot_open_files_or_sockets() {
         return;
     }
     assert_eq!(o.code, 0, "echo: {}{}", o.stdout, o.stderr);
+    // No parent fd survives into the child; the safe stream API works.
+    for mode in ["fds", "stream"] {
+        let o = run_bin(&["validator", mode]);
+        assert_eq!(o.code, 0, "{mode}: {}{}", o.stdout, o.stderr);
+    }
     for mode in ["open", "socket"] {
         let o = run_bin(&["validator", mode]);
         // Killed by seccomp (SIGSYS = 31 → 159) before writing anything.
@@ -347,11 +389,58 @@ fn e97_git_ignored_masked_and_git_exec_paths_read_only() {
 
     let o = sandboxed(&f, &[], &["read", &f.path("wt/local.json")]);
     assert!(has(&o, "len=0"), "git-ignored file visible: {}", o.stdout);
-    for rel in [".git/hooks/pre-commit", ".git/config"] {
+    // Default: the whole .git is read-only — no hook, no config, and no
+    // `commondir` (which would redirect the host's git to agent-written config).
+    for rel in [".git/hooks/pre-commit", ".git/config", ".git/commondir", ".git/HEAD.new"] {
         let o = sandboxed(&f, &[], &["write", &f.path(&format!("wt/{rel}"))]);
         assert!(has(&o, "write-fail"), "{rel} writable: {}", o.stdout);
     }
     assert!(!wt.join(".git/hooks/pre-commit").exists());
+    assert!(!wt.join(".git/commondir").exists());
+    // Opt-in git_writable: git can write its own files, hooks/config stay read-only.
+    let o = sandboxed(&f, &["--git-writable"], &["write", &f.path("wt/.git/HEAD.new")]);
+    assert!(has(&o, "write-ok"), "{}", o.stdout);
+    for rel in [".git/hooks/pre-commit", ".git/config"] {
+        let o = sandboxed(&f, &["--git-writable"], &["write", &f.path(&format!("wt/{rel}"))]);
+        assert!(has(&o, "write-fail"), "{rel} writable with git_writable: {}", o.stdout);
+    }
+}
+
+#[test]
+fn e97_linked_worktree_read_only_and_isolated() {
+    require_sandbox!();
+    let f = Fixture::new("e97lw");
+    let main = f.root.join("main");
+    let git = |dir: &Path, args: &[&str]| {
+        Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).output().map(|o| o.status.success()).unwrap_or(false)
+    };
+    std::fs::create_dir_all(&main).unwrap();
+    if !git(&main, &["init", "-q"]) {
+        eprintln!("SKIP pending: git not available");
+        return;
+    }
+    std::fs::write(main.join("main-only.txt"), b"main").unwrap();
+    assert!(git(&main, &["add", "."]) && git(&main, &["commit", "-qm", "init"]));
+    // Our worktree is `wt` (the fixture's worktree path), a sibling is `other`.
+    std::fs::remove_dir_all(f.wt()).unwrap();
+    assert!(git(&main, &["worktree", "add", "-q", f.wt().to_str().unwrap(), "-b", "mine"]));
+    assert!(git(&main, &["worktree", "add", "-q", f.root.join("other").to_str().unwrap(), "-b", "theirs"]));
+
+    // git reads work inside.
+    let wt = f.path("wt");
+    let o = sandboxed(&f, &[], &["exec-sh", &format!("cd {wt} && git status --short && git log --oneline >/dev/null && echo GIT-OK")]);
+    assert!(o.stdout.contains("GIT-OK"), "{}{}", o.stdout, o.stderr);
+    // Other worktrees' gitdirs and the main worktree's files are not visible.
+    let common = main.join(".git").canonicalize().unwrap();
+    for p in [common.join("worktrees/other/HEAD"), main.join("main-only.txt"), f.root.join("other/main-only.txt")] {
+        let o = sandboxed(&f, &[], &["read", p.to_str().unwrap()]);
+        assert_ne!(o.code, 0, "visible inside: {}", p.display());
+    }
+    // Read-only: no write to the shared repo, no rewrite of the `.git` file.
+    for p in [common.join("objects/probe"), common.join("worktrees/wt/HEAD"), f.wt().join(".git")] {
+        let o = sandboxed(&f, &[], &["write", p.to_str().unwrap()]);
+        assert!(has(&o, "write-fail"), "writable: {}: {}", p.display(), o.stdout);
+    }
 }
 
 #[test]

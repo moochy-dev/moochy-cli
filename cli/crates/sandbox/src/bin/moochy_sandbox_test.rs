@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         "symlink" => probe_symlink(rest),
         "tiocsti" => probe_tiocsti(),
         "env" => probe_env(rest),
+        "exec-sh" => probe_exec_sh(rest),
         "sleep" => probe_sleep(rest),
         "forkbomb" => probe_forkbomb(),
         "memhog" => probe_memhog(),
@@ -222,11 +223,12 @@ fn donor_selftest(a: &[String]) -> ExitCode {
     let relay_port: u16 = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(8443);
 
     let canary = a.get(2).cloned().unwrap_or_default();
+    let gw_port: Option<u16> = a.get(3).and_then(|s| s.parse().ok());
     // A copied binary inside the (writable) state dir: exec must still fail.
     let copy = format!("{state}/true-copy");
     let _ = std::fs::copy("/bin/true", &copy);
     let mut policy = moochy_sandbox::DonorPolicy::new(PathBuf::from(&state), relay_port);
-    policy.ro_paths = vec![PathBuf::from("/etc/ssl/certs")];
+    policy.gateway_port = gw_port;
     match moochy_sandbox::lockdown_self(&policy) {
         Ok(r) => println!(
             "lockdown-ok nnp={} seccomp={} fs={} net={:?} abi={}",
@@ -258,13 +260,37 @@ fn donor_selftest(a: &[String]) -> ExitCode {
     }
 
     // Connecting to a non-allowed port must fail.
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream, ToSocketAddrs as _};
     use std::time::Duration;
     if let Ok(sa) = "127.0.0.1:9".parse() {
         match TcpStream::connect_timeout(&sa, Duration::from_millis(300)) {
             Ok(_) => println!("connect9-ok (BAD)"),
             Err(e) => println!("connect9-fail {e}"),
         }
+    }
+    // The donor must still resolve provider hosts and reach them on 443.
+    let host = std::env::var("MOOCHY_DNS_PROBE_HOST").unwrap_or_else(|_| "api.anthropic.com".into());
+    match (host.as_str(), 443).to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            let ok443 = addrs.iter().any(|sa| TcpStream::connect_timeout(sa, Duration::from_secs(5)).is_ok());
+            if ok443 {
+                println!("dns-ok https-connect-ok");
+            } else {
+                println!("dns-ok https-connect-fail (BAD) {addrs:?}");
+            }
+        }
+        Err(e) => println!("dns-fail (BAD) {e}"),
+    }
+    if let Some(p) = gw_port {
+        match TcpListener::bind(("127.0.0.1", p)) {
+            Ok(_) => println!("gw-bind-ok"),
+            Err(e) => println!("gw-bind-fail (BAD) {e}"),
+        }
+    }
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(_) => println!("bind-other-ok (BAD)"),
+        Err(e) => println!("bind-other-fail {e}"),
     }
     ok()
 }
@@ -342,6 +368,9 @@ fn exec_via_memfd() -> i32 {
 #[cfg(target_os = "linux")]
 fn validator_selftest(a: &[String]) -> ExitCode {
     let mode = a.first().cloned().unwrap_or_else(|| "echo".into());
+    if mode == "fds" || mode == "stream" {
+        return validator_fds_and_stream(&mode);
+    }
     let m2 = mode.clone();
     let v = moochy_sandbox::spawn_validator(move |fd: RawFd| -> i32 {
         match m2.as_str() {
@@ -436,6 +465,11 @@ fn run_sandbox(a: &[String]) -> ExitCode {
             "--gw" => spec.gateway_socket = Some(PathBuf::from(val)),
             "--gw-port" => spec.gateway_loopback_port = val.parse().ok(),
             "--token" => spec.run_token = Some(val),
+            "--git-writable" => {
+                spec.git_writable = true;
+                i += 1;
+                continue;
+            }
             "--nproc" => spec.limits.processes = val.parse().unwrap_or(64),
             "--mem" => spec.limits.memory_bytes = val.parse().unwrap_or(1 << 30),
             "--wall" => spec.limits.wall_seconds = val.parse().unwrap_or(0),
@@ -681,4 +715,65 @@ fn validator_selftest_macos(a: &[String]) -> ExitCode {
         _ => out.ends_with(b"-DENIED"),
     };
     if good { ok() } else { no() }
+}
+
+/// `validator fds`: the parent holds an open, writable file; the child tries to
+/// write to that fd number (it must have been closed: EBADF) — proves no parent
+/// fd (relay/provider sockets, outbox) survives into the validator.
+/// `validator stream`: the safe `spawn_validator_with` entry point round-trips.
+#[cfg(target_os = "linux")]
+fn validator_fds_and_stream(mode: &str) -> ExitCode {
+    use std::os::fd::AsRawFd as _;
+    let leak_path = std::env::temp_dir().join(format!("moochy-fdleak-{}", std::process::id()));
+    let leak = std::fs::File::create(&leak_path).unwrap_or_else(|_| std::process::exit(2));
+    // Park it on a high fd so it cannot alias the child's channel (fd 3).
+    let leak_fd = unsafe { libc::fcntl(leak.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 50) };
+    let v = if mode == "fds" {
+        moochy_sandbox::spawn_validator_with(move |mut ch| {
+            let r = unsafe { libc::write(leak_fd, b"LEAK".as_ptr().cast(), 4) };
+            let _ = ch.write_all(if r == 4 { b"WROTE" } else { b"EBADF" });
+            0
+        })
+    } else {
+        moochy_sandbox::spawn_validator_with(|mut ch| {
+            let mut b = [0u8; 4];
+            if ch.read_exact(&mut b).is_err() {
+                return 3;
+            }
+            let _ = ch.write_all(&b.map(|x| x.to_ascii_uppercase()));
+            0
+        })
+    };
+    let mut v = match v {
+        Ok(v) => v,
+        Err(e) => {
+            println!("validator-spawn-fail {e}");
+            return ExitCode::from(71);
+        }
+    };
+    if mode == "stream" {
+        let _ = v.sock.write_all(b"ping");
+    }
+    let mut out = Vec::new();
+    let _ = v.sock.read_to_end(&mut out);
+    let code = v.wait().unwrap_or(-1);
+    drop(leak);
+    unsafe { libc::close(leak_fd) };
+    let leaked = std::fs::read(&leak_path).map(|b| !b.is_empty()).unwrap_or(true);
+    let _ = std::fs::remove_file(&leak_path);
+    println!("validator-{mode} exit={code} out={:?} leaked={leaked}", String::from_utf8_lossy(&out));
+    let good = match mode {
+        "fds" => code == 0 && out == b"EBADF" && !leaked,
+        _ => code == 0 && out == b"PING",
+    };
+    if good { ok() } else { no() }
+}
+
+/// `exec-sh <snippet>`: run `/bin/sh -c <snippet>`, forward its exit status.
+fn probe_exec_sh(a: &[String]) -> ExitCode {
+    let Some(snippet) = a.first() else { return ExitCode::from(2) };
+    match std::process::Command::new("/bin/sh").arg("-c").arg(snippet).status() {
+        Ok(s) if s.success() => ok(),
+        _ => no(),
+    }
 }
