@@ -224,6 +224,16 @@ pub struct ReceiptAck {
     pub task: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub attempt: u32,
+    /// Receipt transparency log (spec/KEYLOG.md §8): where the settled receipt was logged, an RFC 9162
+    /// inclusion proof, and the signed receipt-log checkpoint the proof is against. Empty until logged.
+    #[prost(uint64, tag = "3")]
+    pub receipt_log_index: u64,
+    /// 32-byte hashes, leaf to root
+    #[prost(bytes = "bytes", repeated, tag = "4")]
+    pub receipt_log_proof: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    /// signed-note bytes (origin moochy.dev/receipts)
+    #[prost(bytes = "bytes", tag = "5")]
+    pub receipt_log_checkpoint: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogCheckpoint {
@@ -914,7 +924,7 @@ pub mod node_link_client {
             self.inner.unary(req, path, codec).await
         }
         /// Public key-log tiles and checkpoint (C2SP tlog-tiles paths, e.g. "tile/0/000", "checkpoint").
-        /// Unauthenticated, strictly rate-limited per IP, response capped at 64 KiB. Lets Nodes mirror and
+        /// Unauthenticated, strictly rate-limited per IP, response capped at 123,392 bytes (one full data tile, spec/KEYLOG.md). Lets Nodes mirror and
         /// verify the key log over the link they already have.
         pub async fn get_log_tile(
             &mut self,
@@ -1005,7 +1015,7 @@ pub mod node_link_server {
             tonic::Status,
         >;
         /// Public key-log tiles and checkpoint (C2SP tlog-tiles paths, e.g. "tile/0/000", "checkpoint").
-        /// Unauthenticated, strictly rate-limited per IP, response capped at 64 KiB. Lets Nodes mirror and
+        /// Unauthenticated, strictly rate-limited per IP, response capped at 123,392 bytes (one full data tile, spec/KEYLOG.md). Lets Nodes mirror and
         /// verify the key log over the link they already have.
         async fn get_log_tile(
             &self,
