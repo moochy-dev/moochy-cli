@@ -35,7 +35,7 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
-  run [--repo OWNER/NAME] [--unsafe-no-sandbox] -- <command> [args]
+  run [--repo OWNER/NAME] [--worktree DIR] [--unsafe-no-sandbox] -- <command> [args]
                                   Run your coding agent in a sandbox wired to Moochy: it sees only
                                   this repository (secrets hidden) and reaches only Moochy. Tool
                                   calls from donated tokens reach only sandboxed agents
@@ -113,6 +113,7 @@ struct Opts {
     out: Option<PathBuf>,
     reason: Option<String>,
     from_file: Option<PathBuf>,
+    worktree: Option<PathBuf>,
     config: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
@@ -139,6 +140,7 @@ fn parse() -> Result<Opts> {
             Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
@@ -349,7 +351,8 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
         std::process::exit(st.code().unwrap_or(1));
     }
     let gw = crate::run::GatewayInfo { anthropic: r.anthropic_base_url, openai: r.openai_base_url, mcp: r.mcp_url, repo_token: r.token, state_dir: home.state_dir() };
-    let code = crate::run::run_sandboxed(&gw, &cmd)?;
+    let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
+    let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
     std::process::exit(code);
 }
 

@@ -135,12 +135,16 @@ pub struct GatewayInfo {
 /// `moochy-sandbox` with only the gateway reachable, revoke the token when it ends (also when
 /// this process is killed: the minting response closes). Returns the command's exit code.
 /// Fails closed: no sandbox, no run.
-pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String]) -> Result<i32> {
+pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::path::PathBuf>) -> Result<i32> {
     let (prog, args) = cmd.split_first().ok_or_else(|| usage("moochy run -- <command> [args…]"))?;
     let port: u16 = gw.anthropic.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).ok_or_else(|| internal("gateway URL without a port"))?;
     let key = std::fs::read_to_string(gw.state_dir.join(RUN_KEY_FILE)).map_err(|_| internal("no run key: restart the Moochy app (`moochy down`, `moochy up`)"))?;
     let cwd = std::env::current_dir().map_err(|e| internal(format!("cwd: {e}")))?;
-    let worktree = crate::files::git_root(&cwd).unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or(cwd.clone()));
+    // The only read-write project dir: --worktree, else the git top-level of cwd, else cwd.
+    let worktree = worktree.or_else(|| crate::files::git_root(&cwd)).unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or(cwd.clone()));
+    if !worktree.is_dir() {
+        return Err(usage("--worktree must be a directory"));
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     rt.block_on(async {
         // The minting response stays open for the whole run: the token dies with it.
