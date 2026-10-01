@@ -177,6 +177,7 @@ fn internal(e: impl std::fmt::Debug) -> Failure {
     Failure::new("internal", true, format!("moochy: internal error ({e:?})"))
 }
 
+#[allow(clippy::too_many_lines, reason = "one linear submit sequence; splitting it hides the order")]
 async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mpsc::Receiver<TaskEv>, Failure> {
     let keys = node.keys.as_ref().ok_or_else(|| Failure::new("not_logged_in", false, "moochy: run `moochy login` first".to_owned()))?;
     let link = node.link_now(std::time::Duration::from_secs(3)).await.ok_or_else(|| Failure::new("overloaded", true, "moochy: relay link is down".to_owned()))?;
@@ -261,6 +262,9 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         truncated: false,
         checkpoints: Vec::new(),
         receipt: None,
+        entry: req.entry.clone(),
+        est_input: req.facts.est_input_tokens,
+        ttl: req.facts.cache_ttl,
     };
     let (slug, model, t_rx, req_body) = (req.slug, req.entry.model, req.t_client_rx, req.body);
     tokio::spawn(async move {
@@ -317,6 +321,10 @@ struct Driver {
     truncated: bool,
     checkpoints: Vec<pb::Checkpoint>,
     receipt: Option<pb::SignedReceipt>,
+    /// What the receipt's usage and model are checked against (03 §12.2).
+    entry: CatalogEntry,
+    est_input: u64,
+    ttl: moochy_worker::firewall::CacheTtl,
 }
 
 enum Step {
@@ -527,7 +535,9 @@ impl Driver {
     }
 
     /// Verify the receipt against what we sent and received; `Err(code)` = dispute.
-    fn check_receipt(&self, r: &pb::SignedReceipt) -> Result<(u64, String), &'static str> {
+    /// `Ok((cost, model, Some(code)))`: authentic receipt whose usage or model disagrees with the
+    /// request; money still settles but the receipt is disputed.
+    fn check_receipt(&self, r: &pb::SignedReceipt) -> Result<(u64, String, Option<&'static str>), &'static str> {
         let a = self.acc.as_ref().ok_or("no_attempt")?;
         let keys: &Keys = self.node.keys.as_ref().ok_or("no_keys")?;
         let pk = a.worker.sign_pub.ok_or("unknown_worker_key")?;
@@ -556,7 +566,8 @@ impl Driver {
         if p.receipt_sha256.0 != crypto::sha256(&r.receipt) || p.cost_uusd != rc.cost_uusd {
             return Err("projection_mismatch");
         }
-        Ok((u64::try_from(rc.cost_uusd).unwrap_or(0), rc.model_reported))
+        let soft = usage_mismatch(&rc.usage, &rc.model_reported, &self.entry, self.est_input, self.ttl == moochy_worker::firewall::CacheTtl::H1);
+        Ok((u64::try_from(rc.cost_uusd).unwrap_or(0), rc.model_reported, soft))
     }
 
     async fn on_end(&mut self, r: &pb::SignedReceipt) -> Step {
@@ -571,21 +582,23 @@ impl Driver {
             }
         }
         self.receipt = Some(r.clone());
-        match self.check_receipt(r) {
-            Ok((cost, model)) => {
+        let code = match self.check_receipt(r) {
+            Ok((cost, model, soft)) => {
                 self.cost = Some(cost);
                 self.model = Some(model);
+                soft
             }
-            Err(code) => {
-                if let (Some(a), Some(keys)) = (&self.acc, &self.node.keys) {
-                    let gateway_sig = crypto::dispute_msg(&self.task, a.attempt, code).map(|m| Bytes::copy_from_slice(&keys.sign.sign(&m))).unwrap_or_default();
-                    let d = pb::ReceiptDispute { task: self.task_text.clone(), attempt: r.attempt, code: code.into(), gateway_sig };
-                    if let Some(l) = self.node.link() {
-                        let _ = l.up.try_send(pb::NodeMsg { msg: Some(pb::node_msg::Msg::Dispute(d)) });
-                    }
+            Err(code) => Some(code),
+        };
+        if let Some(code) = code {
+            if let (Some(a), Some(keys)) = (&self.acc, &self.node.keys) {
+                let gateway_sig = crypto::dispute_msg(&self.task, a.attempt, code).map(|m| Bytes::copy_from_slice(&keys.sign.sign(&m))).unwrap_or_default();
+                let d = pb::ReceiptDispute { task: self.task_text.clone(), attempt: r.attempt, code: code.into(), gateway_sig };
+                if let Some(l) = self.node.link() {
+                    let _ = l.up.try_send(pb::NodeMsg { msg: Some(pb::node_msg::Msg::Dispute(d)) });
                 }
-                log("warn", "receipt disputed", &json!({"task": self.task_text, "code": code}));
             }
+            log("warn", "receipt disputed", &json!({"task": self.task_text, "code": code}));
         }
         let _ = self.tx.send(TaskEv::End { cost_uusd: self.cost, model: self.model.clone() }).await;
         Step::Done
@@ -602,8 +615,50 @@ impl Driver {
     }
 }
 
+/// Usage and model checks of 03 §12.2 on an authentic receipt. The input band is generous
+/// (2× the pessimistic `ceil(bytes/3)` estimate + 4096 for provider-side tool/system prompts),
+/// so only real inflation is disputed.
+/// ponytail: visible-output ±25% check skipped (needs a tokenizer); add with one.
+fn usage_mismatch(u: &moochy_proto::msg::Usage, model: &str, entry: &CatalogEntry, est_input: u64, ttl_1h: bool) -> Option<&'static str> {
+    let total_in = u.input.saturating_add(u.cache_write_5m).saturating_add(u.cache_write_1h).saturating_add(u.cache_read);
+    if total_in > est_input.saturating_mul(2).saturating_add(4096) {
+        return Some("usage_input_out_of_band");
+    }
+    if u.cache_write_1h > 0 && !ttl_1h {
+        return Some("cache_write_1h_without_1h_ttl");
+    }
+    let m = model;
+    let ids = || std::iter::once(entry.provider_model_id.as_str()).chain(std::iter::once(entry.model.as_str())).chain(entry.aliases.iter().map(String::as_str));
+    // Exact id, or a dated snapshot of it (`claude-sonnet-5-5-20260514`).
+    let dated = |id: &str| m.strip_prefix(id).and_then(|r| r.strip_prefix('-')).is_some_and(|d| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit() || c == b'-'));
+    if !ids().any(|id| m == id || dated(id)) {
+        return Some("model_mismatch");
+    }
+    None
+}
+
 async fn emit(tx: &mpsc::Sender<TaskEv>, ev: TaskEv) -> Step {
     if tx.send(ev).await.is_err() { Step::Gone } else { Step::Continue }
+}
+
+#[cfg(test)]
+mod receipt_checks {
+    use super::*;
+    use moochy_proto::msg::Usage;
+
+    #[test]
+    fn usage_bands_ttl_and_model() {
+        let e = CatalogEntry { model: "anthropic/claude-sonnet-5.5".into(), provider_model_id: "claude-sonnet-5-5".into(), ..engine::Catalog::stub().entries[0].clone() };
+        let u = |input, cw1h| Usage { input, cache_write_1h: cw1h, ..Usage::default() };
+        assert_eq!(usage_mismatch(&u(100, 0), "claude-sonnet-5-5", &e, 50, false), None);
+        assert_eq!(usage_mismatch(&u(100, 0), "claude-sonnet-5-5-20260514", &e, 50, false), None);
+        assert_eq!(usage_mismatch(&u(100, 0), "anthropic/claude-sonnet-5.5", &e, 50, false), None);
+        assert_eq!(usage_mismatch(&u(900_000, 0), "claude-sonnet-5-5", &e, 50, false), Some("usage_input_out_of_band"));
+        assert_eq!(usage_mismatch(&u(10, 500), "claude-sonnet-5-5", &e, 50, false), Some("cache_write_1h_without_1h_ttl"));
+        assert_eq!(usage_mismatch(&u(10, 500), "claude-sonnet-5-5", &e, 50, true), None);
+        assert_eq!(usage_mismatch(&u(10, 0), "claude-opus-9", &e, 50, false), Some("model_mismatch"));
+        assert_eq!(usage_mismatch(&u(10, 0), "claude-sonnet-5-5-evil", &e, 50, false), Some("model_mismatch"));
+    }
 }
 
 #[cfg(test)]
