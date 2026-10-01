@@ -48,6 +48,12 @@ impl Kind {
         })
     }
 
+    /// Parses a kind name as used in `SignedLogEntry.kind` / `ApprovalRequest.kind`.
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        (1..=11).filter_map(Self::from_u32).find(|k| k.name() == s)
+    }
+
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -305,7 +311,9 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
 }
 
 #[allow(clippy::too_many_lines)] // one flat arm per entry kind
-fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
+/// Parses and validates a bare body of `kind` (e.g. `ApprovalRequest.body_to_sign`
+/// before showing it to the owner).
+pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
     let bad = Error::Format(kind.name());
     Ok(match kind {
         Kind::KeyAdded => {
