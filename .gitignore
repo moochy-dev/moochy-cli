@@ -6,3 +6,5 @@
 *.db-shm
 .DS_Store
 .worktrees/
+/.local-build/
+/.local-stack/

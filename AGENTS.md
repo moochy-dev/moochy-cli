@@ -41,7 +41,7 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 ## 6. Web palette (fixed)
 
-White `#FFFFFF`, dark `#0B1220`, light blue `#7DD3FC` (accent), `#0369A1` for small text links on white. Dark theme: bg `#0B1220`, text `#F8FAFC`, accent `#7DD3FC`. No other brand colours. Design ambition is maximal (CONTRACT §9: motion system, scroll-driven storytelling, view transitions, micro-interactions), within the §9 performance and accessibility budgets.
+Strictly monochrome from three base colors — Ink (dark), Paper (white), Sky (light blue) — and named variants derived from them; no gradients, glows, glass, sheen, constellations, cursor effects or scroll-jacking (CONTRACT §9, product owner review 2026-10-01). Calm, editorial, product-grade; a pet mascot as the brand mark; subtle functional motion only.
 
 ## 7. Final report (always, even when blocked)
 
