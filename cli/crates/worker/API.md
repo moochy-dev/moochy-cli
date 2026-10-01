@@ -16,7 +16,7 @@ out. No dependency on `moochy-proto`: the node does sealing, signing and the gRP
 | 9. cancel / link lost | drop the `Response` (h2 `RST_STREAM` / h1 socket closed: the provider stops at once), then `finish()` → `usage.estimated` if final usage never came |
 | NACK before the provider call | `Store::release(key)` |
 | `receipt.ack` | `Store::ack(key, now)`; replay with `unacked()`, `since(ms)` (`receipt.replay_since`) |
-| offer | `Store::device_left(cap, now)` → `local_cap_left`; `Response::requests_remaining` → `rl_headroom` |
+| offer | `Store::device_left(cap, now)` → `local_cap_left`; `Response::rate_limit.headroom_pct()` → `rl_headroom` (per model; `Failure::rate_limit` on a 429) |
 
 All `Store` methods do blocking file I/O: own the `Store` in one thread (or `spawn_blocking`).
 Call `Store::compact(now)` daily (also done on `open`). Call `Adapter::warm()` at startup, on
@@ -55,6 +55,7 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 - Transport: one warm HTTP/2 connection per adapter (multiplexed, re-dialed when closed), ALPN `h2` required, rustls/ring, Mozilla roots, `TCP_NODELAY`, stream window 2 MiB, connection window 8 MiB, keep-alive PING 20 s.
 - **Loopback dev targets behave the same way** (so E77 measures production behaviour): `http://` overrides use an HTTP/1.1 keep-alive pool (up to 16 idle connections, `TCP_NODELAY`). `warm()` opens one connection ahead of time; a connection returns to the pool only after its response body was read to the end; a dropped (cancelled) response closes its connection, so the provider sees the abort and the connection is never reused. A request is retried on a fresh connection only when hyper proves it was never sent (a pooled connection the server closed in between), so a provider call is never executed twice. Verified against the real Go fakes: one TCP connection per fake for warm-up + all requests.
 - `Limits` (defaults): connect 5 s, headers 30 s, idle between chunks 120 s, total 1 h, response 128 MiB, error body 64 KiB.
+- **Rate limits** (`provider::RateLimit`, on `Response::rate_limit` and `Failure::rate_limit` for HTTP errors): `requests_limit`, `requests_remaining`, `tokens_limit`, `tokens_remaining` from `anthropic-ratelimit-{requests,tokens}-{limit,remaining}` or `x-ratelimit-{limit,remaining}-{requests,tokens}`; absent or unparsable headers stay `None`. `headroom_pct()` = the tighter of `remaining/limit` for requests and tokens, 0–100 (clamped; limit 0 → 0), `None` when no complete pair was sent (the node then keeps its default). Verified against the Go fakes' `SetHeadroom` (25/40/60/80 % read back exactly, both dialects).
 - `Failure.nack()`: 429 → `rate_limited` (+`retry_after_ms`), 503/529 → `overloaded`, 5xx/network/timeout/401/403 → `provider_error` (retryable), 404 → `model_unavailable`, other 4xx and oversize → `provider_error` **non-retryable**.
 
 ### `stream`
