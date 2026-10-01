@@ -1,6 +1,6 @@
 # Rules for every agent working on Moochy
 
-Moochy is **100% open source (Apache-2.0 OR MIT) and 100% free**. Read `spec/CONTRACT.md` first (normative), then the plan docs it points to in `docs/plan/`.
+Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vectors`, `docs/guides`) and a closed-source core (relay + web + e2e + internal docs)**, and is **100% free**. Respect the boundary in CONTRACT §0a: open code never depends on closed code; public wording is "Open-source client (Apache-2.0) · 100% free". Read `spec/CONTRACT.md` first (normative), then the plan docs it points to in `docs/plan/`.
 
 ## 1. Scope and git discipline
 
