@@ -206,6 +206,9 @@ impl AdapterDef {
             Provider::DeepSeek => {
                 Self { host: "api.deepseek.com", messages: Some("/anthropic/v1/messages"), chat: Some("/chat/completions") }
             }
+            // OpenAI-compatible root `https://api.x.ai/v1` (global endpoint; the US regional
+            // host costs +10% and is not allowlisted). No Anthropic-compatible endpoint.
+            Provider::XAi => Self { host: "api.x.ai", messages: None, chat: Some("/v1/chat/completions") },
         }
     }
 
@@ -752,6 +755,8 @@ mod tests {
             (Provider::OpenRouter, o, Some("https://openrouter.ai/api/v1/chat/completions")),
             (Provider::DeepSeek, a, Some("https://api.deepseek.com/anthropic/v1/messages")),
             (Provider::DeepSeek, o, Some("https://api.deepseek.com/chat/completions")),
+            (Provider::XAi, a, None),
+            (Provider::XAi, o, Some("https://api.x.ai/v1/chat/completions")),
         ];
         for (p, d, url) in want {
             assert_eq!(full(p, d).as_deref(), url, "{p:?} {d:?}");

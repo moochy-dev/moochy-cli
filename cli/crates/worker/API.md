@@ -48,6 +48,7 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 | openai | `https://api.openai.com` | — | `/v1/chat/completions` |
 | openrouter | `https://openrouter.ai` | `/api/v1/messages` (Anthropic-compatible root `/api`) | `/api/v1/chat/completions` (OpenAI-compatible root `/api/v1`) |
 | deepseek | `https://api.deepseek.com` | `/anthropic/v1/messages` (Anthropic-compatible root `/anthropic`) | `/chat/completions` |
+| xai | `https://api.x.ai` | — (no Anthropic-compatible endpoint documented) | `/v1/chat/completions` (OpenAI-compatible root `/v1`) |
 
 - **Base URL = origin, never a root.** The `base_url` override (CONTRACT §6) replaces only `scheme://host:port`; the path always comes from the table above, so the e2e fakes (`e2e/fake`) serve exactly the real paths. Accepted only with `insecure_dev` **and** a loopback **IP literal** (`localhost` refused: name resolution is attackable). A trailing `/` is fine; **any path is refused** (`http://127.0.0.1:P/api` → error "base URL must be an origin"), so nobody has to guess whether a prefix is an origin or an API root. `http://` → HTTP/1.1 (e2e fakes), `https://` → HTTP/2 (+ `dev_root` trust anchor, tests only).
 - Verified against the real Go fakes for all six provider × dialect pairs (`tests/provider.rs::against_e2e_fakes`, opt-in via `MOOCHY_E2E_FAKES`).
@@ -62,7 +63,7 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 - `StreamParser::new(dialect, stream)`, `feed(&chunk, &mut sink) -> Result<Chunk{tool_ends, events}, StreamError>`, `finish() -> Outcome`.
 - `sink(Span{start,end}, Event)`: spans are contiguous byte ranges of whole SSE events (comments included), so the Gateway can forward byte-identical output and hold exactly the tool-call events. Events: `Other`, `ToolStart{index,id,name}`, `ToolArgs{index,json}` (a `json::Val` string, decode with `as_str`), `ToolEnd{index}`, `Forbidden{block_type}`, `Error`, `Stop`, `Invalid`. One event may yield several items with the same span.
 - **Fail closed (Gateway):** on `Invalid` (unparsable/duplicate-key JSON, a stray `\r` or BOM, tool input in `content_block_start` or `message_start`, a delta for a closed/unknown tool block, a re-started index, an OpenAI choice ≠ 0, an unindexed/reopened tool call, a second name fragment, legacy `function_call`) do not forward the event and fail the task; `Outcome.malformed` is set and usage becomes estimated. Real provider streams never trigger it (fixtures, CRLF variants tested).
-- Usage mapping (05 §3): Anthropic `message_start` + cumulative `message_delta`, `cache_creation` TTL split (else all 5m), `usage.iterations` summed when present; OpenAI `prompt − cached − cache_write`, DeepSeek `prompt_cache_miss/hit_tokens`, OpenRouter `usage.cost` → µ$ by exact decimal ceil (`decimal_to_uusd_ceil`). Any unparsable/duplicate-key event ⇒ `estimated`.
+- Usage mapping (05 §3): Anthropic `message_start` + cumulative `message_delta`, `cache_creation` TTL split (else all 5m), `usage.iterations` summed when present; OpenAI `prompt − cached − cache_write`, DeepSeek `prompt_cache_miss/hit_tokens`, OpenRouter `usage.cost` → µ$ by exact decimal ceil (`decimal_to_uusd_ceil`), xAI `usage.cost_in_usd_ticks` (10¹⁰ ticks per $) → `ceil(ticks / 10⁴)` µ$. `output = max(completion_tokens, total_tokens − prompt_tokens)`: exact for OpenAI-style (reasoning inside `completion_tokens`) and xAI (reasoning *outside* it), never undercounting. OpenAI-shape usage is final only once the stream ended (`[DONE]` or a whole JSON body): xAI repeats cumulative usage on every chunk, so a cut stream is `estimated`. Any unparsable/duplicate-key event ⇒ `estimated`.
 - Non-streamed responses: `stream = false`, feed the body, `finish()`. Tool calls of a non-streamed body: `inspect::response_tool_calls`.
 
 ### `inspect` (Gateway side, 06 §8)
@@ -109,3 +110,13 @@ Reusable by the node for every security/money JSON parse (route header, receipts
 | `prepare()` on a 101 KB agent body | 303 µs |
 
 Per-chunk path: no allocation after warm-up (line/data/tape buffers reused; model/id copied once), no lock, no fsync.
+
+## xAI (Grok) adapter
+
+Facts relied on (docs.x.ai, fetched 2026-10-01; sources in the agent report):
+
+- Global host `https://api.x.ai`, OpenAI-compatible `POST /v1/chat/completions`, `Authorization: Bearer <key>`. Chat Completions is labelled *legacy* (Responses API is primary) but supported. `https://us.api.x.ai` (US-only processing, +10% price) is not allowlisted. No Anthropic-compatible endpoint is documented, so xAI serves `openai.chat` only.
+- Firewall: the OpenAI table, plus refused for every provider `search_parameters` (live search, billed per source) and `deferred` (stored, fetched later); `web_search_options`, `service_tier` (`priority`/`fast` = 2× price), `n > 1`, non-function tools (`web_search`, `x_search`, `code_execution`, `mcp`, collections), URL images, `input_file`/file-id parts already refused. xAI-only: `store`, `modalities`, `verbosity`, `logit_bias` (not in xAI's API). Mutations: model id, `stream_options.include_usage`, `safety_identifier` = pseudonym.
+- Usage: `prompt_tokens` includes `prompt_tokens_details.cached_tokens`; `completion_tokens` is visible output only and `completion_tokens_details.reasoning_tokens` is extra (`total_tokens = prompt + completion + reasoning`); `cost_in_usd_ticks` is the authoritative charge (`provider_cost_uusd`). Every stream chunk carries cumulative `usage`.
+- Rate limits: per model RPS/TPM; no rate-limit response headers are documented. `x-ratelimit-*` headers are parsed if present; otherwise `headroom_pct()` is `None`.
+- **Cost-bound caveat (for the catalog/reservation):** xAI's `max_completion_tokens` bounds *visible* output only; reasoning tokens (on by default, effort `high`, cannot be disabled on grok-4.5+) are not bounded by it. See the agent report for the reservation recommendation.
