@@ -24,7 +24,7 @@ COMMANDS:
   login [--relay URL] [--ca-file PEM] [--roles gateway,worker] [--name NAME] [--headless]
                                   Default relay https://relay.moochy.dev:8443; another relay
                                   needs MOOCHY_INSECURE_DEV=1 and gets its own keystore
-  logout                          Wipe this device's keys locally
+  logout                          Revoke this device at the relay (KEY_REVOKED), wipe its keys
   up [--foreground]               Start the node (gateway + MCP doors, relay link, worker)
   down                            Stop the running node
   status [--json]                 Node state
