@@ -13,7 +13,7 @@ publish = false
 # Zero-copy request/response buffers handed to the node.
 bytes = { version = "1", default-features = false, features = ["std"] }
 # Async runtime pieces: TCP, timers, the h2 connection mutex.
-tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "sync"] }
+tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "sync", "process", "io-util"] }
 # HTTP/2 (providers) and HTTP/1.1 (loopback dev fakes) client connections.
 hyper = { version = "1.7", default-features = false, features = ["client", "http1", "http2"] }
 # TokioIo + TokioExecutor adapters for hyper (same version as moochy node).
@@ -25,12 +25,18 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 webpki-roots = { version = "1", default-features = false }
 # Wipe the provider API key copy we own.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# Pure-Rust zstd decoder for hostile request payloads (CONTRACT §15.2: no C on hostile input).
+ruzstd = { version = "0.9.0", default-features = false, features = ["std"] }
+# Strict canonical base64url (already in the tree via moochy-proto/node, same version).
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
 # Test-only: an HTTP/2 + TLS fake provider to exercise the production h2 path.
 hyper = { version = "1.7", default-features = false, features = ["server", "http1", "http2"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# Test-only: interop with the C encoder the gateway (moochy-proto) compresses with.
+zstd = { version = "0.14", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
