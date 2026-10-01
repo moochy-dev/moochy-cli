@@ -1,0 +1,51 @@
+[package]
+name = "moochy-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Moochy wire protocol: encodings, frames, messages, envelopes, signatures, money math"
+
+# Versions are chosen so hpke, ed25519-zebra and our own code share ONE
+# curve25519-dalek (4.x), ONE sha2 (0.10) and ONE chacha20poly1305 (0.10).
+[dependencies]
+# Typed wire structs + JSON (serde_json is only fed bytes that passed json::check).
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# base64url-no-pad (strict, canonical) for every byte field in JSON.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+# Zero-copy frame buffers crossing into the data plane.
+bytes = { version = "1", default-features = false, features = ["std"] }
+# SHA-256 / HKDF-SHA256 (CONTRACT §1).
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+hkdf = { version = "0.12", default-features = false }
+# ChaCha20-Poly1305 chunk AEAD (CONTRACT §1).
+chacha20poly1305 = { version = "0.10", default-features = false }
+# HPKE RFC 9180 base mode, X25519/HKDF-SHA256/ChaCha20Poly1305 only.
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+# Ed25519 with ZIP-215 verification (CONTRACT §1).
+ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
+# OS randomness (rand_core 0.9 is what hpke 0.13 takes).
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+# zstd body compression; default features off = no legacy formats, no dict builder.
+zstd = { version = "0.14", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["std", "zeroize_derive"] }
+subtle = { version = "2", default-features = false, features = ["std"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+module_name_repetitions = "allow"
+# Doc/naming-only pedantic lints: every fallible fn returns the one coarse `Error` documented at
+# its definition; byte-destructuring patterns use short names on purpose.
+missing_errors_doc = "allow"
+many_single_char_names = "allow"
+similar_names = "allow"
+doc_markdown = "allow"
