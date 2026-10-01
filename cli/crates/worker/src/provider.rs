@@ -101,11 +101,50 @@ pub enum FailKind {
     Unsupported,
 }
 
+/// Provider rate-limit headers, for `worker.offer.models[].rl_headroom` (Anthropic
+/// `anthropic-ratelimit-{requests,tokens}-{limit,remaining}`, OpenAI-style
+/// `x-ratelimit-{limit,remaining}-{requests,tokens}`). Absent headers stay `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateLimit {
+    pub requests_limit: Option<u64>,
+    pub requests_remaining: Option<u64>,
+    pub tokens_limit: Option<u64>,
+    pub tokens_remaining: Option<u64>,
+}
+
+impl RateLimit {
+    pub fn from_headers(h: &HeaderMap) -> Self {
+        Self {
+            requests_limit: header_u64(h, &["anthropic-ratelimit-requests-limit", "x-ratelimit-limit-requests"]),
+            requests_remaining: header_u64(h, &["anthropic-ratelimit-requests-remaining", "x-ratelimit-remaining-requests"]),
+            tokens_limit: header_u64(h, &["anthropic-ratelimit-tokens-limit", "x-ratelimit-limit-tokens"]),
+            tokens_remaining: header_u64(h, &["anthropic-ratelimit-tokens-remaining", "x-ratelimit-remaining-tokens"]),
+        }
+    }
+
+    /// Headroom in percent (0–100): the tighter of the request and token budgets, `None`
+    /// when the provider sent no complete limit/remaining pair.
+    pub fn headroom_pct(&self) -> Option<u8> {
+        let pct = |rem: Option<u64>, lim: Option<u64>| {
+            let (rem, lim) = (rem?, lim?);
+            let p = rem.min(lim).saturating_mul(100).checked_div(lim).unwrap_or(0);
+            u8::try_from(p).ok()
+        };
+        match (pct(self.requests_remaining, self.requests_limit), pct(self.tokens_remaining, self.tokens_limit)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Failure {
     pub kind: FailKind,
     pub status: Option<u16>,
     pub retry_after_ms: Option<u64>,
+    /// Rate-limit headers of an HTTP error response (a 429 usually reports zero headroom);
+    /// `None` for failures without a response. Boxed: keeps `Result<_, Failure>` small.
+    pub rate_limit: Option<Box<RateLimit>>,
     /// The provider's error body (bounded), to seal to the Gateway as the native error.
     pub body: Bytes,
     pub detail: &'static str,
@@ -113,7 +152,7 @@ pub struct Failure {
 
 impl Failure {
     fn new(kind: FailKind, detail: &'static str) -> Self {
-        Self { kind, status: None, retry_after_ms: None, body: Bytes::new(), detail }
+        Self { kind, status: None, retry_after_ms: None, rate_limit: None, body: Bytes::new(), detail }
     }
 
     /// NACK code (03 §10.2) and whether another worker may retry.
@@ -465,7 +504,7 @@ impl Adapter {
         Ok(Response {
             status,
             request_id: header_str(&parts.headers, &["request-id", "x-request-id"]),
-            requests_remaining: header_u64(&parts.headers, &["anthropic-ratelimit-requests-remaining", "x-ratelimit-remaining-requests"]),
+            rate_limit: RateLimit::from_headers(&parts.headers),
             body,
             idle: Box::pin(tokio::time::sleep(self.limits.idle)),
             deadline: now.checked_add(self.limits.total).unwrap_or(now),
@@ -500,7 +539,14 @@ impl Adapter {
         let _ = tokio::time::timeout(Duration::from_secs(5), read).await;
         let retry_after_ms = header_u64(headers, &["retry-after-ms"])
             .or_else(|| header_u64(headers, &["retry-after"]).filter(|s| *s <= 86_400).and_then(|s| s.checked_mul(1000)));
-        Failure { kind, status: Some(status), retry_after_ms, body: Bytes::from(buf), detail: "provider returned an error status" }
+        Failure {
+            kind,
+            status: Some(status),
+            retry_after_ms,
+            rate_limit: Some(Box::new(RateLimit::from_headers(headers))),
+            body: Bytes::from(buf),
+            detail: "provider returned an error status",
+        }
     }
 }
 
@@ -563,8 +609,8 @@ pub struct Response {
     pub status: u16,
     /// Provider request id header, if any (else use [`crate::stream::Outcome::id`]).
     pub request_id: Option<String>,
-    /// Rate-limit headroom (requests remaining), for `worker.offer`.
-    pub requests_remaining: Option<u64>,
+    /// Rate-limit headers of this response (`rate_limit.headroom_pct()` → `rl_headroom`).
+    pub rate_limit: RateLimit,
     body: Incoming,
     idle: Pin<Box<Sleep>>,
     deadline: Instant,
@@ -668,6 +714,28 @@ mod tests {
         assert!(Adapter::new(&cfg(Some("http://127.0.0.1:1"), true)).is_ok());
         assert!(Adapter::new(&cfg(Some("http://192.168.1.1:1"), true)).is_err());
         assert!(Adapter::new(&cfg(None, false)).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_headers() {
+        let mut h = HeaderMap::new();
+        assert_eq!(RateLimit::from_headers(&h).headroom_pct(), None);
+        h.insert("anthropic-ratelimit-requests-limit", HeaderValue::from_static("4000"));
+        h.insert("anthropic-ratelimit-requests-remaining", HeaderValue::from_static("1000"));
+        let r = RateLimit::from_headers(&h);
+        assert_eq!((r.requests_limit, r.requests_remaining, r.headroom_pct()), (Some(4000), Some(1000), Some(25)));
+        h.insert("anthropic-ratelimit-tokens-limit", HeaderValue::from_static("2000000"));
+        h.insert("anthropic-ratelimit-tokens-remaining", HeaderValue::from_static("200000"));
+        assert_eq!(RateLimit::from_headers(&h).headroom_pct(), Some(10), "tighter budget wins");
+        let mut o = HeaderMap::new();
+        o.insert("x-ratelimit-limit-requests", HeaderValue::from_static("0"));
+        o.insert("x-ratelimit-remaining-requests", HeaderValue::from_static("5"));
+        assert_eq!(RateLimit::from_headers(&o).headroom_pct(), Some(0), "zero limit = no headroom");
+        o.insert("x-ratelimit-limit-requests", HeaderValue::from_static("10"));
+        o.insert("x-ratelimit-remaining-requests", HeaderValue::from_static("99"));
+        assert_eq!(RateLimit::from_headers(&o).headroom_pct(), Some(100), "clamped");
+        o.insert("x-ratelimit-remaining-requests", HeaderValue::from_static("lots"));
+        assert_eq!(RateLimit::from_headers(&o).headroom_pct(), None, "unparsable = unknown");
     }
 
     #[test]

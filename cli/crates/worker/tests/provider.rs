@@ -230,7 +230,7 @@ async fn provider_paths_and_auth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn error_statuses_map_to_nacks() {
     for (mode, kind, nack, retry) in [
-        (Mode::Status(429, "retry-after: 3\r\n", r#"{"type":"error","error":{"type":"rate_limit_error"}}"#), FailKind::RateLimited, ("rate_limited", true), Some(3000)),
+        (Mode::Status(429, "retry-after: 3\r\nanthropic-ratelimit-requests-limit: 50\r\nanthropic-ratelimit-requests-remaining: 0\r\n", r#"{"type":"error","error":{"type":"rate_limit_error"}}"#), FailKind::RateLimited, ("rate_limited", true), Some(3000)),
         (Mode::Status(429, "retry-after-ms: 250\r\n", "{}"), FailKind::RateLimited, ("rate_limited", true), Some(250)),
         (Mode::Status(529, "", r#"{"type":"error","error":{"type":"overloaded_error"}}"#), FailKind::Overloaded, ("overloaded", true), None),
         (Mode::Status(500, "", "{}"), FailKind::ProviderError, ("provider_error", true), None),
@@ -244,6 +244,9 @@ async fn error_statuses_map_to_nacks() {
         let prep = prepare(Provider::Anthropic, Dialect::AnthropicMessages, ABODY);
         let e = a.send(Dialect::AnthropicMessages, prep.body, &prep.headers).await.unwrap_err();
         assert_eq!((e.kind, e.nack(), e.retry_after_ms), (kind, nack, retry));
+        if retry == Some(3000) {
+            assert_eq!(e.rate_limit.as_ref().and_then(|r| r.headroom_pct()), Some(0), "429 reports its rate-limit headers");
+        }
         assert_eq!(&e.body[..], body.as_bytes(), "native error body kept for the Gateway");
     }
     // Nothing listening: network failure before start, retryable.
@@ -537,6 +540,15 @@ async fn against_e2e_fakes() {
             }
             let o = parser.finish();
             assert!(o.complete && !o.malformed && !o.usage.estimated, "{kind} {d:?}: {o:?}");
+            // The harness sets a distinct rate-limit headroom per fake (fake.SetHeadroom).
+            let want = std::env::var("MOOCHY_E2E_HEADROOM").ok().and_then(|h| {
+                h.split(';').find_map(|kv| kv.strip_prefix(kind).and_then(|v| v.strip_prefix('=')).and_then(|v| v.parse::<u8>().ok()))
+            });
+            if let Some(want) = want {
+                let rl = r.rate_limit;
+                assert!(rl.requests_limit.is_some() && rl.tokens_limit.is_some(), "{kind} {d:?}: {rl:?}");
+                assert_eq!(rl.headroom_pct(), Some(want), "{kind} {d:?}: {rl:?}");
+            }
             println!("{kind} {d:?}: ok, usage {:?}", o.usage);
             checked += 1;
         }
