@@ -54,6 +54,8 @@ pub struct RepoPool {
     pub repo_id: String,
     pub slug: Option<String>,
     pub workers: Vec<PoolWorker>,
+    /// Repo setting `PoolSync.auto_cache` (07 §4.2).
+    pub auto_cache: bool,
 }
 
 impl RepoPool {
@@ -251,10 +253,15 @@ impl Node {
             };
             w.dialects = vec!["anthropic.messages".into(), "openai.chat".into()];
             w.models = vec![STUB_MODEL.into()];
-            return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w] });
+            return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true });
         }
         let pools = lock(&self.pools);
         pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()
+    }
+
+    /// Whether the repo behind `slug` allows auto-caching (no clone of the pool).
+    pub fn repo_auto_cache(&self, slug: &str) -> bool {
+        self.offline || lock(&self.pools).values().any(|p| p.auto_cache && p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug)))
     }
 
     /// Key-log hook (06 §10): a Gateway seals only to worker keys that are logged, unrevoked, and
@@ -277,6 +284,7 @@ impl Node {
             if crate::config::valid_slug(&v.repo_slug) {
                 p.slug = Some(v.repo_slug.to_ascii_lowercase());
             }
+            p.auto_cache = v.auto_cache;
             let before = p.models();
             if v.full {
                 p.workers.clear();

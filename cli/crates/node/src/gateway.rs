@@ -217,7 +217,8 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         // 07 §4.2 step 4: multi-turn Anthropic conversation with no cache_control anywhere →
         // top-level automatic caching (5 m): cache reads cost donors a fraction of input.
         let turns = root.get("messages").map_or(0, |m| m.items().count());
-        let cache = dialect == Dialect::Anthropic && node.cfg.auto_cache() && turns >= 2 && !body.windows(15).any(|w| w == b"\"cache_control\"");
+        // Both the repo setting and the local config must allow it.
+        let cache = dialect == Dialect::Anthropic && turns >= 2 && node.cfg.auto_cache() && !body.windows(15).any(|w| w == b"\"cache_control\"") && node.repo_auto_cache(&slug);
         (missing.then(|| u64::from(max_out).min(DEFAULT_MAX_TOKENS)), cache)
     };
     if inject_max.is_some() || auto_cache {
