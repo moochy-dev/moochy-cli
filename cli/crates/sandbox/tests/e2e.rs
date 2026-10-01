@@ -454,3 +454,156 @@ fn e97_run_token_only_inside_and_gone_after_run() {
     assert!(std::env::var_os("MOOCHY_RUN_TOKEN").is_none());
     assert_eq!(live_with("tok-e97"), 0);
 }
+
+#[test]
+fn e97_every_git_read_only_placeholder_and_change_notice() {
+    require_sandbox!();
+    // No .git at all: `git init` inside must not plant a repo for the host's git.
+    let f = Fixture::new("e97ph");
+    let o = sandboxed(&f, &[], &["exec-sh", &format!("cd {} && git init -q . ; mkdir .git/hooks", f.path("wt"))]);
+    assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    let o = sandboxed(&f, &[], &["write", &f.path("wt/.git/config")]);
+    assert!(has(&o, "write-fail"), "{}", o.stdout);
+    assert!(!f.wt().join(".git").exists(), "placeholder left behind");
+    assert!(!o.stderr.contains("moochy: notice"), "spurious notice: {}", o.stderr);
+
+    // A nested repo (submodule / vendored): read-only too.
+    let sub = f.wt().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    if !Command::new("git").arg("-C").arg(&sub).args(["init", "-q"]).status().is_ok_and(|s| s.success()) {
+        eprintln!("SKIP pending: git not available");
+        return;
+    }
+    for rel in ["wt/sub/.git/config", "wt/sub/.git/hooks/pre-commit", "wt/sub/.git/commondir"] {
+        let o = sandboxed(&f, &[], &["write", &f.path(rel)]);
+        assert!(has(&o, "write-fail"), "{rel} writable: {}", o.stdout);
+    }
+    // A new .git planted in a subdirectory can't be blocked by mounts: the run
+    // says so on its way out.
+    let o = sandboxed(&f, &[], &["exec-sh", &format!("mkdir -p {}/deep/.git && echo planted", f.path("wt"))]);
+    assert!(has(&o, "planted"), "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("moochy: notice: git metadata changed") && o.stderr.contains("deep/.git"), "{}", o.stderr);
+}
+
+#[test]
+fn e93_refuses_to_expose_root_or_home() {
+    require_sandbox!();
+    let f = Fixture::new("e93home");
+    let home = std::env::var("HOME").unwrap();
+    for wt in ["/", home.as_str()] {
+        let o = run_bin(&["run", wt, "--ro", bin_dir().to_str().unwrap(), "--", BIN, "stat", "/"]);
+        assert_eq!(o.code, 125, "{wt}: {}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains("would expose"), "{}", o.stderr);
+    }
+    let parent = Path::new(&home).parent().unwrap().to_str().unwrap().to_string();
+    let o = sandboxed(&f, &["--ro", &parent], &["stat", "/"]);
+    assert_eq!(o.code, 125, "{}{}", o.stdout, o.stderr);
+}
+
+// ───────────────────────────── E94: --allow-host ─────────────────────────────
+
+#[test]
+fn e94_allow_host_proxy_exact_hosts_only() {
+    require_sandbox!();
+    let f = Fixture::new("e94proxy");
+    // Off by default: nothing listens on the proxy port.
+    let o = sandboxed(&f, &[], &["connect", "127.0.0.1:3128"]);
+    assert!(has(&o, "connect-fail"), "{}", o.stdout);
+    // Only exact names are accepted.
+    let o = sandboxed(&f, &["--allow-host", "*.example.com"], &["stat", "/"]);
+    assert_eq!(o.code, 125, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("not an exact DNS host name"), "{}", o.stderr);
+
+    let allow = ["--allow-host", "example.com", "--allow-host", "127.0.0.1.nip.io"];
+    let o = sandboxed(&f, &allow, &["env", "HTTPS_PROXY"]);
+    assert!(has(&o, "env-present HTTPS_PROXY"), "{}", o.stdout);
+    for target in ["evil.example.org:443", "example.com:22", "127.0.0.1:443"] {
+        let o = sandboxed(&f, &allow, &["proxy", "127.0.0.1:3128", target]);
+        assert!(has(&o, "403"), "{target}: {}{}", o.stdout, o.stderr);
+    }
+    let o = sandboxed(&f, &allow, &["proxy", "127.0.0.1:3128", "evil.example.org:443"]);
+    assert!(o.stderr.contains("refused evil.example.org:443"), "{}", o.stderr);
+    // The proxy is the only new route: direct connections still fail.
+    let o = sandboxed(&f, &allow, &["connect", "1.1.1.1:443"]);
+    assert!(has(&o, "connect-fail"), "{}", o.stdout);
+    if ("example.com", 443).to_socket_addrs().is_err() {
+        eprintln!("SKIP pending: host has no DNS/Internet; allowed tunnel not checked");
+        return;
+    }
+    let o = sandboxed(&f, &allow, &["proxy", "127.0.0.1:3128", "example.com:443"]);
+    assert!(has(&o, "200"), "{}{}", o.stdout, o.stderr);
+    // An allowlisted name that resolves to loopback (DNS rebinding) is refused.
+    if ("127.0.0.1.nip.io", 443).to_socket_addrs().is_ok_and(|mut a| a.all(|a| a.ip().is_loopback())) {
+        let o = sandboxed(&f, &allow, &["proxy", "127.0.0.1:3128", "127.0.0.1.nip.io:443"]);
+        assert!(has(&o, "403"), "{}{}", o.stdout, o.stderr);
+    }
+}
+
+// ───────────────────────────── E95: cgroup v2 ─────────────────────────────
+
+/// Pids whose argv is exactly `BIN sleep <secs>`.
+fn sleepers(secs: &str) -> Vec<u32> {
+    let want = format!("{BIN}\0sleep\0{secs}\0");
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| std::fs::read(format!("/proc/{pid}/cgroup")).is_ok())
+        .filter(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == want.as_bytes()))
+        .collect()
+}
+
+#[test]
+fn e95_cgroup_limits_when_delegated() {
+    require_sandbox!();
+    let scope = |args: &[&str]| {
+        Command::new("systemd-run").args(["--user", "--scope", "-q", "--"]).args(args).output()
+    };
+    if !scope(&["true"]).is_ok_and(|o| o.status.success()) {
+        eprintln!("SKIP pending: no systemd user manager (delegated cgroup) on this host");
+        return;
+    }
+    let f = Fixture::new("e95cg");
+    let secs = format!("6{}", std::process::id() % 1000);
+    let wt = f.wt();
+    let bd = bin_dir();
+    let mut launcher = Command::new("systemd-run")
+        .args(["--user", "--scope", "-q", "--", BIN, "run", wt.to_str().unwrap(), "--ro", bd.to_str().unwrap()])
+        .args(["--nproc", "77", "--mem-total", "268435456", "--cpu-percent", "150", "--", BIN, "sleep", &secs])
+        .spawn()
+        .unwrap();
+    let t = Instant::now();
+    let mut agent = Vec::new();
+    while agent.is_empty() && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+        agent = sleepers(&secs);
+    }
+    let pid = *agent.first().expect("agent never started");
+    let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let rel = cg.lines().find_map(|l| l.strip_prefix("0::")).unwrap().trim().to_string();
+    let dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    assert!(dir.file_name().unwrap().to_string_lossy().starts_with("moochy-run-"), "not in a run cgroup: {rel}");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).map(|s| s.trim().to_string()).unwrap_or_default();
+    assert_eq!(read("pids.max"), "77");
+    assert_eq!(read("memory.max"), "268435456");
+    if dir.join("cpu.max").exists() {
+        assert_eq!(read("cpu.max"), "150000 100000");
+    }
+    launcher.kill().unwrap();
+    let _ = launcher.wait();
+    // Launcher SIGKILLed: the sandbox dies (PDEATHSIG) and the next run sweeps
+    // the empty cgroup; a normal run removes its own.
+    let o = Command::new("systemd-run")
+        .args(["--user", "--scope", "-q", "--", BIN, "run", wt.to_str().unwrap(), "--ro", bd.to_str().unwrap()])
+        .args(["--mem", "0", "--mem-total", "268435456", "--", BIN, "memhog"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    // memory.max (swap 0) stops the hog: OOM-killed (137) or refused.
+    assert!(o.status.code() == Some(137) || out.contains("memhog refused"), "{:?} {out}", o.status);
+    let t = Instant::now();
+    while dir.exists() && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!dir.exists(), "stale run cgroup not swept: {}", dir.display());
+}

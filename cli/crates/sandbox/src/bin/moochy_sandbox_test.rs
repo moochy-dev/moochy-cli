@@ -35,6 +35,7 @@ fn main() -> ExitCode {
         "stat" => probe_stat(rest),
         "connect" => probe_connect(rest),
         "http" => probe_http(rest),
+        "proxy" => probe_proxy(rest),
         "exec" => probe_exec(rest),
         "hardlink" => probe_hardlink(rest),
         "symlink" => probe_symlink(rest),
@@ -472,6 +473,9 @@ fn run_sandbox(a: &[String]) -> ExitCode {
             }
             "--nproc" => spec.limits.processes = val.parse().unwrap_or(64),
             "--mem" => spec.limits.memory_bytes = val.parse().unwrap_or(1 << 30),
+            "--mem-total" => spec.limits.memory_total_bytes = val.parse().unwrap_or(0),
+            "--cpu-percent" => spec.limits.cpu_percent = val.parse().unwrap_or(0),
+            "--allow-host" => spec.allow_hosts.push(val),
             "--wall" => spec.limits.wall_seconds = val.parse().unwrap_or(0),
             "--env" => {
                 if let Some((k, v)) = val.split_once('=') {
@@ -576,6 +580,31 @@ fn probe_http(a: &[String]) -> ExitCode {
         }
         Err(e) => {
             println!("http-fail {addr} {e}");
+            no()
+        }
+    }
+}
+
+/// `proxy <addr> <host:port>`: send a CONNECT through the proxy at `addr` and
+/// print its status line.
+fn probe_proxy(a: &[String]) -> ExitCode {
+    let (Some(addr), Some(target)) = (a.first(), a.get(1)) else { return ExitCode::from(2) };
+    let res = (|| -> std::io::Result<String> {
+        let sa = addr.parse().map_err(|_| std::io::Error::other("bad addr"))?;
+        let mut s = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2))?;
+        s.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+        write!(s, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n")?;
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string())
+    })();
+    match res {
+        Ok(line) => {
+            println!("proxy-status {target} {line}");
+            ok()
+        }
+        Err(e) => {
+            println!("proxy-fail {target} {e}");
             no()
         }
     }

@@ -159,12 +159,9 @@ pub fn judge(head: &[u8], allow: &Allowlist) -> Verdict {
     }
 }
 
-/// The proxy of one run: bound before the sandbox is spawned (the socket must
-/// exist to be bind-mounted), served on a thread started after the spawn (no
-/// extra thread exists across the fork), stopped when dropped.
+/// The proxy of one run: bound and served on its own thread before the sandbox
+/// is spawned (the socket must exist to be bind-mounted), stopped when dropped.
 pub(crate) struct Proxy {
-    listener: Option<UnixListener>,
-    allow: Allowlist,
     sock: PathBuf,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -172,19 +169,15 @@ pub(crate) struct Proxy {
 
 impl Proxy {
     pub(crate) fn bind(sock: PathBuf, allow: Allowlist) -> Result<Self, crate::Error> {
-        let listener = UnixListener::bind(&sock).map_err(|err| crate::Error::Setup { what: "bind --allow-host proxy", err })?;
-        Ok(Self { listener: Some(listener), allow, sock, stop: Arc::new(AtomicBool::new(false)), thread: None })
+        let l = UnixListener::bind(&sock).map_err(|err| crate::Error::Setup { what: "bind --allow-host proxy", err })?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || serve(&l, &allow, &s2));
+        Ok(Self { sock, stop, thread: Some(thread) })
     }
 
     pub(crate) fn sock(&self) -> &std::path::Path {
         &self.sock
-    }
-
-    pub(crate) fn start(&mut self) {
-        if let Some(l) = self.listener.take() {
-            let (allow, stop) = (self.allow.clone(), Arc::clone(&self.stop));
-            self.thread = Some(std::thread::spawn(move || serve(&l, &allow, &stop)));
-        }
     }
 }
 

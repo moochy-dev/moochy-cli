@@ -50,12 +50,15 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let scan = mask::scan(&worktree)?;
-    let git_before = crate::git::snapshot(&scan.dotgits);
     let git = crate::git::view(&worktree, spec.git_writable, &scan.dotgits)?;
     let _placeholder = git.placeholder.clone().map(RmdirOnDrop);
+    let git_before = crate::git::snapshot(&scan.dotgits.iter().chain(&git.placeholder).cloned().collect::<Vec<_>>());
     let masks = scan.masks;
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
-    let mut proxy = if spec.allow_hosts.is_empty() {
+    // Served from before the spawn: `spawn` returns only when the reaper exits
+    // (it never execs). The thread is parked in accept(), holding no lock, at
+    // the fork.
+    let proxy = if spec.allow_hosts.is_empty() {
         None
     } else {
         let allow = crate::proxy::Allowlist::new(&spec.allow_hosts)?;
@@ -104,12 +107,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     // `_exit`s without returning. See module + sys.rs docs.
     sys::set_pre_exec(&mut cmd, move || child_main(&plan, &agent_filter));
 
-    let status = cmd.spawn().and_then(|mut child| {
-        if let Some(p) = proxy.as_mut() {
-            p.start();
-        }
-        child.wait()
-    });
+    let status = cmd.spawn().and_then(|mut child| child.wait());
     drop(proxy);
     drop(cgroup);
     drop(base);
