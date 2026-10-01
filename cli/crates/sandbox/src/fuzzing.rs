@@ -200,7 +200,7 @@ mod bpf {
         };
         assert_eq!(at(59), RET_ALLOW);
         assert_eq!(at(0x3FFF_FFFF), RET_ALLOW);
-        assert_eq!(at(0x4000_0000 | 520), errno(libc::EPERM)); // x32 execve
+        assert_eq!(at(0x4000_0000 | 0x208), errno(libc::EPERM)); // x32 execve (520)
         assert_eq!(at(u32::MAX), errno(libc::EPERM));
     }
 
