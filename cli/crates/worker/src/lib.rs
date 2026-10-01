@@ -73,13 +73,9 @@ impl Provider {
         }
     }
 
-    /// Whether this adapter serves `dialect` (07 §6.2).
+    /// Whether this adapter serves `dialect` (07 §6.2), from [`provider::AdapterDef`].
     pub fn serves(self, dialect: Dialect) -> bool {
-        match self {
-            Self::Anthropic => dialect == Dialect::AnthropicMessages,
-            Self::OpenAi => dialect == Dialect::OpenAiChat,
-            Self::OpenRouter | Self::DeepSeek => true,
-        }
+        provider::AdapterDef::of(self).path(dialect).is_some()
     }
 }
 

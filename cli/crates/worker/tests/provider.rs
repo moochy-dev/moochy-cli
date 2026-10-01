@@ -201,15 +201,18 @@ async fn anthropic_stream_end_to_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_paths_and_auth() {
-    for (p, d, base_path, want, body, sse) in [
-        (Provider::DeepSeek, Dialect::AnthropicMessages, "", "POST /anthropic/v1/messages ", ABODY, ANTH),
-        (Provider::DeepSeek, Dialect::OpenAiChat, "", "POST /v1/chat/completions ", OBODY, OAI),
-        (Provider::OpenRouter, Dialect::OpenAiChat, "/api", "POST /api/v1/chat/completions ", OBODY, OAI),
-        (Provider::OpenRouter, Dialect::AnthropicMessages, "", "POST /v1/messages ", ABODY, ANTH),
-        (Provider::OpenAi, Dialect::OpenAiChat, "", "POST /v1/chat/completions ", OBODY, OAI),
+    // The base URL is an origin; every adapter sends its own full path (the e2e fakes and
+    // the real providers serve the same paths).
+    for (p, d, want, body, sse) in [
+        (Provider::DeepSeek, Dialect::AnthropicMessages, "POST /anthropic/v1/messages ", ABODY, ANTH),
+        (Provider::DeepSeek, Dialect::OpenAiChat, "POST /chat/completions ", OBODY, OAI),
+        (Provider::OpenRouter, Dialect::OpenAiChat, "POST /api/v1/chat/completions ", OBODY, OAI),
+        (Provider::OpenRouter, Dialect::AnthropicMessages, "POST /api/v1/messages ", ABODY, ANTH),
+        (Provider::OpenAi, Dialect::OpenAiChat, "POST /v1/chat/completions ", OBODY, OAI),
     ] {
         let mut f = fake(Mode::Sse(sse)).await;
-        let a = adapter(p, format!("http://{}{base_path}", f.addr), Limits::default());
+        let base = if p == Provider::OpenAi { format!("http://{}/", f.addr) } else { format!("http://{}", f.addr) };
+        let a = adapter(p, base, Limits::default());
         let prep = prepare(p, d, body);
         let mut resp = a.send(d, prep.body, &prep.headers).await.unwrap();
         let mut parser = StreamParser::new(d, true);
@@ -490,4 +493,49 @@ fn real_hosts_refuse_overrides() {
     assert!(Adapter::new(&cfg("https://evil.example", true)).is_err());
     assert!(Adapter::new(&cfg("http://127.0.0.1:9", false)).is_err());
     assert!(Adapter::new(&cfg("http://169.254.169.254", true)).is_err());
+    // A path is never interpreted (no origin-vs-root guessing): refused with a clear error.
+    for base in ["http://127.0.0.1:9/api", "http://127.0.0.1:9/api/v1", "http://127.0.0.1:9/anthropic"] {
+        let e = Adapter::new(&cfg(base, true)).unwrap_err();
+        assert!(e.0.contains("origin"), "{base}: {e}");
+    }
+    assert!(Adapter::new(&cfg("http://127.0.0.1:9/", true)).is_ok());
+}
+
+/// Cross-check against the real Go e2e fakes (`e2e/fake`), which mirror the providers'
+/// paths. Opt-in: `MOOCHY_E2E_FAKES="anthropic=URL=KEY;openai=URL=KEY;…" cargo test -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MOOCHY_E2E_FAKES from the Go fake servers"]
+async fn against_e2e_fakes() {
+    let spec = std::env::var("MOOCHY_E2E_FAKES").unwrap();
+    let mut checked = 0;
+    for entry in spec.split(';').filter(|e| !e.is_empty()) {
+        let mut it = entry.splitn(3, '=');
+        let (kind, url, key) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        let p = Provider::parse(kind).unwrap();
+        let a = Adapter::new(&AdapterConfig {
+            provider: p,
+            api_key: Zeroizing::new(key.into()),
+            base_url: Some(url.into()),
+            insecure_dev: true,
+            dev_root: None,
+            limits: Limits::default(),
+        })
+        .unwrap();
+        for (d, body) in [(Dialect::AnthropicMessages, ABODY), (Dialect::OpenAiChat, OBODY)] {
+            if !p.serves(d) {
+                continue;
+            }
+            let prep = prepare(p, d, body);
+            let mut r = a.send(d, prep.body, &prep.headers).await.unwrap_or_else(|e| panic!("{kind} {d:?}: {e}"));
+            let mut parser = StreamParser::new(d, true);
+            while let Some(c) = r.next().await.unwrap() {
+                parser.feed(&c, &mut |_, _| {}).unwrap();
+            }
+            let o = parser.finish();
+            assert!(o.complete && !o.malformed && !o.usage.estimated, "{kind} {d:?}: {o:?}");
+            println!("{kind} {d:?}: ok, usage {:?}", o.usage);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6);
 }
