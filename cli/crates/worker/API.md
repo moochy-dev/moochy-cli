@@ -53,6 +53,7 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 - Verified against the real Go fakes for all six provider × dialect pairs (`tests/provider.rs::against_e2e_fakes`, opt-in via `MOOCHY_E2E_FAKES`).
 - Auth: Anthropic `x-api-key`; others `Authorization: Bearer`.
 - Transport: one warm HTTP/2 connection per adapter (multiplexed, re-dialed when closed), ALPN `h2` required, rustls/ring, Mozilla roots, `TCP_NODELAY`, stream window 2 MiB, connection window 8 MiB, keep-alive PING 20 s.
+- **Loopback dev targets behave the same way** (so E77 measures production behaviour): `http://` overrides use an HTTP/1.1 keep-alive pool (up to 16 idle connections, `TCP_NODELAY`). `warm()` opens one connection ahead of time; a connection returns to the pool only after its response body was read to the end; a dropped (cancelled) response closes its connection, so the provider sees the abort and the connection is never reused. A request is retried on a fresh connection only when hyper proves it was never sent (a pooled connection the server closed in between), so a provider call is never executed twice. Verified against the real Go fakes: one TCP connection per fake for warm-up + all requests.
 - `Limits` (defaults): connect 5 s, headers 30 s, idle between chunks 120 s, total 1 h, response 128 MiB, error body 64 KiB.
 - `Failure.nack()`: 429 → `rate_limited` (+`retry_after_ms`), 503/529 → `overloaded`, 5xx/network/timeout/401/403 → `provider_error` (retryable), 404 → `model_unavailable`, other 4xx and oversize → `provider_error` **non-retryable**.
 
