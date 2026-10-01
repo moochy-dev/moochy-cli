@@ -405,16 +405,26 @@ impl Driver {
         let current = self.acc.as_ref().map(|a| u32::from(a.attempt));
         match m {
             submit_down::Msg::NeedWraps(n) => {
+                // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool
+                // (still approval-filtered), not the snapshot taken at submit (E27).
+                if let Some(p) = crate::node::lock(&self.node.pools).get(&self.repo_id) {
+                    self.pool = p.clone();
+                }
                 let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
                 let w = wraps(&ws, &self.task, &self.route, &self.ck);
                 let _ = self.up.send(up(submit_up::Msg::Wraps(pb::Wraps { wraps: w }))).await;
                 Step::Continue
             }
             submit_down::Msg::Accepted(a) => self.on_accepted(&a),
-            submit_down::Msg::Started(s) if Some(s.attempt) == current => {
+            submit_down::Msg::Started(s) if Some(s.attempt) == current && !self.started => {
                 self.started = true;
                 let donor = self.acc.as_ref().map(|a| a.worker.donor.clone()).unwrap_or_default();
                 emit(&self.tx, TaskEv::Started { task_id: self.task_text.clone(), donor }).await
+            }
+            // A second Started, or one for an attempt that is not the accepted one (E49).
+            submit_down::Msg::Started(s) => {
+                log("warn", "stream_integrity", &json!({"task": self.task_text, "why": "unexpected Started", "attempt": s.attempt}));
+                retry_fail("stream_integrity", "the relay sent an unexpected stream start; retry")
             }
             submit_down::Msg::Chunk(c) => self.on_chunk(c).await,
             submit_down::Msg::Checkpoint(c) if Some(c.attempt) == current => self.on_checkpoint(&c).await,
@@ -540,9 +550,9 @@ impl Driver {
     }
 
     /// Verify the receipt against what we sent and received; `Err(code)` = dispute.
-    /// `Ok((cost, model, Some(code)))`: authentic receipt whose usage or model disagrees with the
-    /// request; money still settles but the receipt is disputed.
-    fn check_receipt(&self, r: &pb::SignedReceipt) -> Result<(u64, String, Option<&'static str>), &'static str> {
+    /// `Ok((cost, model, Some(code), status_ok))`: `Some(code)` = authentic receipt whose usage or
+    /// model disagrees with the request; money still settles but the receipt is disputed.
+    fn check_receipt(&self, r: &pb::SignedReceipt) -> Result<(u64, String, Option<&'static str>, bool), &'static str> {
         let a = self.acc.as_ref().ok_or("no_attempt")?;
         let keys: &Keys = self.node.keys.as_ref().ok_or("no_keys")?;
         let pk = a.worker.sign_pub.ok_or("unknown_worker_key")?;
@@ -572,11 +582,27 @@ impl Driver {
             return Err("projection_mismatch");
         }
         let soft = usage_mismatch(&rc.usage, &rc.model_reported, &self.entry, self.est_input, self.ttl == moochy_worker::firewall::CacheTtl::H1);
-        Ok((u64::try_from(rc.cost_uusd).unwrap_or(0), rc.model_reported, soft))
+        Ok((u64::try_from(rc.cost_uusd).unwrap_or(0), rc.model_reported, soft, rc.status == ReceiptStatus::Ok))
     }
 
     async fn on_end(&mut self, r: &pb::SignedReceipt) -> Step {
+        self.receipt = Some(r.clone());
+        let checked = self.check_receipt(r);
         if !self.closed {
+            // Integrity before the client sees the end (E49): an authentic receipt that matches
+            // what we received, and the whole stream.
+            if let Err(code) = checked {
+                self.dispute(r.attempt, code);
+                log("warn", "stream_integrity", &json!({"task": self.task_text, "why": code}));
+                return retry_fail("stream_integrity", "the donor's receipt does not match the response; retry");
+            }
+            if !self.acc.as_ref().is_some_and(|a| a.opener.is_complete()) {
+                if matches!(checked, Ok((_, _, _, true))) {
+                    log("warn", "stream_integrity", &json!({"task": self.task_text, "why": "stream ended before its last chunk"}));
+                    return retry_fail("stream_integrity", "the response ended before its last chunk; retry");
+                }
+                return retry_fail("provider_error", "the donor's provider stopped mid-response");
+            }
             let all = self.last_seq.is_some() && self.verified >= self.last_seq;
             if let Err(why) = self.gate.finish(all) {
                 return retry_fail("provider_error", why);
@@ -586,9 +612,8 @@ impl Driver {
                 return flushed;
             }
         }
-        self.receipt = Some(r.clone());
-        let code = match self.check_receipt(r) {
-            Ok((cost, model, soft)) => {
+        let code = match checked {
+            Ok((cost, model, soft, _)) => {
                 self.cost = Some(cost);
                 self.model = Some(model);
                 soft
@@ -596,17 +621,22 @@ impl Driver {
             Err(code) => Some(code),
         };
         if let Some(code) = code {
-            if let (Some(a), Some(keys)) = (&self.acc, &self.node.keys) {
-                let gateway_sig = crypto::dispute_msg(&self.task, a.attempt, code).map(|m| Bytes::copy_from_slice(&keys.sign.sign(&m))).unwrap_or_default();
-                let d = pb::ReceiptDispute { task: self.task_text.clone(), attempt: r.attempt, code: code.into(), gateway_sig };
-                if let Some(l) = self.node.link() {
-                    let _ = l.up.try_send(pb::NodeMsg { msg: Some(pb::node_msg::Msg::Dispute(d)) });
-                }
-            }
-            log("warn", "receipt disputed", &json!({"task": self.task_text, "code": code}));
+            self.dispute(r.attempt, code);
         }
         let _ = self.tx.send(TaskEv::End { cost_uusd: self.cost, model: self.model.clone() }).await;
         Step::Done
+    }
+
+    /// Signed `ReceiptDispute` (03 §12.2); money still settles.
+    fn dispute(&self, attempt: u32, code: &str) {
+        if let (Some(a), Some(keys)) = (&self.acc, &self.node.keys) {
+            let gateway_sig = crypto::dispute_msg(&self.task, a.attempt, code).map(|m| Bytes::copy_from_slice(&keys.sign.sign(&m))).unwrap_or_default();
+            let d = pb::ReceiptDispute { task: self.task_text.clone(), attempt, code: code.into(), gateway_sig };
+            if let Some(l) = self.node.link() {
+                let _ = l.up.try_send(pb::NodeMsg { msg: Some(pb::node_msg::Msg::Dispute(d)) });
+            }
+        }
+        log("warn", "receipt disputed", &json!({"task": self.task_text, "code": code}));
     }
 
     async fn flush(&mut self, finale: bool) -> Step {

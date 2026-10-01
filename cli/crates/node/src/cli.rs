@@ -55,9 +55,10 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys and socket
   update --from-file BINARY       Install a signed release (unsigned files are refused)
   pending                         Requests waiting for your signature (maintainers)
-  approve <donor> --repo OWNER/NAME [--revoke] [--yes]
-                                  Accept a donor for your project (--revoke removes them)
-  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N] [--yes]
+  accept <donor> --repo OWNER/NAME [--revoke] [--yes]
+                                  Accept a donor for your project (--revoke removes them);
+                                  `approve` is the same command
+  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
   claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by this device
@@ -138,6 +139,7 @@ fn parse() -> Result<Opts> {
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
@@ -230,6 +232,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        // VOICE.md: "accept a donor".
+        ["accept", donor] => owner_ops(&home, &o, &["approve", donor]),
         ["pending"] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             let r = c.pending(crate::pb::local::PendingRequest {}).await.map_err(|s| internal(clean(s.message()).into_owned()))?.into_inner();
