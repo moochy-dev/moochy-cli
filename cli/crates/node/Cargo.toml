@@ -54,6 +54,9 @@ hmac = { version = "0.12", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
 subtle = { version = "2", default-features = false }
+# MCP `files` (A171/A172): openat with O_NOFOLLOW per component + fstat of the opened fd, without
+# unsafe code. Already in the tree (moochy-sandbox); only the `fs` feature.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [lints.rust]

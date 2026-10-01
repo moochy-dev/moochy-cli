@@ -175,6 +175,10 @@ fn run() -> Result<()> {
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     match w.as_slice() {
         ["login"] => {
+            // A175: a pinned CA replaces the public roots: development and tests only.
+            if o.ca_file.is_some() && !dev_mode() {
+                return Err(usage("--ca-file is only accepted with MOOCHY_INSECURE_DEV=1 (development and tests)"));
+            }
             let relay = o.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
             if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
                 // A135: a lookalike relay could harvest a login; only for development and tests.
@@ -317,7 +321,7 @@ fn slug_or_detect(o: &Opts) -> Result<String> {
 
 /// `owner/name` from the `origin` remote of the current git repository.
 fn detect_repo() -> Option<String> {
-    let out = std::process::Command::new("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
+    let out = crate::util::command("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
     let url = String::from_utf8(out.stdout).ok()?;
     let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let path = url.rsplit_once(':').map_or(url, |(_, p)| p);
@@ -610,7 +614,7 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
 /// Is `path` tracked by git (in whatever repository contains it)?
 fn git_tracked(path: &std::path::Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
-    std::process::Command::new("git")
+    crate::util::command("git")
         .arg("-C")
         .arg(dir)
         .args(["ls-files", "--error-unmatch", "--"])

@@ -1053,6 +1053,7 @@ dependencies = [
  "moochy-proto",
  "moochy-worker",
  "prost",
+ "rustix",
  "rustls",
  "scrypt",
  "serde",

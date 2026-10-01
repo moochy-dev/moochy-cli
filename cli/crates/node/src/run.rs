@@ -132,7 +132,7 @@ pub fn run_unsandboxed(env: &[(&'static str, String)], cmd: &[String]) -> Result
         "WARNING: --unsafe-no-sandbox: `{}` runs WITHOUT a sandbox, with full access to your files, keys and network.\nTool calls from donated tokens stay withheld in this mode; only text is returned.",
         crate::util::clean(prog)
     );
-    let mut c = std::process::Command::new(prog);
+    let mut c = crate::util::command(prog);
     c.args(args);
     for (k, v) in env {
         c.env(k, v);

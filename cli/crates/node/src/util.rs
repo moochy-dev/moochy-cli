@@ -121,6 +121,19 @@ pub fn fmt_dollars(uusd: u64) -> String {
     format!("${}.{frac:0<2}", uusd / 1_000_000)
 }
 
+/// Environment variables that carry secrets: never inherited by a child we spawn (A190), except
+/// our own `moochy up`, which needs the passphrase to open the keystore.
+pub const SECRET_ENV: &[&str] = &["MOOCHY_PASSPHRASE", "MOOCHY_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+/// `std::process::Command` without [`SECRET_ENV`].
+pub fn command(prog: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut c = std::process::Command::new(prog);
+    for k in SECRET_ENV {
+        c.env_remove(k);
+    }
+    c
+}
+
 /// Dev/test clock offset (`MOOCHY_DEV_CLOCK_SKEW_MS`, honoured only with `MOOCHY_INSECURE_DEV=1`).
 static SKEW_MS: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
     if std::env::var("MOOCHY_INSECURE_DEV").as_deref() != Ok("1") {

@@ -267,9 +267,12 @@ impl Gate {
                 self.buf.clear();
                 let seq = self.last_seq;
                 self.out.push_back(Out::Tool { seq, bytes: Bytes::new(), calls, block: Some("incomplete tool call".into()) });
+            } else if self.buf.iter().any(|b| !matches!(b, b'\n' | b' ' | b'\t')) {
+                // A173: bytes the parser never split into complete events (e.g. a lone-CR tail
+                // hiding a tool_use) are never forwarded: the attempt fails.
+                return Err("unterminated trailing event in the donor stream");
             } else {
-                let end = self.base.saturating_add(self.buf.len() as u64);
-                self.emit_until(end);
+                self.buf.clear();
             }
             return Ok(());
         }
@@ -437,6 +440,21 @@ mod tests {
         assert!(o.contains("[moochy] tool call `get_weather`") && o.contains("not sandboxed"), "{o}");
         let ok = run_with("get_weather", r#"{"city":"Oslo"}"#, Some(99), true);
         assert!(ok.contains(r#""type":"tool_use""#), "released to a sandboxed session: {ok}");
+    }
+
+    #[test]
+    fn unterminated_tail_is_refused() {
+        let mut g = Gate::new(Dialect::Anthropic, true, REQ, true);
+        let evs = stream("get_weather", r#"{"city":"Oslo"}"#);
+        g.push(0, evs[0].as_bytes()).unwrap();
+        let tail = "event: content_block_start\rdata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"rm\",\"input\":{}}}\r";
+        let _ = g.push(1, tail.as_bytes());
+        assert!(g.finish(true).is_err(), "an unparsed tail must fail the attempt");
+        let mut out = Vec::new();
+        while let Some(b) = g.pop(Some(9), true) {
+            out.extend_from_slice(&b);
+        }
+        assert!(!String::from_utf8_lossy(&out).contains("tool_use"), "tail never forwarded");
     }
 
     #[test]

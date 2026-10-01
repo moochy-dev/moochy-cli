@@ -11,7 +11,6 @@
 //! git-ignored files refused, UTF-8 text only, total ≤ 2 MiB, secret scrubber applied.
 
 use std::io::Read as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_TOTAL: u64 = 2 << 20;
@@ -105,7 +104,7 @@ pub fn inline(items: &[serde_json::Value]) -> Result<Vec<FileText>, String> {
 
 /// Git top-level of `dir` (canonical), if `dir` is inside a work tree.
 pub fn git_root(dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = crate::util::command("git")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
@@ -123,7 +122,7 @@ pub fn git_root(dir: &Path) -> Option<PathBuf> {
 /// Relative paths (to `root`) that git ignores.
 fn git_ignored(root: &Path, rels: &[String]) -> Result<Vec<String>, String> {
     use std::io::Write as _;
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::util::command("git")
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "-z", "--stdin"])
@@ -181,6 +180,33 @@ fn check(scope_root: &Path, client_roots: Option<&[PathBuf]>, p: &str) -> Result
     Ok((real.clone(), rel.to_str().ok_or("non-UTF-8 path")?.to_owned()))
 }
 
+/// Open `rel` (plain components, already checked) beneath `root`: every component with
+/// `O_NOFOLLOW` relative to the previous directory fd, the last one `O_NONBLOCK`; the opened fd
+/// must be a regular file.
+fn open_beneath(root: &Path, rel: &str) -> Result<std::fs::File, String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = open(root, dir_flags, Mode::empty()).map_err(|_| "cannot open the workspace root".to_owned())?;
+    let mut parts = rel.split('/').peekable();
+    while let Some(name) = parts.next() {
+        if matches!(name, "" | "." | "..") {
+            return Err("invalid path".into());
+        }
+        if parts.peek().is_some() {
+            dir = openat(&dir, name, dir_flags, Mode::empty()).map_err(|_| "a path component changed or is a symlink".to_owned())?;
+            continue;
+        }
+        let fd = openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|_| "cannot open (symlink or changed)".to_owned())?;
+        let st = fstat(&fd).map_err(|_| "cannot stat".to_owned())?;
+        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+            return Err("not a regular file".into());
+        }
+        return Ok(std::fs::File::from(fd));
+    }
+    Err("invalid path".into())
+}
+
 /// Read all requested files or refuse the whole call with the first reason (fail closed).
 pub fn read(scope: &Scope, paths: &[String]) -> Result<Vec<FileText>, String> {
     if paths.is_empty() {
@@ -200,14 +226,11 @@ pub fn read(scope: &Scope, paths: &[String]) -> Result<Vec<FileText>, String> {
     }
     let mut total: u64 = 0;
     let mut out = Vec::with_capacity(checked.len());
-    for (real, rel) in checked {
-        let f = std::fs::File::open(&real).map_err(|_| format!("{rel}: cannot open"))?;
-        let md = f.metadata().map_err(|_| format!("{rel}: cannot stat"))?;
-        let lmd = std::fs::symlink_metadata(&real).map_err(|_| format!("{rel}: cannot stat"))?;
-        // The opened file must be the regular file we checked (no swap in between).
-        if !md.is_file() || md.ino() != lmd.ino() || md.dev() != lmd.dev() {
-            return Err(format!("{rel}: not a regular file"));
-        }
+    for (_real, rel) in checked {
+        // Read from an fd opened beneath the root with no symlink anywhere (A171: a component
+        // swapped after `check` cannot redirect the read), non-blocking (A172: a FIFO cannot
+        // hang the shim), and fstat-checked as a regular file.
+        let f = open_beneath(root, &rel).map_err(|e| format!("{rel}: {e}"))?;
         let left = MAX_TOTAL.saturating_sub(total);
         let mut buf = Vec::new();
         f.take(left.saturating_add(1)).read_to_end(&mut buf).map_err(|_| format!("{rel}: read error"))?;
