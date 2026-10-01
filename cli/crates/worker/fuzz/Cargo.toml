@@ -13,6 +13,8 @@ license = "Apache-2.0"
 [dependencies]
 moochy-worker = { path = ".." }
 libfuzzer-sys = "0.4"
+# Differential oracle only (a lenient, last-key-wins parser like the providers' stacks).
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip", "arbitrary_precision"] }
 
 [profile.release]
 debug = 1

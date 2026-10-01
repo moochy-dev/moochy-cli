@@ -25,10 +25,12 @@ fn main() {
             v.extend_from_slice(body);
             std::fs::write(d.join(format!("{i:03}-{sel}-{name}")), v).expect("write");
         };
+        if name.ends_with(".json") { put("json_diff", 0, &b); }
         put("stream", sel | if sse { 0 } else { 2 } | (7 << 2), &b);
         put("reemit", sel | if sse { 0 } else { 2 } | (5 << 2), &b);
         if name.ends_with(".json") && !name.contains("headers") {
             put("json", 0, &b);
+            put("json_diff", 0, &b);
             put("firewall", sel | 4 | 8, &b);
             put("inspect", 0, &b);
         }

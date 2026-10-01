@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 SECS=${1:-300}
 shift || true
-TARGETS=${*:-firewall json stream reemit validate inspect}
+TARGETS=${*:-firewall json json_diff stream reemit validate inspect}
 DIR=${FUZZ_DIR:-/tmp/moochy-worker-fuzz}
 HOST=$(rustc -vV | sed -n 's/^host: //p')
 export RUSTC_BOOTSTRAP=1
