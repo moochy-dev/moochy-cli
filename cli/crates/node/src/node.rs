@@ -121,6 +121,9 @@ pub struct Node {
     pub paused: AtomicBool,
     pub worker_busy: AtomicU32,
     pub gateway_tasks: AtomicU32,
+    /// `Welcome.max_concurrent_tasks`: the relay fails a Submit past it, so the Gateway queues.
+    pub max_tasks: AtomicU32,
+    pub task_freed: tokio::sync::Notify,
     pub journal: Mutex<VecDeque<JournalEntry>>,
     pub journal_tx: broadcast::Sender<JournalEntry>,
     pub shutdown: watch::Sender<bool>,
@@ -163,6 +166,8 @@ impl Node {
             paused: AtomicBool::new(false),
             worker_busy: AtomicU32::new(0),
             gateway_tasks: AtomicU32::new(0),
+            max_tasks: AtomicU32::new(16),
+            task_freed: tokio::sync::Notify::new(),
             journal: Mutex::new(VecDeque::new()),
             journal_tx: broadcast::channel(64).0,
             shutdown: watch::channel(false).0,
@@ -366,7 +371,37 @@ pub struct WorkerParts {
     pub store: Option<Arc<Mutex<Store>>>,
 }
 
-/// RAII counter for in-flight work (`gateway_tasks`, `worker_busy`).
+/// A Gateway task slot under the relay's per-device limit; freed (and waiters woken) on drop.
+pub struct TaskSlot(Arc<Node>);
+
+impl Drop for TaskSlot {
+    fn drop(&mut self) {
+        self.0.gateway_tasks.fetch_sub(1, Ordering::Relaxed);
+        self.0.task_freed.notify_waiters();
+    }
+}
+
+/// Wait up to `wait` for a Gateway task slot (a relay task ends at its receipt, which can trail
+/// the client's last byte, so a fast sequential client must queue here, not overrun the relay).
+pub async fn task_slot(node: &Arc<Node>, wait: std::time::Duration) -> Option<TaskSlot> {
+    let deadline = tokio::time::Instant::now().checked_add(wait)?;
+    loop {
+        let freed = node.task_freed.notified();
+        tokio::pin!(freed);
+        freed.as_mut().enable();
+        let max = node.max_tasks.load(Ordering::Relaxed);
+        let mut n = node.gateway_tasks.load(Ordering::Acquire);
+        while n < max {
+            match node.gateway_tasks.compare_exchange_weak(n, n.saturating_add(1), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(TaskSlot(node.clone())),
+                Err(cur) => n = cur,
+            }
+        }
+        tokio::time::timeout_at(deadline, freed).await.ok()?;
+    }
+}
+
+/// RAII counter for in-flight work (`worker_busy`).
 pub struct Busy<'a>(&'a AtomicU32);
 
 impl<'a> Busy<'a> {

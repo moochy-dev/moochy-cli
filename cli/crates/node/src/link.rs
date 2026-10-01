@@ -179,6 +179,10 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
         relay_msg::Msg::Error(e) => return Err(End::Refused(clean(&e.code).into_owned())),
         _ => return Err(End::Refused("expected Welcome".into())),
     };
+    if welcome.max_concurrent_tasks > 0 {
+        node.max_tasks.store(welcome.max_concurrent_tasks.min(4096), std::sync::atomic::Ordering::Relaxed);
+        node.task_freed.notify_waiters();
+    }
     let session = welcome.session_id.parse().map_err(|_| End::Refused("bad session id".into()))?;
     *lock(&node.link) = Some(LinkHandle { client, session, up: up.clone() });
     node.link_state.send_replace(LinkState::Up);
