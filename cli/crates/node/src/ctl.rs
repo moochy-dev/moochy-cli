@@ -152,9 +152,8 @@ impl LocalControl for Ctl {
         let n = &self.node;
         if r.rotate {
             let g = n.token_gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-            let mut cfg = n.home.load().map_err(|e| Status::internal(e.msg))?;
-            cfg.token_gen = g;
-            n.home.save(&cfg).map_err(|e| Status::internal(e.msg))?;
+            // In the state dir: the locked-down node cannot write its config (CONTRACT §15.2).
+            crate::config::write_private(&n.home.state_dir().join("token_gen"), g.to_string().as_bytes()).map_err(|e| Status::internal(e.msg))?;
         }
         let url = n.gateway_url();
         Ok(Response::new(EnvResponse {

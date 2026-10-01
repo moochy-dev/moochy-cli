@@ -147,7 +147,9 @@ const JOURNAL_KEEP: usize = 512;
 impl Node {
     pub fn new(home: Home, cfg: Config, secrets: Secrets, keys: Option<Keys>, w: WorkerParts, offline: bool) -> Arc<Self> {
         let keylog = crate::keylog::LogMirror::open(&home, &cfg, keys.as_ref().map(|k| k.sign.public()));
-        let token_gen = AtomicU64::new(cfg.token_gen);
+        // Rotations persist in the state dir (`ctl.rs`); config's value is the older location.
+        let rotated = std::fs::read_to_string(home.state_dir().join("token_gen")).ok().and_then(|s| s.trim().parse::<u64>().ok());
+        let token_gen = AtomicU64::new(rotated.unwrap_or(0).max(cfg.token_gen));
         Arc::new(Self {
             home,
             cfg,

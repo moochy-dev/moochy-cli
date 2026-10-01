@@ -27,7 +27,10 @@ COMMANDS:
                                   tokens, worker donates yours. Only the default server unless
                                   MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
   logout                          Remove this device: revoke its keys, then delete them here
-  up [--foreground]               Start the Moochy app on this machine
+  up [--foreground] [--unsafe-no-lockdown]
+                                  Start the Moochy app on this machine. It locks itself down
+                                  (no commands, files limited to its state); the flag disables
+                                  that for debugging only
   down                            Stop it
   status [--json]                 Connection, slots in use, donations available to your projects
   pause | resume                  Stop or restart donating from this device (works offline)
@@ -47,7 +50,8 @@ COMMANDS:
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
   report <task> [--reason TEXT]   Save signed evidence about a bad response
-  doctor                          Check the keystore, connection, clock, provider keys and socket
+  doctor                          Check the keystore, connection, clock, provider keys, socket
+                                  and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
   pending                         Requests waiting for your signature (maintainers)
   approve <donor> --repo OWNER/NAME [--revoke] [--yes]
@@ -137,7 +141,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -191,7 +195,7 @@ fn run() -> Result<()> {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
             }
-            if o.has("foreground") { up_foreground(home, o.has("offline")) } else { up_background(&home, &o) }
+            if o.has("foreground") { up_foreground(home, o.has("offline"), o.has("unsafe-no-lockdown")) } else { up_background(&home, &o) }
         }
         ["down"] => rt_small()?.block_on(async {
             crate::ctl::connect(&home.socket_path()).await?.shutdown(ShutdownRequest {}).await.map_err(|s| internal(s.message().to_owned()))?;
@@ -489,6 +493,9 @@ fn doctor(home: &Home) -> Result<()> {
         line(false, "clock", "unknown: measured when the app connects".into());
     }
     line(true, "safety", format!("checks level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
+    for (ok, what, detail) in crate::lockdown::doctor(home, st.is_some()) {
+        line(ok, what, detail);
+    }
     let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
     match std::fs::metadata(home.socket_path()) {
         Ok(m) => line(Some(m.uid()) == me && m.mode() & 0o777 == 0o600, "socket", format!("node.sock uid {} mode {:o}", m.uid(), m.mode() & 0o777)),
@@ -665,10 +672,13 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     })
 }
 
-fn up_foreground(home: Home, offline: bool) -> Result<()> {
+fn up_foreground(home: Home, offline: bool, unsafe_no_lockdown: bool) -> Result<()> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    // CONTRACT §15.2: load, bind, lock down while single-threaded, then start the runtime.
+    let boot = crate::lockdown::Boot::load(&home, offline)?;
+    crate::lockdown::apply(&home, &boot, unsafe_no_lockdown)?;
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().ctx("runtime")?;
-    rt.block_on(up(home, offline))
+    rt.block_on(up(home, offline, boot))
 }
 
 /// Provider adapters (one per stored key) and the outbox store.
@@ -699,26 +709,10 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
     Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))) })
 }
 
-async fn up(home: Home, offline: bool) -> Result<()> {
-    home.ensure()?;
-    let mut cfg = home.load()?;
-    let secrets = if offline {
-        keystore::load_or_init(&home, &mut cfg)?
-    } else {
-        let s = keystore::load(&home, &cfg)?.ok_or_else(|| auth("no keystore: run `moochy login` first"))?;
-        if cfg.device_id.is_none() || s.device.is_none() || cfg.relay.is_none() {
-            return Err(auth("not logged in: run `moochy login` first"));
-        }
-        s
-    };
-    let addr = cfg.gateway_addr()?;
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| usage(format!("bind {addr}: {e}")))?;
-    let port = listener.local_addr().ctx("local addr")?.port();
-    if cfg.gateway_addr.is_none() {
-        // First start: keep this port so clients keep a stable base URL (CONTRACT §6).
-        cfg.gateway_addr = Some(format!("127.0.0.1:{port}"));
-        home.save(&cfg)?;
-    }
+async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
+    let port = boot.port();
+    let crate::lockdown::Boot { cfg, secrets, listener } = boot;
+    let listener = tokio::net::TcpListener::from_std(listener).ctx("gateway listener")?;
     let sock_path = home.socket_path();
     let sock = crate::ctl::bind(&sock_path).await?;
     let keys = match (&secrets.device, cfg.device_id.as_deref()) {

@@ -22,6 +22,7 @@ pub mod keycheck;
 pub mod keylog;
 pub mod keystore;
 pub mod link;
+pub mod lockdown;
 pub mod login;
 pub mod mcp;
 pub mod native;
