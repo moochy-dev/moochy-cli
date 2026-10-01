@@ -16,3 +16,7 @@ strip = true
 
 [profile.dev]
 panic = "abort"
+
+# cargo-dist builds use the release profile unchanged (reproducible, LTO, abort, stripped).
+[profile.dist]
+inherits = "release"
