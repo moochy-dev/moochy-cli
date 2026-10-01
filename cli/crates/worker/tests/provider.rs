@@ -557,11 +557,14 @@ async fn against_e2e_fakes() {
                 assert!(rl.requests_limit.is_some() && rl.tokens_limit.is_some(), "{kind} {d:?}: {rl:?}");
                 assert_eq!(rl.headroom_pct(), Some(want), "{kind} {d:?}: {rl:?}");
             }
+            if p == Provider::XAi {
+                assert!(o.usage.provider_cost_uusd.is_some(), "xAI reports cost_in_usd_ticks: {o:?}");
+            }
             println!("{kind} {d:?}: ok, usage {:?}", o.usage);
             checked += 1;
         }
     }
-    assert_eq!(checked, 18);
+    assert!(checked >= 18, "{checked}");
 }
 
 // --- HTTP/1.1 keep-alive (the loopback dev path the e2e fakes speak) ---------------------

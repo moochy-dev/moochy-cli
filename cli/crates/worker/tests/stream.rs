@@ -318,3 +318,24 @@ fn xai_usage_reasoning_and_cost() {
     let (o, _) = run(Dialect::OpenAiChat, OAI.as_bytes(), 9);
     assert_eq!(o.usage.output, 20);
 }
+
+/// Regression (mo-e2e: "provider_cost_uusd is None against the xAI fake"): bodies captured
+/// from the real Go fake (`e2e/fake`, kind xai) carry `cost_in_usd_ticks` on every chunk and
+/// the parser reports it. The None came from the node's receipt builder (OpenRouter-only).
+#[test]
+fn xai_go_fake_bodies_report_cost() {
+    for (name, body, stream, cost, output) in [
+        ("tool", include_str!("fixtures/xai_fake_tool.sse"), true, 201, 12),
+        ("reasoning", include_str!("fixtures/xai_fake_reasoning.sse"), true, 861, 56),
+        ("nostream", include_str!("fixtures/xai_fake_nostream.json"), false, 267, 17),
+    ] {
+        for step in [1, 13, body.len()] {
+            let mut p = StreamParser::new(Dialect::OpenAiChat, stream);
+            for c in body.as_bytes().chunks(step) {
+                p.feed(c, &mut |_, _| {}).unwrap();
+            }
+            let o = p.finish();
+            assert_eq!((o.usage.provider_cost_uusd, o.usage.output, o.usage.estimated, o.malformed), (Some(cost), output, false, false), "{name} step {step}");
+        }
+    }
+}
