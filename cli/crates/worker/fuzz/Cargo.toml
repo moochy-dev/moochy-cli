@@ -1,0 +1,18 @@
+# libFuzzer targets for every hostile-input parser of moochy-worker (T-02-040, T-06-064,
+# T-07-089). Standalone workspace: never part of a product build. Run with ./run.sh [seconds].
+# Exception to `forbid(unsafe_code)`: libFuzzer's entry point is an `extern "C"` symbol.
+[package]
+name = "moochy-worker-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+moochy-worker = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[profile.release]
+debug = 1
