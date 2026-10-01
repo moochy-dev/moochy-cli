@@ -173,20 +173,45 @@ pub async fn read_body(b: Incoming, limit: usize) -> Result<Bytes, Failure> {
 
 /// Validate + scrub a provider-dialect body into a task request.
 pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: Vec<(String, String)>, t_client_rx: u64) -> Result<TaskReq, Failure> {
+    use moochy_worker::json::{self as wj, Kind, Val};
     let bad = |m: String| Failure::new("invalid_request", false, m);
     let mut body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
-    let mut parsed = crate::json::parse_object(&body).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
-    if dialect == Dialect::OpenAi && !parsed.contains_key("max_tokens") && !parsed.contains_key("max_completion_tokens") {
-        parsed.insert("max_tokens".into(), DEFAULT_MAX_TOKENS.into());
-        body = Bytes::from(Value::Object(parsed.clone()).to_string());
+    // Strict tape parse (no tree allocation): this is the per-request hot path (CONTRACT §13).
+    let mut tape = Vec::new();
+    let inject = {
+        let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
+        let root = doc.root();
+        if root.kind() != Kind::Obj {
+            return Err(bad("moochy: the body must be a JSON object".into()));
+        }
+        dialect == Dialect::OpenAi && root.get("max_tokens").is_none() && root.get("max_completion_tokens").is_none()
+    };
+    if inject {
+        let mut m = crate::json::parse_object(&body).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
+        m.insert("max_tokens".into(), DEFAULT_MAX_TOKENS.into());
+        body = Bytes::from(Value::Object(m).to_string());
     }
-    let entry = catalog_entry(node, &parsed)?;
+    let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
+    let root = doc.root();
+    let model = root.get("model").and_then(Val::as_str).ok_or_else(|| bad("moochy: `model` is required".into()))?;
+    let entry = catalog_entry(node, &model)?;
+    // Affinity key over the exact bytes of system, tools and the first user message (04 §5).
+    let first = |role: &str| root.get("messages").and_then(|m| m.items().find(|x| x.get("role").is_some_and(|r| r.is_str(role))));
+    let system = match dialect {
+        Dialect::Anthropic => root.get("system"),
+        Dialect::OpenAi => first("system").or_else(|| first("developer")),
+    };
+    let affinity = node.secrets.affinity(raw_of(system), raw_of(root.get("tools")), raw_of(first("user")));
+    drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
-    Ok(TaskReq { slug, dialect, body, parsed, facts, entry, headers, t_client_rx })
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx })
 }
 
-fn catalog_entry(node: &Node, parsed: &serde_json::Map<String, Value>) -> Result<moochy_proto::money::CatalogEntry, Failure> {
-    let model = parsed.get("model").and_then(Value::as_str).ok_or_else(|| Failure::new("invalid_request", false, "moochy: `model` is required".to_owned()))?;
+fn raw_of(v: Option<moochy_worker::json::Val<'_>>) -> &[u8] {
+    v.map_or(&b""[..], |v| v.raw().as_bytes())
+}
+
+fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::CatalogEntry, Failure> {
     let cat = node.catalog();
     cat.resolve(model).cloned().ok_or_else(|| {
         let why = if cat.version == 0 { "moochy: no price catalog from the relay yet".to_owned() } else { format!("moochy: model `{}` is not in the catalog", crate::util::clean(model)) };
@@ -213,7 +238,8 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         };
         v.entry("max_tokens").or_insert(1.into());
         let body = Value::Object(v.clone()).to_string();
-        return match catalog_entry(&node, &v).and_then(|e| crate::engine::analyze(&e, dialect, body.as_bytes(), &headers)) {
+        let model = v.get("model").and_then(Value::as_str).unwrap_or_default();
+        return match catalog_entry(&node, model).and_then(|e| crate::engine::analyze(&e, dialect, body.as_bytes(), &headers)) {
             Ok(f) => json_resp(200, &json!({"input_tokens": f.est_input_tokens})),
             Err(f) => native_error(dialect, &f),
         };

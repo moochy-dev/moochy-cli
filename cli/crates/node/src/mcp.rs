@@ -100,19 +100,7 @@ impl Session {
     /// Right after `moochy up` the relay may not have pushed the donors yet (it throttles pool
     /// updates): wait up to 2 s for a non-empty pool, only during the first seconds of the node.
     async fn settle_pool(&self) {
-        let young = crate::util::now_ms().saturating_sub(self.node.boot_ms) < 5_000;
-        if !young || !self.pool_models().is_empty() {
-            return;
-        }
-        let mut rx = self.node.pool_gen.subscribe();
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            while rx.changed().await.is_ok() {
-                if !self.pool_models().is_empty() {
-                    return;
-                }
-            }
-        })
-        .await;
+        self.node.settle_pool(&self.slug, |p| !p.models().is_empty()).await;
     }
 
     fn pool_models(&self) -> Vec<(String, Vec<String>)> {

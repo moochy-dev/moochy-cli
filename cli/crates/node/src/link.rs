@@ -114,6 +114,7 @@ pub async fn run(node: Arc<Node>) {
         attempt = attempt.saturating_add(1);
         tokio::select! {
             () = sleep(Duration::from_millis(delay)) => {}
+            () = node.link_kick.notified() => {}
             _ = shutdown.changed() => return,
         }
     }

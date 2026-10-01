@@ -173,7 +173,8 @@ struct Refuse<'a> {
 
 impl Refuse<'_> {
     async fn nack(&self, ck: Option<&ContentKey>, f: &Failure) {
-        log("warn", "task refused", &json!({"task": self.task, "attempt": self.attempt, "code": f.code}));
+        // The detail names fields / short reasons only (never prompt text): fine in the donor's own log.
+        log("warn", "task refused", &json!({"task": self.task, "attempt": self.attempt, "code": f.code, "detail": f.detail.as_deref().map(|d| d.get(..200).unwrap_or(d))}));
         let sealed_detail = match (ck, &f.detail) {
             (Some(ck), Some(d)) => {
                 let c = DetailCtx { ck: ck.expose(), r: &self.r, task: self.task, task16: &self.task16, worker: self.worker, attempt: self.attempt };
@@ -194,7 +195,7 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
         let (tx, rx) = mpsc::channel::<ServeUp>(64);
         let _ = tx.try_send(up(serve_up::Msg::Open(pb::ServeOpen { task: task.clone(), attempt })));
         let mut client = link.client.clone();
-        let down = match client.serve(crate::link::with_session(&link, ReceiverStream::new(rx))).await {
+        let mut down = match client.serve(crate::link::with_session(&link, ReceiverStream::new(rx))).await {
             Ok(r) => r.into_inner(),
             Err(s) => {
                 log("warn", "serve stream refused", &json!({"task": task, "code": format!("{:?}", s.code())}));
@@ -204,8 +205,12 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
         let t0 = now_ms();
         let out = {
             let _busy = Busy::new(&node.worker_busy);
-            serve(&node, &task, attempt, down, &tx).await
+            serve(&node, &task, attempt, &mut down, &tx).await
         };
+        // Half-close and let the relay end the stream: dropping `down` first would reset it
+        // before the last Nack / End is flushed.
+        drop(tx);
+        let _ = timeout(Duration::from_secs(10), async { while next(&mut down).await.is_some() {} }).await;
         node.journal(JournalEntry {
             t_ms: i64::try_from(t0).unwrap_or(0),
             role: "worker".into(),
@@ -404,7 +409,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
 }
 
 /// Returns `(journal status, model, cost)`.
-async fn serve(node: &Arc<Node>, task_s: &str, attempt: u32, mut down: tonic::Streaming<ServeDown>, tx: &mpsc::Sender<ServeUp>) -> (String, String, i64) {
+async fn serve(node: &Arc<Node>, task_s: &str, attempt: u32, down: &mut tonic::Streaming<ServeDown>, tx: &mpsc::Sender<ServeUp>) -> (String, String, i64) {
     let r = crypto::random32().unwrap_or([0; 32]);
     let task16 = task_s.parse::<TaskId>().map_or([0; 16], |t| t.0.0);
     let device = node.device_id().unwrap_or_default().to_owned();
@@ -416,7 +421,7 @@ async fn serve(node: &Arc<Node>, task_s: &str, attempt: u32, mut down: tonic::St
         refuse.nack(None, &Failure::new(code, true, None)).await;
         return refused(code);
     };
-    let Some((assign, body)) = receive(task_s, attempt, &mut down).await else {
+    let Some((assign, body)) = receive(task_s, attempt, down).await else {
         refuse.nack(None, &Failure::new("bad_envelope", false, None)).await;
         return refused("bad_envelope");
     };
@@ -433,7 +438,7 @@ async fn serve(node: &Arc<Node>, task_s: &str, attempt: u32, mut down: tonic::St
     drop(body);
     let _ = tx.send(up(serve_up::Msg::Ack(pb::Ack { r: Bytes::copy_from_slice(&r) }))).await;
     log("info", "timing", &json!({"task": task_s, "attempt": attempt, "t_assign_rx": t_assign_rx, "t_ack_tx": now_us()}));
-    run_provider(node, keys, a, attempt, r, t_start, &mut down, &refuse).await
+    run_provider(node, keys, a, attempt, r, t_start, down, &refuse).await
 }
 
 /// Steps 6–9: provider call, sealed streaming, receipt.
@@ -450,17 +455,18 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let mut resp = match call {
         Some(Ok(resp)) => resp,
         Some(Err(f)) => {
-            let key = a.key.clone();
-            let _ = with_store(node, move |s| s.release(&key)).await;
             let (code, retry) = f.nack();
             let mut fl = Failure::new(code, retry, Some(String::from_utf8_lossy(&f.body).into_owned()));
             fl.retry_after_ms = f.retry_after_ms;
             refuse.nack(Some(&a.ck), &fl).await;
+            // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
+            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
+            finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
             return (format!("refused:{code}"), String::new(), 0);
         }
         None => {
-            let key = a.key.clone();
-            let _ = with_store(node, move |s| s.release(&key)).await;
+            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
+            finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
             return ("cancelled".into(), String::new(), 0);
         }
     };
@@ -521,43 +527,26 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         status = if out.provider_error { ReceiptStatus::ProviderError } else { ReceiptStatus::Partial };
     }
     let openrouter = a.entry.provider == "openrouter";
+    let reserved = money::reserve_for_route(&a.entry, &a.route).unwrap_or(0);
+    // OpenRouter's reported cost is authoritative; when it never came, settle pessimistically at
+    // the reservation and mark the usage estimated (05 §5.2).
+    let or_cost = out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok());
     let usage = Usage {
         input: out.usage.input,
         output: out.usage.output,
         cache_write_5m: out.usage.cache_write_5m,
         cache_write_1h: out.usage.cache_write_1h,
         cache_read: out.usage.cache_read,
-        estimated: out.usage.estimated,
-        provider_cost_uusd: if openrouter { out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok()) } else { None },
+        estimated: out.usage.estimated || (openrouter && or_cost.is_none()),
+        provider_cost_uusd: if openrouter { Some(or_cost.unwrap_or(reserved)) } else { None },
     };
     let fast = a.route.flags.iter().any(|f| f == "fast");
     // Fallback when a cost cannot be computed (e.g. OpenRouter without a reported cost): the reservation.
-    let cost = money::cost_uusd(&a.entry, &usage, fast).or_else(|_| money::reserve_for_route(&a.entry, &a.route)).unwrap_or(0);
+    let cost = money::cost_uusd(&a.entry, &usage, fast).unwrap_or(reserved);
     let model = clean(out.model.as_deref().unwrap_or("")).into_owned();
-    let receipt = build_receipt(keys, &a, attempt8, &sealer, request_id.or(out.id).as_deref().unwrap_or(""), usage, cost, status, &model, (t_start, t_started), node.catalog().version);
-    let Some(signed) = receipt else {
-        log("error", "receipt signing failed", &json!({"task": refuse.task}));
-        return ("failed:internal".into(), model, cost);
-    };
-    let (key, payload, ucost) = (a.key.clone(), signed.encode_to_vec(), u64::try_from(cost).unwrap_or(0));
-    if with_store(node, move |s| s.put_receipt(&key, &payload, ucost, now_ms())).await.is_none_or(|r| r.is_err()) {
-        log("error", "outbox write failed", &json!({"task": refuse.task}));
-    }
-    let _ = tx.send(up(serve_up::Msg::End(signed))).await;
-    // ReceiptAck may come on this stream or on the session.
-    let key = a.key.clone();
-    if let Ok(true) = timeout(Duration::from_secs(5), async {
-        while let Some(m) = next(down).await {
-            if matches!(m, serve_down::Msg::ReceiptAck(_)) {
-                return true;
-            }
-        }
-        false
-    })
-    .await
-    {
-        let _ = with_store(node, move |s| s.ack(&key, now_ms())).await;
-    }
+    let req_id = request_id.or(out.id).unwrap_or_default();
+    let end = Ending { status, usage, cost, model: model.clone(), req_id, times: (t_start, t_started) };
+    finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
     let st = match status {
         ReceiptStatus::Ok => "ok",
         ReceiptStatus::Cancelled => "cancelled",
@@ -566,6 +555,50 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         ReceiptStatus::NotStarted => "not_started",
     };
     (st.into(), model, cost)
+}
+
+struct Ending {
+    status: ReceiptStatus,
+    usage: Usage,
+    cost: i64,
+    model: String,
+    req_id: String,
+    times: (u64, u64),
+}
+
+/// Sign the receipt, persist it (fsync) before `End`, then wait for the ack; if none comes on
+/// the Serve stream, hand it to the session (`ReplayReceipt`) so it is never lost.
+#[allow(clippy::too_many_arguments)]
+async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer: &ResponseSealer, e: Ending, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) {
+    let ucost = u64::try_from(e.cost).unwrap_or(0);
+    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times, node.catalog().version) else {
+        log("error", "receipt signing failed", &json!({"task": refuse.task}));
+        return;
+    };
+    let (key, payload) = (a.key.clone(), signed.encode_to_vec());
+    if with_store(node, move |s| s.put_receipt(&key, &payload, ucost, now_ms())).await.is_none_or(|r| r.is_err()) {
+        log("error", "outbox write failed", &json!({"task": refuse.task}));
+    }
+    let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
+    let acked = sent
+        && matches!(
+            timeout(Duration::from_secs(5), async {
+                while let Some(m) = next(down).await {
+                    if matches!(m, serve_down::Msg::ReceiptAck(_)) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await,
+            Ok(true)
+        );
+    if acked {
+        let key = a.key.clone();
+        let _ = with_store(node, move |s| s.ack(&key, now_ms())).await;
+    } else if let Some(l) = node.link() {
+        let _ = l.up.send(pb::NodeMsg { msg: Some(pb::node_msg::Msg::ReplayReceipt(pb::ReplayReceipt { receipt: Some(signed) })) }).await;
+    }
 }
 
 /// Resolves when the relay cancels the attempt (or the stream dies). Other messages are ignored.

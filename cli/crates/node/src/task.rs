@@ -18,7 +18,7 @@ use moochy_proto::money::CatalogEntry;
 use moochy_proto::msg::{InnerPayload, ReceiptStatus};
 use moochy_proto::{DeviceId, TaskId};
 use moochy_worker::firewall::Facts;
-use serde_json::{Map, Value, json};
+use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +31,8 @@ pub struct TaskReq {
     pub dialect: Dialect,
     /// Exact body sent to the donor (scrubbed, otherwise as the client sent it).
     pub body: Bytes,
-    pub parsed: Map<String, Value>,
+    /// Session-affinity key (HMAC under the device secret, 04 §5).
+    pub affinity: [u8; 16],
     pub facts: Facts,
     pub entry: CatalogEntry,
     /// Allowlisted provider headers (`anthropic-version`, `anthropic-beta`).
@@ -55,6 +56,8 @@ pub fn now_us() -> u64 {
 }
 
 pub async fn submit(node: &Arc<Node>, req: TaskReq) -> Result<mpsc::Receiver<TaskEv>, Failure> {
+    let offered = |p: &RepoPool| p.models().iter().any(|(m, ds)| *m == req.entry.model && ds.iter().any(|d| d == req.dialect.wire()));
+    node.settle_pool(&req.slug, offered).await;
     let pool = node.pool_for(&req.slug);
     if let Some(p) = &pool
         && !p.models().iter().any(|(m, ds)| *m == req.entry.model && ds.iter().any(|d| d == req.dialect.wire()))
@@ -99,20 +102,6 @@ fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
     rx
 }
 
-fn first_role<'a>(p: &'a Map<String, Value>, role: &str) -> Option<&'a Value> {
-    p.get("messages")?.as_array()?.iter().find(|m| m.get("role").and_then(Value::as_str) == Some(role))
-}
-
-fn affinity(node: &Node, req: &TaskReq) -> [u8; 16] {
-    let p = &req.parsed;
-    let enc = |v: Option<&Value>| v.map(|v| v.to_string().into_bytes()).unwrap_or_default();
-    let (system, first_user) = match req.dialect {
-        Dialect::Anthropic => (enc(p.get("system")), enc(first_role(p, "user"))),
-        Dialect::OpenAi => (enc(first_role(p, "system").or_else(|| first_role(p, "developer"))), enc(first_role(p, "user"))),
-    };
-    node.secrets.affinity(&system, &enc(p.get("tools")), &first_user)
-}
-
 /// Affinity worker first, then the best `hint`s, ≤ 8 wraps (04 §7).
 fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>) -> Vec<PoolWorker> {
     let mut c: Vec<&PoolWorker> =
@@ -137,9 +126,9 @@ fn internal(e: impl std::fmt::Debug) -> Failure {
 
 async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mpsc::Receiver<TaskEv>, Failure> {
     let keys = node.keys.as_ref().ok_or_else(|| Failure::new("not_logged_in", false, "moochy: run `moochy login` first".to_owned()))?;
-    let link = node.link().ok_or_else(|| Failure::new("overloaded", true, "moochy: relay link is down".to_owned()))?;
+    let link = node.link_now(std::time::Duration::from_secs(3)).await.ok_or_else(|| Failure::new("overloaded", true, "moochy: relay link is down".to_owned()))?;
     let t0 = now_ms();
-    let aff = affinity(node, &req);
+    let aff = req.affinity;
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
     let route = header.to_bytes().map_err(internal)?;
     let sticky = node.session_worker(&aff);
@@ -150,12 +139,18 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let task = TaskId::new(now_ms()).map_err(internal)?;
     let ck = ContentKey::random().map_err(internal)?;
     let s = crypto::random32().map_err(internal)?;
+    // HPKE wraps (X25519, ~100 µs each) run on a blocking thread while the body is signed and
+    // sealed (CONTRACT §13 row 1).
+    let wrap_job = {
+        let (ws, route, ck) = (chosen.clone(), route.clone(), ck.clone());
+        tokio::task::spawn_blocking(move || wraps(&ws, &task, &route, &ck))
+    };
     let headers: BTreeMap<String, String> = req.headers.iter().cloned().collect();
     let ctx = crypto::TaskContext { task: &task, repo: &header.repo_id, route: &route };
     let inner = InnerPayload::build(&ctx, req.body.to_vec(), headers, s, keys.device_id, &keys.sign).map_err(internal)?;
     let sealed = crypto::seal_request(&ck, &task, &inner.to_bytes().map_err(internal)?).map_err(internal)?;
     drop(inner);
-    let first_wraps = wraps(&chosen, &task, &route, &ck);
+    let first_wraps = wrap_job.await.map_err(internal)?;
     let n = sealed.chunks.len();
     let (up_tx, up_rx) = mpsc::channel::<SubmitUp>(n.saturating_add(4));
     let open = pb::SubmitOpen {
@@ -207,6 +202,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         last_seq: None,
         cost: None,
         model: None,
+        closed: false,
     };
     let (slug, model, t_rx) = (req.slug, req.entry.model, req.t_client_rx);
     tokio::spawn(async move {
@@ -252,6 +248,8 @@ struct Driver {
     last_seq: Option<u32>,
     cost: Option<u64>,
     model: Option<String>,
+    /// The client stream was already completed (last chunk in, nothing held).
+    closed: bool,
 }
 
 enum Step {
@@ -272,7 +270,7 @@ impl Driver {
         let step = loop {
             let m = tokio::select! {
                 m = down.message() => m,
-                () = self.tx.closed() => break Step::Gone,
+                () = self.tx.closed(), if !self.closed => break Step::Gone,
             };
             let step = match m {
                 Ok(Some(SubmitDown { msg: Some(m) })) => self.on_msg(m).await,
@@ -375,7 +373,27 @@ impl Driver {
         if let Err(why) = self.gate.push(seq, &pt) {
             return retry_fail("provider_error", why);
         }
-        self.flush(false).await
+        let s = self.flush(false).await;
+        if matches!(s, Step::Continue) { self.try_close().await } else { s }
+    }
+
+    /// Complete the client stream as soon as the response is whole and every held tool block is
+    /// covered by a verified checkpoint, without waiting for the receipt (checked when it comes).
+    async fn try_close(&mut self) -> Step {
+        let complete = self.acc.as_ref().is_some_and(|a| a.opener.is_complete());
+        let covered = self.last_seq.is_some() && self.verified >= self.last_seq;
+        if self.closed || !complete || (self.gate.holds_tools() && !covered) {
+            return Step::Continue;
+        }
+        if let Err(why) = self.gate.finish(covered) {
+            return retry_fail("provider_error", why);
+        }
+        let s = self.flush(true).await;
+        if !matches!(s, Step::Continue) {
+            return s;
+        }
+        self.closed = true;
+        emit(&self.tx, TaskEv::End { cost_uusd: None, model: None }).await
     }
 
     async fn on_checkpoint(&mut self, c: &pb::Checkpoint) -> Step {
@@ -390,7 +408,8 @@ impl Driver {
             return Step::Continue;
         }
         self.verified = Some(self.verified.map_or(c.seq, |v| v.max(c.seq)));
-        self.flush(false).await
+        let s = self.flush(false).await;
+        if matches!(s, Step::Continue) { self.try_close().await } else { s }
     }
 
     /// Verify the receipt against what we sent and received; `Err(code)` = dispute.
@@ -427,13 +446,15 @@ impl Driver {
     }
 
     async fn on_end(&mut self, r: &pb::SignedReceipt) -> Step {
-        let all = self.last_seq.is_some() && self.verified >= self.last_seq;
-        if let Err(why) = self.gate.finish(all) {
-            return retry_fail("provider_error", why);
-        }
-        let flushed = self.flush(true).await;
-        if !matches!(flushed, Step::Continue) {
-            return flushed;
+        if !self.closed {
+            let all = self.last_seq.is_some() && self.verified >= self.last_seq;
+            if let Err(why) = self.gate.finish(all) {
+                return retry_fail("provider_error", why);
+            }
+            let flushed = self.flush(true).await;
+            if !matches!(flushed, Step::Continue) {
+                return flushed;
+            }
         }
         match self.check_receipt(r) {
             Ok((cost, model)) => {
@@ -468,4 +489,61 @@ impl Driver {
 
 async fn emit(tx: &mpsc::Sender<TaskEv>, ev: TaskEv) -> Step {
     if tx.send(ev).await.is_err() { Step::Gone } else { Step::Continue }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// `cargo test --release -p moochy -- --ignored --nocapture hot_path`: per-step cost of the
+    /// Gateway path request → first sealed byte on a 100 KB body (CONTRACT §13 row 1).
+    #[test]
+    #[ignore = "benchmark"]
+    fn hot_path() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(2300);
+        let body = json!({"model":"anthropic/claude-sonnet-5.5","max_tokens":256,"stream":true,"messages":[{"role":"user","content":text}]}).to_string().into_bytes();
+        let entry = engine::Catalog::stub().entries[0].clone();
+        let entry = CatalogEntry { model: "anthropic/claude-sonnet-5.5".into(), ..entry };
+        let sign = crypto::SignKey::generate().unwrap();
+        let enc = crypto::EncSecret::generate().unwrap();
+        let n = 200u32;
+        let mut t = [0u128; 7];
+        for _ in 0..n {
+            let mut s = Instant::now();
+            let mut lap = |i: usize, s: &mut Instant| {
+                t[i] += s.elapsed().as_nanos();
+                *s = Instant::now();
+            };
+            let b = crate::scrub::scrub(&body).unwrap_or_else(|| body.clone());
+            lap(0, &mut s);
+            let mut tape = Vec::new();
+            let _ = moochy_worker::json::parse(&b, &mut tape).unwrap().root();
+            lap(1, &mut s);
+            let f = engine::analyze(&entry, Dialect::Anthropic, &b, &[]).unwrap();
+            lap(2, &mut s);
+            let h = engine::route_header(&entry, Dialect::Anthropic, &f, "r_01ARZ3NDEKTSV4RRFFQ69G5FAV", [0; 16]).unwrap();
+            let route = h.to_bytes().unwrap();
+            let task = TaskId::new(now_ms()).unwrap();
+            let ck = ContentKey::random().unwrap();
+            let ctx = crypto::TaskContext { task: &task, repo: &h.repo_id, route: &route };
+            let inner = InnerPayload::build(&ctx, b.clone(), BTreeMap::new(), [1; 32], "d_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(), &sign).unwrap();
+            lap(3, &mut s);
+            let p = inner.to_bytes().unwrap();
+            lap(4, &mut s);
+            let _ = crypto::seal_request(&ck, &task, &p).unwrap();
+            lap(5, &mut s);
+            let _ = crypto::wrap(&enc.public(), &task, &route, &ck).unwrap();
+            lap(6, &mut s);
+        }
+        let s0 = Instant::now();
+        for _ in 0..n {
+            let _ = crypto::sha256(&body);
+        }
+        println!("sha256 100KB (sha2 via moochy-proto): {} µs", s0.elapsed().as_nanos() / u128::from(n) / 1000);
+        let names = ["scrub", "tape parse", "analyze", "route+sign", "payload json", "zstd+seal", "hpke wrap"];
+        for (i, nm) in names.iter().enumerate() {
+            println!("{nm:>14}: {:>7} µs", t[i] / u128::from(n) / 1000);
+        }
+    }
 }

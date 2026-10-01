@@ -182,6 +182,11 @@ impl Gate {
         })
     }
 
+    /// A tool block is held (or still open): releasing needs a covering checkpoint.
+    pub fn holds_tools(&self) -> bool {
+        self.hold.is_some() || self.out.iter().any(|o| matches!(o, Out::Tool { .. })) || !self.stream
+    }
+
     /// Next releasable output. A tool block needs a verified checkpoint with seq ≥ its chunk;
     /// at the end (`finale`) unverified blocks are replaced.
     pub fn pop(&mut self, verified: Option<u32>, finale: bool) -> Option<Bytes> {

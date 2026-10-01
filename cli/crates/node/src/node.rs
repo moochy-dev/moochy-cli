@@ -107,6 +107,8 @@ pub struct Node {
     pub log_acks: Mutex<HashMap<String, oneshot::Sender<LogEntryAck>>>,
     pub link: Mutex<Option<LinkHandle>>,
     pub link_state: watch::Sender<LinkState>,
+    /// Wakes the reconnect loop now (a request arrived while the link was down).
+    pub link_kick: tokio::sync::Notify,
     pub pools: Mutex<HashMap<String, RepoPool>>,
     /// Bumped whenever the set of pool models changes (MCP `tools/list_changed`).
     pub pool_gen: watch::Sender<u64>,
@@ -143,6 +145,7 @@ impl Node {
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
             link_state: watch::channel(LinkState::Down).0,
+            link_kick: tokio::sync::Notify::new(),
             pools: Mutex::new(HashMap::new()),
             pool_gen: watch::channel(0).0,
             sessions: Mutex::new(HashMap::new()),
@@ -161,6 +164,28 @@ impl Node {
         lock(&self.catalog).clone()
     }
 
+    /// Right after start the relay may not have pushed every donor yet (it throttles pool
+    /// updates): wait up to 2 s for `ok(pool)`, only during the node's first 5 seconds.
+    pub async fn settle_pool(&self, slug: &str, ok: impl Fn(&RepoPool) -> bool) {
+        let ready = |n: &Self| n.pool_for(slug).is_some_and(|p| ok(&p));
+        if now_ms().saturating_sub(self.boot_ms) >= 5_000 || ready(self) {
+            return;
+        }
+        let mut rx = self.pool_gen.subscribe();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    r = rx.changed() => if r.is_err() { return },
+                    () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
+                if ready(self) {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+
     /// Accept a newer catalog (versions never go down).
     pub fn set_catalog(&self, c: Catalog) {
         let mut cur = lock(&self.catalog);
@@ -175,6 +200,17 @@ impl Node {
 
     pub fn link(&self) -> Option<LinkHandle> {
         lock(&self.link).clone()
+    }
+
+    /// The link, reconnecting at once if it is down (waits at most `wait`).
+    pub async fn link_now(&self, wait: std::time::Duration) -> Option<LinkHandle> {
+        if let Some(l) = self.link() {
+            return Some(l);
+        }
+        self.link_kick.notify_one();
+        let mut rx = self.link_state.subscribe();
+        let _ = tokio::time::timeout(wait, rx.wait_for(|s| *s == LinkState::Up)).await;
+        self.link()
     }
 
     pub fn gateway_url(&self) -> String {
