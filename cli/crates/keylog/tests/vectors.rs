@@ -247,16 +247,18 @@ fn mirror_monitor_and_fork() {
             .iter()
             .map(h32)
             .collect(),
-        known_owner_keys: mon["known_owner_keys"]
+    };
+
+    let mut m = Mirror::new(origin, key.clone());
+    m.set_me(Some(me));
+    m.set_owner_keys(
+        mon["known_owner_keys"]
             .as_array()
             .unwrap()
             .iter()
             .map(h32)
             .collect(),
-    };
-
-    let mut m = Mirror::new(origin, key.clone());
-    m.set_me(Some(me));
+    );
     let cp = m
         .open_checkpoint(c["valid"][0]["note"].as_str().unwrap().as_bytes())
         .unwrap();

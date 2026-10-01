@@ -52,6 +52,8 @@ pub struct Config {
     pub dir: Option<PathBuf>,
     /// The user, for the own-key and owner rules.
     pub me: Option<Me>,
+    /// Public halves of the user's own owner keys (CONTRACT §15.4).
+    pub known_owner_keys: Vec<[u8; 32]>,
     /// Pinned witness keys and how many distinct valid cosignatures a checkpoint
     /// needs before it is applied (0 = witnesses not required).
     pub witnesses: Vec<CosignerKey>,
@@ -366,6 +368,7 @@ impl Monitor {
             }
         }
         mirror.set_me(cfg.me.clone());
+        mirror.set_owner_keys(cfg.known_owner_keys.clone());
         let served = mirror.size();
         Ok(Self {
             cfg,

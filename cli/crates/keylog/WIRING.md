@@ -47,8 +47,8 @@ let mut mon = Monitor::open(Config {
     me: Some(Me {
         pseudonym,                              // from DevicePoll / Welcome
         known_keys: vec![device_sign_pub],      // + keys the user acknowledged
-        known_owner_keys,                       // public keys of the user's owner keys (§4), if any
     }),
+    known_owner_keys,                           // public halves of the user's owner keys (§4), if any
     witnesses: vec![],                          // pinned witness vkeys once witnesses run
     min_cosignatures: 0,
 })?;
@@ -98,7 +98,7 @@ D14 relay-asserted path for tests only).
 - `moochy owner init`: generate an Ed25519 owner key, store it encrypted at rest (scrypt/argon2 +
   the keystore passphrase, separate file, never loaded by `moochy up`), then submit
   `SignedLogEntry{kind:"OWNER_KEY_ADDED", body: entry::owner_key_body(ps, &pub, None, now_ms),
-  sigs:[sign(sig_message(OwnerKeyAdded, body))]}` and add `pub` to `Me::known_owner_keys`.
+  sigs:[sign(sig_message(OwnerKeyAdded, body))]}` and add `pub` to the monitor's `known_owner_keys` (persist the public half in config).
 - `moochy owner rotate`: body with `prev = Some(&old_pub)`, `sigs: [new_sig, old_sig]`.
 - `moochy approve` / `members add|remove` / `claim`: take the `ApprovalRequest`, parse
   `body_to_sign` with `entry::parse_body(Kind::from_name(&r.kind)?, &r.body_to_sign)` (kind, repo,

@@ -99,6 +99,7 @@ struct Fx {
     origin: String,
     key: NoteKey,
     me: Me,
+    owner_keys: Vec<[u8; 32]>,
     witnesses: Vec<CosignerKey>,
 }
 
@@ -145,13 +146,13 @@ fn fx() -> Fx {
                 .iter()
                 .map(|k| unhex(k.as_str().unwrap()).try_into().unwrap())
                 .collect(),
-            known_owner_keys: m["known_owner_keys"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|k| unhex(k.as_str().unwrap()).try_into().unwrap())
-                .collect(),
         },
+        owner_keys: m["known_owner_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| unhex(k.as_str().unwrap()).try_into().unwrap())
+            .collect(),
         witnesses: w["witnesses"]
             .as_array()
             .unwrap()
@@ -167,6 +168,7 @@ fn monitor(f: &Fx, dir: Option<&Path>, min_cosignatures: usize) -> Monitor {
         key: f.key.clone(),
         dir: dir.map(Path::to_path_buf),
         me: Some(f.me.clone()),
+        known_owner_keys: f.owner_keys.clone(),
         witnesses: f.witnesses.clone(),
         min_cosignatures,
     })

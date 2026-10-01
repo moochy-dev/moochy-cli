@@ -21,18 +21,11 @@ pub struct Me {
     /// Signing keys the user created on their devices or acknowledged after an
     /// [`Alert::UnknownKey`] ("yes, that was me").
     pub known_keys: Vec<[u8; 32]>,
-    /// Owner keys the user created (CONTRACT §15.4) or acknowledged after an
-    /// [`Alert::UnknownOwnerKey`]. Approvals on the user's repos signed by any
-    /// other key raise [`Alert::NotSignedByMe`].
-    pub known_owner_keys: Vec<[u8; 32]>,
 }
 
 impl Me {
     fn knows(&self, k: &[u8; 32]) -> bool {
         self.known_keys.contains(k)
-    }
-    fn knows_owner(&self, k: &[u8; 32]) -> bool {
-        self.known_owner_keys.contains(k)
     }
 }
 
@@ -90,6 +83,10 @@ pub struct Mirror {
     range: CompactRange,
     state: State,
     me: Option<Me>,
+    /// Owner keys the user created (CONTRACT §15.4) or acknowledged after an
+    /// [`Alert::UnknownOwnerKey`]; approvals on the user's repos signed by any other
+    /// key raise [`Alert::NotSignedByMe`].
+    owner_keys: Vec<[u8; 32]>,
     checkpoint: Option<Checkpoint>,
 }
 
@@ -104,6 +101,7 @@ impl Mirror {
             range: CompactRange::default(),
             state: State::default(),
             me: None,
+            owner_keys: Vec::new(),
             checkpoint: None,
         }
     }
@@ -133,6 +131,11 @@ impl Mirror {
 
     pub fn set_me(&mut self, me: Option<Me>) {
         self.me = me;
+    }
+
+    /// Sets the user's own owner keys (public halves) for the owner rules.
+    pub fn set_owner_keys(&mut self, keys: Vec<[u8; 32]>) {
+        self.owner_keys = keys;
     }
 
     #[must_use]
@@ -236,17 +239,18 @@ impl Mirror {
             return Ok(());
         }
         let Some(me) = &self.me else { return Ok(()) };
+        let knows_owner = |k: &[u8; 32]| self.owner_keys.contains(k);
         let signer_known = |signer: &str| {
             self.state
                 .owner_key(signer)
-                .is_some_and(|k| me.knows_owner(&k.owner_pub))
+                .is_some_and(|k| knows_owner(&k.owner_pub))
         };
         match e.body {
             Body::OwnerKey {
                 pseudonym,
                 owner_pub,
                 ..
-            } if pseudonym == me.pseudonym && !me.knows_owner(owner_pub) => {
+            } if pseudonym == me.pseudonym && !knows_owner(owner_pub) => {
                 alerts.push(Alert::UnknownOwnerKey {
                     idx,
                     owner_key: crate::entry::owner_key_id(owner_pub),
@@ -256,9 +260,7 @@ impl Mirror {
                 pseudonym,
                 owner_pub,
                 ..
-            } if pseudonym != me.pseudonym
-                && (me.knows_owner(owner_pub) || me.knows(owner_pub)) =>
-            {
+            } if pseudonym != me.pseudonym && (knows_owner(owner_pub) || me.knows(owner_pub)) => {
                 alerts.push(Alert::KeyHijack {
                     idx,
                     device_id: crate::entry::owner_key_id(owner_pub),

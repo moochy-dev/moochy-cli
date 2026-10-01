@@ -99,13 +99,13 @@ fn main() -> ExitCode {
     let me = a.get("me").map(|ps| Me {
         pseudonym: ps.clone(),
         known_keys: a.get("known").map(|k| hex32s(k)).unwrap_or_default(),
-        known_owner_keys: a.get("known-owner").map(|k| hex32s(k)).unwrap_or_default(),
     });
     let cfg = Config {
         origin: origin.clone(),
         key: NoteKey::parse(vkey).expect("vkey"),
         dir: a.get("state").map(PathBuf::from),
         me,
+        known_owner_keys: a.get("known-owner").map(|k| hex32s(k)).unwrap_or_default(),
         witnesses: a
             .get("witness")
             .map(|w| vec![CosignerKey::parse(w).expect("witness vkey")])

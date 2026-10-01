@@ -7,7 +7,7 @@ Formats and rules: `spec/KEYLOG.md`. How mo-node wires it: `WIRING.md`. Dependen
 | Module | What |
 |---|---|
 | `monitor` | `Monitor::open(Config)` (restores from disk), `Monitor::run(&mut impl LogLink, on_event)`, `on_checkpoint`, `on_anchor`; `Event` (`message()`, `is_security()`); `View` (cloneable, fail closed): `gate()`, `seal_check(worker, repo, key_idx, approval_idx)`, `gateway_allowed(gateway, repo)`, `sealable`, `state(|s| …)`; `Gate` = `NoCheckpoint` / `Verified` / `Stale` / `Forked`; `MAX_LOG_AGE`, `POLL_EVERY` |
-| `mirror` | `Mirror` (full incremental mirror, `update(cp, records)` all-or-nothing, `check(cp)` → `AnchorStatus`, `restore`), `Me { pseudonym, known_keys, known_owner_keys }`, `Alert` |
+| `mirror` | `Mirror` (full incremental mirror, `update(cp, records)` all-or-nothing, `check(cp)` → `AnchorStatus`, `restore`), `Me { pseudonym, known_keys }`, `set_owner_keys`, `Alert` |
 | `state` | the authority state machine (`apply`), `sealable`, `gateway_allowed`, `owner_key`, `active_owner_key`, `owner`, `device`, `catalog_sha256`; `Code` (stable strings) |
 | `entry` | record/body parsing (`parse_record`, `parse_body`), `Kind` (`from_name`), builders for what the owner's CLI signs: `owner_key_body`, `claim_body`, `grant_body`, `owner_key_id`, `sig_message`, `pop_message` |
 | `note` | `NoteKey::parse(vkey)`, `open_checkpoint(note, origin, key)` |
