@@ -1,0 +1,18 @@
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{"content":" from"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{"content":" the"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{"content":" fake"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{"content":" provider"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl-Fake00000000000000000001","object":"chat.completion.chunk","created":1790889231,"model":"gpt-5","service_tier":"default","system_fingerprint":null,"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}
+
+data: [DONE]
+

@@ -10,7 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::panic, clippy::range_plus_one, clippy::cast_precision_loss)]
 
 use moochy_worker::stream::{Event, Outcome, Span, StreamParser};
-use moochy_worker::{Dialect, inspect, json, stream, validate};
+use moochy_worker::{Dialect, inspect, json, reemit, stream, validate};
 
 struct Rng(u64);
 
@@ -334,4 +334,55 @@ fn fuzz_inspection_and_money() {
             assert!((g - est).abs() <= 1.0, "{s}: {g} vs {est}");
         }
     }
+}
+
+/// Canonical re-emission (CONTRACT §15.4) on mutated provider streams: never panics; accepted
+/// output is a fixed point, chunking-independent, and never malformed when the input was not.
+#[test]
+fn fuzz_reemission() {
+    let anth: &[&[u8]] = &[include_bytes!("fixtures/anthropic_tool.sse"), include_bytes!("fixtures/fake/anthropic_msg_tool.sse")];
+    let oai: &[&[u8]] = &[
+        include_bytes!("fixtures/openai_tool.sse"),
+        include_bytes!("fixtures/openrouter.sse"),
+        include_bytes!("fixtures/xai.sse"),
+        include_bytes!("fixtures/fake/deepseek_chat_tool.sse"),
+    ];
+    let bodies: &[&[u8]] = &[include_bytes!("fixtures/fake/anthropic_msg_body.json"), include_bytes!("fixtures/fake/openai_chat_body.json")];
+    let mut rng = Rng(0x5EED_0006);
+    let mut accepted = 0usize;
+    for _ in 0..iters() {
+        for (d, corpus) in [(Dialect::AnthropicMessages, anth), (Dialect::OpenAiChat, oai)] {
+            let input = mutate(&mut rng, corpus);
+            let Ok(out) = reemit::reemit(d, true, &input) else { continue };
+            accepted += 1;
+            assert_eq!(reemit::reemit(d, true, &out).unwrap(), out, "not a fixed point");
+            let mut r = reemit::Reemitter::new(d, true);
+            let mut chunked = Vec::new();
+            let mut at = 0;
+            while at < input.len() {
+                let n = 1 + rng.below(64);
+                let end = (at + n).min(input.len());
+                r.push(&input[at..end], &mut chunked).unwrap();
+                at = end;
+            }
+            r.finish(&mut chunked).unwrap();
+            assert_eq!(chunked, out, "chunking changed the output");
+            // Re-emission never introduces malformation: a stream the strict parser accepts
+            // stays accepted (sequence rules such as deltas after a closed block remain the
+            // gate's job, on the original stream).
+            let malformed = |b: &[u8]| {
+                let mut p = StreamParser::new(d, true);
+                p.feed(b, &mut |_, _| {}).is_err() || p.finish().malformed
+            };
+            if !malformed(&input) {
+                assert!(!malformed(&out), "re-emission introduced malformation: {}", String::from_utf8_lossy(&out));
+            }
+        }
+        let d = if rng.below(2) == 0 { Dialect::AnthropicMessages } else { Dialect::OpenAiChat };
+        let body = mutate(&mut rng, &bodies[usize::from(d == Dialect::OpenAiChat)..=usize::from(d == Dialect::OpenAiChat)]);
+        if let Ok(out) = reemit::reemit(d, false, &body) {
+            assert_eq!(reemit::reemit(d, false, &out).unwrap(), out);
+        }
+    }
+    assert!(accepted > 0);
 }
