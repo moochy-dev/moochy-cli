@@ -92,7 +92,7 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         ))
         .map_err(|e| ll("landlock ro rule", e))?;
 
-    // Outbound TCP: providers (443) and the relay port. Bind: the loopback
+    // Outbound TCP: providers (443), the relay port, DNS. Bind: the loopback
     // gateway port (§15.4). Everything else is refused.
     let mut created = created
         .add_rule(NetPort::new(443, AccessNet::ConnectTcp))
@@ -100,6 +100,16 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
     created = created
         .add_rule(NetPort::new(policy.relay_port, AccessNet::ConnectTcp))
         .map_err(|e| ll("landlock connect relay", e))?;
+    // DNS over TCP (truncated answers). Port 443 is already open to any host,
+    // so this adds no reach.
+    created = created
+        .add_rule(NetPort::new(53, AccessNet::ConnectTcp))
+        .map_err(|e| ll("landlock connect dns", e))?;
+    for &p in &policy.connect_ports {
+        created = created
+            .add_rule(NetPort::new(p, AccessNet::ConnectTcp))
+            .map_err(|e| ll("landlock connect extra", e))?;
+    }
     if let Some(gw) = policy.gateway_port {
         created = created
             .add_rule(NetPort::new(gw, AccessNet::BindTcp))
@@ -114,6 +124,15 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         .map_err(|e| ll("landlock restrict_self", e))?;
 
     report.no_new_privs = status.no_new_privs;
+    // Below ABI 8 the crate (best-effort) drops TSYNC: only this thread would be
+    // caged. Fail closed if other threads exist.
+    report.all_threads = status.all_threads || thread_count() == 1;
+    if !report.all_threads {
+        return Err(Error::Unsupported(
+            "Landlock ABI < 8 cannot cage existing threads: call lockdown_self before \
+             starting any thread (before the async runtime)",
+        ));
+    }
     // Report the kernel's real ABI (what `moochy doctor` shows), not our ceiling.
     report.abi = match status.landlock {
         landlock::LandlockStatus::Available { effective_abi, kernel_abi } => {
@@ -134,6 +153,18 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         ));
     }
     Ok(report)
+}
+
+/// Threads of this process (`/proc/self/status`); 0 if unknown (treated as many).
+fn thread_count() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Threads:"))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// CONTRACT §15.2b: fork a jailed validator child and hand it one end of a
@@ -176,6 +207,12 @@ where
     F: FnOnce(RawFd) -> i32,
 {
     use rustix::process::{Resource, Rlimit, setrlimit};
+    // First: drop every fd inherited from the donor (relay/provider sockets,
+    // outbox …); only the channel survives, at sys::CHANNEL_FD.
+    if sys::isolate_fds(fd).is_err() {
+        return 71;
+    }
+    let fd = sys::CHANNEL_FD;
     // Tight rlimits: no new files, bounded memory, no core.
     let lim = |res, v| {
         let _ = setrlimit(

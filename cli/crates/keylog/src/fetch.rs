@@ -34,6 +34,22 @@ fn io(e: impl std::fmt::Display) -> Error {
 impl Fetcher {
     /// `timeout` bounds each request end to end (connect, TLS, send, receive).
     pub fn new(base: &str, timeout: Duration) -> Result<Self, Error> {
+        Self::with_roots(
+            base,
+            timeout,
+            rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            },
+        )
+    }
+
+    /// Like [`Fetcher::new`] but trusting only `roots` for `https://` (e.g. the
+    /// relay CA a dev Node pins with `--ca-file`).
+    pub fn with_roots(
+        base: &str,
+        timeout: Duration,
+        roots: rustls::RootCertStore,
+    ) -> Result<Self, Error> {
         let (tls, rest) = if let Some(r) = base.strip_prefix("https://") {
             (true, r)
         } else if let Some(r) = base.strip_prefix("http://") {
@@ -69,9 +85,6 @@ impl Fetcher {
             prefix.push('/');
         }
         let tls_config = if tls {
-            let roots = rustls::RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            };
             let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))

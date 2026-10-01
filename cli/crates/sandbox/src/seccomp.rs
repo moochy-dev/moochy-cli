@@ -180,6 +180,10 @@ pub fn validator_filter() -> Result<BpfProgram, Error> {
     let allow = [
         libc::SYS_read,
         libc::SYS_write,
+        // std's UnixStream I/O is send(MSG_NOSIGNAL)/recv = sendto/recvfrom on the
+        // already-connected channel; the child cannot create or connect sockets.
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
         libc::SYS_readv,
         libc::SYS_writev,
         libc::SYS_close,
@@ -209,6 +213,15 @@ pub fn validator_filter() -> Result<BpfProgram, Error> {
     {
         m.insert(libc::SYS_rseq, Vec::new());
     }
+    // fcntl: read-only queries only (std's debug fd-validity check on drop uses
+    // F_GETFD). F_DUPFD / F_SETFL / locks stay fatal.
+    m.insert(
+        libc::SYS_fcntl,
+        vec![
+            eq(1, SeccompCmpArgLen::Dword, libc::F_GETFD as u64)?,
+            eq(1, SeccompCmpArgLen::Dword, libc::F_GETFL as u64)?,
+        ],
+    );
     // mmap / mprotect: only without PROT_EXEC (prot is arg index 2).
     m.insert(
         libc::SYS_mmap,
