@@ -193,7 +193,7 @@ impl Spec {
 /// Default read-only system roots. These exist on virtually every Unix host and
 /// carry no user secrets. The integrator appends language toolchains.
 fn default_ro_paths() -> Vec<PathBuf> {
-    ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives"]
+    ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
         .iter()
         .map(PathBuf::from)
         .collect()

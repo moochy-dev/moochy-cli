@@ -113,7 +113,6 @@ fn deny_common() -> Result<BTreeMap<i64, Vec<SeccompRule>>, Error> {
         libc::SYS_quotactl,
         libc::SYS_settimeofday,
         libc::SYS_clock_settime,
-        libc::SYS_clone3,
     ];
     for nr in unconditional {
         m.insert(nr, Vec::new());
@@ -138,28 +137,36 @@ fn deny_common() -> Result<BTreeMap<i64, Vec<SeccompRule>>, Error> {
     Ok(m)
 }
 
+/// `clone3` answered with `ENOSYS` (its flags live in a struct seccomp cannot
+/// inspect), so glibc falls back to `clone`, whose flags the deny-lists check.
+/// Installed as its own filter: the kernel combines stacked filters and ERRNO
+/// outranks ALLOW, so a distinct errno needs a distinct program.
+pub fn clone3_filter() -> Result<BpfProgram, Error> {
+    let mut m: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    m.insert(libc::SYS_clone3, Vec::new());
+    compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::ENOSYS as u32))
+}
+
 /// Maintainer-side agent deny-list. Denied calls fail with `EPERM` so the agent
 /// stays alive and sees a normal error (robustness).
-pub fn agent_filter() -> Result<BpfProgram, Error> {
+pub fn agent_filter() -> Result<Vec<BpfProgram>, Error> {
     let m = deny_common()?;
-    compile(
-        m,
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-    )
+    Ok(vec![
+        clone3_filter()?,
+        compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32))?,
+    ])
 }
 
 /// Donor self-lockdown deny-list: everything [`agent_filter`] denies, **plus**
 /// `execve`/`execveat` — "zero commands on donors" (§15.2a).
-pub fn donor_filter() -> Result<BpfProgram, Error> {
+pub fn donor_filter() -> Result<Vec<BpfProgram>, Error> {
     let mut m = deny_common()?;
     m.insert(libc::SYS_execve, Vec::new());
     m.insert(libc::SYS_execveat, Vec::new());
-    compile(
-        m,
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-    )
+    Ok(vec![
+        clone3_filter()?,
+        compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32))?,
+    ])
 }
 
 /// Validator-child allowlist (§15.2b): read/write/memory/exit only. `mmap`/

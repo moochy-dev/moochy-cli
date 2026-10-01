@@ -112,7 +112,7 @@ struct Plan {
 
 /// The pre_exec closure. Returns `Ok(())` only in the agent branch (std then
 /// execs). Any error aborts the spawn (fail closed).
-fn child_main(plan: &Plan, filter: &seccompiler::BpfProgram) -> std::io::Result<()> {
+fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Result<()> {
     enter_namespaces(plan).map_err(to_io)?;
 
     // Fork: the child becomes PID 1 in the new PID namespace (it is the agent);
@@ -317,7 +317,7 @@ fn pivot_into(root: &Path) -> Result<(), Error> {
 
 /// Agent branch (PID 1 in the new ns): /proc, rlimits, pdeathsig, new session,
 /// drop capabilities, Landlock FS layer, no_new_privs, seccomp. Then returns.
-fn harden_agent(plan: &Plan, filter: &seccompiler::BpfProgram) -> Result<(), Error> {
+fn harden_agent(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> Result<(), Error> {
     chdir_into_worktree(plan)?;
     apply_rlimits(&plan.limits)?;
 
@@ -330,8 +330,10 @@ fn harden_agent(plan: &Plan, filter: &seccompiler::BpfProgram) -> Result<(), Err
     drop_all_caps();
     landlock_agent(plan)?;
     rustix::thread::set_no_new_privs(true).map_err(io("no_new_privs"))?;
-    seccompiler::apply_filter(filter)
-        .map_err(|e| setup("seccomp apply", std::io::Error::other(e.to_string())))?;
+    for prog in filter {
+        seccompiler::apply_filter(prog)
+            .map_err(|e| setup("seccomp apply", std::io::Error::other(e.to_string())))?;
+    }
     Ok(())
 }
 

@@ -36,7 +36,7 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         "donor" => donor_selftest(rest),
         #[cfg(target_os = "linux")]
-        "validator" => validator_selftest(),
+        "validator" => validator_selftest(rest),
         other => {
             eprintln!("unknown subcommand: {other}");
             ExitCode::from(2)
@@ -53,12 +53,9 @@ fn no() -> ExitCode {
 
 fn probe_read(a: &[String]) -> ExitCode {
     let Some(p) = a.first() else { return ExitCode::from(2) };
-    match std::fs::File::open(p).and_then(|mut f| {
-        let mut buf = [0u8; 1];
-        f.read(&mut buf)
-    }) {
-        Ok(_) => {
-            println!("read-ok {p}");
+    match std::fs::read(p) {
+        Ok(b) => {
+            println!("read-ok {p} len={}", b.len());
             ok()
         }
         Err(e) => {
@@ -207,6 +204,10 @@ fn donor_selftest(a: &[String]) -> ExitCode {
     let state = a.first().cloned().unwrap_or_else(|| "/tmp".into());
     let relay_port: u16 = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(8443);
 
+    let canary = a.get(2).cloned().unwrap_or_default();
+    // A copied binary inside the (writable) state dir: exec must still fail.
+    let copy = format!("{state}/true-copy");
+    let _ = std::fs::copy("/bin/true", &copy);
     let mut policy = moochy_sandbox::DonorPolicy::new(PathBuf::from(&state), relay_port);
     policy.ro_paths = vec![PathBuf::from("/etc/ssl/certs")];
     match moochy_sandbox::lockdown_self(&policy) {
@@ -223,15 +224,20 @@ fn donor_selftest(a: &[String]) -> ExitCode {
     // Exec must be denied (EPERM), several ways.
     report_exec_denied("sh", exec_path(c"/bin/sh"));
     report_exec_denied("env", exec_path(c"/usr/bin/env"));
-    report_exec_denied("execveat-fd", exec_via_fd());
+    let copy_c = std::ffi::CString::new(copy.clone()).unwrap_or_default();
+    report_exec_denied("copied-binary", exec_path(&copy_c));
+    report_exec_denied("execveat-fd", exec_via_fd(&copy_c));
     report_exec_denied("memfd", exec_via_memfd());
 
-    // Reading a secret outside the state dir must fail.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let ssh = format!("{home}/.ssh/id_ed25519");
-    match std::fs::File::open(&ssh) {
-        Ok(_) => println!("ssh-read-ok (BAD) {ssh}"),
-        Err(e) => println!("ssh-read-fail {e}"),
+    // Reading an existing secret outside the state dir must fail.
+    match std::fs::read(&canary) {
+        Ok(_) => println!("canary-read-ok (BAD) {canary}"),
+        Err(e) => println!("canary-read-fail {e}"),
+    }
+    // Writing inside the state dir still works (outbox).
+    match std::fs::write(format!("{state}/outbox.probe"), b"x") {
+        Ok(()) => println!("state-write-ok"),
+        Err(e) => println!("state-write-fail (BAD) {e}"),
     }
 
     // Connecting to a non-allowed port must fail.
@@ -268,13 +274,13 @@ fn exec_path(path: &std::ffi::CStr) -> i32 {
 }
 
 #[cfg(target_os = "linux")]
-fn exec_via_fd() -> i32 {
-    // SAFETY: open a known binary and attempt execveat on the fd.
+fn exec_via_fd(path: &std::ffi::CStr) -> i32 {
+    // SAFETY: open a readable binary and attempt execveat on the fd.
     unsafe {
-        let fd = libc::open(c"/bin/true".as_ptr(), libc::O_RDONLY);
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
         if fd < 0 {
-            // can't even open it (Landlock); treat as denied path to exec.
-            return libc::EPERM;
+            println!("execveat-open-failed {}", std::io::Error::last_os_error());
+            return -1;
         }
         let empty = c"";
         let argv: [*const libc::c_char; 1] = [std::ptr::null()];
@@ -311,22 +317,47 @@ fn exec_via_memfd() -> i32 {
     }
 }
 
+/// `validator echo|open|socket`. `echo`: the child reads a length-prefixed
+/// request, parses it with allocation + a HashMap (RNG seeding), and writes the
+/// reversed bytes back — proves the allowlist is enough for real parsing.
+/// `open`/`socket`: the child attempts the forbidden call; seccomp must kill it
+/// (SIGSYS) before it can report anything.
 #[cfg(target_os = "linux")]
-fn validator_selftest() -> ExitCode {
-    // The child tries to open a file and a socket; both must fail (seccomp kills
-    // it on the socket syscall). It writes one status byte before dying, if it
-    // can; the parent reports what it saw.
-    let v = moochy_sandbox::spawn_validator(|fd: RawFd| -> i32 {
-        // No filesystem: open must fail.
-        let opened = std::fs::File::open("/etc/hostname").is_ok();
-        // Report the FS result over the socket before attempting a socket (which
-        // the seccomp allowlist kills).
-        let msg: &[u8] = if opened { b"FOPEN\n" } else { b"NOOPEN\n" };
-        write_fd(fd, msg);
-        // This syscall is not in the allowlist → process is killed here.
-        let _ = std::net::TcpStream::connect("127.0.0.1:9");
-        write_fd(fd, b"SOCKET\n"); // should never be reached
-        0
+fn validator_selftest(a: &[String]) -> ExitCode {
+    let mode = a.first().cloned().unwrap_or_else(|| "echo".into());
+    let m2 = mode.clone();
+    let v = moochy_sandbox::spawn_validator(move |fd: RawFd| -> i32 {
+        match m2.as_str() {
+            "open" => {
+                let _ = std::fs::File::open("/etc/hostname");
+                write_fd(fd, b"OPENED\n");
+                0
+            }
+            "socket" => {
+                let _ = std::net::TcpStream::connect("127.0.0.1:9");
+                write_fd(fd, b"SOCKET\n");
+                0
+            }
+            _ => {
+                let mut hdr = [0u8; 4];
+                if read_fd(fd, &mut hdr) != 4 {
+                    return 3;
+                }
+                let n = u32::from_be_bytes(hdr) as usize;
+                let mut body = vec![0u8; n];
+                if read_fd(fd, &mut body) != n {
+                    return 4;
+                }
+                let mut seen = std::collections::HashMap::new();
+                for b in &body {
+                    *seen.entry(*b).or_insert(0u32) += 1;
+                }
+                body.reverse();
+                write_fd(fd, &(body.len() as u32).to_be_bytes());
+                write_fd(fd, &body);
+                0
+            }
+        }
     });
     let mut v = match v {
         Ok(v) => v,
@@ -335,18 +366,34 @@ fn validator_selftest() -> ExitCode {
             return ExitCode::from(71);
         }
     };
-    let mut buf = Vec::new();
-    let _ = v.sock.read_to_end(&mut buf);
-    let text = String::from_utf8_lossy(&buf);
-    print!("validator-output: {text}");
-    let code = v.wait().unwrap_or(-1);
-    println!("validator-exit {code}");
-    // Expect: NOOPEN present, SOCKET absent, killed by signal (code >= 128).
-    if text.contains("NOOPEN") && !text.contains("SOCKET") {
-        ok()
-    } else {
-        no()
+    let mut out = Vec::new();
+    if mode == "echo" {
+        let req = b"moochy-request";
+        let _ = v.sock.write_all(&(req.len() as u32).to_be_bytes());
+        let _ = v.sock.write_all(req);
     }
+    let _ = v.sock.read_to_end(&mut out);
+    let code = v.wait().unwrap_or(-1);
+    println!("validator-{mode} exit={code} out={:?}", String::from_utf8_lossy(&out));
+    let good = match mode.as_str() {
+        "echo" => code == 0 && out.ends_with(b"tseuqer-yhcoom"),
+        _ => code == 128 + 31 && out.is_empty(), // SIGSYS, nothing written
+    };
+    if good { ok() } else { no() }
+}
+
+#[cfg(target_os = "linux")]
+fn read_fd(fd: RawFd, buf: &mut [u8]) -> usize {
+    let mut got = 0;
+    while got < buf.len() {
+        // SAFETY: fd is the inherited socketpair end; the slice is valid.
+        let r = unsafe { libc::read(fd, buf[got..].as_mut_ptr().cast(), buf.len() - got) };
+        if r <= 0 {
+            break;
+        }
+        got += r as usize;
+    }
+    got
 }
 
 #[cfg(target_os = "linux")]

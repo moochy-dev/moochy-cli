@@ -44,9 +44,10 @@ pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         rustix::thread::set_no_new_privs(true).map_err(|e| setup("no_new_privs", e.into()))?;
         report.no_new_privs = true;
     }
-    let prog = seccomp::donor_filter()?;
-    seccompiler::apply_filter_all_threads(&prog)
-        .map_err(|e| setup("seccomp apply", std::io::Error::other(e.to_string())))?;
+    for prog in seccomp::donor_filter()? {
+        seccompiler::apply_filter_all_threads(&prog)
+            .map_err(|e| setup("seccomp apply", std::io::Error::other(e.to_string())))?;
+    }
     report.seccomp = true;
     Ok(report)
 }
