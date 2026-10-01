@@ -1,0 +1,43 @@
+[package]
+name = "moochy-keylog"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Moochy key log verifier: tlog proofs, signed checkpoints, C2SP tiles, mirror, monitor rules"
+publish = false
+
+[features]
+default = []
+# Blocking HTTP/1.0 tile fetcher (std TcpStream + rustls). Off by default: the Node passes bytes in.
+http = ["dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+# Same versions as moochy-proto: one sha2 0.10 and one ed25519-zebra 4 (ZIP-215) in the tree.
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
+# http feature only; both already in the Node's tree (ring provider, no OpenSSL).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+webpki-roots = { version = "1", default-features = false, optional = true }
+
+[dev-dependencies]
+# Vector files and the example's JSON report only.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[[example]]
+name = "keylog-check"
+required-features = ["http"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+doc_markdown = "allow"
