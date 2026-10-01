@@ -113,7 +113,7 @@ struct Plan {
 /// The pre_exec closure. Returns `Ok(())` only in the agent branch (std then
 /// execs). Any error aborts the spawn (fail closed).
 fn child_main(plan: &Plan, filter: &seccompiler::BpfProgram) -> std::io::Result<()> {
-    build_namespaces_and_view(plan).map_err(to_io)?;
+    enter_namespaces(plan).map_err(to_io)?;
 
     // Fork: the child becomes PID 1 in the new PID namespace (it is the agent);
     // the current process stays outside and reaps it. Both branches reach execve
@@ -126,18 +126,27 @@ fn child_main(plan: &Plan, filter: &seccompiler::BpfProgram) -> std::io::Result<
             sys::exit_immediately(code);
         }
         sys::Fork::Child => {
+            build_view(plan).map_err(to_io)?;
             harden_agent(plan, filter).map_err(to_io)?;
             Ok(()) // → std performs execve(program, argv, envp)
         }
     }
 }
 
+/// std only forwards an errno from `pre_exec`, so print the precise reason here
+/// (the child is single-threaded at this point) and keep the OS errno if any.
 fn to_io(e: Error) -> std::io::Error {
-    std::io::Error::other(e.to_string())
+    let msg = format!("moochy-sandbox: {e}\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
+    match e {
+        Error::Setup { err, .. } if err.raw_os_error().is_some() => err,
+        _ => std::io::Error::from_raw_os_error(libc::EPERM),
+    }
 }
 
 /// Child, pre-fork: new namespaces, uid/gid maps, the pivoted minimal view.
-fn build_namespaces_and_view(plan: &Plan) -> Result<(), Error> {
+/// Reaper, pre-fork: new namespaces, uid/gid maps, hostname.
+fn enter_namespaces(plan: &Plan) -> Result<(), Error> {
     sys::unshare(
         UnshareFlags::NEWUSER
             | UnshareFlags::NEWNS
@@ -150,6 +159,14 @@ fn build_namespaces_and_view(plan: &Plan) -> Result<(), Error> {
 
     write_id_maps(plan.uid_raw, plan.gid_raw)?;
     let _ = rustix::system::sethostname(b"moochy");
+    Ok(())
+}
+
+/// Agent (PID 1 of the new pid ns), pre-exec: build the pivoted minimal view.
+/// Runs here, not in the reaper, so the fresh `/proc` belongs to the new pid
+/// namespace and is mounted while the host procfs is still visible (the kernel
+/// refuses a procfs mount in a userns otherwise).
+fn build_view(plan: &Plan) -> Result<(), Error> {
 
     // All mounts private so nothing propagates back to the host.
     mount_change("/", MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
@@ -193,6 +210,12 @@ fn build_namespaces_and_view(plan: &Plan) -> Result<(), Error> {
         mount_bind_recursive(sock, &dst).map_err(io("bind gateway socket"))?;
     }
 
+    // /proc of the NEW pid namespace, mounted before the host procfs goes away.
+    let proc_dir = root.join("proc");
+    mkdir_p(&proc_dir)?;
+    mount("proc", &proc_dir, "proc", MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC, None)
+        .map_err(io("mount /proc"))?;
+
     pivot_into(&root)
 }
 
@@ -212,6 +235,18 @@ fn bind_into(root: &Path, src: &Path, writable: bool) -> Result<(), Error> {
     let rel = src.strip_prefix("/").unwrap_or(src);
     let dst = root.join(rel);
     let meta = std::fs::symlink_metadata(src).map_err(|e| setup("stat bind src", e))?;
+    if meta.file_type().is_symlink() {
+        // usrmerge (`/bin -> usr/bin`): recreate the link, never follow it.
+        let target = std::fs::read_link(src).map_err(|e| setup("readlink", e))?;
+        if let Some(parent) = dst.parent() {
+            mkdir_p(parent)?;
+        }
+        return match std::os::unix::fs::symlink(&target, &dst) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(setup("symlink", e)),
+        };
+    }
     if meta.is_dir() {
         mkdir_p(&dst)?;
     } else {
@@ -283,11 +318,6 @@ fn pivot_into(root: &Path) -> Result<(), Error> {
 /// Agent branch (PID 1 in the new ns): /proc, rlimits, pdeathsig, new session,
 /// drop capabilities, Landlock FS layer, no_new_privs, seccomp. Then returns.
 fn harden_agent(plan: &Plan, filter: &seccompiler::BpfProgram) -> Result<(), Error> {
-    // /proc of the NEW pid namespace (we are a task in it now).
-    mkdir_p(Path::new("/proc")).ok();
-    mount("proc", "/proc", "proc", MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC, None)
-        .map_err(io("mount /proc"))?;
-
     chdir_into_worktree(plan)?;
     apply_rlimits(&plan.limits)?;
 

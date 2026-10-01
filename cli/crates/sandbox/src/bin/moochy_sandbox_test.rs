@@ -28,6 +28,11 @@ fn main() -> ExitCode {
         "symlink" => probe_symlink(rest),
         "tiocsti" => probe_tiocsti(),
         "env" => probe_env(rest),
+        "sleep" => probe_sleep(rest),
+        "forkbomb" => probe_forkbomb(),
+        "memhog" => probe_memhog(),
+        "ptrace" => probe_ptrace(rest),
+        "run" => run_sandbox(rest),
         #[cfg(target_os = "linux")]
         "donor" => donor_selftest(rest),
         #[cfg(target_os = "linux")]
@@ -349,5 +354,106 @@ fn write_fd(fd: RawFd, msg: &[u8]) {
     // SAFETY: fd is the inherited socketpair end, valid for the call.
     unsafe {
         libc::write(fd, msg.as_ptr().cast(), msg.len());
+    }
+}
+
+/// `run <worktree> [--ro P]... [--gw SOCK] [--token T] [--nproc N] [--mem B] -- CMD ARGS...`
+fn run_sandbox(a: &[String]) -> ExitCode {
+    use std::path::PathBuf;
+    let Some(wt) = a.first() else { return ExitCode::from(2) };
+    let mut spec = moochy_sandbox::Spec::new(PathBuf::from(wt));
+    let mut i = 1;
+    let mut cmd: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(arg) = a.get(i) {
+        let val = a.get(i + 1).cloned().unwrap_or_default();
+        match arg.as_str() {
+            "--ro" => spec.ro_paths.push(PathBuf::from(val)),
+            "--rw" => spec.rw_paths.push(PathBuf::from(val)),
+            "--gw" => spec.gateway_socket = Some(PathBuf::from(val)),
+            "--gw-port" => spec.gateway_loopback_port = val.parse().ok(),
+            "--token" => spec.run_token = Some(val),
+            "--nproc" => spec.limits.processes = val.parse().unwrap_or(64),
+            "--mem" => spec.limits.memory_bytes = val.parse().unwrap_or(1 << 30),
+            "--env" => {
+                if let Some((k, v)) = val.split_once('=') {
+                    spec.env.insert(k.into(), v.into());
+                }
+            }
+            "--" => {
+                cmd = a[i + 1..].iter().map(Into::into).collect();
+                break;
+            }
+            _ => {
+                eprintln!("bad flag {arg}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 2;
+    }
+    let Some((prog, rest)) = cmd.split_first() else { return ExitCode::from(2) };
+    match spec.run(prog, rest) {
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
+        Err(e) => {
+            eprintln!("moochy-sandbox: {e}");
+            ExitCode::from(125)
+        }
+    }
+}
+
+fn probe_sleep(a: &[String]) -> ExitCode {
+    let secs: u64 = a.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    ok()
+}
+
+/// Bounded fork bomb: try to create many children; report how many succeeded.
+fn probe_forkbomb() -> ExitCode {
+    let mut kids = Vec::new();
+    let mut failed = false;
+    for _ in 0..2000 {
+        match std::process::Command::new("/proc/self/exe").arg("sleep").arg("5").spawn() {
+            Ok(c) => kids.push(c),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    println!("forkbomb spawned={} hit_limit={failed}", kids.len());
+    for mut k in kids {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
+    if failed { ok() } else { no() }
+}
+
+/// Allocate and touch memory until refused; report.
+fn probe_memhog() -> ExitCode {
+    let mut v: Vec<Vec<u8>> = Vec::new();
+    for i in 0..64u32 {
+        let mut chunk = Vec::new();
+        if chunk.try_reserve_exact(64 << 20).is_err() {
+            println!("memhog refused after {} MiB", i * 64);
+            return ok();
+        }
+        chunk.resize(64 << 20, 1u8);
+        v.push(chunk);
+    }
+    println!("memhog allocated 4096 MiB (no limit hit)");
+    no()
+}
+
+/// Try to ptrace-attach to a pid (e.g. our parent).
+fn probe_ptrace(a: &[String]) -> ExitCode {
+    let pid: i32 = a.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    // SAFETY: PTRACE_ATTACH with no data pointers; we detach if it worked.
+    let r = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid, 0, 0) };
+    if r == 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) };
+        println!("ptrace-ok {pid} (BAD)");
+        ok()
+    } else {
+        println!("ptrace-fail {pid} {}", std::io::Error::last_os_error());
+        no()
     }
 }
