@@ -8,7 +8,7 @@
 
 use crate::engine::{self, DetailCtx, Dialect, Failure};
 use crate::gate::Gate;
-use crate::node::{Keys, Node, PoolWorker, RepoPool};
+use crate::node::{Busy, Keys, Node, PoolWorker, RepoPool};
 use crate::pb::link::{self as pb, SubmitDown, SubmitUp, submit_down, submit_up};
 use crate::pb::local::JournalEntry;
 use crate::util::{b64e, clean, log, now_ms};
@@ -181,9 +181,6 @@ fn internal(e: impl std::fmt::Debug) -> Failure {
 async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mpsc::Receiver<TaskEv>, Failure> {
     let keys = node.keys.as_ref().ok_or_else(|| Failure::new("not_logged_in", false, "moochy: run `moochy login` first".to_owned()))?;
     let link = node.link_now(std::time::Duration::from_secs(3)).await.ok_or_else(|| Failure::new("overloaded", true, "moochy: relay link is down".to_owned()))?;
-    let slot = crate::node::task_slot(node, std::time::Duration::from_secs(30))
-        .await
-        .ok_or_else(|| Failure::new("overloaded", true, "moochy: too many tasks in flight on this device".to_owned()))?;
     let t0 = now_ms();
     let aff = req.affinity;
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
@@ -272,7 +269,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let (slug, model, t_rx, req_body) = (req.slug, req.entry.model, req.t_client_rx, req.body);
     tokio::spawn(async move {
         let node = drv.node.clone();
-        let _slot = slot;
+        let _busy = Busy::new(&node.gateway_tasks);
         let task_id = drv.task_text.clone();
         let (status, cost, ev) = drv.run(down, aff, ttl).await;
         log("info", "timing", &json!({"task": task_id, "t_client_rx": t_rx, "t_first_sealed_tx": first_tx.load(Ordering::Relaxed)}));
