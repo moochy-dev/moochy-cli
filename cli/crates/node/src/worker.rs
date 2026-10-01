@@ -51,9 +51,10 @@ fn slots_max(node: &Node) -> u32 {
 /// `(dialect, public model)` this node can serve: adapters × catalog entries of their provider.
 fn served_models(node: &Node) -> Vec<(Dialect, String)> {
     let cat = node.catalog();
+    let only = node.cfg.models_override();
     let mut out = Vec::new();
     for a in &node.adapters {
-        for e in cat.entries.iter().filter(|e| e.provider == a.provider().as_str()) {
+        for e in cat.entries.iter().filter(|e| e.provider == a.provider().as_str() && only.as_ref().is_none_or(|o| o.contains(&e.model.as_str()))) {
             for d in &e.dialects {
                 let Some(d) = Dialect::from_wire(d.as_str()) else { continue };
                 if a.provider().serves(d.worker()) && !out.contains(&(d, e.model.clone())) {
@@ -298,10 +299,37 @@ fn gateway_key(_node: &Node, _device: &str, _repo_id: &str) -> Option<[u8; 32]> 
     None
 }
 
+/// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
+/// whatever the relay decided; the firewall level is the donor's own setting (06 §7.3).
+fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<Policy, String> {
+    let level = if node.cfg.firewall_level.as_deref() == Some("paranoid") { firewall::Level::Paranoid } else { firewall::Level::Strict };
+    if raw.is_empty() {
+        // Older relay without the field: no opt-in flags, effort unbounded by the pledge.
+        return Ok(Policy { level, flags: moochy_worker::Flags::NONE, max_effort: Effort::Max });
+    }
+    let v = crate::json::parse_object(raw).map_err(|e| format!("pledge policy: {e}"))?;
+    let strs = |k: &str| -> Vec<&str> { v.get(k).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).collect() };
+    let models = strs("models");
+    let model_ok = models.is_empty() || models.iter().any(|m| *m == route.model || m.strip_suffix('*').is_some_and(|p| route.model.starts_with(p)));
+    if !model_ok {
+        return Err(format!("model `{}` is not in the pledge policy", route.model));
+    }
+    let dialects = strs("dialects");
+    if !dialects.is_empty() && !dialects.contains(&route.dialect.as_str()) {
+        return Err("dialect is not in the pledge policy".into());
+    }
+    let max_effort = match v.get("max_effort").and_then(serde_json::Value::as_str).filter(|e| !e.is_empty()) {
+        Some(e) => Effort::parse(e).ok_or("unknown max_effort in the pledge policy")?,
+        None => Effort::Max,
+    };
+    let flags = moochy_worker::Flags::parse(strs("flags")).map_err(|e| format!("pledge policy: {e}"))?;
+    Ok(Policy { level, flags, max_effort })
+}
+
 /// `H(repo_id ‖ gateway_device)`: pseudonymous end-user attribution for the provider (06 §7.1).
 fn user_pseudonym(repo: &str, gw: &str) -> String {
     let h = crypto::sha256(&crate::util::lp(&[b"moochy/v1/user", repo.as_bytes(), gw.as_bytes()]));
-    h.iter().take(16).fold(String::from("moochy-"), |mut s, b| {
+    h.iter().take(16).fold(String::with_capacity(32), |mut s, b| {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
         s
@@ -378,7 +406,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("model_unavailable", true, None));
     };
     let fwc = engine::fw_catalog(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
-    let policy = Policy { level: firewall::Level::Strict, flags: moochy_worker::Flags::NONE, max_effort: Effort::Max };
+    let policy = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
     let hdrs: Vec<(&str, &str)> = inner.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let pseudo = user_pseudonym(&assign.repo_id, &inner.gateway_device.text());
     let fw = firewall::Request {
@@ -414,8 +442,13 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         let (code, retry) = e.code.nack();
         with_ck(code, retry, Some(e.to_string()))
     })?;
-    // 4. Local reservation (device cap; pledge numbers are relay-side until Assign carries them).
+    // 4. Local reservation: device cap, plus the pledge's per-task cap and headroom from Assign.
     let amount = money::reserve_for_route(&entry, &route).ok().and_then(|a| u64::try_from(a).ok()).ok_or_else(|| with_ck("local_cap", true, None))?;
+    let positive = |v: i64| u64::try_from(v).ok().filter(|v| *v > 0);
+    let task_cap = positive(assign.per_task_cap_uusd).unwrap_or(u64::MAX);
+    if positive(assign.pledge_headroom_uusd).is_some_and(|h| amount > h) && assign.pledge_headroom_uusd != 0 {
+        return Err(with_ck("local_cap", true, Some("pledge headroom".into())));
+    }
     let key = attempt_key(&task.text(), u32::from(attempt));
     let (k2, p2, cap) = (key.clone(), pledge.text(), device_cap(node).unwrap_or(0));
     let reserved = with_store(node, move |s| {
@@ -424,7 +457,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
             pledge_id: &p2,
             pledge_period: u64::from(moochy_worker::store::month_of(now)),
             pledge_budget_uusd: u64::MAX,
-            per_task_cap_uusd: u64::MAX,
+            per_task_cap_uusd: task_cap,
             amount_uusd: amount,
             device_cap_uusd: cap,
             now_ms: now,

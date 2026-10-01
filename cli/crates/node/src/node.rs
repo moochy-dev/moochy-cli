@@ -122,6 +122,10 @@ pub struct Node {
     pub journal: Mutex<VecDeque<JournalEntry>>,
     pub journal_tx: broadcast::Sender<JournalEntry>,
     pub shutdown: watch::Sender<bool>,
+    /// Relay server_time − node clock at the last Hello.
+    pub clock_skew_ms: std::sync::atomic::AtomicI64,
+    /// Evidence of the last consumed tasks, for `moochy report` (bounded).
+    pub evidence: Mutex<VecDeque<crate::task::Evidence>>,
 }
 
 const MAX_SESSIONS: usize = 4096;
@@ -157,6 +161,8 @@ impl Node {
             journal: Mutex::new(VecDeque::new()),
             journal_tx: broadcast::channel(64).0,
             shutdown: watch::channel(false).0,
+            clock_skew_ms: std::sync::atomic::AtomicI64::new(0),
+            evidence: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -310,6 +316,14 @@ impl Node {
             }
         }
         s.insert(key, (worker, now_ms().saturating_add(ttl_ms)));
+    }
+
+    pub fn keep_evidence(&self, e: crate::task::Evidence) {
+        let mut v = lock(&self.evidence);
+        if v.len() >= 32 {
+            v.pop_front();
+        }
+        v.push_back(e);
     }
 
     /// Record a finished task in the local journal (metadata only, never content).

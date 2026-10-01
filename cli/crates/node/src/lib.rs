@@ -18,6 +18,7 @@ pub mod files;
 pub mod gate;
 pub mod gateway;
 pub mod json;
+pub mod keycheck;
 pub mod keystore;
 pub mod link;
 pub mod login;

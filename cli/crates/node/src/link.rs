@@ -165,8 +165,10 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     if hello.nonce.len() != 32 {
         return Err(End::Refused("Hello without a 32-byte nonce".into()));
     }
+    let skew = hello.server_time_ms.saturating_sub(i64::try_from(now_ms()).unwrap_or(i64::MAX));
+    node.clock_skew_ms.store(skew, std::sync::atomic::Ordering::Relaxed);
     if u64::try_from(hello.server_time_ms).unwrap_or(0).abs_diff(now_ms()) > 300_000 {
-        log("warn", "clock skew larger than 5 minutes vs relay", &json!({}));
+        log("warn", "clock skew larger than 5 minutes vs relay: task ids from other nodes may be refused", &json!({"skew_ms": i128::from(hello.server_time_ms).saturating_sub(i128::from(now_ms()))}));
     }
     let origin_s = origin.url();
     let sig = keys.sign(&lp(&[b"moochy/v1/auth", &hello.nonce, origin_s.as_bytes(), &exporter, device_id.as_bytes()]));

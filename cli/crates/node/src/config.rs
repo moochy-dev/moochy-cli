@@ -24,6 +24,8 @@ pub struct Config {
     pub ca_file: Option<PathBuf>,
     pub roles: Vec<String>,
     pub device_id: Option<String>,
+    /// The user's public pseudonym (`ps_…`, from device approval): key-log entries name it.
+    pub pseudonym: Option<String>,
     pub device_monthly_cap_uusd: Option<u64>,
     pub slots_max: Option<u32>,
     pub gateway_addr: Option<String>,
@@ -35,6 +37,12 @@ pub struct Config {
     pub keystore: Option<String>,
     /// Opt-in: the local journal may keep full request/response text (default off: metadata only).
     pub journal_full_text: bool,
+    /// Gateway: automatic prompt caching for multi-turn Anthropic requests (default on).
+    pub auto_cache: Option<bool>,
+    /// Worker firewall strictness: `strict` (default) or `paranoid` (06 §7.3).
+    pub firewall_level: Option<String>,
+    /// Worker: serve only these public models (comma-separated), below what the keys allow.
+    pub models_override: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -141,6 +149,15 @@ impl Config {
         Ok(a)
     }
 
+    pub fn auto_cache(&self) -> bool {
+        self.auto_cache.unwrap_or(true)
+    }
+
+    /// `models_override` as a list (`None` = no override).
+    pub fn models_override(&self) -> Option<Vec<&str>> {
+        self.models_override.as_deref().map(|v| v.split(',').map(str::trim).filter(|m| !m.is_empty()).collect())
+    }
+
     pub fn has_role(&self, r: &str) -> bool {
         self.roles.iter().any(|x| x == r)
     }
@@ -165,20 +182,30 @@ impl Config {
                     return Err(e);
                 }
             }
-            "journal_full_text" => {
-                self.journal_full_text = match value {
-                    "true" | "1" | "on" => true,
-                    "false" | "0" | "off" => false,
-                    _ => return Err(usage("journal_full_text is true or false")),
-                };
+            "journal_full_text" => self.journal_full_text = parse_bool(key, value)?,
+            "auto_cache" => self.auto_cache = Some(parse_bool(key, value)?),
+            "firewall_level" => {
+                if !matches!(value, "strict" | "paranoid") {
+                    return Err(usage("firewall_level is strict or paranoid"));
+                }
+                self.firewall_level = Some(value.into());
             }
+            "models_override" => self.models_override = Some(value.into()).filter(|v: &String| !v.is_empty()),
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr, journal_full_text)"
+                    "unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override)"
                 )));
             }
         }
         Ok(())
+    }
+}
+
+fn parse_bool(key: &str, v: &str) -> Result<bool> {
+    match v {
+        "true" | "1" | "on" => Ok(true),
+        "false" | "0" | "off" => Ok(false),
+        _ => Err(usage(format!("{key} is true or false"))),
     }
 }
 

@@ -9,13 +9,12 @@
 use crate::node::{Node, lock};
 use crate::pb::link::{ApprovalRequest, ApprovalRequests, LogEntryAck, NodeMsg, SignedLogEntry, node_msg};
 use crate::pb::local::SignResponse;
-use crate::util::{clean, log, lp, now_ms};
+use crate::util::{clean, log, now_ms};
 use bytes::Bytes;
 use serde_json::json;
 use std::time::Duration;
 use tonic::Status;
 
-const LABEL_SIG: &[u8] = b"moochy/v1/keylog-sig";
 const MAX_PENDING: usize = 256;
 const MAX_SKEW_MS: u64 = 24 * 3600 * 1000;
 
@@ -111,17 +110,9 @@ pub async fn sign(node: &Node, kind: &str, repo: &str, subject: Option<&str>, dr
     if dry_run {
         return Ok(preview);
     }
-    let sig = keys.sign.sign(&lp(&[LABEL_SIG, &kn.to_be_bytes(), &q.body_to_sign]));
-    let link = node.link().ok_or_else(|| Status::unavailable("relay link is down"))?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    lock(&node.log_acks).insert(q.request_id.clone(), tx);
-    let e = SignedLogEntry { request_id: q.request_id.clone(), kind: q.kind.clone(), body: q.body_to_sign.clone(), sigs: vec![Bytes::copy_from_slice(&sig)] };
-    if link.up.send(NodeMsg { msg: Some(node_msg::Msg::LogEntry(e)) }).await.is_err() {
-        return Err(Status::unavailable("relay link is down"));
-    }
-    let ack = tokio::time::timeout(Duration::from_secs(15), rx).await;
-    lock(&node.log_acks).remove(&q.request_id);
-    let ack = ack.map_err(|_| Status::deadline_exceeded("relay did not acknowledge the entry"))?.map_err(|_| Status::unavailable("relay link lost"))?;
+    let kind_k = moochy_keylog::Kind::from_u32(kn).ok_or_else(|| Status::invalid_argument("unknown entry kind"))?;
+    let sig = keys.sign.sign(&moochy_keylog::entry::sig_message(kind_k, &q.body_to_sign));
+    let ack = submit_entry(node, &q.request_id, &q.kind, q.body_to_sign.clone(), &sig, Duration::from_secs(15)).await?;
     if !ack.error.is_empty() {
         return Err(Status::failed_precondition(format!("relay refused the entry: {}", clean(&ack.error))));
     }
@@ -129,6 +120,33 @@ pub async fn sign(node: &Node, kind: &str, repo: &str, subject: Option<&str>, dr
     preview.signed = true;
     preview.log_index = ack.index;
     Ok(preview)
+}
+
+/// Send one signed key-log entry over the session and wait for its `LogEntryAck`.
+pub async fn submit_entry(node: &Node, request_id: &str, kind: &str, body: Bytes, sig: &[u8; 64], wait: Duration) -> Result<LogEntryAck, Status> {
+    let link = node.link().ok_or_else(|| Status::unavailable("relay link is down"))?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    lock(&node.log_acks).insert(request_id.to_owned(), tx);
+    let e = SignedLogEntry { request_id: request_id.into(), kind: kind.into(), body, sigs: vec![Bytes::copy_from_slice(sig)] };
+    if link.up.send(NodeMsg { msg: Some(node_msg::Msg::LogEntry(e)) }).await.is_err() {
+        lock(&node.log_acks).remove(request_id);
+        return Err(Status::unavailable("relay link is down"));
+    }
+    let ack = tokio::time::timeout(wait, rx).await;
+    lock(&node.log_acks).remove(request_id);
+    ack.map_err(|_| Status::deadline_exceeded("relay did not acknowledge the entry"))?.map_err(|_| Status::unavailable("relay link lost"))
+}
+
+/// `moochy logout`: a KEY_REVOKED request for this device, self-signed (KEYLOG §2 body
+/// `device_id, pseudonym, reason`); the relay asserts it in the log and drops the device.
+pub async fn revoke_self(node: &Node, reason: &str) -> Result<LogEntryAck, Status> {
+    let (Some(keys), Some(me)) = (node.keys.as_ref(), node.device_id()) else {
+        return Err(Status::failed_precondition("not logged in"));
+    };
+    let pseudonym = node.cfg.pseudonym.as_deref().unwrap_or_default();
+    let body = moochy_keylog::entry::lp(&[me.as_bytes(), pseudonym.as_bytes(), reason.as_bytes()]);
+    let sig = keys.sign.sign(&moochy_keylog::entry::sig_message(moochy_keylog::Kind::KeyRevoked, &body));
+    submit_entry(node, &format!("revoke-{me}"), "KEY_REVOKED", Bytes::from(body), &sig, Duration::from_secs(5)).await
 }
 
 pub fn pending(node: &Node) -> Vec<SignResponse> {
@@ -139,6 +157,7 @@ pub fn pending(node: &Node) -> Vec<SignResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::lp;
 
     fn grant(repo: &str, subj: &str, signer: &str, ts: u64) -> Vec<u8> {
         lp(&[repo.as_bytes(), subj.as_bytes(), signer.as_bytes(), &ts.to_be_bytes()])

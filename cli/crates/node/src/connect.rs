@@ -79,3 +79,85 @@ mod tests {
         assert!(super::snippet("nope", "", "", "", "").is_none());
     }
 }
+
+/// JSON paths and the values to set there.
+pub type Plan = Vec<(Vec<&'static str>, serde_json::Value)>;
+
+/// `--write` support: the user-scoped JSON config file of a client and the values to merge in
+/// (`(json path, value)`). Never a token: stdio shim entries, or env references.
+pub fn write_plan(client: &str, home: &std::path::Path, repo: &str, url: &str, main: &str, small: &str) -> Option<(std::path::PathBuf, Plan)> {
+    use serde_json::json;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), std::path::PathBuf::from);
+    let stdio = json!({"command": "moochy", "args": ["mcp", "--repo", repo]});
+    Some(match client {
+        "claude-code" => (home.join(".claude.json"), vec![(vec!["mcpServers", "moochy"], json!({"type": "stdio", "command": "moochy", "args": ["mcp", "--repo", repo]}))]),
+        "cursor" => (home.join(".cursor/mcp.json"), vec![(vec!["mcpServers", "moochy"], stdio)]),
+        "windsurf" => (home.join(".codeium/windsurf/mcp_config.json"), vec![(vec!["mcpServers", "moochy"], stdio)]),
+        "claude-desktop" => (xdg.join("Claude/claude_desktop_config.json"), vec![(vec!["mcpServers", "moochy"], stdio)]),
+        // Cline keeps its settings inside the editor profile: pass --config.
+        "cline" => (home.join("cline_mcp_settings.json"), vec![(vec!["mcpServers", "moochy"], json!({"command": "moochy", "args": ["mcp", "--repo", repo], "timeout": 300}))]),
+        "vscode" => (xdg.join("Code/User/mcp.json"), vec![(vec!["servers", "moochy"], json!({"type": "stdio", "command": "moochy", "args": ["mcp", "--repo", repo]}))]),
+        "zed" => (xdg.join("zed/settings.json"), vec![(vec!["context_servers", "moochy"], stdio)]),
+        "opencode" => (
+            xdg.join("opencode/opencode.json"),
+            vec![
+                (vec!["mcp", "moochy"], json!({"type": "local", "command": ["moochy", "mcp", "--repo", repo], "enabled": true})),
+                (
+                    vec!["provider", "moochy"],
+                    json!({"npm": "@ai-sdk/openai-compatible", "name": "Moochy", "options": {"baseURL": format!("{url}/v1"), "apiKey": "{env:MOOCHY_TOKEN}"},
+                        "models": {main: {}, small: {}}}),
+                ),
+                (vec!["model"], json!(format!("moochy/{main}"))),
+                (vec!["small_model"], json!(format!("moochy/{small}"))),
+            ],
+        ),
+        _ => return None,
+    })
+}
+
+/// Merge `(path, value)` pairs into a JSON object, creating intermediate objects.
+pub fn merge(root: &mut serde_json::Value, plan: &Plan) -> bool {
+    for (path, v) in plan {
+        let mut cur = &mut *root;
+        let Some((last, parents)) = path.split_last() else { continue };
+        for k in parents {
+            let Some(obj) = cur.as_object_mut() else { return false };
+            cur = obj.entry((*k).to_owned()).or_insert_with(|| serde_json::json!({}));
+        }
+        let Some(obj) = cur.as_object_mut() else { return false };
+        obj.insert((*last).to_owned(), v.clone());
+    }
+    true
+}
+
+/// Line diff preview: lines only in `old` as `-`, lines only in `new` as `+`.
+pub fn diff(old: &str, new: &str) -> String {
+    let (o, n): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let mut out = String::new();
+    for l in o.iter().filter(|l| !n.contains(l)) {
+        out.push_str("- ");
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in n.iter().filter(|l| !o.contains(l)) {
+        out.push_str("+ ");
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod write_tests {
+    #[test]
+    fn merge_and_diff() {
+        let mut v = serde_json::json!({"theme": "dark"});
+        let (_, plan) = super::write_plan("cursor", std::path::Path::new("/h"), "acme/w", "http://127.0.0.1:1", "m", "s").unwrap();
+        assert!(super::merge(&mut v, &plan));
+        assert_eq!(v["mcpServers"]["moochy"]["args"][2], "acme/w");
+        assert_eq!(v["theme"], "dark");
+        let d = super::diff("{\n  \"theme\": \"dark\"\n}", &serde_json::to_string_pretty(&v).unwrap());
+        assert!(d.contains("+ ") && !d.contains("- \"theme\""));
+        assert!(super::write_plan("aider", std::path::Path::new("/h"), "a/b", "", "", "").is_none());
+    }
+}

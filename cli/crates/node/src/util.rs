@@ -89,10 +89,18 @@ pub fn lp(fields: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Dev/test clock offset (`MOOCHY_DEV_CLOCK_SKEW_MS`, honoured only with `MOOCHY_INSECURE_DEV=1`).
+static SKEW_MS: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    if std::env::var("MOOCHY_INSECURE_DEV").as_deref() != Ok("1") {
+        return 0;
+    }
+    std::env::var("MOOCHY_DEV_CLOCK_SKEW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+});
+
+/// Node clock in Unix ms (the dev skew above included).
 pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    let real = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    real.checked_add_signed(*SKEW_MS).unwrap_or(real)
 }
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";

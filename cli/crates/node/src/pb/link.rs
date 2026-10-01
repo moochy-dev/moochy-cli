@@ -396,6 +396,15 @@ pub struct Failed {
     /// detail sealed to the Gateway (Relay sees only `code`)
     #[prost(bytes = "bytes", tag = "4")]
     pub sealed_detail: ::prost::bytes::Bytes,
+    /// attempt whose Worker produced sealed_detail (0 = relay-side failure)
+    #[prost(uint32, tag = "5")]
+    pub attempt: u32,
+    /// needed with `r` to derive K_det (CONTRACT §3)
+    #[prost(string, tag = "6")]
+    pub worker_device: ::prost::alloc::string::String,
+    /// the attempt's response salt
+    #[prost(bytes = "bytes", tag = "7")]
+    pub r: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitUp {
@@ -573,6 +582,17 @@ pub struct Assign {
     pub body_len: u64,
     #[prost(uint32, tag = "9")]
     pub body_chunks: u32,
+    /// exact pledge policy JSON (models, max_effort, dialects, flags, max_slots, schedule) for local enforcement
+    #[prost(bytes = "bytes", tag = "10")]
+    pub pledge_policy: ::prost::bytes::Bytes,
+    /// budget - spent - reserved at assignment (advisory; the Worker's local caps still rule)
+    #[prost(int64, tag = "11")]
+    pub pledge_headroom_uusd: i64,
+    #[prost(int64, tag = "12")]
+    pub per_task_cap_uusd: i64,
+    /// catalog version in effect at attempt start
+    #[prost(uint64, tag = "13")]
+    pub catalog_version: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeviceStartRequest {
@@ -592,6 +612,9 @@ pub struct DeviceStartRequest {
     /// Ed25519(sign key, lp("moochy/v1/device-start", sign_pub, enc_pub, roles_csv, name, suite))
     #[prost(bytes = "bytes", tag = "6")]
     pub sig: ::prost::bytes::Bytes,
+    /// key-log proof of possession (label moochy/v1/key-pop, spec/KEYLOG.md); goes into KEY_ADDED
+    #[prost(bytes = "bytes", tag = "7")]
+    pub pop_sig: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeviceStartResponse {

@@ -28,7 +28,10 @@ pub const MAX_MCP_BODY: usize = 4 << 20;
 const MAX_RESPONSE: usize = 16 << 20;
 const MAX_CONNS: usize = 512;
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Default `max_tokens` injected for OpenAI-dialect requests that omit it (tools often do).
+static MAX_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Default `max_tokens` injected for requests that omit it (tools often do), capped by the
+/// catalog's `max_output`.
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 
 /// Response body: a full buffer or a channel of chunks flushed one by one.
@@ -143,7 +146,10 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
     };
     match (req.method(), path.as_str()) {
         (_, "/mcp") => crate::mcp::http(node, slug, req).await,
-        (&Method::GET, "/v1/models") => models(&node, &slug),
+        (&Method::GET, "/v1/models") => {
+            node.settle_pool(&slug, |p| !p.models().is_empty()).await;
+            models(&node, &slug)
+        }
         (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false).await,
         (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true).await,
         (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false).await,
@@ -153,13 +159,25 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
 
 /// One shape that satisfies both the Anthropic and the OpenAI model-list parsers.
 fn models(node: &Node, slug: &str) -> Resp {
-    let ms = node.pool_for(slug).map(|p| p.models()).unwrap_or_default();
-    let data: Vec<Value> = ms
+    // Pool slugs, then the native aliases the catalog maps to them (05 §2.1).
+    let mut ids: Vec<String> = node.pool_for(slug).map(|p| p.models()).unwrap_or_default().into_iter().map(|(m, _)| m).collect();
+    let cat = node.catalog();
+    let aliases: Vec<String> = ids
         .iter()
-        .map(|(id, _)| json!({"id": id, "object": "model", "type": "model", "created": 0, "created_at": "1970-01-01T00:00:00Z", "owned_by": "moochy", "display_name": id}))
+        .flat_map(|m| cat.entries.iter().filter(move |e| &e.model == m))
+        .flat_map(|e| std::iter::once(e.provider_model_id.clone()).chain(e.aliases.iter().cloned()))
         .collect();
-    let first = ms.first().map(|(m, _)| m.as_str());
-    let last = ms.last().map(|(m, _)| m.as_str());
+    for a in aliases {
+        if !ids.contains(&a) {
+            ids.push(a);
+        }
+    }
+    let data: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"id": id, "object": "model", "type": "model", "created": 0, "created_at": "1970-01-01T00:00:00Z", "owned_by": "moochy", "display_name": id}))
+        .collect();
+    let first = ids.first().map(String::as_str);
+    let last = ids.last().map(String::as_str);
     json_resp(200, &json!({"object": "list", "data": data, "has_more": false, "first_id": first, "last_id": last}))
 }
 
@@ -178,17 +196,32 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let mut body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
     // Strict tape parse (no tree allocation): this is the per-request hot path (CONTRACT §13).
     let mut tape = Vec::new();
-    let inject = {
+    let (inject_max, auto_cache) = {
         let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
         let root = doc.root();
         if root.kind() != Kind::Obj {
             return Err(bad("moochy: the body must be a JSON object".into()));
         }
-        dialect == Dialect::OpenAi && root.get("max_tokens").is_none() && root.get("max_completion_tokens").is_none()
+        let model = root.get("model").and_then(Val::as_str).ok_or_else(|| bad("moochy: `model` is required".into()))?;
+        let max_out = catalog_entry(node, &model)?.max_output;
+        let missing = root.get("max_tokens").is_none() && root.get("max_completion_tokens").is_none();
+        // 07 §4.2 step 4: multi-turn Anthropic conversation with no cache_control anywhere →
+        // top-level automatic caching (5 m): cache reads cost donors a fraction of input.
+        let turns = root.get("messages").map_or(0, |m| m.items().count());
+        let cache = dialect == Dialect::Anthropic && node.cfg.auto_cache() && turns >= 2 && !body.windows(15).any(|w| w == b"\"cache_control\"");
+        (missing.then(|| u64::from(max_out).min(DEFAULT_MAX_TOKENS)), cache)
     };
-    if inject {
+    if inject_max.is_some() || auto_cache {
         let mut m = crate::json::parse_object(&body).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
-        m.insert("max_tokens".into(), DEFAULT_MAX_TOKENS.into());
+        if let Some(n) = inject_max {
+            if !MAX_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::util::log("warn", "request without max_tokens: injected the catalog default (told once)", &json!({"max_tokens": n}));
+            }
+            m.insert("max_tokens".into(), n.into());
+        }
+        if auto_cache {
+            m.insert("cache_control".into(), json!({"type": "ephemeral"}));
+        }
         body = Bytes::from(Value::Object(m).to_string());
     }
     let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
