@@ -17,6 +17,7 @@ pub const RESERVED: &[&str] = &[
     "api", "dev", "p", "r", "u", "log", "logout", "events", "open", "connect", "explore", "station", "console",
     "device", "devices", "claim", "leaderboard", "auth", "admin", "static", "mcp", "v1", "moochy", "root", "support",
     "security", "staff", "official", "system", "null", "undefined", "anonymous", "relay", "node", "bot",
+    "activity", "button", "donate", "donations", "members", "repos", "settings", "signin", "theme", "studio", "overview", "repositories", "sessions", "account", "export", "help", "docs", "about", "privacy", "terms", "status", "login", "signup", "search", "favicon", "new",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
