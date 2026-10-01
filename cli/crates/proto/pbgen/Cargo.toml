@@ -1,0 +1,14 @@
+# Code generator for src/pb (link.proto → Rust). Standalone on purpose: never part of a normal
+# build, so tonic-prost-build stays out of every dependency graph.
+#   cd cli/crates/proto/pbgen && PROTOC=$HOME/.local/bin/protoc cargo run
+[package]
+name = "moochy-pbgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[workspace]
+
+[dependencies]
+tonic-prost-build = "=0.14.6"
