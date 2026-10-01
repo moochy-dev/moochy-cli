@@ -32,6 +32,8 @@ mod donor;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod git;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod mask;
 #[cfg(target_os = "linux")]
 mod seccomp;
@@ -77,6 +79,11 @@ pub struct Spec {
     pub run_token: Option<String>,
     /// Resource limits. Defaults are generous but finite (fork-bomb / OOM safe).
     pub limits: Limits,
+    /// Let the agent write `.git` (commit inside). `hooks/`, `config` and
+    /// `modules/` stay read-only, but a created `.git/commondir` would redirect
+    /// the host's git to agent-written config (DESIGN.md). Default `false`:
+    /// `.git` is read-only inside. Linked worktrees are always read-only.
+    pub git_writable: bool,
     /// Escape hatch for debugging only. When true, [`run`](Spec::run) executes
     /// the command with NO sandbox after printing a loud warning to stderr.
     pub unsafe_no_sandbox: bool,
@@ -152,6 +159,7 @@ impl Spec {
             env: BTreeMap::new(),
             cwd: None,
             run_token: None,
+            git_writable: false,
             limits: Limits::default(),
             unsafe_no_sandbox: false,
         }
@@ -207,6 +215,10 @@ pub struct DonorPolicy {
     /// The relay port the donor connects to. Outbound TCP is allowed only to
     /// this port and 443 (providers), where Landlock network (ABI ≥ 4) exists.
     pub relay_port: u16,
+    /// Extra outbound TCP ports (default empty). For dev/e2e only: fake
+    /// providers on loopback ports (`--base-url`, `MOOCHY_INSECURE_DEV=1`).
+    /// Production leaves it empty.
+    pub connect_ports: Vec<u16>,
     /// The loopback gateway port this process binds (§15.4). `None` = no bind
     /// allowed (donor-only machine with no local gateway door).
     pub gateway_port: Option<u16>,
@@ -221,6 +233,7 @@ impl DonorPolicy {
             state_dir,
             ro_paths: default_donor_ro_paths(),
             relay_port,
+            connect_ports: Vec::new(),
             gateway_port: None,
             unsafe_no_lockdown: false,
         }
@@ -238,6 +251,10 @@ pub struct LockdownReport {
     /// deployment must rely on the systemd/launchd `RestrictAddressFamilies`
     /// hardening instead (§15.2 "bounded worst case").
     pub landlock_net: Option<bool>,
+    /// The Landlock domain covers every thread (TSYNC, ABI ≥ 8), or the process
+    /// was single-threaded when it locked itself. `lockdown_self` refuses
+    /// otherwise, so in a successful report this is always true.
+    pub all_threads: bool,
     pub abi: i32,
 }
 
@@ -305,7 +322,13 @@ impl Validator {
 /// Spawn a [`Validator`] child. `run` executes inside the jailed child with the
 /// child end of the socketpair as its only channel; its return value is the
 /// child's exit code. `run` must not touch the filesystem or network — the
-/// sandbox kills the process if it tries.
+/// sandbox kills the process if it tries. Every other inherited fd is closed in
+/// the child first; `run` receives [`sys`]'s channel fd (3).
+///
+/// **Never call this from a process that holds secrets**: `fork` copies the
+/// caller's memory (provider key, device keys) into the child, where a parser
+/// exploit could smuggle them into its output. Fork validators from a key-less
+/// zygote started before any secret is loaded (see API.md §2.2).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn spawn_validator<F>(run: F) -> Result<Validator, Error>
 where
@@ -321,10 +344,45 @@ where
     }
 }
 
-/// Read-only roots a donor still needs after lockdown: TLS trust store and the
-/// usual CA bundle locations. The integrator adds its own binary path.
+/// [`spawn_validator`] for safe callers: `run` gets the channel as an owned
+/// `UnixStream` (no `unsafe` needed in node/worker). Every other fd the parent
+/// held is closed in the child before the sandbox is applied.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn spawn_validator_with<F>(run: F) -> Result<Validator, Error>
+where
+    F: FnOnce(std::os::unix::net::UnixStream) -> i32 + Send,
+{
+    spawn_validator(move |_channel_fd| {
+        #[cfg(target_os = "linux")]
+        let stream = sys::channel_stream();
+        #[cfg(target_os = "macos")]
+        let stream = sys_macos::channel_stream();
+        run(stream)
+    })
+}
+
+/// Read-only roots a donor still needs after lockdown: the TLS trust store, and
+/// name resolution for provider hosts (resolver + NSS config, the
+/// systemd-resolved stub dir so a replaced resolv.conf stays readable, the
+/// loader cache and lib dirs NSS modules are dlopen'ed from). No user data.
+/// The integrator adds its own binary path.
 fn default_donor_ro_paths() -> Vec<PathBuf> {
-    ["/etc/ssl/certs", "/etc/pki", "/usr/share/ca-certificates"]
+    [
+        "/etc/ssl/certs",
+        "/etc/pki",
+        "/usr/share/ca-certificates",
+        "/etc/nsswitch.conf",
+        "/etc/hosts",
+        "/etc/host.conf",
+        "/etc/gai.conf",
+        "/etc/resolv.conf",
+        "/run/systemd/resolve",
+        "/etc/ld.so.cache",
+        "/usr/lib",
+        "/lib",
+        "/usr/lib64",
+        "/lib64",
+    ]
         .iter()
         .map(PathBuf::from)
         .filter(|p| p.exists())

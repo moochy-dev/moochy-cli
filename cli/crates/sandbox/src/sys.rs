@@ -111,3 +111,57 @@ pub fn capbset_drop(cap: u32) -> bool {
     r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
 }
 
+
+/// The fd the validator child talks on after [`isolate_fds`].
+pub const CHANNEL_FD: i32 = 3;
+
+/// Validator child, before any sandbox step: keep only `keep` (moved to
+/// [`CHANNEL_FD`]), point 0/1/2 at /dev/null, close every other fd the parent
+/// held (relay TLS socket, provider sockets, outbox file …) so a compromised
+/// parser cannot write into them.
+pub fn isolate_fds(keep: i32) -> io::Result<()> {
+    // SAFETY: plain fd syscalls on integers; no user memory beyond the path
+    // literal. Single-threaded forked child.
+    unsafe {
+        // Park the channel above stdio first (keep might be 0..=2).
+        let parked = libc::fcntl(keep, libc::F_DUPFD_CLOEXEC, 10);
+        if parked < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+        if null < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for std_fd in 0..=2 {
+            if libc::dup2(null, std_fd) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if libc::dup2(parked, CHANNEL_FD) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Everything above the channel: gone (parked + null included).
+        if libc::syscall(libc::SYS_close_range, CHANNEL_FD + 1, u32::MAX, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Agent, just before `execve`: mark every fd ≥ 3 close-on-exec so nothing the
+/// launcher held leaks into the sandbox (std's own exec-status pipe is already
+/// CLOEXEC, so this never breaks spawn error reporting).
+pub fn cloexec_from_3() -> io::Result<()> {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    // SAFETY: close_range only toggles fd flags of this process.
+    let r = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// Take ownership of [`CHANNEL_FD`] as a `UnixStream` in the validator child.
+pub fn channel_stream() -> std::os::unix::net::UnixStream {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: after `isolate_fds`, CHANNEL_FD is open, is the socketpair end,
+    // and nothing else in this process owns it.
+    unsafe { std::os::unix::net::UnixStream::from_raw_fd(CHANNEL_FD) }
+}

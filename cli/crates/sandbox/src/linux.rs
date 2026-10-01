@@ -50,18 +50,21 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let masks = mask::collect(&worktree)?;
-    let git_ro = git_protected(&worktree);
+    let git = crate::git::view(&worktree, spec.git_writable);
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
 
     let plan = Plan {
         base: base.path().to_path_buf(),
         worktree,
-        ro_paths: spec.ro_paths.iter().filter(|p| p.exists()).cloned().collect(),
-        rw_paths: spec.rw_paths.clone(),
-        gateway_socket: spec.gateway_socket.clone(),
+        ro_paths: spec.ro_paths.iter().filter_map(|p| Bind::resolve(p)).collect(),
+        rw_paths: spec.rw_paths.iter().filter_map(|p| Bind::resolve(p)).collect(),
+        gateway_socket: match &spec.gateway_socket {
+            Some(s) => Some(s.canonicalize().map_err(|e| setup("canonicalize gateway socket", e))?),
+            None => None,
+        },
         gateway_port: spec.gateway_loopback_port,
         cwd: spec.cwd.clone(),
-        git_ro,
+        git,
         masks,
         uid_raw: uid.as_raw(),
         gid_raw: gid.as_raw(),
@@ -106,12 +109,12 @@ fn exit_code(s: std::process::ExitStatus) -> i32 {
 struct Plan {
     base: PathBuf,
     worktree: PathBuf,
-    ro_paths: Vec<PathBuf>,
-    rw_paths: Vec<PathBuf>,
+    ro_paths: Vec<Bind>,
+    rw_paths: Vec<Bind>,
     gateway_socket: Option<PathBuf>,
     gateway_port: Option<u16>,
     cwd: Option<PathBuf>,
-    git_ro: Vec<PathBuf>,
+    git: crate::git::GitView,
     masks: Vec<PathBuf>,
     uid_raw: u32,
     gid_raw: u32,
@@ -392,28 +395,42 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
         tmpfs(&t, opts)?;
     }
 
-    // Read-only system paths (visibility only; Landlock enforces read-only).
-    for p in &plan.ro_paths {
-        bind_into(&root, p, false)?;
-    }
-    // Read-write extras + the worktree.
-    for p in &plan.rw_paths {
-        bind_into(&root, p, true)?;
+    // Read-only system paths, read-write extras, the worktree. Mounts always
+    // use the canonical target (a symlinked path would otherwise mount nothing
+    // or the wrong thing); a real already inside a bound ancestor of the same
+    // mode is not bound twice. Links are recreated after every mount.
+    let mut bound: Vec<(&Path, bool)> = Vec::new();
+    for (b, rw) in plan.ro_paths.iter().map(|b| (b, false)).chain(plan.rw_paths.iter().map(|b| (b, true))) {
+        if !bound.iter().any(|(r, w)| *w == rw && b.real.starts_with(r)) {
+            bind_into(&root, &b.real, rw)?;
+            bound.push((&b.real, rw));
+        }
     }
     bind_into(&root, &plan.worktree, true)?;
+    for b in plan.ro_paths.iter().chain(plan.rw_paths.iter()) {
+        if let Some(link) = &b.link {
+            link_into(&root, link, &b.real)?;
+        }
+    }
 
     // Mask secret-shaped / git-ignored files inside the worktree (§15.4).
     apply_masks(&root, plan)?;
     // Git paths whose content the HOST later executes (hooks; `core.fsmonitor`,
     // `core.hooksPath`, aliases in config): read-only inside, so code written by
     // the agent can never run outside the sandbox on the user's next `git`.
-    for p in &plan.git_ro {
+    for p in &plan.git.read_only {
         bind_into(&root, p, false)?;
+    }
+    if let Some(l) = &plan.git.linked {
+        bind_linked_gitdir(&root, l)?;
     }
 
 
-    // Minimal /dev.
+    // Minimal /dev, with a private /dev/shm (POSIX shm, Python multiprocessing).
     setup_dev(&root)?;
+    let shm = root.join("dev/shm");
+    mkdir_p(&shm)?;
+    tmpfs(&shm, c"mode=1777")?;
 
     // Gateway Unix socket bridged in read-write (the one allowed channel).
     if let Some(sock) = &plan.gateway_socket {
@@ -442,36 +459,70 @@ fn write_id_maps(uid: u32, gid: u32) -> Result<(), Error> {
     Ok(())
 }
 
-/// `.git/hooks` (created empty if missing, as git itself would) and
-/// `.git/config` of a worktree whose `.git` is a directory. A linked worktree's
-/// `.git` *file* points at a gitdir outside the view, which stays invisible.
-fn git_protected(worktree: &Path) -> Vec<PathBuf> {
-    let git = worktree.join(".git");
-    if !git.is_dir() {
-        return Vec::new();
+/// Linked worktree: the shared commondir read-only, other worktrees' gitdirs
+/// hidden under an empty read-only tmpfs, this worktree's gitdir read-only.
+fn bind_linked_gitdir(root: &Path, l: &crate::git::Linked) -> Result<(), Error> {
+    if let Some(common) = &l.commondir {
+        bind_into(root, common, false)?;
     }
-    let hooks = git.join("hooks");
-    let _ = std::fs::create_dir(&hooks);
-    [hooks, git.join("config")].into_iter().filter(|p| p.exists()).collect()
+    match &l.worktrees_dir {
+        Some(wts) if l.gitdir.parent() == Some(wts.as_path()) => {
+            let t = root.join(wts.strip_prefix("/").unwrap_or(wts));
+            tmpfs(&t, c"mode=0755")?;
+            bind_into(root, &l.gitdir, false)?;
+            mount_remount(&t, MountFlags::RDONLY, "").map_err(io("remount worktrees ro"))?;
+        }
+        Some(wts) => {
+            let t = root.join(wts.strip_prefix("/").unwrap_or(wts));
+            tmpfs(&t, c"mode=0755")?;
+            mount_remount(&t, MountFlags::RDONLY, "").map_err(io("remount worktrees ro"))?;
+            bind_into(root, &l.gitdir, false)?;
+        }
+        None => bind_into(root, &l.gitdir, false)?,
+    }
+    Ok(())
 }
 
-/// Bind `src` (host absolute path) into `root` at the same absolute path.
+/// A path the caller listed, resolved on the host: `real` is canonical (what we
+/// mount and what Landlock rules name); `link` is the listed path when it went
+/// through a symlink (`/bin -> usr/bin`, `~/tools -> /opt/x`), recreated inside.
+#[derive(Debug)]
+struct Bind {
+    link: Option<PathBuf>,
+    real: PathBuf,
+}
+
+impl Bind {
+    /// None when the path does not exist (optional defaults like `/lib64`).
+    fn resolve(p: &Path) -> Option<Self> {
+        let real = p.canonicalize().ok()?;
+        let link = (real != p).then(|| p.to_path_buf());
+        Some(Self { link, real })
+    }
+}
+
+/// Recreate `link -> real` inside the new root unless that path already exists
+/// there (e.g. it is itself a mounted real, or below one).
+fn link_into(root: &Path, link: &Path, real: &Path) -> Result<(), Error> {
+    let dst = root.join(link.strip_prefix("/").unwrap_or(link));
+    if std::fs::symlink_metadata(&dst).is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        mkdir_p(parent)?;
+    }
+    match std::os::unix::fs::symlink(real, &dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(setup("symlink", e)),
+    }
+}
+
+/// Bind the canonical host path `src` into `root` at the same absolute path.
 fn bind_into(root: &Path, src: &Path, writable: bool) -> Result<(), Error> {
     let rel = src.strip_prefix("/").unwrap_or(src);
     let dst = root.join(rel);
-    let meta = std::fs::symlink_metadata(src).map_err(|e| setup("stat bind src", e))?;
-    if meta.file_type().is_symlink() {
-        // usrmerge (`/bin -> usr/bin`): recreate the link, never follow it.
-        let target = std::fs::read_link(src).map_err(|e| setup("readlink", e))?;
-        if let Some(parent) = dst.parent() {
-            mkdir_p(parent)?;
-        }
-        return match std::os::unix::fs::symlink(&target, &dst) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(setup("symlink", e)),
-        };
-    }
+    let meta = std::fs::metadata(src).map_err(|e| setup("stat bind src", e))?;
     if meta.is_dir() {
         mkdir_p(&dst)?;
     } else {
@@ -557,6 +608,8 @@ fn harden_agent(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> Result<(), E
         .map_err(io("pdeathsig"))?;
     let _ = rustix::process::setsid();
 
+    // Nothing the launcher held may leak into the agent across execve.
+    sys::cloexec_from_3().map_err(|e| setup("cloexec fds", e))?;
     drop_all_caps();
     landlock_agent(plan)?;
     rustix::thread::set_no_new_privs(true).map_err(io("no_new_privs"))?;
@@ -639,8 +692,8 @@ fn landlock_agent(plan: &Plan) -> Result<(), Error> {
         ))
         .map_err(ll("ro root rule"))?;
     let rw: Vec<PathBuf> = std::iter::once(plan.worktree.clone())
-        .chain(plan.rw_paths.iter().cloned())
-        .chain(["/tmp", "/home/sandbox", "/run/moochy", "/dev/null", "/dev/zero", "/dev/full"].map(PathBuf::from))
+        .chain(plan.rw_paths.iter().map(|b| b.real.clone()))
+        .chain(["/tmp", "/home/sandbox", "/run/moochy", "/dev/shm", "/dev/null", "/dev/zero", "/dev/full"].map(PathBuf::from))
         .collect();
     let created = created
         .add_rules(path_beneath_rules(rw, AccessFs::from_all(abi)))
@@ -777,7 +830,13 @@ impl ScratchDir {
         getrandom(&mut buf)?;
         let name = format!("moochy-run-{}", crate::hex(&buf));
         let dir = std::env::temp_dir().join(name);
-        std::fs::create_dir(&dir).map_err(|e| setup("scratch mkdir", e))?;
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| setup("scratch mkdir", e))?;
+        }
         std::fs::create_dir(dir.join("empty")).map_err(|e| setup("scratch empty", e))?;
         std::fs::write(dir.join("empty_file"), b"").map_err(|e| setup("scratch empty_file", e))?;
         Ok(Self(dir))
