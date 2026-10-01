@@ -1,7 +1,7 @@
 //! The authority state machine (spec/KEYLOG.md §4), identical to Go's
 //! `relay/internal/tlog/state.go`, plus the two pure questions Gateways and Workers ask.
 
-use crate::entry::{Body, Entry, Kind, Roles, pop_message, sig_message};
+use crate::entry::{Body, Entry, Kind, Roles, owner_key_id, pop_message, sig_message};
 use ed25519_zebra::{Signature, VerificationKey};
 use std::collections::HashMap;
 
@@ -23,6 +23,20 @@ pub enum Code {
     Scope,
     NotApproved,
     NotMember,
+    /// The mirror saw a forked log: no authority question is answered (fail closed).
+    LogForked,
+    /// The relay's pool.sync / route indexes do not match the mirrored log.
+    IndexMismatch,
+    /// The mirror is unavailable (lock poisoned).
+    Unavailable,
+    /// A signer / prev / revoked key that is not a logged owner key of that user
+    /// (a device key signing an approval lands here).
+    UnknownOwnerKey,
+    /// A second owner key without the current owner key's rotation signature.
+    OwnerKeyExists,
+    /// Sealing gate: no verified checkpoint yet (or it is too old).
+    NoCheckpoint,
+    StaleLog,
 }
 
 impl Code {
@@ -44,6 +58,13 @@ impl Code {
             Self::Scope => "scope",
             Self::NotApproved => "not_approved",
             Self::NotMember => "not_member",
+            Self::LogForked => "log_forked",
+            Self::IndexMismatch => "index_mismatch",
+            Self::Unavailable => "unavailable",
+            Self::UnknownOwnerKey => "unknown_owner_key",
+            Self::OwnerKeyExists => "owner_key_exists",
+            Self::NoCheckpoint => "no_checkpoint",
+            Self::StaleLog => "stale_log",
         }
     }
 }
@@ -75,8 +96,21 @@ struct Repo {
     provider_repo_id: String,
     owner: String,
     issued: u64,
-    /// (is_member, subject pseudonym) → grant.
-    grants: HashMap<(bool, String), Grant>,
+    /// subject pseudonym → DONOR_* grant (looked up by `&str`: no allocation per query).
+    donors: HashMap<String, Grant>,
+    /// subject pseudonym → MEMBER_* grant.
+    members: HashMap<String, Grant>,
+}
+
+/// A logged owner key (CONTRACT §15.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerKeyInfo {
+    pub id: String,
+    pub pseudonym: String,
+    pub owner_pub: [u8; 32],
+    /// Index of the OWNER_KEY_ADDED entry.
+    pub idx: u64,
+    pub revoked: bool,
 }
 
 /// The result of a successful [`State::sealable`] check.
@@ -94,6 +128,10 @@ pub struct State {
     repos: HashMap<String, Repo>,
     catalogs: HashMap<u64, [u8; 32]>,
     catalog: u64,
+    /// owner key id → key.
+    owners: HashMap<String, OwnerKeyInfo>,
+    /// pseudonym → active owner key id.
+    owner_of: HashMap<String, String>,
 }
 
 fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
@@ -186,11 +224,13 @@ impl State {
                         provider_repo_id: provider_repo_id.to_owned(),
                         owner: owner.to_owned(),
                         issued: 0,
-                        grants: HashMap::new(),
+                        donors: HashMap::new(),
+                        members: HashMap::new(),
                     });
                 if r.owner != owner {
                     // New owner: every approval and membership must be re-signed.
-                    r.grants.clear();
+                    r.donors.clear();
+                    r.members.clear();
                     owner.clone_into(&mut r.owner);
                 }
                 r.issued = issued_at_ms;
@@ -210,13 +250,20 @@ impl State {
                 self.check_signer(signer, &owner, e, check_sigs)?;
                 let member = matches!(e.kind, Kind::MemberAdded | Kind::MemberRemoved);
                 let r = self.repos.get_mut(repo_id).ok_or(Code::Unclaimed)?;
-                let key = (member, subject.to_owned());
-                if r.grants.get(&key).is_some_and(|g| issued_at_ms <= g.issued) {
+                let grants = if member {
+                    &mut r.members
+                } else {
+                    &mut r.donors
+                };
+                if grants
+                    .get(subject)
+                    .is_some_and(|g| issued_at_ms <= g.issued)
+                {
                     return Err(Code::Replay);
                 }
                 let active = matches!(e.kind, Kind::DonorApproved | Kind::MemberAdded);
-                r.grants.insert(
-                    key,
+                grants.insert(
+                    subject.to_owned(),
                     Grant {
                         active,
                         idx,
@@ -234,28 +281,106 @@ impl State {
                 self.catalogs.insert(version, *sha256);
             }
             Body::Moderation { .. } => {}
+            Body::OwnerKey {
+                pseudonym,
+                owner_pub,
+                prev,
+                ..
+            } => {
+                if self.pubs.contains_key(owner_pub) {
+                    return Err(Code::DupKey);
+                }
+                let cur = self
+                    .owner_of
+                    .get(pseudonym)
+                    .and_then(|id| self.owners.get(id));
+                match (cur, prev) {
+                    (None, Some(_)) => return Err(Code::UnknownOwnerKey),
+                    (Some(c), p) if p != Some(&c.owner_pub) => return Err(Code::OwnerKeyExists),
+                    _ => {}
+                }
+                let msg = sig_message(Kind::OwnerKeyAdded, e.raw_body);
+                if check_sigs && !verify(owner_pub, &msg, e.sig.get(..64).unwrap_or_default()) {
+                    return Err(Code::BadPop);
+                }
+                if let (true, Some(p)) = (check_sigs, prev)
+                    && !verify(p, &msg, e.sig.get(64..).unwrap_or_default())
+                {
+                    return Err(Code::BadSig);
+                }
+                let cur_id = cur.map(|c| c.id.clone());
+                let id = owner_key_id(owner_pub);
+                self.pubs.insert(*owner_pub, id.clone());
+                if let Some(c) = cur_id.and_then(|c| self.owners.get_mut(&c)) {
+                    c.revoked = true;
+                }
+                self.owners.insert(
+                    id.clone(),
+                    OwnerKeyInfo {
+                        id: id.clone(),
+                        pseudonym: pseudonym.to_owned(),
+                        owner_pub: *owner_pub,
+                        idx,
+                        revoked: false,
+                    },
+                );
+                self.owner_of.insert(pseudonym.to_owned(), id);
+            }
+            Body::OwnerRevoke {
+                pseudonym,
+                owner_pub,
+                ..
+            } => {
+                let id = owner_key_id(owner_pub);
+                let k = self
+                    .owners
+                    .get_mut(&id)
+                    .filter(|k| k.pseudonym == pseudonym)
+                    .ok_or(Code::UnknownOwnerKey)?;
+                if k.revoked {
+                    return Err(Code::Revoked);
+                }
+                k.revoked = true;
+                if self.owner_of.get(pseudonym) == Some(&id) {
+                    self.owner_of.remove(pseudonym);
+                }
+            }
         }
         Ok(())
     }
 
     fn check_signer(
         &self,
-        dev: &str,
+        key_id: &str,
         owner: &str,
         e: &Entry<'_>,
         check_sigs: bool,
     ) -> Result<(), Code> {
-        let d = self.devices.get(dev).ok_or(Code::UnknownDevice)?;
-        if d.revoked {
+        let k = self.owners.get(key_id).ok_or(Code::UnknownOwnerKey)?;
+        if k.revoked {
             return Err(Code::Revoked);
         }
-        if d.pseudonym != owner {
+        if k.pseudonym != owner {
             return Err(Code::NotOwner);
         }
-        if check_sigs && !verify(&d.sign_pub, &sig_message(e.kind, e.raw_body), e.sig) {
+        if check_sigs && !verify(&k.owner_pub, &sig_message(e.kind, e.raw_body), e.sig) {
             return Err(Code::BadSig);
         }
         Ok(())
+    }
+
+    /// A logged owner key by id (`ok_…`), active or not.
+    #[must_use]
+    pub fn owner_key(&self, id: &str) -> Option<&OwnerKeyInfo> {
+        self.owners.get(id)
+    }
+
+    /// The user's active owner key.
+    #[must_use]
+    pub fn active_owner_key(&self, pseudonym: &str) -> Option<&OwnerKeyInfo> {
+        self.owner_of
+            .get(pseudonym)
+            .and_then(|id| self.owners.get(id))
     }
 
     #[must_use]
@@ -304,7 +429,7 @@ impl State {
     /// owner-signed DONOR_APPROVED for the repo.
     pub fn sealable(&self, worker: &str, repo_id: &str) -> Result<Sealable, Code> {
         let (d, r) = self.usable(worker, true, repo_id)?;
-        match r.grants.get(&(false, d.pseudonym.clone())) {
+        match r.donors.get(d.pseudonym.as_str()) {
             Some(g) if g.active => Ok(Sealable {
                 enc_pub: d.enc_pub,
                 key_idx: d.idx,
@@ -321,8 +446,8 @@ impl State {
     pub fn gateway_allowed(&self, gateway: &str, repo_id: &str) -> Result<&Device, Code> {
         let (d, r) = self.usable(gateway, false, repo_id)?;
         if d.pseudonym == r.owner
-            || r.grants
-                .get(&(true, d.pseudonym.clone()))
+            || r.members
+                .get(d.pseudonym.as_str())
                 .is_some_and(|g| g.active)
         {
             Ok(d)

@@ -1,0 +1,18 @@
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{"content":" from"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{"content":" the"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{"content":" fake"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{"content":" provider"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"0b1c2d3e-0000-4000-8000-000000000001","object":"chat.completion.chunk","created":1790889231,"model":"deepseek-chat","system_fingerprint":"fp_fake_prod0820_fp8_kvcache","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":0},"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":7}}
+
+data: [DONE]
+

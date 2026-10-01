@@ -56,6 +56,11 @@ pub enum Alert {
         repo_id: String,
         owner: String,
     },
+    /// An owner key was registered on my account that I neither created nor acknowledged.
+    UnknownOwnerKey { idx: u64, owner_key: String },
+    /// One of my owner keys was revoked by the relay (first step of an account takeover,
+    /// or a recovery I asked for).
+    OwnerKeyRevoked { idx: u64, owner_key: String },
 }
 
 /// Result of comparing a checkpoint (e.g. the Git anchor) with the mirror.
@@ -78,6 +83,10 @@ pub struct Mirror {
     range: CompactRange,
     state: State,
     me: Option<Me>,
+    /// Owner keys the user created (CONTRACT §15.4) or acknowledged after an
+    /// [`Alert::UnknownOwnerKey`]; approvals on the user's repos signed by any other
+    /// key raise [`Alert::NotSignedByMe`].
+    owner_keys: Vec<[u8; 32]>,
     checkpoint: Option<Checkpoint>,
 }
 
@@ -92,6 +101,7 @@ impl Mirror {
             range: CompactRange::default(),
             state: State::default(),
             me: None,
+            owner_keys: Vec::new(),
             checkpoint: None,
         }
     }
@@ -121,6 +131,11 @@ impl Mirror {
 
     pub fn set_me(&mut self, me: Option<Me>) {
         self.me = me;
+    }
+
+    /// Sets the user's own owner keys (public halves) for the owner rules.
+    pub fn set_owner_keys(&mut self, keys: Vec<[u8; 32]>) {
+        self.owner_keys = keys;
     }
 
     #[must_use]
@@ -196,6 +211,7 @@ impl Mirror {
         Ok(alerts)
     }
 
+    #[allow(clippy::too_many_lines)] // one flat arm per monitor rule
     fn push(&mut self, rec: &[u8], check_sigs: bool, alerts: &mut Vec<Alert>) -> Result<(), Error> {
         if rec.len() > MAX_RECORD {
             return Err(Error::TooLarge);
@@ -223,12 +239,44 @@ impl Mirror {
             return Ok(());
         }
         let Some(me) = &self.me else { return Ok(()) };
+        let knows_owner = |k: &[u8; 32]| self.owner_keys.contains(k);
         let signer_known = |signer: &str| {
             self.state
-                .device(signer)
-                .is_some_and(|d| me.knows(&d.sign_pub))
+                .owner_key(signer)
+                .is_some_and(|k| knows_owner(&k.owner_pub))
         };
         match e.body {
+            Body::OwnerKey {
+                pseudonym,
+                owner_pub,
+                ..
+            } if pseudonym == me.pseudonym && !knows_owner(owner_pub) => {
+                alerts.push(Alert::UnknownOwnerKey {
+                    idx,
+                    owner_key: crate::entry::owner_key_id(owner_pub),
+                });
+            }
+            Body::OwnerKey {
+                pseudonym,
+                owner_pub,
+                ..
+            } if pseudonym != me.pseudonym && (knows_owner(owner_pub) || me.knows(owner_pub)) => {
+                alerts.push(Alert::KeyHijack {
+                    idx,
+                    device_id: crate::entry::owner_key_id(owner_pub),
+                    pseudonym: pseudonym.to_owned(),
+                });
+            }
+            Body::OwnerRevoke {
+                pseudonym,
+                owner_pub,
+                ..
+            } if pseudonym == me.pseudonym => {
+                alerts.push(Alert::OwnerKeyRevoked {
+                    idx,
+                    owner_key: crate::entry::owner_key_id(owner_pub),
+                });
+            }
             Body::Key {
                 device_id,
                 pseudonym,

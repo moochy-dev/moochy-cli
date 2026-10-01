@@ -91,6 +91,50 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 - Usage mapping (05 §3): Anthropic `message_start` + cumulative `message_delta`, `cache_creation` TTL split (else all 5m), `usage.iterations` summed when present; OpenAI `prompt − cached − cache_write`, DeepSeek `prompt_cache_miss/hit_tokens`, OpenRouter `usage.cost` → µ$ by exact decimal ceil (`decimal_to_uusd_ceil`), xAI `usage.cost_in_usd_ticks` (10¹⁰ ticks per $) → `ceil(ticks / 10⁴)` µ$. `output = max(completion_tokens, total_tokens − prompt_tokens)`: exact for OpenAI-style (reasoning inside `completion_tokens`) and xAI (reasoning *outside* it), never undercounting. OpenAI-shape usage is final only once the stream ended (`[DONE]` or a whole JSON body): xAI repeats cumulative usage on every chunk, so a cut stream is `estimated`. Any unparsable/duplicate-key event ⇒ `estimated`.
 - Non-streamed responses: `stream = false`, feed the body, `finish()`. Tool calls of a non-streamed body: `inspect::response_tool_calls`.
 
+### `reemit` (Gateway side, CONTRACT §15.4, attacks A162/A145)
+
+No donor byte reaches the agent verbatim. Every event is parsed (strict JSON) into a typed form checked against a per-event allowlist and written back canonically:
+- **Framing:** `event: <type>\n` (Anthropic only), then `data: <json>\n\n`, LF only. No `id:`, `retry:` or comments are written.
+- **JSON:** members in schema order, minimal escapes, numbers re-validated, strings bounded.
+- **Text:** human-visible fields (`text`, `thinking`, `content`, `reasoning*`, `refusal`, error `message`) go through `clean_text`.
+- **Unknown optional members** are dropped and counted (`dropped_fields()`).
+- **Failure** (`Err(ReemitError)`, which fails the attempt with the dialect's native retryable error: Anthropic `overloaded_error` event / OpenAI 502):
+  - unknown event or block types; wrong types; oversize events (> 1 MiB) or fields;
+  - duplicate keys, invalid UTF-8, a BOM;
+  - CR-only or embedded-CR line endings;
+  - a second `event:` or `data:` line, an `event:` name that differs from `data.type`, an `event:` line in the OpenAI dialect, `id:`/`retry:`/unknown fields;
+  - a truncated final event;
+  - a pre-filled `message_start.content` or tool input in `content_block_start` (must be `{}`);
+  - a choice index other than 0;
+  - identifiers (ids, model, tool names) outside `[A-Za-z0-9._:/@+-]` or over 256 bytes (tool names over 128).
+
+**One-call integration in `node/src/gate.rs`:**
+1. Keep one `Reemitter::new(dialect, stream)` per attempt.
+2. Pass every `Bytes` the gate releases (`Gate::pop`, including its own `[moochy]` replacement events, which re-emit unchanged) through `reemitter.push(&bytes, &mut out)?`. Write only `out` to the client, then clear it.
+3. At the end, call `reemitter.finish(&mut out)?`. For a non-streamed body, `finish` emits the whole canonical body; `reemit::reemit(dialect, false, &body)` does the same in one call.
+4. Any `Err` means: write nothing more and fail the attempt.
+
+Spans stay the gate's job (holding tool blocks until a verified checkpoint); re-emission is the last step before the client write.
+
+**Verified:**
+- Differential tests: for all 21 streamed and 8 non-streamed fixtures (hand-written real-provider shapes plus bodies captured from every Go fake: Anthropic, DeepSeek and OpenRouter Anthropic-shape; OpenAI, DeepSeek, OpenRouter and xAI chat), the strict parser sees the same usage, model, id, completeness and tool events before and after re-emission. The output is a fixed point and independent of chunking.
+- mo-sec's A162 matrix is in `tests/reemit.rs`.
+- Fuzzed: re-emission never panics and never turns an accepted stream into a malformed one.
+
+**Cost** (release, one core): 0.7 µs per Anthropic text event, 1.2 µs per OpenAI chunk (budget 20 µs).
+
+### `clean_text` (CONTRACT §15.4, A165/A46)
+
+`moochy_worker::clean_text(&str) -> Cow<str>` removes:
+- ESC sequences: CSI, OSC (incl. OSC 8 links and OSC 52 clipboard writes), DCS/SOS/PM/APC, and any other `ESC x`;
+- C1 controls, including 8-bit CSI/OSC with their parameters;
+- C0 controls except `\n` and `\t` (`\r\n` becomes `\n`; a lone `\r` is dropped) and DEL;
+- bidi controls (LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI, LRM/RLM/ALM).
+
+Clean input is returned borrowed, with no allocation. mo-node: apply it to every donor text shown in a terminal (MCP door results, NACK details, model enums). `reemit` already applies it to text fields.
+
+Tool-call inputs stay byte-exact (they are executed), so instead `ToolSet::check_call` blocks any input containing ESC, C1 or bidi controls (tripwire rule `terminal-control`). That stops a spoofed approval prompt.
+
 ### `inspect` (Gateway side, 06 §8)
 - `ToolSet::from_request(dialect, body)`, `check_call(name, input_json) -> Verdict::{Allow, Block(reason)}`: name ∈ `tools[]`, input is a strict JSON object, schema subset (`type, enum, const, properties, required, additionalProperties, items, anyOf, oneOf, allOf`; other keywords ignored), then the tripwire.
 - `scan_text(text)` for MCP `moochy_delegate` results.

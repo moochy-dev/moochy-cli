@@ -7,7 +7,10 @@ pub const LABEL_RECORD: &[u8] = b"moochy/v1/keylog";
 pub const LABEL_SIG: &[u8] = b"moochy/v1/keylog-sig";
 pub const LABEL_POP: &[u8] = b"moochy/v1/key-pop";
 /// Bound on every record (and every entry of an entry bundle).
-pub const MAX_RECORD: usize = 1024;
+/// 256 × (2 + 480) = 123,392 bytes: a full entry bundle fits one 128 KiB gRPC message.
+pub const MAX_RECORD: usize = 480;
+/// Label of receipt-log leaves: `lp("moochy/v1/receipt-log", sha256(receipt))`.
+pub const LABEL_RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -20,6 +23,10 @@ pub enum Kind {
     MemberRemoved = 7,
     Catalog = 8,
     Moderation = 9,
+    /// Binds a user's owner key: the only key that signs kinds 3–7 (CONTRACT §15.4).
+    OwnerKeyAdded = 10,
+    /// Retires a user's owner key (relay-asserted; removes trust only).
+    OwnerKeyRevoked = 11,
 }
 
 impl Kind {
@@ -35,8 +42,16 @@ impl Kind {
             7 => Self::MemberRemoved,
             8 => Self::Catalog,
             9 => Self::Moderation,
+            10 => Self::OwnerKeyAdded,
+            11 => Self::OwnerKeyRevoked,
             _ => return None,
         })
+    }
+
+    /// Parses a kind name as used in `SignedLogEntry.kind` / `ApprovalRequest.kind`.
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        (1..=11).filter_map(Self::from_u32).find(|k| k.name() == s)
     }
 
     #[must_use]
@@ -51,6 +66,8 @@ impl Kind {
             Self::MemberRemoved => "MEMBER_REMOVED",
             Self::Catalog => "CATALOG",
             Self::Moderation => "MODERATION",
+            Self::OwnerKeyAdded => "OWNER_KEY_ADDED",
+            Self::OwnerKeyRevoked => "OWNER_KEY_REVOKED",
         }
     }
 
@@ -126,6 +143,19 @@ pub enum Body<'a> {
     Moderation {
         subject: &'a str,
         action: &'a str,
+        reason: &'a str,
+    },
+    /// OWNER_KEY_ADDED: `prev` is the owner key being rotated out (then `sig` is
+    /// new-key signature ‖ prev-key signature, 128 bytes).
+    OwnerKey {
+        pseudonym: &'a str,
+        owner_pub: &'a [u8; 32],
+        prev: Option<&'a [u8; 32]>,
+        issued_at_ms: u64,
+    },
+    OwnerRevoke {
+        pseudonym: &'a str,
+        owner_pub: &'a [u8; 32],
         reason: &'a str,
     },
 }
@@ -258,10 +288,19 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
     let kind = Kind::from_u32(u32::from_be_bytes(kind)).ok_or(Error::Format("unknown kind"))?;
     let logged_at_ms = u64_of(at)?;
     let want_sig = kind == Kind::KeyAdded || kind.owner_signed();
-    if sig.len() != if want_sig { 64 } else { 0 } {
+    let sig_ok = match kind {
+        Kind::OwnerKeyAdded => sig.len() == 64 || sig.len() == 128,
+        _ => sig.len() == if want_sig { 64 } else { 0 },
+    };
+    if !sig_ok {
         return Err(Error::Format("sig length"));
     }
     let body_p = parse_body(kind, body)?;
+    if let Body::OwnerKey { prev, .. } = body_p
+        && prev.is_some() != (sig.len() == 128)
+    {
+        return Err(Error::Format("OWNER_KEY_ADDED sig count"));
+    }
     Ok(Entry {
         kind,
         logged_at_ms,
@@ -272,7 +311,9 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
 }
 
 #[allow(clippy::too_many_lines)] // one flat arm per entry kind
-fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
+/// Parses and validates a bare body of `kind` (e.g. `ApprovalRequest.body_to_sign`
+/// before showing it to the owner).
+pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
     let bad = Error::Format(kind.name());
     Ok(match kind {
         Kind::KeyAdded => {
@@ -325,7 +366,7 @@ fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 || !(pv == "github" || pv == "gitlab")
                 || !is_decimal(pid)
                 || !is_pseudonym(o)
-                || !is_id(sg, "d_")
+                || !is_owner_key_id(sg)
                 || t == 0
             {
                 return Err(bad);
@@ -342,7 +383,7 @@ fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
         Kind::DonorApproved | Kind::DonorRevoked | Kind::MemberAdded | Kind::MemberRemoved => {
             let [r, sub, sg, t] = unlp::<4>(b)?;
             let (r, sub, sg, t) = (s(r)?, s(sub)?, s(sg)?, u64_of(t)?);
-            if !is_id(r, "r_") || !is_pseudonym(sub) || !is_id(sg, "d_") || t == 0 {
+            if !is_id(r, "r_") || !is_pseudonym(sub) || !is_owner_key_id(sg) || t == 0 {
                 return Err(bad);
             }
             Body::Grant {
@@ -379,7 +420,84 @@ fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 reason: r,
             }
         }
+        Kind::OwnerKeyAdded => {
+            let [p, k, prev, t] = unlp::<4>(b)?;
+            let (p, t) = (s(p)?, u64_of(t)?);
+            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else {
+                return Err(bad);
+            };
+            let prev = match prev.len() {
+                0 => None,
+                _ => Some(<&[u8; 32]>::try_from(prev).map_err(|_| bad.clone())?),
+            };
+            if !is_pseudonym(p) || t == 0 || prev == Some(owner_pub) {
+                return Err(bad);
+            }
+            Body::OwnerKey {
+                pseudonym: p,
+                owner_pub,
+                prev,
+                issued_at_ms: t,
+            }
+        }
+        Kind::OwnerKeyRevoked => {
+            let [p, k, r] = unlp::<3>(b)?;
+            let (p, r) = (s(p)?, s(r)?);
+            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else {
+                return Err(bad);
+            };
+            if !is_pseudonym(p) || !is_token(r, 32) {
+                return Err(bad);
+            }
+            Body::OwnerRevoke {
+                pseudonym: p,
+                owner_pub,
+                reason: r,
+            }
+        }
     })
+}
+
+/// Owner key id used as `signer` in kinds 3–7: `ok_` + hex(SHA-256(pub)[..16]).
+#[must_use]
+pub fn owner_key_id(owner_pub: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(owner_pub);
+    let mut out = String::with_capacity(35);
+    out.push_str("ok_");
+    for b in d.iter().take(16) {
+        out.push(char::from(
+            HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
+        ));
+        out.push(char::from(
+            HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'),
+        ));
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn is_owner_key_id(s: &str) -> bool {
+    s.strip_prefix("ok_")
+        .is_some_and(|u| u.len() == 32 && u.bytes().all(|c| HEX.contains(&c)))
+}
+
+/// OWNER_KEY_ADDED body (the user's foreground CLI builds and signs it; on rotation
+/// with both keys: `sig = new.sign(m) ‖ prev.sign(m)`, `m = sig_message(OwnerKeyAdded, body)`).
+#[must_use]
+pub fn owner_key_body(
+    pseudonym: &str,
+    owner_pub: &[u8; 32],
+    prev: Option<&[u8; 32]>,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    lp(&[
+        pseudonym.as_bytes(),
+        owner_pub,
+        prev.map_or(&[][..], |p| &p[..]),
+        &issued_at_ms.to_be_bytes(),
+    ])
 }
 
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -394,11 +512,14 @@ pub fn is_id(s: &str, prefix: &str) -> bool {
     })
 }
 
-/// `ps_` + 16 ASCII alphanumerics.
+/// `ps_` + 16 lowercase Crockford base32 chars (CONTRACT §1).
 #[must_use]
 pub fn is_pseudonym(s: &str) -> bool {
-    s.strip_prefix("ps_")
-        .is_some_and(|u| u.len() == 16 && u.bytes().all(|c| c.is_ascii_alphanumeric()))
+    s.strip_prefix("ps_").is_some_and(|u| {
+        u.len() == 16
+            && u.bytes()
+                .all(|c| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&c))
+    })
 }
 
 fn is_token(s: &str, max: usize) -> bool {
