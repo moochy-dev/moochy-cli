@@ -1081,6 +1081,7 @@ dependencies = [
  "prost",
  "rand_core 0.9.5",
  "ring",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",

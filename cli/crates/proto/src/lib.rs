@@ -5,6 +5,7 @@
 //! - [`pb`]: generated protobuf + gRPC stubs for `spec/proto/moochy/v1/link.proto` (CONTRACT §12)
 //! - [`msg`]: signed JSON artifacts: route header, inner payload, receipt, projection, catalog
 //! - [`crypto`]: keys, envelopes, HPKE wraps, signatures (CONTRACT §3)
+//! - [`inflate`]: pure-Rust, capped, streaming zstd decoder for other parties' bytes (CONTRACT §15.2)
 //! - [`money`]: catalog entry, cost, reservation, deterministic input estimate (plan 05)
 //! - [`username`]: shared handle validator (CONTRACT §11) and safe display of remote strings
 #![forbid(unsafe_code)]
@@ -21,6 +22,7 @@
 
 pub mod crypto;
 pub mod enc;
+pub mod inflate;
 pub mod json;
 pub mod money;
 pub mod msg;
