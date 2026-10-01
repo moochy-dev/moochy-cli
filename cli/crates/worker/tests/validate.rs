@@ -13,7 +13,7 @@ use moochy_worker::firewall::{self, CacheTtl, Catalog, Level, Policy, RejectCode
 use moochy_worker::validate::{self, ValidateError, ValidateRequest, Validator, ValidatorLimits};
 use moochy_worker::{Dialect, Effort, Flags, Provider};
 
-const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600 };
+const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600, max_page_tokens: 3000 };
 const POL: Policy = Policy { level: Level::Strict, flags: Flags::NONE, max_effort: Effort::Max };
 const DEV: &str = "d_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ALIASES: &[&str] = &["anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"];
@@ -235,4 +235,26 @@ fn ttl_and_types_roundtrip() {
     let v = validate::validate_in_process(&req(&p, route_for(b))).unwrap();
     let f = &v.prepared.facts;
     assert_eq!((f.max_tokens, f.effort, f.cache_ttl, f.stream), (77, Effort::Low, CacheTtl::H1, false));
+}
+
+/// `validate_on`: the same exchange over a socket to a child running `child_main` (the
+/// zygote design: no exec after lockdown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_on_a_socket() {
+    let b = body("over a socket");
+    let p = zst(inner(&b, "").as_bytes());
+    let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+    let t = std::thread::spawn(move || {
+        let r = child.try_clone().unwrap();
+        validate::child_main(r, child)
+    });
+    parent.set_nonblocking(true).unwrap();
+    let s = tokio::net::UnixStream::from_std(parent).unwrap();
+    let v = validate::validate_on(s, &req(&p, route_for(&b)), Duration::from_secs(5)).await.unwrap();
+    assert_eq!(&v.body[..], b.as_bytes());
+    assert_eq!(t.join().unwrap(), 0);
+    // A peer that never answers hits the deadline (retryable).
+    let (a, _keep) = tokio::net::UnixStream::pair().unwrap();
+    let e = validate::validate_on(a, &req(&p, route_for(&b)), Duration::from_millis(200)).await.unwrap_err();
+    assert_eq!(e.nack(), ("busy", true));
 }

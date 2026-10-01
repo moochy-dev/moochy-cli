@@ -110,15 +110,33 @@ pub struct RateLimit {
     pub requests_remaining: Option<u64>,
     pub tokens_limit: Option<u64>,
     pub tokens_remaining: Option<u64>,
+    /// Milliseconds until the request budget resets (Anthropic RFC 3339 `…-requests-reset`,
+    /// OpenAI-style duration `x-ratelimit-reset-requests` such as `6m0s`).
+    pub requests_reset_ms: Option<u64>,
+    pub tokens_reset_ms: Option<u64>,
 }
 
 impl RateLimit {
     pub fn from_headers(h: &HeaderMap) -> Self {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        Self::from_headers_at(h, now)
+    }
+
+    /// Header names per adapter: Anthropic `anthropic-ratelimit-{requests,tokens}-{limit,
+    /// remaining,reset}`; OpenAI and OpenRouter `x-ratelimit-{limit,remaining,reset}-{requests,
+    /// tokens}`; DeepSeek and xAI document none (all `None`).
+    pub fn from_headers_at(h: &HeaderMap, now_ms: u64) -> Self {
+        let reset = |anth: &str, oai: &str| {
+            let t = h.get(anth).and_then(|v| v.to_str().ok()).and_then(rfc3339_ms).map(|t| t.saturating_sub(now_ms));
+            t.or_else(|| h.get(oai).and_then(|v| v.to_str().ok()).and_then(duration_ms))
+        };
         Self {
             requests_limit: header_u64(h, &["anthropic-ratelimit-requests-limit", "x-ratelimit-limit-requests"]),
             requests_remaining: header_u64(h, &["anthropic-ratelimit-requests-remaining", "x-ratelimit-remaining-requests"]),
             tokens_limit: header_u64(h, &["anthropic-ratelimit-tokens-limit", "x-ratelimit-limit-tokens"]),
             tokens_remaining: header_u64(h, &["anthropic-ratelimit-tokens-remaining", "x-ratelimit-remaining-tokens"]),
+            requests_reset_ms: reset("anthropic-ratelimit-requests-reset", "x-ratelimit-reset-requests"),
+            tokens_reset_ms: reset("anthropic-ratelimit-tokens-reset", "x-ratelimit-reset-tokens"),
         }
     }
 
@@ -553,6 +571,81 @@ impl Adapter {
     }
 }
 
+/// RFC 3339 UTC-or-offset timestamp → Unix ms (`2026-10-01T21:50:00Z`, `…00.123+02:00`).
+fn rfc3339_ms(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let num = |a: usize, n: usize| -> Option<i64> {
+        let r = s.get(a..a.checked_add(n)?)?;
+        if r.bytes().all(|c| c.is_ascii_digit()) { r.parse().ok() } else { None }
+    };
+    if b.len() < 20 || b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') || !matches!(b.get(10), Some(b'T' | b't' | b' ')) || b.get(13) != Some(&b':') || b.get(16) != Some(&b':') {
+        return None;
+    }
+    let (y, mo, d, hh, mm, ss) = (num(0, 4)?, num(5, 2)?, num(8, 2)?, num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let mut i = 19usize;
+    let mut ms = 0i64;
+    if b.get(i) == Some(&b'.') {
+        i = i.checked_add(1)?;
+        let start = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i = i.checked_add(1)?;
+        }
+        let frac = s.get(start..i)?;
+        let digits = frac.get(..frac.len().min(3))?;
+        ms = format!("{digits:0<3}").parse().ok()?;
+    }
+    let offset = match b.get(i) {
+        Some(b'Z' | b'z') if b.len() == i.checked_add(1)? => 0,
+        Some(sign @ (b'+' | b'-')) if b.len() == i.checked_add(6)? && b.get(i.checked_add(3)?) == Some(&b':') => {
+            let m = num(i.checked_add(1)?, 2)?.checked_mul(60)?.checked_add(num(i.checked_add(4)?, 2)?)?;
+            if *sign == b'+' { m } else { m.checked_neg()? }
+        }
+        _ => return None,
+    };
+    // Howard Hinnant's days_from_civil.
+    let y2 = if mo <= 2 { y.checked_sub(1)? } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2.checked_sub(era.checked_mul(400)?)?;
+    let mp = if mo > 2 { mo.checked_sub(3)? } else { mo.checked_add(9)? };
+    let doy = mp.checked_mul(153)?.checked_add(2)?.checked_div(5)?.checked_add(d)?.checked_sub(1)?;
+    let doe = yoe.checked_mul(365)?.checked_add(yoe.checked_div(4)?)?.checked_sub(yoe.checked_div(100)?)?.checked_add(doy)?;
+    let days = era.checked_mul(146_097)?.checked_add(doe)?.checked_sub(719_468)?;
+    let secs = days.checked_mul(86_400)?.checked_add(hh.checked_mul(3600)?)?.checked_add(mm.checked_mul(60)?)?.checked_add(ss)?.checked_sub(offset.checked_mul(60)?)?;
+    u64::try_from(secs.checked_mul(1000)?.checked_add(ms)?).ok()
+}
+
+/// OpenAI-style duration (`1s`, `6m0s`, `1h2m3.5s`, `20ms`) → ms.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // finite, ≥ 0, < 1e15: exact in u64
+fn duration_ms(s: &str) -> Option<u64> {
+    let mut total = 0f64;
+    let mut rest = s.trim();
+    if rest.is_empty() || rest.len() > 32 {
+        return None;
+    }
+    while !rest.is_empty() {
+        let n = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).filter(|n| *n > 0)?;
+        let (num, tail) = rest.split_at(n);
+        let v: f64 = num.parse().ok()?;
+        let (mult, len) = if tail.starts_with("ms") {
+            (1.0, 2)
+        } else if tail.starts_with('h') {
+            (3_600_000.0, 1)
+        } else if tail.starts_with('m') {
+            (60_000.0, 1)
+        } else if tail.starts_with('s') {
+            (1000.0, 1)
+        } else {
+            return None;
+        };
+        total += v * mult;
+        rest = tail.get(len..)?;
+    }
+    (total.is_finite() && total < 1e15).then(|| total.ceil() as u64)
+}
+
 fn header_str(h: &HeaderMap, names: &[&str]) -> Option<String> {
     names.iter().find_map(|n| h.get(*n)).and_then(|v| v.to_str().ok()).filter(|s| s.len() <= 256).map(str::to_owned)
 }
@@ -739,6 +832,30 @@ mod tests {
         assert_eq!(RateLimit::from_headers(&o).headroom_pct(), Some(100), "clamped");
         o.insert("x-ratelimit-remaining-requests", HeaderValue::from_static("lots"));
         assert_eq!(RateLimit::from_headers(&o).headroom_pct(), None, "unparsable = unknown");
+    }
+
+    #[test]
+    fn rate_limit_resets() {
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("2026-10-01T00:00:00Z"), Some(1_790_812_800_000));
+        assert_eq!(rfc3339_ms("2026-10-01T02:00:00.5+02:00"), Some(1_790_812_800_500));
+        assert_eq!(rfc3339_ms("2000-02-29T12:34:56.789Z"), Some(951_827_696_789));
+        for bad in ["2026-13-01T00:00:00Z", "2026-10-01 00:00:00", "garbage", "2026-10-01T00:00:00+0200", "2026-10-01T25:00:00Z"] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad}");
+        }
+        assert_eq!(duration_ms("1s"), Some(1000));
+        assert_eq!(duration_ms("6m0s"), Some(360_000));
+        assert_eq!(duration_ms("1h2m3.5s"), Some(3_723_500));
+        assert_eq!(duration_ms("20ms"), Some(20));
+        for bad in ["", "s", "1x", "5"] {
+            assert_eq!(duration_ms(bad), None, "{bad}");
+        }
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-ratelimit-requests-reset", HeaderValue::from_static("2026-10-01T00:00:30Z"));
+        h.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("1.5s"));
+        let r = RateLimit::from_headers_at(&h, 1_790_812_800_000);
+        assert_eq!((r.requests_reset_ms, r.tokens_reset_ms), (Some(30_000), Some(1500)));
+        assert_eq!(RateLimit::from_headers_at(&h, 1_790_812_900_000).requests_reset_ms, Some(0), "past reset = now");
     }
 
     #[test]

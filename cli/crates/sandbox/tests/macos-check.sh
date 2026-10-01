@@ -39,6 +39,11 @@ R deny /bin/sh -c "cat ~/.zshrc"
 R deny /usr/bin/osascript -e "tell application \"System Events\" to get name of every process"
 R deny /usr/bin/pbpaste
 kill $GW $GS 2>/dev/null; wait 2>/dev/null; rm -f $SHARED /tmp/moochy-check-$$-w.txt
+# Terminal injection (TIOCSTI) under a real pty: the control run outside must succeed (so the
+# check is meaningful), the same call inside `moochy run` must be refused (A192).
+ctl=$(script -q /dev/null "$B" tiocsti < /dev/null | tr -d '\r')
+ins=$(script -q /dev/null "$B" run $J/wt --ro $BD -- "$B" tiocsti < /dev/null | tr -d '\r')
+if echo "$ctl" | grep -q "tiocsti-ok" && echo "$ins" | grep -q "tiocsti-fail"; then pass=$((pass+1)); echo "PASS  tiocsti denied inside (control injects outside)"; else fail=$((fail+1)); echo "FAIL  tiocsti control=[$ctl] inside=[$ins]"; fi
 # Donor lockdown (§15.2) and validator child: exec, files and ports closed; DNS + 443 open.
 mkdir -p $J/state; echo canary > $J/canary.txt
 d=$("$B" donor $J/state 8443 $J/canary.txt 18788)
