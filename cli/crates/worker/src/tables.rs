@@ -25,6 +25,11 @@ pub(crate) const ANTHROPIC_BETAS: &[(&str, Flags)] = &[
     ("computer-use-2025-11-24", Flags::NONE),
     ("structured-outputs-2025-11-13", Flags::NONE),
     ("effort-2025-11-24", Flags::NONE),
+    // Observed in Claude Code 2.1.287 traffic (tests/fixtures/clients); they enable exactly the
+    // allowlisted plain-inference features above. [review: allowlist widening, 06 §7.3]
+    ("context-management-2025-06-27", Flags::NONE),
+    ("mid-conversation-system-2026-04-07", Flags::NONE),
+    ("per-turn-control-2026-07-01", Flags::NONE),
     ("context-1m-2025-08-07", Flags::LONG_CONTEXT),
 ];
 
@@ -132,10 +137,42 @@ const CONTENT_BLOCK: R = R::Tagged {
     ],
 };
 
-const MESSAGE: R = R::Obj(&[
-    F("role", R::Enum(&["user", "assistant"]), true),
-    F("content", R::OneOf(&[R::Str, R::Arr(&CONTENT_BLOCK)]), true),
-]);
+/// Conversation turns. `system` turns (Claude Code's mid-conversation reminders, beta
+/// `mid-conversation-system-*`) are text only. [review: allowlist widening, 06 §7.3]
+const MESSAGE: R = R::Tagged {
+    key: "role",
+    cases: &[
+        ("user", R::Obj(&[F("content", R::OneOf(&[R::Str, R::Arr(&CONTENT_BLOCK)]), true)])),
+        ("assistant", R::Obj(&[F("content", R::OneOf(&[R::Str, R::Arr(&CONTENT_BLOCK)]), true)])),
+        (
+            "system",
+            R::Obj(&[
+                F("content", R::OneOf(&[R::Str, R::Arr(&R::Tagged { key: "type", cases: &[("text", TEXT_BLOCK)] })]), true),
+                // Per-turn effort (beta `per-turn-control-*`): the effective effort is the max.
+                F("output_config", R::Obj(&[F("effort", R::Hook(Hook::TurnEffort, &R::Enum(&["low", "medium", "high", "xhigh", "max"])), false)]), false),
+            ]),
+        ),
+    ],
+};
+
+/// `context_management`: only edits that *remove* old content server-side (thinking blocks,
+/// tool uses); no execution, no account data, lower cost. [review: allowlist widening, 06 §7.3]
+const CONTEXT_EDIT: R = R::Tagged {
+    key: "type",
+    cases: &[
+        ("clear_thinking_*", R::Obj(&[F("keep", R::Any, false)])),
+        (
+            "clear_tool_uses_*",
+            R::Obj(&[
+                F("trigger", R::Any, false),
+                F("keep", R::Any, false),
+                F("clear_at_least", R::Any, false),
+                F("exclude_tools", R::Arr(&R::Str), false),
+                F("clear_tool_inputs", R::Any, false),
+            ]),
+        ),
+    ],
+};
 
 const CUSTOM_TOOL: R = R::Obj(&[
     F("name", R::Str, true),
@@ -235,7 +272,12 @@ pub(crate) static ANTHROPIC: R = R::Obj(&[
     F("inference_geo", R::Hook(Hook::InferenceGeo, &R::Str), false),
     F("mcp_servers", R::Deny("the provider would connect to arbitrary servers on the donor's behalf"), false),
     F("container", R::Deny("containers are server-side execution environments"), false),
-    F("context_management", R::Deny("server-side context editing is not in the v1 allowlist"), false),
+    F("context_management", R::Obj(&[F("edits", R::Arr(&CONTEXT_EDIT), false)]), false),
+    F(
+        "safeguards",
+        R::Deny("server-side safety classifiers are extra billed model calls on the donor's account and carry the maintainer's local paths (the Gateway strips them)"),
+        false,
+    ),
     F("provider", R::Deny("upstream routing is set by the Worker"), false),
     F("models", R::Deny("fallback model lists would bill models outside the pledge"), false),
 ]);
@@ -414,3 +456,7 @@ pub(crate) fn provider_denies(p: Provider) -> &'static [(&'static str, &'static 
         _ => &[],
     }
 }
+
+/// Top-level members the Gateway strips before sealing (see `firewall::pool_compatible`): a
+/// pooled donor would refuse them, and the client keeps working without them.
+pub(crate) const POOL_STRIP: &[&str] = &["safeguards"];

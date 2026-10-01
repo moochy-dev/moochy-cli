@@ -246,6 +246,69 @@ pub fn analyze(dialect: Dialect, body: &[u8], headers: &[(&str, &str)], policy: 
     Ok(facts)
 }
 
+/// What [`pool_compatible`] produced: the body and headers to seal, and what was removed.
+#[derive(Debug)]
+pub struct PoolRequest {
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+    /// Removed members, beta values and headers (for a visible `[moochy]` note and logs).
+    pub stripped: Vec<String>,
+}
+
+/// Gateway side, before sealing: drop what a pooled donor would refuse although the client can
+/// do without it, so real clients (Claude Code's `safeguards` classifier, unknown betas,
+/// `anthropic-dangerous-direct-browser-access`) work through the pool. Strips only:
+/// top-level members in the strip list, beta values outside the allowlist, and headers other
+/// than `anthropic-version` / `anthropic-beta`. Everything else is left for [`analyze`] to
+/// accept or refuse. The body is re-serialized canonically from the strict parse.
+pub fn pool_compatible(dialect: Dialect, body: &[u8], headers: &[(&str, &str)]) -> Result<PoolRequest, Reject> {
+    let mut tape = Vec::new();
+    let root = json::parse(body, &mut tape).map_err(|e| Reject::new(RejectCode::Firewall, "", format!("is not strict JSON ({e})")))?.root();
+    let mut stripped = Vec::new();
+    let mut out = Vec::with_capacity(body.len());
+    if root.kind() == Kind::Obj && dialect == Dialect::AnthropicMessages {
+        out.push(b'{');
+        let mut first = true;
+        for (k, v) in root.entries() {
+            if let Some(name) = tables::POOL_STRIP.iter().find(|n| k.is_str(n)) {
+                stripped.push((*name).to_owned());
+                continue;
+            }
+            if !std::mem::replace(&mut first, false) {
+                out.push(b',');
+            }
+            json::write(k, &mut out);
+            out.push(b':');
+            json::write(v, &mut out);
+        }
+        out.push(b'}');
+    } else {
+        json::write(root, &mut out);
+    }
+    let mut kept = Vec::new();
+    for (name, value) in headers {
+        let lname = name.to_ascii_lowercase();
+        match lname.as_str() {
+            "anthropic-version" if dialect == Dialect::AnthropicMessages => kept.push((lname, (*value).to_owned())),
+            "anthropic-beta" if dialect == Dialect::AnthropicMessages => {
+                let mut ok = Vec::new();
+                for b in value.split(',').map(str::trim).filter(|b| !b.is_empty()) {
+                    if tables::ANTHROPIC_BETAS.iter().any(|(a, _)| *a == b) {
+                        ok.push(b);
+                    } else {
+                        stripped.push(format!("anthropic-beta: {}", b.chars().take(64).collect::<String>()));
+                    }
+                }
+                if !ok.is_empty() {
+                    kept.push((lname, ok.join(",")));
+                }
+            }
+            _ => stripped.push(format!("header {}", lname.chars().take(64).collect::<String>())),
+        }
+    }
+    Ok(PoolRequest { body: out, headers: kept, stripped })
+}
+
 /// Firewall + route facts + safe mutations (06 §7.1–7.2), in one pass over one parse.
 pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
     if !req.provider.serves(req.dialect) {
@@ -372,6 +435,8 @@ fn check<'a>(
         None => catalog.default_effort,
         Some(e) => e.as_str().as_deref().and_then(Effort::parse).ok_or_else(|| fw("effort", "is not a known effort".into()))?,
     };
+    // Per-turn efforts can only raise the effective effort (cost bound, 05 §5.1).
+    let effort = effort.max(w.acc.turn_effort.unwrap_or(Effort::None));
     if effort > policy.max_effort {
         return Err(fw("effort", format!("`{}` exceeds the pledge maximum `{}`", effort.as_str(), policy.max_effort.as_str()).into()));
     }
@@ -447,10 +512,13 @@ pub(crate) enum Hook {
     InferenceGeo,
     /// OpenAI `n`: must be 1.
     One,
+    /// Per-turn `output_config.effort` (Anthropic `per-turn-control`): tracked, max wins.
+    TurnEffort,
 }
 
 #[derive(Default)]
 struct Acc {
+    turn_effort: Option<Effort>,
     images: u64,
     pages: u64,
     excluded: u64,
@@ -671,6 +739,10 @@ impl<'a> Walk<'a> {
             Hook::InferenceGeo => {
                 self.need(Flags::INFERENCE_GEO, "is not allowed: data residency is the donor's call")?;
                 self.acc.flags = self.acc.flags.with(Flags::INFERENCE_GEO);
+            }
+            Hook::TurnEffort => {
+                let e = v.as_str().as_deref().and_then(Effort::parse);
+                self.acc.turn_effort = self.acc.turn_effort.max(e);
             }
             Hook::One => {
                 if v.as_u64() != Some(1) {

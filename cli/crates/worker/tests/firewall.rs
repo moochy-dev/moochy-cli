@@ -1,6 +1,6 @@
 //! Table-driven firewall tests (plan 06 §7): every deny, nested content, strict JSON,
 //! huge inputs, header allowlist, route facts, safe mutations.
-#![allow(clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines)]
+#![allow(clippy::panic, clippy::format_push_string, clippy::needless_raw_string_hashes, clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines)]
 
 use moochy_worker::firewall::{self, Catalog, CacheTtl, Level, MaxPrice, Policy, RejectCode, Request, Route};
 use moochy_worker::{Dialect, Effort, Flags, Provider};
@@ -110,7 +110,7 @@ fn anthropic_denies() {
         (anth(r#""hi""#, r#","foo":1"#), images, "foo", "is not allowed"),
         (anth(r#""hi""#, r#","container":"c"#), images, "", ""),
         (anth(r#""hi""#, r#","container":"c""#), images, "container", "execution"),
-        (anth(r#""hi""#, r#","context_management":{}"#), images, "context_management", "not allowed"),
+        (anth(r#""hi""#, r#","context_management":{"edits":[{"type":"compact_20260112"}]}"#), images, "context_management.edits[0].type", "not allowed"),
         (anth(r#""hi""#, r#","speed":"fast""#), images, "speed", "`fast` opt-in"),
         (anth(r#""hi""#, r#","service_tier":"auto""#), images, "service_tier", "donor's call"),
         (anth(r#""hi""#, r#","inference_geo":"us""#), images, "inference_geo", "donor's call"),
@@ -123,7 +123,7 @@ fn anthropic_denies() {
         (r#"{"model":"m","max_tokens":0,"messages":[]}"#.into(), images, "max_tokens", "between"),
         (r#"{"model":"m","max_tokens":64001,"messages":[]}"#.into(), images, "max_tokens", "between"),
         (r#"{"model":"","max_tokens":1,"messages":[]}"#.into(), images, "model", "non-empty"),
-        (r#"{"model":"m","max_tokens":1,"messages":[{"role":"system","content":"x"}]}"#.into(), images, "messages[0].role", "not allowed"),
+        (r#"{"model":"m","max_tokens":1,"messages":[{"role":"developer","content":"x"}]}"#.into(), images, "messages[0].role", "not allowed"),
         (r#"{"model":"m","model":"m","max_tokens":1,"messages":[]}"#.into(), images, "", "duplicate object key"),
         (r#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"a","type":"image"}]}]}"#.into(), images, "", "duplicate"),
         (r#"["not an object"]"#.into(), images, "", "must be an object"),
@@ -481,4 +481,62 @@ fn r3_pdf_documents() {
     assert!(analyze(Dialect::AnthropicMessages, &png, &[], docs).is_err());
     // The Gateway (PERMISSIVE) and the Worker compute the same facts.
     assert_eq!(firewall::analyze(Dialect::AnthropicMessages, body.as_bytes(), &[], &Policy::PERMISSIVE, &CAT).unwrap(), f);
+}
+
+/// T-07-087: recorded real-client corpus (Claude Code 2.1.287 against a local recorder;
+/// structure kept, prose and local data redacted to same-length placeholders).
+#[test]
+fn recorded_claude_code_corpus() {
+    let cat = Catalog { default_effort: Effort::High, max_output: 128_000, max_image_tokens: 1600, max_page_tokens: 3000 };
+    let all = policy(Flags::NONE);
+    for (name, body, hdrs) in [
+        ("first-turn", &include_bytes!("fixtures/clients/claude-code-2.1.287-first-turn.json")[..], &include_bytes!("fixtures/clients/claude-code-2.1.287-first-turn.headers.json")[..]),
+        ("tool-turn1", include_bytes!("fixtures/clients/claude-code-2.1.287-tool-turn1.json"), include_bytes!("fixtures/clients/claude-code-2.1.287-tool-turn1.headers.json")),
+        ("tool-turn2", include_bytes!("fixtures/clients/claude-code-2.1.287-tool-turn2.json"), include_bytes!("fixtures/clients/claude-code-2.1.287-tool-turn2.headers.json")),
+    ] {
+        let mut tape = Vec::new();
+        let h = moochy_worker::json::parse(hdrs, &mut tape).unwrap().root();
+        let headers: Vec<(String, String)> =
+            h.entries().filter(|(k, _)| !k.is_str("_path")).map(|(k, v)| (k.as_str().unwrap().into_owned(), v.as_str().unwrap().into_owned())).collect();
+        let hs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        // As sent by Claude Code: refused only for the classifier and unvetted betas/headers.
+        let raw = firewall::analyze(Dialect::AnthropicMessages, body, &hs, &all, &cat).unwrap_err();
+        assert!(raw.path == "safeguards" || raw.path.starts_with("header"), "{name}: {raw}");
+        // Gateway normalisation: accepted by the Worker's firewall.
+        let pooled = firewall::pool_compatible(Dialect::AnthropicMessages, body, &hs).unwrap();
+        assert!(pooled.stripped.iter().any(|s| s.contains("dangerous-tool-use")), "{name}: {:?}", pooled.stripped);
+        assert!(pooled.stripped.iter().any(|s| s == "header anthropic-dangerous-direct-browser-access"));
+        assert_eq!(pooled.stripped.iter().any(|s| s == "safeguards"), name != "tool-turn2", "{name}");
+        let ph: Vec<(&str, &str)> = pooled.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let f = firewall::analyze(Dialect::AnthropicMessages, &pooled.body, &ph, &all, &cat).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!((f.max_tokens, f.effort, f.stream), (128_000, Effort::Medium, true), "{name}");
+        for p in [Provider::Anthropic, Provider::OpenRouter, Provider::DeepSeek] {
+            let r = Request {
+                provider: p,
+                dialect: Dialect::AnthropicMessages,
+                body: &pooled.body,
+                headers: &ph,
+                policy: &all,
+                catalog: &cat,
+                provider_model_id: "claude-sonnet-5-5",
+                user_pseudonym: "ps_1",
+                max_price: Some(MaxPrice { prompt_uusd_per_mtok: 3_000_000, completion_uusd_per_mtok: 15_000_000 }),
+            };
+            let out = firewall::prepare(&r).unwrap_or_else(|e| panic!("{name} via {p:?}: {e}"));
+            assert!(!std::str::from_utf8(&out.body).unwrap().contains("safeguards"));
+        }
+    }
+    // Per-turn effort raises the effective effort (cost bound) and is checked against the pledge.
+    let b = br#"{"model":"m","max_tokens":10,"output_config":{"effort":"low"},"messages":[{"role":"user","content":"x"},{"role":"system","content":"y","output_config":{"effort":"high"}}]}"#;
+    assert_eq!(firewall::analyze(Dialect::AnthropicMessages, b, &[], &all, &CAT).unwrap().effort, Effort::High);
+    let low = Policy { max_effort: Effort::Medium, ..all };
+    assert!(firewall::analyze(Dialect::AnthropicMessages, b, &[], &low, &CAT).unwrap_err().to_string().contains("exceeds"));
+    // System turns are text only.
+    let img = br#"{"model":"m","max_tokens":10,"messages":[{"role":"system","content":[{"type":"tool_use","id":"t","name":"x","input":{}}]}]}"#;
+    assert!(firewall::analyze(Dialect::AnthropicMessages, img, &[], &all, &CAT).is_err());
+    // Context editing: only the content-removing edits.
+    let ctx = |t: &str| format!(r#"{{"model":"m","max_tokens":10,"messages":[],"context_management":{{"edits":[{{"type":"{t}"}}]}}}}"#);
+    assert!(firewall::analyze(Dialect::AnthropicMessages, ctx("clear_thinking_20251015").as_bytes(), &[], &all, &CAT).is_ok());
+    assert!(firewall::analyze(Dialect::AnthropicMessages, ctx("clear_tool_uses_20250919").as_bytes(), &[], &all, &CAT).is_ok());
+    assert!(firewall::analyze(Dialect::AnthropicMessages, ctx("compact_20260101").as_bytes(), &[], &all, &CAT).is_err());
 }
