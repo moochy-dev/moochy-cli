@@ -310,9 +310,10 @@ fn encode_err(e: &ValidateError, out: &mut Vec<u8>) {
     }
 }
 
-/// Parent-side strict decode of the child's response. `buf` is the whole response; byte
-/// fields become zero-copy slices of it.
-fn decode_response(buf: &Bytes) -> Result<Validated, ValidateError> {
+/// Parent-side strict decode of the child's response (the bytes after the `u32_be` length
+/// prefix). Byte fields become zero-copy slices of `buf`. Public for custom transports (a
+/// zygote-forked child on a socket); [`validate_on`] does the whole exchange.
+pub fn decode_response(buf: &Bytes) -> Result<Validated, ValidateError> {
     let garbage = || ValidateError::Child("malformed response");
     let mut r = Rd(buf);
     let slice = |s: &[u8]| buf.slice_ref(s);
@@ -678,25 +679,9 @@ impl Validator {
         let mut wire = Vec::with_capacity(req.payload.len().saturating_add(256));
         encode_request(req, &mut wire);
         let work = async {
-            let mut stdin = child.stdin.take().ok_or(ValidateError::Child("no stdin"))?;
-            let mut stdout = child.stdout.take().ok_or(ValidateError::Child("no stdout"))?;
-            let write = async move {
-                stdin.write_all(&wire).await?;
-                stdin.shutdown().await
-            };
-            // `u32_be len || response`; never wait for the child's exit (it is killed and
-            // reaped in the background when dropped).
-            let read = async {
-                let len = stdout.read_u32().await?;
-                let len = usize::try_from(len).ok().filter(|l| *l <= MAX_RESPONSE).ok_or_else(|| std::io::Error::other("oversize"))?;
-                let mut resp = vec![0; len];
-                stdout.read_exact(&mut resp).await?;
-                Ok::<_, std::io::Error>(resp)
-            };
-            let (w, r) = tokio::join!(write, read);
-            w.map_err(|_| ValidateError::Child("write failed"))?;
-            let resp = r.map_err(|_| ValidateError::Child("no complete response"))?;
-            decode_response(&Bytes::from(resp))
+            let stdin = child.stdin.take().ok_or(ValidateError::Child("no stdin"))?;
+            let stdout = child.stdout.take().ok_or(ValidateError::Child("no stdout"))?;
+            exchange(stdout, stdin, &wire).await
         };
         let out = tokio::time::timeout(self.limits.deadline, work).await;
         match out {
@@ -707,6 +692,44 @@ impl Validator {
             }
         }
     }
+}
+
+/// Write one request (then half-close), read exactly one length-prefixed response; never wait
+/// for the child's exit (it is killed and reaped when dropped).
+async fn exchange<R, W>(mut reader: R, mut writer: W, wire: &[u8]) -> Result<Validated, ValidateError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let write = async move {
+        writer.write_all(wire).await?;
+        writer.shutdown().await
+    };
+    let read = async {
+        let len = reader.read_u32().await?;
+        let len = usize::try_from(len).ok().filter(|l| *l <= MAX_RESPONSE).ok_or_else(|| std::io::Error::other("oversize"))?;
+        let mut resp = vec![0; len];
+        reader.read_exact(&mut resp).await?;
+        Ok::<_, std::io::Error>(resp)
+    };
+    let (w, r) = tokio::join!(write, read);
+    w.map_err(|_| ValidateError::Child("write failed"))?;
+    let resp = r.map_err(|_| ValidateError::Child("no complete response"))?;
+    decode_response(&Bytes::from(resp))
+}
+
+/// Validate one request over any byte stream to a single-use child running [`child_main`]
+/// on the other end (e.g. a socketpair to a zygote-forked, jailed child): write, half-close,
+/// read one framed response, all within `deadline`. Child failures map to
+/// [`ValidateError::Child`] (retryable, `busy`). The caller owns the child's lifetime.
+pub async fn validate_on<S>(stream: S, req: &ValidateRequest<'_>, deadline: Duration) -> Result<Validated, ValidateError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut wire = Vec::with_capacity(req.payload.len().saturating_add(256));
+    encode_request(req, &mut wire);
+    let (r, w) = tokio::io::split(stream);
+    tokio::time::timeout(deadline, exchange(r, w, &wire)).await.map_err(|_| ValidateError::Child("deadline exceeded"))?
 }
 
 #[cfg(test)]
