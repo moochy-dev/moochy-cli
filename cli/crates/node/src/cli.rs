@@ -35,8 +35,13 @@ COMMANDS:
   mcp [--repo OWNER/NAME]         stdio MCP server (shim to the running node)
   keys add <anthropic|openrouter|deepseek|openai> --key-stdin [--base-url URL]
   keys list | keys remove <provider>
-  config set <device_monthly_cap_uusd|slots_max|gateway_addr|journal_full_text> <VALUE> | config show
-  connect <client>                Print the MCP / base-URL setup for a client (see `connect list`)
+  config set <device_monthly_cap_uusd|slots_max|gateway_addr|journal_full_text|auto_cache|firewall_level> <VALUE> | config show
+  connect <client> [--repo OWNER/NAME] [--write]
+                                  Print (or merge into the client's config) the MCP / base-URL
+                                  setup for a client (see `connect list`)
+  report <task> [--reason TEXT]   Write a signed evidence bundle for a task's response
+  doctor                          Check keystore, relay link, provider keys and doors
+  update --from-file BINARY       Install a signed release (unsigned candidates are refused)
   pending                         Requests waiting for your signature (repo owners)
   approve <donor> --repo OWNER/NAME [--revoke] [--yes]
   members <add|remove> <user> --repo OWNER/NAME [--device] [--cap UUSD] [--yes]
