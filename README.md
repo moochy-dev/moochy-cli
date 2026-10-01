@@ -8,7 +8,7 @@ A donor's machine only makes the inference call: it never runs a command, and th
 
 **Open-source client (Apache-2.0) · 100% free.** No fees, no commission, no paid tier. The relay and web app are closed source.
 
-This development monorepo is internal. At release, the open-source parts (`cli/`, `spec/proto`, `spec/vectors`, `spec/protocol.md`, `docs/guides`) are exported to the public `moochy-cli` repository; everything else stays in the private `moochy-core` repository (see `spec/CONTRACT.md` §0a).
+This development monorepo is internal. At release, the open-source parts (`cli/`, `spec/proto`, `spec/vectors`, `spec/protocol.md`, `spec/KEYLOG.md`, `docs/guides`, `deploy/client`) are exported to the public `moochy-cli` repository; everything else stays in the private `moochy-core` repository (see `spec/CONTRACT.md` §0a).
 
 - Guides (public): [`docs/guides/`](docs/guides/README.md)
 - User-facing wording: [`docs/brand/VOICE.md`](docs/brand/VOICE.md)
