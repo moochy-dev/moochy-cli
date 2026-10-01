@@ -278,35 +278,6 @@ fn sealed_detail() {
 }
 
 #[test]
-fn owner_key_and_approvals() {
-    let owner = SignKey::from_seed(&[0x51; 32]);
-    let device = SignKey::from_seed(&[0x52; 32]);
-    let dv = dev("d_01K6A0000000000000000000G1");
-    let ps = "ps_K7Q2M9XDRB4TWN8E";
-    let b = crypto::sign_owner_key(&owner, &device, ps, &dv, 1_790_000_000_000).unwrap();
-    crypto::verify_owner_key(&owner.public(), &device.public(), ps, &dv, 1_790_000_000_000, &b).unwrap();
-    // Every bound field matters; swapped roles and same-key bindings fail.
-    assert!(crypto::verify_owner_key(&owner.public(), &device.public(), "ps_K7Q2M9XDRB4TWN8F", &dv, 1_790_000_000_000, &b).is_err());
-    assert!(crypto::verify_owner_key(&owner.public(), &device.public(), ps, &dv, 1_790_000_000_001, &b).is_err());
-    assert!(crypto::verify_owner_key(&device.public(), &owner.public(), ps, &dv, 1_790_000_000_000, &b).is_err());
-    assert_eq!(crypto::verify_owner_key(&owner.public(), &owner.public(), ps, &dv, 1_790_000_000_000, &b), Err(Error::BadSignature));
-    assert_eq!(crypto::sign_owner_key(&owner, &owner, ps, &dv, 1).err(), Some(Error::Malformed));
-    for bad in ["ps_short", "pu_K7Q2M9XDRB4TWN8E", "ps_K7Q2M9XDRB4TWN8-", "ps_K7Q2M9XDRB4TWN8EX"] {
-        assert_eq!(crypto::owner_key_msg(bad, &owner.public(), &dv, 1).err(), Some(Error::Malformed), "{bad}");
-    }
-    assert_eq!(crypto::owner_key_msg(ps, &owner.public(), &dv, 0).err(), Some(Error::Malformed));
-    // Approvals: owner key over lp("moochy/v1/keylog-sig", u32(kind), body); kinds 3–7 only.
-    let body = b"approval body";
-    let sig = crypto::sign_approval(&owner, 4, body).unwrap();
-    crypto::verify_approval(&owner.public(), 4, body, &sig).unwrap();
-    assert!(crypto::verify_approval(&owner.public(), 5, body, &sig).is_err(), "kind is bound");
-    assert!(crypto::verify_approval(&device.public(), 4, body, &sig).is_err(), "device keys cannot approve");
-    for k in [0, 1, 2, 8, 9] {
-        assert_eq!(crypto::sign_approval(&owner, k, body).err(), Some(Error::Malformed), "kind {k}");
-    }
-}
-
-#[test]
 fn hpke_wrap() {
     let sk = EncSecret::from_bytes(&[0x33; 32]).unwrap();
     let pk = sk.public();

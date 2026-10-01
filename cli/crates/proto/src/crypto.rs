@@ -590,84 +590,9 @@ pub fn open_detail(ck: &ContentKey, r: &[u8; 32], task: &TaskId, worker: &Device
     String::from_utf8(buf).map_err(|_| Error::Malformed)
 }
 
-// ---------- owner key (CONTRACT §15.4 "Approvals need the human") ----------
-//
-// PENDING: spec/KEYLOG.md does not define the owner-key entry yet. Proposal (mo-proto, for
-// mo-keylog/integrator): a user's OWNER key is a separate Ed25519 key, registered by a
-// `KEY_ADDED{roles="owner"}`-style entry whose body carries `pseudonym, owner_pub,
-// signer_device, u64(issued_at_ms)` and TWO signatures over
-//     owner_key_msg = lp("moochy/v1/owner-key", pseudonym, owner_pub, signer_device, u64(issued_at_ms))
-// - `owner_pop`: by the owner key itself (proof of possession, binds it to the pseudonym);
-// - `device_sig`: by an existing, unrevoked device key of the same pseudonym (`signer_device`).
-// Approval entries (KEYLOG kinds 3–7) are then signed with the OWNER key over the unchanged
-// message `lp("moochy/v1/keylog-sig", u32(kind), body)`; device keys can no longer approve.
-// The owner key is kept encrypted at rest and loaded only by the foreground CLI (node).
-
-/// `ps_` + 16 ASCII alphanumerics (spec/KEYLOG.md field grammar).
-fn check_pseudonym(p: &str) -> Result<(), Error> {
-    let ok = p.strip_prefix("ps_").is_some_and(|r| r.len() == 16 && r.bytes().all(|c| c.is_ascii_alphanumeric()));
-    if ok { Ok(()) } else { Err(Error::Malformed) }
-}
-
-/// `lp("moochy/v1/owner-key", pseudonym, owner_pub, signer_device, u64(issued_at_ms))` (PENDING).
-pub fn owner_key_msg(pseudonym: &str, owner_pub: &[u8; 32], signer_device: &DeviceId, issued_at_ms: u64) -> Result<Vec<u8>, Error> {
-    check_pseudonym(pseudonym)?;
-    if issued_at_ms == 0 {
-        return Err(Error::Malformed);
-    }
-    lp(&[label::OWNER_KEY, pseudonym.as_bytes(), owner_pub, signer_device.text().as_bytes(), &u64be(issued_at_ms)])
-}
-
-/// Both signatures registering an owner key (PENDING format, see above).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnerKeyBinding {
-    /// By the owner key: proof of possession.
-    pub owner_pop: [u8; 64],
-    /// By `signer_device`'s key: an existing device of the same user vouches for it.
-    pub device_sig: [u8; 64],
-}
-
-/// Foreground CLI: sign the owner-key registration with the new owner key and a device key.
-pub fn sign_owner_key(owner: &SignKey, device: &SignKey, pseudonym: &str, signer_device: &DeviceId, issued_at_ms: u64) -> Result<OwnerKeyBinding, Error> {
-    if owner.public() == device.public() {
-        return Err(Error::Malformed); // the owner key must be a separate key
-    }
-    let m = owner_key_msg(pseudonym, &owner.public(), signer_device, issued_at_ms)?;
-    Ok(OwnerKeyBinding { owner_pop: owner.sign(&m), device_sig: device.sign(&m) })
-}
-
-/// Verifier side (relay append, node mirror): both signatures, distinct keys.
-pub fn verify_owner_key(owner_pub: &[u8; 32], device_pub: &[u8; 32], pseudonym: &str, signer_device: &DeviceId, issued_at_ms: u64, b: &OwnerKeyBinding) -> Result<(), Error> {
-    if ct_eq(owner_pub, device_pub) {
-        return Err(Error::BadSignature);
-    }
-    let m = owner_key_msg(pseudonym, owner_pub, signer_device, issued_at_ms)?;
-    verify(owner_pub, &m, &b.owner_pop)?;
-    verify(device_pub, &m, &b.device_sig)
-}
-
-/// Key-log kinds that only an owner may sign (spec/KEYLOG.md §2: 3–7).
-pub const OWNER_SIGNED_KINDS: std::ops::RangeInclusive<u32> = 3..=7;
-
-/// `lp("moochy/v1/keylog-sig", u32(kind), body)` (spec/KEYLOG.md §2).
-pub fn keylog_sig_msg(kind: u32, body: &[u8]) -> Result<Vec<u8>, Error> {
-    lp(&[label::KEYLOG_SIG, &kind.to_be_bytes(), body])
-}
-
-/// Owner signature on an approval entry (REPO_CLAIMED, DONOR_*, MEMBER_*). Other kinds refused.
-pub fn sign_approval(owner: &SignKey, kind: u32, body: &[u8]) -> Result<[u8; 64], Error> {
-    if !OWNER_SIGNED_KINDS.contains(&kind) {
-        return Err(Error::Malformed);
-    }
-    Ok(owner.sign(&keylog_sig_msg(kind, body)?))
-}
-
-pub fn verify_approval(owner_pub: &[u8; 32], kind: u32, body: &[u8], sig: &[u8; 64]) -> Result<(), Error> {
-    if !OWNER_SIGNED_KINDS.contains(&kind) {
-        return Err(Error::Malformed);
-    }
-    verify(owner_pub, &keylog_sig_msg(kind, body)?, sig)
-}
+// Owner keys (CONTRACT §15.4) and every key-log message (records, `keylog-sig`, `key-pop`,
+// receipt-log leaves and inclusion proofs) live in the `moochy_keylog` crate (spec/KEYLOG.md,
+// vectors in spec/vectors/keylog/); sign them with [`SignKey::sign`]. Not duplicated here.
 
 // ---------- HPKE wraps ----------
 
