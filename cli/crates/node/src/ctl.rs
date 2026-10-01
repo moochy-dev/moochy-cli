@@ -6,9 +6,9 @@ use crate::node::{LinkState, Node, lock};
 use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
-    ApproveRequest, ApproveResponse, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest,
-    MembersResponse, PauseRequest, PauseResponse, PoolSummary, ShutdownRequest, ShutdownResponse, StatusRequest, StatusResponse,
-    mcp_up,
+    ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
+    PauseResponse, PendingRequest, PendingResponse, PoolSummary, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest,
+    StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
 use bytes::Bytes;
@@ -161,12 +161,32 @@ impl LocalControl for Ctl {
         }))
     }
 
-    async fn approve(&self, _: Request<ApproveRequest>) -> std::result::Result<Response<ApproveResponse>, Status> {
-        Err(Status::unimplemented("owner-signed approvals need a relay message that link.proto does not define yet"))
+    async fn approve(&self, r: Request<ApproveRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        let r = r.into_inner();
+        let kind = if r.revoke { "DONOR_REVOKED" } else { "DONOR_APPROVED" };
+        crate::approve::sign(&self.node, kind, &r.repo, Some(&r.donor), r.dry_run).await.map(Response::new)
     }
 
-    async fn members(&self, _: Request<MembersRequest>) -> std::result::Result<Response<MembersResponse>, Status> {
-        Err(Status::unimplemented("owner-signed memberships need a relay message that link.proto does not define yet"))
+    async fn members(&self, r: Request<MembersRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        let r = r.into_inner();
+        let kind = match members_request::Op::try_from(r.op) {
+            Ok(members_request::Op::Add) => "MEMBER_ADDED",
+            Ok(members_request::Op::Remove) => "MEMBER_REMOVED",
+            _ => return Err(Status::invalid_argument("op must be add or remove")),
+        };
+        if r.device && !r.user.starts_with("d_") {
+            return Err(Status::invalid_argument("--device expects a device id (d_…)"));
+        }
+        crate::approve::sign(&self.node, kind, &r.repo, Some(&r.user), r.dry_run).await.map(Response::new)
+    }
+
+    async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        let r = r.into_inner();
+        crate::approve::sign(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).await.map(Response::new)
+    }
+
+    async fn pending(&self, _: Request<PendingRequest>) -> std::result::Result<Response<PendingResponse>, Status> {
+        Ok(Response::new(PendingResponse { requests: crate::approve::pending(&self.node) }))
     }
 
     type JournalStream = ReceiverStream<std::result::Result<JournalEntry, Status>>;

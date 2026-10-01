@@ -38,21 +38,23 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
     }
     let ca_file = ca_file.map(|p| std::fs::canonicalize(&p).map_err(|e| usage(format!("--ca-file {}: {e}", p.display())))).transpose()?;
     let mut cfg = home.load()?;
+    // Per-origin keystore (A135): select it before touching any secret.
+    cfg.relay = Some(origin.url());
     let mut secrets = keystore::load_or_init(home, &mut cfg)?;
     let keys = DeviceKeys::generate()?;
-    let (sign_pub, enc_pub) = (keys.sign_pub(), keys.enc_pub());
+    let (sign_pub, enc_pub) = (keys.sign_pub(), keys.enc_pub()?);
     let roles_csv = roles.join(",");
     let sig = keys.sign(&lp(&[b"moochy/v1/device-start", &sign_pub, &enc_pub, roles_csv.as_bytes(), name.as_bytes(), SUITE.as_bytes()]));
 
     let (ch, _) = link::dial(ca_file.as_deref(), &origin).await?;
     let mut client = link::client(ch);
     let start = DeviceStartRequest {
-        sign_pub: sign_pub.to_vec(),
-        enc_pub: enc_pub.to_vec(),
+        sign_pub: bytes::Bytes::copy_from_slice(&sign_pub),
+        enc_pub: bytes::Bytes::copy_from_slice(&enc_pub),
         roles: link::roles(&roles),
         name,
         suite: SUITE.into(),
-        sig: sig.to_vec(),
+        sig: bytes::Bytes::copy_from_slice(&sig),
     };
     let r = tokio::time::timeout(crate::tls::IO_TIMEOUT, client.device_start(start))
         .await

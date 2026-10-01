@@ -121,20 +121,47 @@ fn env_value(b: &[u8], eq: usize) -> Option<(usize, usize)> {
     (n >= 8).then(|| (v, v.saturating_add(n)))
 }
 
+/// Cheap check of the bytes after a candidate first byte, so ordinary prose (full of `e`, `s`,
+/// `g`) almost never reaches the full pattern match.
+fn plausible(b: &[u8], i: usize, c: u8) -> bool {
+    let n = |k: usize| at(b, i.saturating_add(k));
+    match c {
+        b'-' => n(1) == b'-' && n(4) == b'-' && n(5) == b'B',
+        b'e' => n(1) == b'y' && n(2) == b'J',
+        b's' => n(1) == b'k' && n(2) == b'-',
+        b'g' => (n(1) == b'h' && n(3) == b'_') || (n(1) == b'l' && n(2) == b'p') || (n(1) == b'i' && n(6) == b'_'),
+        b'x' => (n(1) == b'o' && n(2) == b'x') || (n(1) == b'a' && n(2) == b'p'),
+        b'A' => matches!((n(1), n(2)), (b'K' | b'S', b'I') | (b'I', b'z')),
+        _ => false,
+    }
+}
+
+/// Bytes that can start a match (table: ~2× faster than a compare chain on prose).
+static TRIGGER: std::sync::LazyLock<[bool; 256]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|i| u8::try_from(i).is_ok_and(|c| b"=-esgxA".contains(&c))));
+
+/// Word boundary before `i`; a JSON escape (`\n`, `\t`, `\r`) right before also counts.
+fn boundary(b: &[u8], i: usize) -> bool {
+    let prev = at(b, i.saturating_sub(1));
+    i == 0 || !tok(prev) || (i >= 2 && at(b, i.saturating_sub(2)) == b'\\' && matches!(prev, b'n' | b't' | b'r'))
+}
+
 /// Scrub; `None` when nothing matched (no copy).
 pub fn scrub(b: &[u8]) -> Option<Vec<u8>> {
     let mut out: Option<Vec<u8>> = None;
     let mut last = 0usize;
     let mut i = 0usize;
+    let trig: &[bool; 256] = &TRIGGER;
     while i < b.len() {
+        // Jump to the next byte that can start a match.
+        match b.get(i..).and_then(|r| r.iter().position(|c| trig.get(usize::from(*c)).copied().unwrap_or(true))) {
+            Some(k) => i = i.saturating_add(k),
+            None => break,
+        }
         let c = at(b, i);
-        // A JSON escape (`\n`, `\t`, `\r`) right before also counts as a word boundary.
-        let prev = at(b, i.saturating_sub(1));
-        let escaped = i >= 2 && at(b, i.saturating_sub(2)) == b'\\' && matches!(prev, b'n' | b't' | b'r');
-        let boundary = i == 0 || !tok(prev) || escaped;
         let hit = if c == b'=' {
             env_value(b, i).map(|(s, e)| (s, e, "env_secret"))
-        } else if boundary && matches!(c, b'-' | b'e' | b's' | b'g' | b'x' | b'A') {
+        } else if plausible(b, i, c) && boundary(b, i) {
             match_at(b, i).map(|(e, k)| (i, e, k))
         } else {
             None

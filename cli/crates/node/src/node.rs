@@ -2,15 +2,18 @@
 //! sessions, journal.
 
 use crate::config::{Config, Home};
-use crate::engine::{Executor, Sealer};
+use crate::engine::{Catalog, STUB_MODEL};
 use crate::keystore::Secrets;
-use crate::pb::link::{NodeMsg, PoolSync, node_link_client::NodeLinkClient};
+use crate::pb::link::{ApprovalRequest, LogEntryAck, NodeMsg, PoolSync, node_link_client::NodeLinkClient};
+use moochy_proto::crypto::{EncSecret, SignKey};
+use moochy_worker::provider::Adapter;
+use moochy_worker::store::Store;
 use crate::pb::local::JournalEntry;
 use crate::util::{clean, now_ms};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
@@ -76,16 +79,36 @@ impl RepoPool {
     }
 }
 
+/// Device keys in usable form (built once from the keystore seeds).
+pub struct Keys {
+    pub sign: SignKey,
+    pub enc: EncSecret,
+    pub device_id: moochy_proto::DeviceId,
+}
+
 pub struct Node {
     pub home: Home,
     pub cfg: Config,
     pub secrets: Secrets,
-    pub executor: Arc<dyn Executor>,
-    pub sealer: Option<Arc<dyn Sealer>>,
-    /// Own-key / stub mode: no relay; tasks run on the local executor.
+    pub keys: Option<Keys>,
+    /// Dev/test mode: no relay; the doors answer with canned stub responses.
     pub offline: bool,
+    /// `MOOCHY_INSECURE_DEV=1`: loopback provider URLs, relay-asserted trust (D14).
+    pub insecure_dev: bool,
+    /// Process start (ms): the served-task boot floor (D18).
+    pub boot_ms: u64,
+    pub catalog: Mutex<Arc<Catalog>>,
+    /// Worker: one warm adapter per provider key.
+    pub adapters: Vec<Arc<Adapter>>,
+    /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
+    pub store: Option<Arc<Mutex<Store>>>,
+    /// Owner: requests waiting for this device's signature (pushed by the relay).
+    pub approvals: Mutex<Vec<ApprovalRequest>>,
+    pub log_acks: Mutex<HashMap<String, oneshot::Sender<LogEntryAck>>>,
     pub link: Mutex<Option<LinkHandle>>,
     pub link_state: watch::Sender<LinkState>,
+    /// Wakes the reconnect loop now (a request arrived while the link was down).
+    pub link_kick: tokio::sync::Notify,
     pub pools: Mutex<HashMap<String, RepoPool>>,
     /// Bumped whenever the set of pool models changes (MCP `tools/list_changed`).
     pub pool_gen: watch::Sender<u64>,
@@ -105,17 +128,24 @@ const MAX_SESSIONS: usize = 4096;
 const JOURNAL_KEEP: usize = 512;
 
 impl Node {
-    pub fn new(home: Home, cfg: Config, secrets: Secrets, executor: Arc<dyn Executor>, sealer: Option<Arc<dyn Sealer>>, offline: bool) -> Arc<Self> {
+    pub fn new(home: Home, cfg: Config, secrets: Secrets, keys: Option<Keys>, w: WorkerParts, offline: bool) -> Arc<Self> {
         let token_gen = AtomicU64::new(cfg.token_gen);
         Arc::new(Self {
             home,
             cfg,
             secrets,
-            executor,
-            sealer,
+            keys,
             offline,
+            insecure_dev: std::env::var("MOOCHY_INSECURE_DEV").as_deref() == Ok("1"),
+            boot_ms: now_ms(),
+            catalog: Mutex::new(if offline { Catalog::stub() } else { Arc::new(Catalog::default()) }),
+            adapters: w.adapters,
+            store: w.store,
+            approvals: Mutex::new(Vec::new()),
+            log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
             link_state: watch::channel(LinkState::Down).0,
+            link_kick: tokio::sync::Notify::new(),
             pools: Mutex::new(HashMap::new()),
             pool_gen: watch::channel(0).0,
             sessions: Mutex::new(HashMap::new()),
@@ -130,12 +160,57 @@ impl Node {
         })
     }
 
+    pub fn catalog(&self) -> Arc<Catalog> {
+        lock(&self.catalog).clone()
+    }
+
+    /// Right after start the relay may not have pushed every donor yet (it throttles pool
+    /// updates): wait up to 2 s for `ok(pool)`, only during the node's first 5 seconds.
+    pub async fn settle_pool(&self, slug: &str, ok: impl Fn(&RepoPool) -> bool) {
+        let ready = |n: &Self| n.pool_for(slug).is_some_and(|p| ok(&p));
+        if now_ms().saturating_sub(self.boot_ms) >= 5_000 || ready(self) {
+            return;
+        }
+        let mut rx = self.pool_gen.subscribe();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    r = rx.changed() => if r.is_err() { return },
+                    () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
+                if ready(self) {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Accept a newer catalog (versions never go down).
+    pub fn set_catalog(&self, c: Catalog) {
+        let mut cur = lock(&self.catalog);
+        if c.version >= cur.version {
+            *cur = Arc::new(c);
+        }
+    }
+
     pub fn device_id(&self) -> Option<&str> {
         self.cfg.device_id.as_deref()
     }
 
     pub fn link(&self) -> Option<LinkHandle> {
         lock(&self.link).clone()
+    }
+
+    /// The link, reconnecting at once if it is down (waits at most `wait`).
+    pub async fn link_now(&self, wait: std::time::Duration) -> Option<LinkHandle> {
+        if let Some(l) = self.link() {
+            return Some(l);
+        }
+        self.link_kick.notify_one();
+        let mut rx = self.link_state.subscribe();
+        let _ = tokio::time::timeout(wait, rx.wait_for(|s| *s == LinkState::Up)).await;
+        self.link()
     }
 
     pub fn gateway_url(&self) -> String {
@@ -152,8 +227,7 @@ impl Node {
 
     /// The pool serving `slug`. Offline: a synthetic pool of the local executor's models.
     ///
-    /// `PoolSync` carries no slug yet: when exactly one repo pool is known it serves every
-    /// local token (they all belong to this device's user). Requested: `slug` in `PoolSync`.
+    /// Matched by `PoolSync.repo_slug` (case-insensitive: slugs are lowercase on the wire).
     pub fn pool_for(&self, slug: &str) -> Option<RepoPool> {
         if self.offline {
             let mut w = PoolWorker {
@@ -165,26 +239,19 @@ impl Node {
                 models: Vec::new(),
                 hint: 100,
             };
-            for m in self.executor.models() {
-                let d = m.dialect.wire().to_owned();
-                if !w.dialects.contains(&d) {
-                    w.dialects.push(d);
-                }
-                if !w.models.contains(&m.model) {
-                    w.models.push(m.model);
-                }
-            }
+            w.dialects = vec!["anthropic.messages".into(), "openai.chat".into()];
+            w.models = vec![STUB_MODEL.into()];
             return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w] });
         }
         let pools = lock(&self.pools);
-        if let Some(p) = pools.values().find(|p| p.slug.as_deref() == Some(slug)) {
-            return Some(p.clone());
-        }
-        let mut it = pools.values().filter(|p| p.slug.is_none());
-        match (it.next(), it.next()) {
-            (Some(p), None) => Some(p.clone()),
-            _ => None,
-        }
+        pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()
+    }
+
+    /// Key-log hook (06 §10): a Gateway seals only to worker keys that are logged, unrevoked, and
+    /// belong to a donor with an owner-signed `DONOR_APPROVED` for the repo. Until the
+    /// `moochy-keylog` mirror is wired this accepts the relay's pool (relay-asserted, like D14).
+    fn worker_approved(_repo_id: &str, _worker_device: &str, _sign_pub: Option<&[u8; 32]>) -> bool {
+        true
     }
 
     pub fn apply_pool_sync(&self, v: &PoolSync) {
@@ -194,18 +261,25 @@ impl Node {
         let changed = {
             let mut pools = lock(&self.pools);
             let p = pools.entry(v.repo_id.clone()).or_insert_with(|| RepoPool { repo_id: v.repo_id.clone(), ..RepoPool::default() });
+            if crate::config::valid_slug(&v.repo_slug) {
+                p.slug = Some(v.repo_slug.to_ascii_lowercase());
+            }
             let before = p.models();
             if v.full {
                 p.workers.clear();
             }
             p.workers.retain(|x| !v.removed_worker_devices.contains(&x.worker_device));
             for w in v.workers.iter().take(4096) {
-                let Ok(enc_pub) = <[u8; 32]>::try_from(w.enc_pub.as_slice()) else { continue };
+                let Ok(enc_pub) = <[u8; 32]>::try_from(w.enc_pub.as_ref()) else { continue };
+                let sign_pub = <[u8; 32]>::try_from(w.sign_pub.as_ref()).ok();
+                if !Self::worker_approved(&v.repo_id, &w.worker_device, sign_pub.as_ref()) {
+                    continue;
+                }
                 p.workers.retain(|x| x.worker_device != w.worker_device);
                 p.workers.push(PoolWorker {
                     worker_device: w.worker_device.clone(),
                     enc_pub,
-                    sign_pub: None,
+                    sign_pub,
                     donor: clean(&w.donor_pseudonym).into_owned(),
                     dialects: w.dialects.clone(),
                     models: w.models.clone(),
@@ -217,6 +291,7 @@ impl Node {
         if changed {
             self.pool_gen.send_modify(|g| *g = g.wrapping_add(1));
         }
+        crate::util::log("info", "pool sync", &serde_json::json!({"repo_id": v.repo_id, "full": v.full, "workers": v.workers.len(), "models_changed": changed}));
     }
 
     pub fn session_worker(&self, key: &[u8; 16]) -> Option<String> {
@@ -248,6 +323,13 @@ impl Node {
         }
         let _ = self.journal_tx.send(e);
     }
+}
+
+/// Worker-role parts built at startup.
+#[derive(Default)]
+pub struct WorkerParts {
+    pub adapters: Vec<Arc<Adapter>>,
+    pub store: Option<Arc<Mutex<Store>>>,
 }
 
 /// RAII counter for in-flight work (`gateway_tasks`, `worker_busy`).

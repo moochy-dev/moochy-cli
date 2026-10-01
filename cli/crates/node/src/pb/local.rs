@@ -74,24 +74,74 @@ pub struct ApproveRequest {
     /// owner/name
     #[prost(string, tag = "1")]
     pub repo: ::prost::alloc::string::String,
-    /// donor username (CONTRACT §11 handle)
+    /// donor username (CONTRACT §11 handle) or pseudonym
     #[prost(string, tag = "2")]
     pub donor: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub dry_run: bool,
+    /// DONOR_REVOKED instead of DONOR_APPROVED
+    #[prost(bool, tag = "4")]
+    pub revoke: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClaimRequest {
+    #[prost(string, tag = "1")]
+    pub repo: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub dry_run: bool,
+}
+/// What the owner signs (or would sign), decoded from the exact body bytes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SignResponse {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub repo_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// pseudonym / device id inside the signed body
+    #[prost(string, tag = "5")]
+    pub subject: ::prost::alloc::string::String,
+    /// relay-provided, display only
+    #[prost(string, tag = "6")]
+    pub subject_username: ::prost::alloc::string::String,
+    /// this device
+    #[prost(string, tag = "7")]
+    pub signer: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub issued_at_ms: i64,
+    #[prost(bool, tag = "9")]
+    pub signed: bool,
+    /// once appended
+    #[prost(uint64, tag = "10")]
+    pub log_index: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ApproveResponse {}
+pub struct PendingRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PendingResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub requests: ::prost::alloc::vec::Vec<SignResponse>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MembersRequest {
     #[prost(string, tag = "1")]
     pub repo: ::prost::alloc::string::String,
     #[prost(enumeration = "members_request::Op", tag = "2")]
     pub op: i32,
-    /// username
+    /// username, pseudonym, or device id (with `device`)
     #[prost(string, tag = "3")]
     pub user: ::prost::alloc::string::String,
-    /// 0 = repo default
+    /// 0 = repo default (relay-side setting, not signed)
     #[prost(int64, tag = "4")]
     pub cap_uusd_month: i64,
+    /// the subject is a device (CI / headless node)
+    #[prost(bool, tag = "5")]
+    pub device: bool,
+    #[prost(bool, tag = "6")]
+    pub dry_run: bool,
 }
 /// Nested message and enum types in `MembersRequest`.
 pub mod members_request {
@@ -135,8 +185,6 @@ pub mod members_request {
         }
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MembersResponse {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct JournalRequest {
     #[prost(bool, tag = "1")]
@@ -364,14 +412,13 @@ pub mod local_control_client {
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "Env"));
             self.inner.unary(req, path, codec).await
         }
-        /// Repo owner: sign a donor approval / membership change with this device (plan 06 §5).
+        /// Repo owner: sign a pending donor approval / membership change / repo claim with this device
+        /// (plan 06 §5). The Node only signs a request the Relay pushed (ApprovalRequests), after
+        /// checking its exact body; `dry_run` returns what would be signed without signing.
         pub async fn approve(
             &mut self,
             request: impl tonic::IntoRequest<super::ApproveRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ApproveResponse>,
-            tonic::Status,
-        > {
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status> {
             self.inner
                 .ready()
                 .await
@@ -392,10 +439,7 @@ pub mod local_control_client {
         pub async fn members(
             &mut self,
             request: impl tonic::IntoRequest<super::MembersRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::MembersResponse>,
-            tonic::Status,
-        > {
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status> {
             self.inner
                 .ready()
                 .await
@@ -411,6 +455,52 @@ pub mod local_control_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "Members"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn claim(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClaimRequest>,
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/Claim",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "Claim"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Requests waiting for this owner's signature.
+        pub async fn pending(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PendingRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PendingResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/Pending",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "Pending"));
             self.inner.unary(req, path, codec).await
         }
         /// Local audit journal (metadata only). `follow` keeps the stream open for new entries.
@@ -522,15 +612,26 @@ pub mod local_control_server {
             &self,
             request: tonic::Request<super::EnvRequest>,
         ) -> std::result::Result<tonic::Response<super::EnvResponse>, tonic::Status>;
-        /// Repo owner: sign a donor approval / membership change with this device (plan 06 §5).
+        /// Repo owner: sign a pending donor approval / membership change / repo claim with this device
+        /// (plan 06 §5). The Node only signs a request the Relay pushed (ApprovalRequests), after
+        /// checking its exact body; `dry_run` returns what would be signed without signing.
         async fn approve(
             &self,
             request: tonic::Request<super::ApproveRequest>,
-        ) -> std::result::Result<tonic::Response<super::ApproveResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status>;
         async fn members(
             &self,
             request: tonic::Request<super::MembersRequest>,
-        ) -> std::result::Result<tonic::Response<super::MembersResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status>;
+        async fn claim(
+            &self,
+            request: tonic::Request<super::ClaimRequest>,
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status>;
+        /// Requests waiting for this owner's signature.
+        async fn pending(
+            &self,
+            request: tonic::Request<super::PendingRequest>,
+        ) -> std::result::Result<tonic::Response<super::PendingResponse>, tonic::Status>;
         /// Server streaming response type for the Journal method.
         type JournalStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::JournalEntry, tonic::Status>,
@@ -821,7 +922,7 @@ pub mod local_control_server {
                         T: LocalControl,
                     > tonic::server::UnaryService<super::ApproveRequest>
                     for ApproveSvc<T> {
-                        type Response = super::ApproveResponse;
+                        type Response = super::SignResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
@@ -866,7 +967,7 @@ pub mod local_control_server {
                         T: LocalControl,
                     > tonic::server::UnaryService<super::MembersRequest>
                     for MembersSvc<T> {
-                        type Response = super::MembersResponse;
+                        type Response = super::SignResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
@@ -889,6 +990,95 @@ pub mod local_control_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = MembersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/Claim" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClaimSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::ClaimRequest> for ClaimSvc<T> {
+                        type Response = super::SignResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ClaimRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::claim(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClaimSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/Pending" => {
+                    #[allow(non_camel_case_types)]
+                    struct PendingSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::PendingRequest>
+                    for PendingSvc<T> {
+                        type Response = super::PendingResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PendingRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::pending(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PendingSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

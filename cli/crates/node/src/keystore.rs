@@ -8,6 +8,7 @@ use crate::util::{Ctx as _, Result, auth, b64d, b64e, internal, lp, rand_bytes};
 use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac as _};
+use moochy_proto::crypto::{EncSecret, SignKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
@@ -54,17 +55,20 @@ impl DeviceKeys {
     pub fn generate() -> Result<Self> {
         Ok(Self { sign_seed: rand_bytes()?, enc_secret: rand_bytes()? })
     }
-    pub fn signing_key(&self) -> ed25519_zebra::SigningKey {
-        ed25519_zebra::SigningKey::from(self.sign_seed)
+    pub fn sign_key(&self) -> SignKey {
+        SignKey::from_seed(&self.sign_seed)
     }
     pub fn sign_pub(&self) -> [u8; 32] {
-        ed25519_zebra::VerificationKeyBytes::from(&self.signing_key()).into()
+        self.sign_key().public()
     }
-    pub fn enc_pub(&self) -> [u8; 32] {
-        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(self.enc_secret)).to_bytes()
+    pub fn enc_key(&self) -> Result<EncSecret> {
+        EncSecret::from_bytes(&self.enc_secret).map_err(|_| auth("device encryption key is corrupt"))
+    }
+    pub fn enc_pub(&self) -> Result<[u8; 32]> {
+        self.enc_key().map(|k| k.public())
     }
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
-        self.signing_key().sign(msg).into()
+        self.sign_key().sign(msg)
     }
 }
 
@@ -194,12 +198,12 @@ fn use_keychain(cfg: &Config) -> bool {
 /// Load secrets; `None` when no keystore exists yet.
 pub fn load(home: &Home, cfg: &Config) -> Result<Option<Secrets>> {
     let plain = if use_keychain(cfg) {
-        match keychain::get(home)? {
+        match keychain::get(home, cfg)? {
             Some(p) => p,
             None => return Ok(None),
         }
     } else {
-        match std::fs::read(home.keystore_path()) {
+        match std::fs::read(home.keystore_path(cfg.relay.as_deref())) {
             Ok(b) => open(&b, &passphrase()?)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(internal(format!("read keystore: {e}"))),
@@ -227,21 +231,25 @@ pub fn save(home: &Home, cfg: &Config, s: &Secrets) -> Result<()> {
     home.ensure()?;
     let plain = Zeroizing::new(serde_json::to_vec(s).ctx("encode secrets")?);
     if use_keychain(cfg) {
-        return keychain::set(home, &plain);
+        return keychain::set(home, cfg, &plain);
     }
-    write_private(&home.keystore_path(), &seal(&plain, &passphrase()?)?)
+    write_private(&home.keystore_path(cfg.relay.as_deref()), &seal(&plain, &passphrase()?)?)
 }
 
 #[cfg(feature = "keychain")]
 mod keychain {
-    use super::{Home, Result, Zeroizing, b64d, b64e};
+    use super::{Config, Home, Result, Zeroizing, b64d, b64e};
     use crate::util::{auth, internal};
 
-    fn entry(home: &Home) -> Result<keyring::Entry> {
-        keyring::Entry::new("moochy", &home.dir.to_string_lossy()).map_err(|e| internal(format!("keychain: {e}")))
+    fn entry(home: &Home, cfg: &Config) -> Result<keyring::Entry> {
+        let user = match cfg.relay.as_deref() {
+            Some(r) if r != crate::config::DEFAULT_RELAY => format!("{}#{}", home.dir.to_string_lossy(), crate::config::origin_tag(r)),
+            _ => home.dir.to_string_lossy().into_owned(),
+        };
+        keyring::Entry::new("moochy", &user).map_err(|e| internal(format!("keychain: {e}")))
     }
-    pub fn get(home: &Home) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        match entry(home)?.get_password() {
+    pub fn get(home: &Home, cfg: &Config) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        match entry(home, cfg)?.get_password() {
             Ok(p) => {
                 let p = Zeroizing::new(p);
                 b64d(&p).map(|v| Some(Zeroizing::new(v))).ok_or_else(|| auth("keychain entry is corrupt"))
@@ -250,20 +258,20 @@ mod keychain {
             Err(e) => Err(auth(format!("keychain: {e}"))),
         }
     }
-    pub fn set(home: &Home, plain: &[u8]) -> Result<()> {
+    pub fn set(home: &Home, cfg: &Config, plain: &[u8]) -> Result<()> {
         let s = Zeroizing::new(b64e(plain));
-        entry(home)?.set_password(&s).map_err(|e| internal(format!("keychain: {e}")))
+        entry(home, cfg)?.set_password(&s).map_err(|e| internal(format!("keychain: {e}")))
     }
 }
 
 #[cfg(not(feature = "keychain"))]
 mod keychain {
-    use super::{Home, Result, Zeroizing};
+    use super::{Config, Home, Result, Zeroizing};
     use crate::util::usage;
-    pub fn get(_: &Home) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    pub fn get(_: &Home, _: &Config) -> Result<Option<Zeroizing<Vec<u8>>>> {
         Err(usage("this build has no keychain support (feature `keychain`)"))
     }
-    pub fn set(_: &Home, _: &[u8]) -> Result<()> {
+    pub fn set(_: &Home, _: &Config, _: &[u8]) -> Result<()> {
         Err(usage("this build has no keychain support (feature `keychain`)"))
     }
 }

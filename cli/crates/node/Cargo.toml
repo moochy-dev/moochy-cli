@@ -21,6 +21,12 @@ default = []
 keychain = ["dep:keyring"]
 
 [dependencies]
+# Wire types, envelopes, signatures, money math, generated link.proto code (open, same workspace).
+moochy-proto = { path = "../proto" }
+# Firewall, provider adapters, stream parsers, tool-call inspection, outbox store.
+moochy-worker = { path = "../worker" }
+# K_det for sealed refusal details (CONTRACT §3); same version moochy-proto already links.
+hkdf = { version = "0.12", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal", "process", "fs"] }
 hyper = { version = "1.7", default-features = false, features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.17", default-features = false, features = ["tokio", "service"] }
@@ -41,12 +47,9 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
 scrypt = { version = "0.11", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-getrandom = { version = "0.3", default-features = false }
 zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
 subtle = { version = "2", default-features = false }
 keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
