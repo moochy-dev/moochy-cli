@@ -519,6 +519,9 @@ impl Driver {
         if self.closed || !self.gate.is_stream() || !complete || (self.gate.holds_tools() && !covered) {
             return Step::Continue;
         }
+        if !self.gate.ended() {
+            return retry_fail("provider_error", "the donor's provider stopped mid-response");
+        }
         if let Err(why) = self.gate.finish(covered) {
             return retry_fail("provider_error", why);
         }
@@ -601,6 +604,9 @@ impl Driver {
                     log("warn", "stream_integrity", &json!({"task": self.task_text, "why": "stream ended before its last chunk"}));
                     return retry_fail("stream_integrity", "the response ended before its last chunk; retry");
                 }
+                return retry_fail("provider_error", "the donor's provider stopped mid-response");
+            }
+            if !self.gate.ended() {
                 return retry_fail("provider_error", "the donor's provider stopped mid-response");
             }
             let all = self.last_seq.is_some() && self.verified >= self.last_seq;

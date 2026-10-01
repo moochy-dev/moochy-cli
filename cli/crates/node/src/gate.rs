@@ -50,6 +50,8 @@ pub struct Gate {
     items: Vec<(u64, u64, K)>,
     /// §15.4: the session may receive tool calls (sandboxed, or the project opted in).
     release: bool,
+    /// The stream reached `message_stop` / `[DONE]`, or carried a provider error event.
+    ended: bool,
 }
 
 const MAX_TOOL_INPUT: usize = 4 << 20;
@@ -77,7 +79,14 @@ impl Gate {
             last_seq: 0,
             items: Vec::new(),
             release,
+            ended: false,
         }
+    }
+
+    /// A streamed response that never reached its terminal event was cut (E54): the client must
+    /// get an error, not a silently truncated answer.
+    pub fn ended(&self) -> bool {
+        !self.stream || self.ended
     }
 
     fn verdict(&self, name: &str, input: &[u8]) -> Option<String> {
@@ -100,9 +109,14 @@ impl Gate {
         }
         let mut items = std::mem::take(&mut self.items);
         items.clear();
+        let mut ended = false;
         let r = self.parser.feed(pt, &mut |span, ev| {
             let k = match ev {
-                Event::Other | Event::Stop | Event::Error => K::Pass,
+                Event::Stop | Event::Error => {
+                    ended = true;
+                    K::Pass
+                }
+                Event::Other => K::Pass,
                 Event::ToolStart { index, name, .. } => K::Start(index, name.and_then(moochy_worker::json::Val::as_str).map(std::borrow::Cow::into_owned).unwrap_or_default()),
                 Event::ToolArgs { index, json } => K::Args(index, json.as_str().map(std::borrow::Cow::into_owned).unwrap_or_default()),
                 Event::ToolEnd { .. } => K::End,
@@ -114,6 +128,7 @@ impl Gate {
         if r.is_err() {
             return Err("provider event too large");
         }
+        self.ended |= ended;
         let mut emit_to = self.base;
         for (start, end, k) in items.drain(..) {
             // A closed tool block ends when an event past it begins (a shared span may restart it).
