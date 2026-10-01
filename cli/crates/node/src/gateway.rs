@@ -238,20 +238,30 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let root = doc.root();
     let model = root.get("model").and_then(Val::as_str).ok_or_else(|| bad("moochy: `model` is required".into()))?;
     let entry = catalog_entry(node, &model)?;
-    // Affinity key over the exact bytes of system, tools and the first user message (04 §5).
+    // Affinity key over system, tools and the first user message (04 §5), each re-serialized
+    // canonically (`Val::raw` is empty for objects and arrays, which made every key equal).
     let first = |role: &str| root.get("messages").and_then(|m| m.items().find(|x| x.get("role").is_some_and(|r| r.is_str(role))));
     let system = match dialect {
         Dialect::Anthropic => root.get("system"),
         Dialect::OpenAi => first("system").or_else(|| first("developer")),
     };
-    let affinity = node.secrets.affinity(raw_of(system), raw_of(root.get("tools")), raw_of(first("user")));
+    let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
     Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx })
 }
 
-fn raw_of(v: Option<moochy_worker::json::Val<'_>>) -> &[u8] {
-    v.map_or(&b""[..], |v| v.raw().as_bytes())
+fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
+    let mut buf = Vec::new();
+    let mut ends = [0usize; 3];
+    for (end, v) in ends.iter_mut().zip([system, tools, user]) {
+        if let Some(v) = v {
+            moochy_worker::json::write(v, &mut buf);
+        }
+        *end = buf.len();
+    }
+    let [a, b, c] = ends;
+    secrets.affinity(buf.get(..a).unwrap_or_default(), buf.get(a..b).unwrap_or_default(), buf.get(b..c).unwrap_or_default())
 }
 
 fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::CatalogEntry, Failure> {
@@ -360,4 +370,28 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         h.insert("x-moochy-donor", v);
     }
     resp
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    fn key(body: &str) -> [u8; 16] {
+        let mut tape = Vec::new();
+        let doc = moochy_worker::json::parse(body.as_bytes(), &mut tape).unwrap();
+        let root = doc.root();
+        let user = root.get("messages").and_then(|m| m.items().next());
+        affinity_key(&crate::keystore::Secrets::default(), root.get("system"), root.get("tools"), user)
+    }
+
+    #[test]
+    fn affinity_depends_on_object_and_array_content() {
+        let a = key(r#"{"messages":[{"role":"user","content":"probe 1"}]}"#);
+        let b = key(r#"{"messages":[{"role":"user","content":"probe 2"}]}"#);
+        assert_ne!(a, b, "first user message must change the key");
+        assert_eq!(a, key(r#"{"messages":[{"role":"user", "content":"probe 1"}]}"#), "formatting must not");
+        let t1 = key(r#"{"tools":[{"name":"x"}],"messages":[{"role":"user","content":"p"}]}"#);
+        let t2 = key(r#"{"tools":[{"name":"y"}],"messages":[{"role":"user","content":"p"}]}"#);
+        assert_ne!(t1, t2, "tools must change the key");
+    }
 }
