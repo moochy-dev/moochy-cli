@@ -325,7 +325,7 @@ async fn receive(task: &str, attempt: u32, down: &mut tonic::Streaming<ServeDown
 /// Hook for the key-log mirror (moochy-keylog): the signing key of a Gateway device whose user is
 /// an owner-signed member of `repo_id`. `None` until the mirror is wired.
 fn gateway_key(node: &Node, device: &str, repo_id: &str) -> Option<[u8; 32]> {
-    node.keylog.as_ref().filter(|l| l.active()).and_then(|l| l.gateway_key(device, repo_id))
+    node.keylog.as_ref().and_then(|l| l.gateway_key(device, repo_id))
 }
 
 /// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
@@ -409,7 +409,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
         // D14: relay-asserted membership only without a verified key log and in insecure dev
         // mode; the body hash still binds.
-        None if node.insecure_dev && !node.keylog.as_ref().is_some_and(|l| l.active()) => {
+        None if node.insecure_dev && !node.keylog.as_ref().is_some_and(|l| l.verified()) => {
             if !crypto::ct_eq(&crypto::sha256(&inner.body_b64.0), &inner.body_sha256.0) {
                 return Err(with_ck("bad_envelope", false, None));
             }

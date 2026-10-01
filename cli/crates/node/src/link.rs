@@ -191,11 +191,8 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     if node.cfg.has_role("worker") {
         crate::worker::on_welcome(node);
     }
-    if let (Some(l), false) = (node.keylog.clone(), hello.log_checkpoint.is_empty()) {
-        let c = node.link().map(|h| h.client);
-        if let Some(c) = c {
-            tokio::spawn(async move { l.sync(c, hello.log_checkpoint.to_vec()).await });
-        }
+    if let Some(l) = &node.keylog {
+        l.push(hello.log_checkpoint.to_vec());
     }
 
     let mut ping = interval(PING_EVERY);
@@ -212,8 +209,8 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                     relay_msg::Msg::PoolSync(p) => node.apply_pool_sync(&p),
                     relay_msg::Msg::Assign(a) => crate::worker::on_assign(node, a.task, a.attempt),
                     relay_msg::Msg::LogCheckpoint(c) => {
-                        if let (Some(l), Some(h)) = (node.keylog.clone(), node.link()) {
-                            tokio::spawn(async move { l.sync(h.client, c.note.to_vec()).await });
+                        if let Some(l) = &node.keylog {
+                            l.push(c.note.to_vec());
                         }
                     }
                     relay_msg::Msg::Draining(d) => {
@@ -243,7 +240,6 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                     relay_msg::Msg::ReplaySince(r) => crate::worker::on_replay_since(node, r.since_ms),
                     relay_msg::Msg::ApprovalRequests(r) => crate::approve::on_requests(node, r),
                     relay_msg::Msg::LogEntryAck(a) => crate::approve::on_ack(node, a),
-                    // Key-log checkpoints: monitor hook (moochy-keylog), not wired yet.
                     _ => {}
                 },
                 Ok(Some(RelayMsg { msg: None })) => {}

@@ -27,6 +27,7 @@ pub mod login;
 pub mod mcp;
 pub mod native;
 pub mod node;
+pub mod owner;
 pub mod pb;
 pub mod scrub;
 pub mod task;

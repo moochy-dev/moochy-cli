@@ -53,13 +53,16 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
+  owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
+                                  with its own passphrase, that signs approvals, memberships and
+                                  claims; only used by these commands, never by the app
   pending                         Requests waiting for your signature (maintainers)
   approve <donor> --repo OWNER/NAME [--revoke] [--yes]
                                   Accept a donor for your project (--revoke removes them)
   members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
-  claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by this device
+  claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by your owner key
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (development only)
 ";
@@ -228,6 +231,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["owner", "init"] => crate::owner::init(&home, false),
+        ["owner", "rotate"] => crate::owner::init(&home, true),
         ["pending"] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             let r = c.pending(crate::pb::local::PendingRequest {}).await.map_err(|s| internal(clean(s.message()).into_owned()))?.into_inner();
@@ -311,7 +316,7 @@ fn slug_or_detect(o: &Opts) -> Result<String> {
 
 /// `owner/name` from the `origin` remote of the current git repository.
 fn detect_repo() -> Option<String> {
-    let out = std::process::Command::new("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
+    let out = std::process::Command::new("git").args(["config", "--get", "remote.origin.url"]).env_remove("MOOCHY_PASSPHRASE").env_remove("MOOCHY_OWNER_PASSPHRASE").stderr(std::process::Stdio::null()).output().ok()?;
     let url = String::from_utf8(out.stdout).ok()?;
     let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let path = url.rsplit_once(':').map_or(url, |(_, p)| p);
@@ -397,52 +402,10 @@ fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
         "subject_username": q.subject_username, "signer": q.signer, "issued_at_ms": q.issued_at_ms, "signed": q.signed, "log_index": q.log_index})
 }
 
-/// Owner signatures: show exactly what will be signed, then sign only on explicit consent.
+/// Owner signatures (CONTRACT §15.4): previewed by the Node, signed here with the owner key.
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
-    use crate::pb::local::{ApproveRequest, ClaimRequest, MembersRequest, members_request::Op};
-    use std::io::IsTerminal as _;
     let slug = slug_or_detect(o)?;
-    rt_small()?.block_on(async {
-        let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        let call = |c: &mut crate::pb::local::local_control_client::LocalControlClient<tonic::transport::Channel>, dry_run: bool| {
-            let mut c = c.clone();
-            let (slug, w) = (slug.clone(), w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
-            let (revoke, device, cap) = (o.has("revoke"), o.has("device"), o.cap.unwrap_or(0));
-            async move {
-                let r = match w.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-                    ["approve", donor] => c.approve(ApproveRequest { repo: slug, donor: (*donor).into(), dry_run, revoke }).await,
-                    ["members", op, user] => {
-                        let op = if *op == "add" { Op::Add } else { Op::Remove };
-                        c.members(MembersRequest { repo: slug, op: op as i32, user: (*user).into(), cap_uusd_month: cap, device, dry_run }).await
-                    }
-                    _ => c.claim(ClaimRequest { repo: slug, dry_run }).await,
-                };
-                r.map(tonic::Response::into_inner).map_err(|s| match s.code() {
-                    tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => usage(clean(s.message()).into_owned()),
-                    _ => internal(clean(s.message()).into_owned()),
-                })
-            }
-        };
-        let preview = call(&mut c, true).await?;
-        eprintln!(
-            "You are about to sign {} for {} ({}):\n  for     {} ({})\n  signer  {} (this device)\n  issued  {} ms",
-            preview.kind, preview.repo_slug, preview.repo_id, preview.subject, preview.subject_username, preview.signer, preview.issued_at_ms
-        );
-        if !o.has("yes") {
-            if !std::io::stdin().is_terminal() {
-                return Err(usage("pass --yes to sign non-interactively"));
-            }
-            eprint!("Sign it? [y/N] ");
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            if !matches!(line.trim(), "y" | "Y" | "yes") {
-                return Err(usage("not signed"));
-            }
-        }
-        let done = call(&mut c, false).await?;
-        emit(&sign_json(&done));
-        Ok(())
-    })
+    crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))
 }
 
 /// `moochy report <task> [--out file] [--reason text]`: evidence bundle (06 §9).
@@ -588,6 +551,8 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
 fn git_tracked(path: &std::path::Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
     std::process::Command::new("git")
+        .env_remove("MOOCHY_PASSPHRASE")
+        .env_remove("MOOCHY_OWNER_PASSPHRASE")
         .arg("-C")
         .arg(dir)
         .args(["ls-files", "--error-unmatch", "--"])
@@ -613,7 +578,8 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if raw.len() > 4096 {
         return Err(usage("key too long"));
     }
-    let key = zeroize::Zeroizing::new(String::from_utf8(raw.to_vec()).map_err(|_| usage("key must be UTF-8"))?.trim().to_owned());
+    // A190: borrow, never an un-zeroized intermediate copy of the key.
+    let key = zeroize::Zeroizing::new(std::str::from_utf8(&raw).map_err(|_| usage("key must be UTF-8"))?.trim().to_owned());
     if key.is_empty() || !key.bytes().all(|c| c.is_ascii_graphic()) {
         return Err(usage("key must be non-empty printable ASCII"));
     }
@@ -643,7 +609,8 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(home.state_dir().join("node.log")).ctx("open node.log")?;
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]);
+    // The background process never sees the owner passphrase (CONTRACT §15.4, A190).
+    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE");
     if offline {
         cmd.arg("--offline");
     }
@@ -727,12 +694,11 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));
     }
-    match (&node.keylog, node.cfg.log_anchor_url.clone()) {
-        (Some(l), Some(u)) => {
-            tokio::spawn(l.clone().anchor_loop(u, node.shutdown.subscribe()));
-        }
-        (None, _) if !offline => log("warn", "no key-log key pinned (log_key): approvals and memberships are relay-asserted", &json!({})),
-        _ => {}
+    match &node.keylog {
+        Some(l) => l.start(&node),
+        None if offline => {}
+        None if node.insecure_dev => log("warn", "no key-log key pinned (log_key): approvals and memberships are relay-asserted (MOOCHY_INSECURE_DEV)", &json!({})),
+        None => log("error", "no key-log key pinned (log_key): this device seals to no donor and accepts no task until it is set", &json!({})),
     }
     if !offline {
         tokio::spawn(crate::link::run(node.clone()));

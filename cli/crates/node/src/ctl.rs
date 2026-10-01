@@ -7,7 +7,7 @@ use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
     ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
-    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest,
+    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest,
     StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
@@ -167,7 +167,7 @@ impl LocalControl for Ctl {
     async fn approve(&self, r: Request<ApproveRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         let kind = if r.revoke { "DONOR_REVOKED" } else { "DONOR_APPROVED" };
-        crate::approve::sign(&self.node, kind, &r.repo, Some(&r.donor), r.dry_run).await.map(Response::new)
+        crate::approve::preview(&self.node, kind, &r.repo, Some(&r.donor), r.dry_run).map(Response::new)
     }
 
     async fn members(&self, r: Request<MembersRequest>) -> std::result::Result<Response<SignResponse>, Status> {
@@ -180,12 +180,16 @@ impl LocalControl for Ctl {
         if r.device && !r.user.starts_with("d_") {
             return Err(Status::invalid_argument("--device expects a device id (d_…)"));
         }
-        crate::approve::sign(&self.node, kind, &r.repo, Some(&r.user), r.dry_run).await.map(Response::new)
+        crate::approve::preview(&self.node, kind, &r.repo, Some(&r.user), r.dry_run).map(Response::new)
     }
 
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
-        crate::approve::sign(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).await.map(Response::new)
+        crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+    }
+
+    async fn submit_entry(&self, r: Request<SubmitEntryRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        crate::approve::submit(&self.node, r.into_inner()).await.map(Response::new)
     }
 
     async fn pending(&self, _: Request<PendingRequest>) -> std::result::Result<Response<PendingResponse>, Status> {

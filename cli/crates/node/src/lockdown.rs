@@ -87,6 +87,13 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
     p.ro_paths.extend(ro_paths(home, &boot.cfg));
     p.gateway_port = Some(boot.port());
     p.unsafe_no_lockdown = unsafe_no_lockdown;
+    if !boot.cfg.has_role("worker") && !unsafe_no_lockdown {
+        // ponytail: gateway-only nodes still run `git` for delegate file sharing (files.rs);
+        // lock them too once mo-node's move of file sharing into the stdio shim is on main.
+        log("warn", "gateway-only device: lockdown pending (delegate file sharing still runs git in this process)", &json!({}));
+        record(home, &json!({"locked": false, "reason": "gateway-only: pending file-sharing move"}));
+        return Ok(());
+    }
     let dev = dev_ports(&boot.secrets);
     if !dev.is_empty() && !unsafe_no_lockdown {
         // ponytail: needs DonorPolicy.connect_ports (requested from mo-sandbox); until then a
@@ -94,7 +101,7 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
         let msg = "moochy: WARNING lockdown skipped: a development provider URL uses a port this build cannot allow (MOOCHY_INSECURE_DEV only)";
         eprintln!("{msg}");
         log("warn", "lockdown skipped for a development provider port", &json!({"ports": dev}));
-        record(home, &json!({"locked": false, "reason": "dev provider port"}));
+        record(home, &json!({"locked": false, "reason": "insecure dev: provider port"}));
         return Ok(());
     }
     let r = lockdown_self(&p).map_err(|e| internal(format!("cannot lock the background process down ({e}); run `moochy doctor`, or `moochy up --unsafe-no-lockdown` for debugging only")))?;
@@ -136,16 +143,25 @@ fn record(home: &Home, v: &serde_json::Value) {
 pub fn doctor(home: &Home, running: bool) -> Vec<(bool, &'static str, String)> {
     let mut out = Vec::new();
     let rec = std::fs::read(home.state_dir().join("lockdown.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let f = |r: &serde_json::Value, k: &str| r.get(k).cloned().unwrap_or(serde_json::Value::Null);
     match rec.filter(|_| running) {
-        Some(r) if r["locked"] == true => out.push((
+        Some(r) if f(&r, "locked") == true => out.push((
             true,
             "lockdown",
             format!(
                 "background process locked: seccomp {}, no_new_privs {}, Landlock fs {}, net {}, ABI {}",
-                r["seccomp"], r["no_new_privs"], r["landlock_fs"], r["landlock_net"], r["landlock_abi"]
+                f(&r, "seccomp"),
+                f(&r, "no_new_privs"),
+                f(&r, "landlock_fs"),
+                f(&r, "landlock_net"),
+                f(&r, "landlock_abi")
             ),
         )),
-        Some(r) => out.push((false, "lockdown", format!("background process NOT locked down ({})", r["reason"].as_str().unwrap_or("--unsafe-no-lockdown")))),
+        Some(r) => {
+            let reason = f(&r, "reason").as_str().unwrap_or("--unsafe-no-lockdown").to_owned();
+            // Only the debug flag is a failure; the other skips are known, logged gaps.
+            out.push((reason != "--unsafe-no-lockdown", "lockdown", format!("background process not locked down ({reason})")));
+        }
         None => out.push((true, "lockdown", "checked when the app starts (`moochy up` refuses to serve without it)".into())),
     }
     host_support(&mut out);
@@ -164,11 +180,12 @@ fn host_support(out: &mut Vec<(bool, &'static str, String)>) {
     let detail = if userns_off {
         "unprivileged user namespaces disabled (kernel.unprivileged_userns_clone=0): `moochy run` cannot sandbox".to_owned()
     } else if apparmor {
-        "restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns=1): `moochy run` needs a per-binary profile, e.g. /etc/apparmor.d/moochy:\n       abi <abi/4.0>, include <tunables/global> profile moochy /usr/local/bin/moochy flags=(unconfined) { userns, }\n       then: sudo apparmor_parser -r /etc/apparmor.d/moochy (never the global sysctl)".to_owned()
+        "restricted by AppArmor: `moochy run` needs a per-binary profile /etc/apparmor.d/moochy granting `userns` to the moochy binary, then `sudo apparmor_parser -r /etc/apparmor.d/moochy` (never the global sysctl)".to_owned()
     } else {
         "available".to_owned()
     };
-    out.push((!userns_off && !apparmor, "userns", detail));
+    // Advisory: only `moochy run` (maintainer side) needs user namespaces, not this app.
+    out.push((true, "userns", detail));
 }
 
 #[cfg(target_os = "macos")]
