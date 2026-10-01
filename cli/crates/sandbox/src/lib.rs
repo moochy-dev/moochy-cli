@@ -43,15 +43,6 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod sys_macos;
 
-/// How strict the filesystem/network policy is. `Strict` is the default for
-/// `moochy run`; `Paranoid` additionally forbids the optional host allowlist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Level {
-    #[default]
-    Strict,
-    Paranoid,
-}
-
 /// A fully-specified sandbox. Build it, then [`run`](Spec::run) a command inside.
 ///
 /// Every field has a safe default (deny). The integrator fills in the worktree,
@@ -78,7 +69,6 @@ pub struct Spec {
     pub env: BTreeMap<OsString, OsString>,
     /// Working directory inside the sandbox. Defaults to the worktree root.
     pub cwd: Option<PathBuf>,
-    pub level: Level,
     /// Per-run gateway token (§15.4). Minted by the parent (mo-node), injected
     /// into the sandbox env as [`RUN_TOKEN_ENV`] and nowhere else, registered
     /// with the gateway over the local control socket and revoked when the run
@@ -105,7 +95,8 @@ pub struct Limits {
     pub processes: u64,
     /// Max core dump size (`RLIMIT_CORE`); 0 disables cores.
     pub core_bytes: u64,
-    /// Wall-clock deadline for the whole run, seconds. 0 = no deadline.
+    /// Wall-clock deadline for the whole run, seconds. 0 = no deadline. On
+    /// expiry the whole sandbox is killed and `run` returns 124.
     pub wall_seconds: u64,
 }
 
@@ -159,7 +150,6 @@ impl Spec {
             gateway_loopback_port: None,
             env: BTreeMap::new(),
             cwd: None,
-            level: Level::default(),
             run_token: None,
             limits: Limits::default(),
             unsafe_no_sandbox: false,

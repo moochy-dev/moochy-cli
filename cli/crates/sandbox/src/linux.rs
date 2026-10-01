@@ -50,6 +50,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let masks = mask::collect(&worktree)?;
+    let git_ro = git_protected(&worktree);
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
 
     let plan = Plan {
@@ -59,6 +60,8 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         rw_paths: spec.rw_paths.clone(),
         gateway_socket: spec.gateway_socket.clone(),
         gateway_port: spec.gateway_loopback_port,
+        cwd: spec.cwd.clone(),
+        git_ro,
         masks,
         uid_raw: uid.as_raw(),
         gid_raw: gid.as_raw(),
@@ -107,6 +110,8 @@ struct Plan {
     rw_paths: Vec<PathBuf>,
     gateway_socket: Option<PathBuf>,
     gateway_port: Option<u16>,
+    cwd: Option<PathBuf>,
+    git_ro: Vec<PathBuf>,
     masks: Vec<PathBuf>,
     uid_raw: u32,
     gid_raw: u32,
@@ -134,10 +139,15 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
         sys::Fork::Parent(agent_pid) => {
             // Reaper: serve the gateway bridge, wait for the agent, propagate its
             // code. Never returns.
-            if let Some(l) = listener {
-                bridge_serve(&l, agent_pid);
+            let timed_out = supervise(listener.as_ref(), agent_pid, plan.limits.wall_seconds);
+            if timed_out {
+                let _ = rustix::process::kill_process(
+                    rustix::process::Pid::from_raw(agent_pid).unwrap_or(rustix::process::Pid::INIT),
+                    rustix::process::Signal::KILL,
+                );
             }
             let code = crate::donor::wait_raw(agent_pid).unwrap_or(-1);
+            let code = if timed_out { WALL_TIMEOUT_EXIT } else { code };
             sys::exit_immediately(code);
         }
         sys::Fork::Child => {
@@ -188,32 +198,50 @@ struct Conn {
 /// Single-threaded bridge (threads are impossible here: after
 /// `unshare(CLONE_NEWPID)` the kernel refuses CLONE_THREAD). Polls the listener,
 /// every connection and a pidfd for the agent; returns when the agent exits.
-fn bridge_serve(l: &std::net::TcpListener, agent_pid: i32) {
-    use rustix::event::{PollFd, PollFlags, poll};
+/// Exit code when the wall-clock deadline kills the run (as `timeout(1)`).
+pub const WALL_TIMEOUT_EXIT: i32 = 124;
+
+/// The reaper's loop: serve the gateway bridge (if any) and watch the agent
+/// through a pidfd until it exits or the wall-clock deadline passes. Returns
+/// true on deadline. Threads are impossible here (after `unshare(CLONE_NEWPID)`
+/// the kernel refuses CLONE_THREAD), hence one poll loop.
+fn supervise(l: Option<&std::net::TcpListener>, agent_pid: i32, wall_seconds: u64) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use std::os::fd::AsFd as _;
-    let Some(pid) = rustix::process::Pid::from_raw(agent_pid) else { return };
+    use std::time::{Duration, Instant};
+    let Some(pid) = rustix::process::Pid::from_raw(agent_pid) else { return false };
     let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) else {
-        return;
+        return false; // fall back to a plain waitpid in the caller
     };
+    let deadline = (wall_seconds > 0).then(|| Instant::now() + Duration::from_secs(wall_seconds));
     let mut conns: Vec<Conn> = Vec::new();
     loop {
+        let timeout = deadline.map(|d| {
+            let left = d.saturating_duration_since(Instant::now());
+            Timespec { tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX), tv_nsec: i64::from(left.subsec_nanos()) }
+        });
         let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(conns.len().saturating_mul(2).saturating_add(2));
         fds.push(PollFd::new(&pidfd, PollFlags::IN));
-        fds.push(PollFd::new(l, PollFlags::IN));
+        if let Some(l) = l {
+            fds.push(PollFd::new(l, PollFlags::IN));
+        }
         for c in &conns {
             fds.push(PollFd::from_borrowed_fd(c.tcp.as_fd(), interest(&c.up, &c.down)));
             fds.push(PollFd::from_borrowed_fd(c.unix.as_fd(), interest(&c.down, &c.up)));
         }
-        if poll(&mut fds, None).is_err() {
+        if poll(&mut fds, timeout.as_ref()).is_err() {
             continue; // EINTR
         }
         let agent_done = fds.first().is_some_and(|f| !f.revents().is_empty());
-        let accept = fds.get(1).is_some_and(|f| !f.revents().is_empty());
+        let accept = l.is_some() && fds.get(1).is_some_and(|f| !f.revents().is_empty());
         drop(fds);
         if agent_done {
-            return;
+            return false;
         }
-        if accept {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return true;
+        }
+        if let (true, Some(l)) = (accept, l) {
             accept_all(l, &mut conns);
         }
         conns.retain_mut(pump);
@@ -354,8 +382,7 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     let root = plan.base.join("root");
     mkdir(&root)?;
     // tmpfs as the new root skeleton.
-    mount("tmpfs", &root, "tmpfs", MountFlags::NOSUID | MountFlags::NODEV, None)
-        .map_err(io("mount root tmpfs"))?;
+    tmpfs(&root, c"mode=0755")?;
 
     // Read-only system paths (visibility only; Landlock enforces read-only).
     for p in &plan.ro_paths {
@@ -369,14 +396,18 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
 
     // Mask secret-shaped / git-ignored files inside the worktree (§15.4).
     apply_masks(&root, plan)?;
+    // Git paths whose content the HOST later executes (hooks; `core.fsmonitor`,
+    // `core.hooksPath`, aliases in config): read-only inside, so code written by
+    // the agent can never run outside the sandbox on the user's next `git`.
+    for p in &plan.git_ro {
+        bind_into(&root, p, false)?;
+    }
 
     // Private tmpfs home + tmp.
-    for (dir, mode) in [("tmp", 0o1777u32), ("home/sandbox", 0o700), ("run/moochy", 0o755)] {
+    for (dir, opts) in [("tmp", c"mode=1777"), ("home/sandbox", c"mode=0700"), ("run/moochy", c"mode=0755")] {
         let t = root.join(dir);
         mkdir_p(&t)?;
-        mount("tmpfs", &t, "tmpfs", MountFlags::NOSUID | MountFlags::NODEV, None)
-            .map_err(io("mount tmpfs"))?;
-        let _ = mode;
+        tmpfs(&t, opts)?;
     }
 
     // Minimal /dev.
@@ -407,6 +438,19 @@ fn write_id_maps(uid: u32, gid: u32) -> Result<(), Error> {
     std::fs::write("/proc/self/gid_map", format!("0 {gid} 1").as_bytes())
         .map_err(|e| setup("gid_map", e))?;
     Ok(())
+}
+
+/// `.git/hooks` (created empty if missing, as git itself would) and
+/// `.git/config` of a worktree whose `.git` is a directory. A linked worktree's
+/// `.git` *file* points at a gitdir outside the view, which stays invisible.
+fn git_protected(worktree: &Path) -> Vec<PathBuf> {
+    let git = worktree.join(".git");
+    if !git.is_dir() {
+        return Vec::new();
+    }
+    let hooks = git.join("hooks");
+    let _ = std::fs::create_dir(&hooks);
+    [hooks, git.join("config")].into_iter().filter(|p| p.exists()).collect()
 }
 
 /// Bind `src` (host absolute path) into `root` at the same absolute path.
@@ -469,10 +513,15 @@ fn apply_masks(root: &Path, plan: &Plan) -> Result<(), Error> {
     Ok(())
 }
 
+/// Private tmpfs with an explicit mode (the default would be a sticky 1777).
+fn tmpfs(target: &Path, opts: &std::ffi::CStr) -> Result<(), Error> {
+    mount("tmpfs", target, "tmpfs", MountFlags::NOSUID | MountFlags::NODEV, opts).map_err(io("mount tmpfs"))
+}
+
 fn setup_dev(root: &Path) -> Result<(), Error> {
     let dev = root.join("dev");
     mkdir_p(&dev)?;
-    mount("tmpfs", &dev, "tmpfs", MountFlags::NOSUID, None).map_err(io("mount /dev"))?;
+    tmpfs(&dev, c"mode=0755")?;
     for node in ["null", "zero", "full", "random", "urandom"] {
         let src = PathBuf::from("/dev").join(node);
         let dst = dev.join(node);
@@ -517,7 +566,7 @@ fn harden_agent(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> Result<(), E
 }
 
 fn chdir_into_worktree(plan: &Plan) -> Result<(), Error> {
-    rustix::process::chdir(&plan.worktree).map_err(io("chdir worktree"))?;
+    rustix::process::chdir(plan.cwd.as_ref().unwrap_or(&plan.worktree)).map_err(io("chdir"))?;
     Ok(())
 }
 
@@ -589,7 +638,7 @@ fn landlock_agent(plan: &Plan) -> Result<(), Error> {
         .map_err(ll("ro root rule"))?;
     let rw: Vec<PathBuf> = std::iter::once(plan.worktree.clone())
         .chain(plan.rw_paths.iter().cloned())
-        .chain([PathBuf::from("/tmp"), PathBuf::from("/home/sandbox"), PathBuf::from("/run/moochy")])
+        .chain(["/tmp", "/home/sandbox", "/run/moochy", "/dev/null", "/dev/zero", "/dev/full"].map(PathBuf::from))
         .collect();
     let created = created
         .add_rules(path_beneath_rules(rw, AccessFs::from_all(abi)))

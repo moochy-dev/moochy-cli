@@ -422,6 +422,7 @@ fn run_sandbox(a: &[String]) -> ExitCode {
             "--token" => spec.run_token = Some(val),
             "--nproc" => spec.limits.processes = val.parse().unwrap_or(64),
             "--mem" => spec.limits.memory_bytes = val.parse().unwrap_or(1 << 30),
+            "--wall" => spec.limits.wall_seconds = val.parse().unwrap_or(0),
             "--env" => {
                 if let Some((k, v)) = val.split_once('=') {
                     spec.env.insert(k.into(), v.into());
