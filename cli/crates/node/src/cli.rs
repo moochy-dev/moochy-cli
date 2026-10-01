@@ -718,6 +718,13 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));
     }
+    match (&node.keylog, node.cfg.log_anchor_url.clone()) {
+        (Some(l), Some(u)) => {
+            tokio::spawn(l.clone().anchor_loop(u, node.shutdown.subscribe()));
+        }
+        (None, _) if !offline => log("warn", "no key-log key pinned (log_key): approvals and memberships are relay-asserted", &json!({})),
+        _ => {}
+    }
     if !offline {
         tokio::spawn(crate::link::run(node.clone()));
         match crate::link::wait_first(&node, Duration::from_secs(5)).await {

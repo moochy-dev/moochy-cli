@@ -41,6 +41,12 @@ pub struct Config {
     pub auto_cache: Option<bool>,
     /// Worker firewall strictness: `strict` (default) or `paranoid` (06 §7.3).
     pub firewall_level: Option<String>,
+    /// Key-log note key (`origin+hash+base64`, signed-note vkey) pinned for the relay; without
+    /// it the node trusts relay-asserted membership and approvals (D14, dev only).
+    pub log_key: Option<String>,
+    pub log_origin: Option<String>,
+    /// Public Git anchor of the key log (hourly fork check), e.g. a raw-file base URL.
+    pub log_anchor_url: Option<String>,
     /// Worker: serve only these public models (comma-separated), below what the keys allow.
     pub models_override: Option<String>,
 }
@@ -190,10 +196,20 @@ impl Config {
                 }
                 self.firewall_level = Some(value.into());
             }
+            "log_key" => {
+                moochy_keylog::NoteKey::parse(value).map_err(|e| usage(format!("log_key: {e}")))?;
+                self.log_key = Some(value.into());
+            }
+            "log_anchor_url" => {
+                if !value.starts_with("https://") {
+                    return Err(usage("log_anchor_url must be https://"));
+                }
+                self.log_anchor_url = Some(value.into());
+            }
             "models_override" => self.models_override = Some(value.into()).filter(|v: &String| !v.is_empty()),
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override)"
+                    "unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, log_key, log_anchor_url)"
                 )));
             }
         }

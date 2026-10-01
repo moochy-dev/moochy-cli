@@ -186,6 +186,12 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     if node.cfg.has_role("worker") {
         crate::worker::on_welcome(node);
     }
+    if let (Some(l), false) = (node.keylog.clone(), hello.log_checkpoint.is_empty()) {
+        let c = node.link().map(|h| h.client);
+        if let Some(c) = c {
+            tokio::spawn(async move { l.sync(c, hello.log_checkpoint.to_vec()).await });
+        }
+    }
 
     let mut ping = interval(PING_EVERY);
     ping.tick().await;
@@ -196,6 +202,11 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                 Ok(Some(RelayMsg { msg: Some(m) })) => match m {
                     relay_msg::Msg::PoolSync(p) => node.apply_pool_sync(&p),
                     relay_msg::Msg::Assign(a) => crate::worker::on_assign(node, a.task, a.attempt),
+                    relay_msg::Msg::LogCheckpoint(c) => {
+                        if let (Some(l), Some(h)) = (node.keylog.clone(), node.link()) {
+                            tokio::spawn(async move { l.sync(h.client, c.note.to_vec()).await });
+                        }
+                    }
                     relay_msg::Msg::Draining(d) => return Ok(End::Reconnect(u64::from(d.reconnect_after_ms).min(BACKOFF_CAP_MS))),
                     relay_msg::Msg::Pong(_) => last_pong = Instant::now(),
                     relay_msg::Msg::Error(e) => log("warn", "relay error", &json!({"code": e.code, "message": e.message, "task": e.task})),

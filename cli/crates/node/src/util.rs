@@ -77,6 +77,12 @@ pub fn b64d32(s: &str) -> Option<[u8; 32]> {
     b64d(s)?.try_into().ok()
 }
 
+/// Constant-time byte comparison (keys, tokens, MACs).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq as _;
+    a.ct_eq(b).into()
+}
+
 /// `lp(a, b, …)`: each field prefixed with its u32 big-endian length (CONTRACT §1).
 pub fn lp(fields: &[&[u8]]) -> Vec<u8> {
     let cap = fields.iter().fold(0usize, |a, f| a.saturating_add(f.len()).saturating_add(4));
