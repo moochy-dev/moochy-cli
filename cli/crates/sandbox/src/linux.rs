@@ -679,7 +679,14 @@ fn probe_userns() -> std::io::Result<()> {
     // SAFETY: child only calls unshare + _exit.
     match sys::fork()? {
         sys::Fork::Child => {
-            let ok = sys::unshare(UnshareFlags::NEWUSER).is_ok();
+            // Exercise the real first steps: Ubuntu's AppArmor restriction lets
+            // unshare(NEWUSER) succeed but strips the namespace's capabilities,
+            // so only the id maps / a mount change reveal it.
+            let uid = rustix::process::getuid().as_raw();
+            let gid = rustix::process::getgid().as_raw();
+            let ok = sys::unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWNS).is_ok()
+                && write_id_maps(uid, gid).is_ok()
+                && mount_change("/", MountPropagationFlags::PRIVATE | MountPropagationFlags::REC).is_ok();
             sys::exit_immediately(i32::from(!ok));
         }
         sys::Fork::Parent(pid) => match crate::donor::wait_raw(pid) {
@@ -689,19 +696,23 @@ fn probe_userns() -> std::io::Result<()> {
     }
 }
 
-/// The exact fix `moochy doctor` prints (AppArmor per-binary profile).
+/// The exact fix `moochy doctor` prints: a per-binary AppArmor profile for the
+/// binary that is actually running (never the global sysctl).
 pub fn apparmor_fix() -> String {
-    "Unprivileged user namespaces are restricted on this host \
-     (kernel.apparmor_restrict_unprivileged_userns=1). Install a per-binary AppArmor \
-     profile that grants `userns` to the moochy binary only, e.g. in \
-     /etc/apparmor.d/moochy:\n\n\
-     abi <abi/4.0>,\n\
-     include <tunables/global>\n\
-     profile moochy /usr/local/bin/moochy flags=(unconfined) {\n  userns,\n  \
-     include if exists <local/moochy>\n}\n\n\
-     then: sudo apparmor_parser -r /etc/apparmor.d/moochy\n\
-     (Do NOT set the sysctl to 0 globally; that weakens the whole host.)"
-        .to_string()
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map_or_else(|| "/usr/local/bin/moochy".to_string(), |p| p.to_string_lossy().into_owned());
+    format!(
+        "Unprivileged user namespaces are restricted on this host \
+         (kernel.apparmor_restrict_unprivileged_userns=1). Grant `userns` to this binary only \
+         with /etc/apparmor.d/moochy:\n\n\
+         abi <abi/4.0>,\n\
+         include <tunables/global>\n\
+         profile moochy {exe} flags=(unconfined) {{\n  userns,\n  include if exists <local/moochy>\n}}\n\n\
+         then run: sudo apparmor_parser -r /etc/apparmor.d/moochy\n\
+         (Do NOT set the sysctl to 0: that hands the permission to every program on the host.)"
+    )
 }
 
 fn build_env(spec: &Spec) -> Vec<(OsString, OsString)> {
