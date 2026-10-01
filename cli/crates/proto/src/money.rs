@@ -13,6 +13,7 @@ const PER_MILLION: u128 = 1_000_000;
 
 /// One catalog row (plan 05 §2.2). Prices in µ$ per million tokens.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
     /// Public slug, e.g. `anthropic/claude-sonnet-5.5`.
     pub model: String,

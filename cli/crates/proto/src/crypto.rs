@@ -5,9 +5,8 @@
 //! pinned by `spec/vectors/`.
 
 use crate::enc::{label, lp, u64be};
-use crate::frame::{HEADER_LEN, Header, Kind, MAX_CHUNK, MAX_FRAME, TAG_LEN};
 use crate::msg::{InnerPayload, Projection, Receipt};
-use crate::{B, Blob, DeviceId, Error, RepoId, TaskId, json};
+use crate::{B, Blob, DeviceId, Error, RepoId, TaskId, json, pb};
 use bytes::{Bytes, BytesMut};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
@@ -25,7 +24,6 @@ pub const MAX_PAYLOAD: usize = 32 << 20;
 /// Hard cap on sealed request bytes (zstd worst-case expansion of MAX_PAYLOAD, plus tags).
 pub const MAX_SEALED: usize = MAX_PAYLOAD + (MAX_PAYLOAD >> 7) + (1 << 20);
 pub const WRAP_LEN: usize = 80;
-pub const ZSTD_LEVEL: i32 = 3;
 
 type HKem = hpke::kem::X25519HkdfSha256;
 type HKdf = hpke::kdf::HkdfSha256;
@@ -136,6 +134,16 @@ pub fn headers_sha256(h: &BTreeMap<String, String>) -> Result<[u8; 32], Error> {
 }
 
 // ---------- chunk AEAD streams ----------
+//
+// Chunks travel as `pb::Chunk{attempt, seq, last, ct}` (CONTRACT §12); `ct` = ciphertext || tag.
+// The AEAD AAD (CONTRACT §3) binds the task id (16 B), attempt, seq and last, so the gRPC fields
+// are only hints that must agree with what the opener expects.
+
+pub const TAG_LEN: usize = 16;
+/// Largest plaintext chunk (65,536 − 23 − 16, kept from plan 03 §4.2 so a Chunk stays < 64 KiB).
+pub const MAX_CHUNK: usize = 65_497;
+/// Request-body chunk kind byte inside the request AAD.
+const KIND_REQUEST: u8 = 0x01;
 
 fn nonce(seq: u32) -> Nonce {
     let mut n = [0u8; 12];
@@ -153,30 +161,50 @@ fn patch_aad<const N: usize>(aad: &mut [u8; N], seq: u32, last: bool) {
     }
 }
 
+/// `lp("moochy/v1/req", kind_byte, task_id_16B, u32(seq), last_byte)` with seq/last = 0.
 fn req_aad(task: &TaskId) -> Result<[u8; 55], Error> {
-    let v = lp(&[label::REQ, &[Kind::Request as u8], &task.0.0, &[0; 4], &[0]])?;
+    let v = lp(&[label::REQ, &[KIND_REQUEST], &task.0.0, &[0; 4], &[0]])?;
     v.try_into().map_err(|_| Error::Malformed)
 }
 
+/// `lp("moochy/v1/resp", task_id_16B, u64(attempt), R, u32(seq), last_byte)` with seq/last = 0.
 fn resp_aad(task: &TaskId, attempt: u8, r: &[u8; 32]) -> Result<[u8; 99], Error> {
     let v = lp(&[label::RESP, &task.0.0, &u64be(attempt.into()), r, &[0; 4], &[0]])?;
     v.try_into().map_err(|_| Error::Malformed)
 }
 
-/// Sealed request: ready-to-send `0x01` frames plus the `task.submit` size fields.
+/// Split `buf` = ciphertext || tag and decrypt in place; returns the plaintext length.
+fn open_in_place<const N: usize>(aead: &ChaCha20Poly1305, aad: &mut [u8; N], seq: u32, last: bool, buf: &mut [u8]) -> Result<usize, Error> {
+    if buf.len() < TAG_LEN || buf.len() > MAX_CHUNK + TAG_LEN {
+        return Err(Error::TooLarge);
+    }
+    let n = buf.len().saturating_sub(TAG_LEN);
+    let (ct, tag) = buf.split_at_mut(n);
+    patch_aad(aad, seq, last);
+    aead.decrypt_in_place_detached(&nonce(seq), aad, ct, Tag::from_slice(tag)).map_err(|_| Error::Decrypt)?;
+    Ok(n)
+}
+
+/// zstd level by size (CONTRACT §13): 3 for ordinary bodies, 1 for very large ones.
+#[must_use]
+pub fn zstd_level(len: usize) -> i32 {
+    if len <= 4 << 20 { 3 } else { 1 }
+}
+
+/// Sealed request: ready-to-send body chunks (attempt 0) plus the `SubmitOpen` size fields.
 pub struct SealedRequest {
-    pub frames: Vec<Bytes>,
-    /// Sum of frame payload lengths (ciphertext + tags) → `task.submit.body_len`.
+    pub chunks: Vec<pb::Chunk>,
+    /// Sum of `ct` lengths (tags included) → `SubmitOpen.body_len`; `body_chunks` = `chunks.len()`.
     pub body_len: u64,
 }
 
-/// Gateway: zstd(level 3) the inner payload, chunk it (≤ 65,497 B), seal every chunk under
-/// `K_req`. One contiguous allocation for all frames; each frame is a zero-copy `Bytes` slice.
+/// Gateway: zstd the inner payload, cut it into ≤ 65,497-byte chunks, seal each under `K_req`.
+/// One contiguous allocation holds every chunk; each `ct` is a zero-copy `Bytes` slice of it.
 pub fn seal_request(ck: &ContentKey, task: &TaskId, payload: &[u8]) -> Result<SealedRequest, Error> {
     if payload.len() > MAX_PAYLOAD {
         return Err(Error::TooLarge);
     }
-    let z = zstd::bulk::compress(payload, ZSTD_LEVEL).map_err(|_| Error::Malformed)?;
+    let z = zstd::bulk::compress(payload, zstd_level(payload.len())).map_err(|_| Error::Malformed)?;
     seal_compressed(ck, task, &z)
 }
 
@@ -185,41 +213,38 @@ pub fn seal_request(ck: &ContentKey, task: &TaskId, payload: &[u8]) -> Result<Se
 #[doc(hidden)]
 pub fn seal_compressed(ck: &ContentKey, task: &TaskId, z: &[u8]) -> Result<SealedRequest, Error> {
     let n = z.len().div_ceil(MAX_CHUNK).max(1);
-    let total = n.checked_mul(HEADER_LEN + TAG_LEN).and_then(|o| o.checked_add(z.len())).ok_or(Error::TooLarge)?;
+    let total = n.checked_mul(TAG_LEN).and_then(|t| t.checked_add(z.len())).ok_or(Error::TooLarge)?;
     let aead = ChaCha20Poly1305::new(k_req(ck, task)?.expose().into());
     let mut aad = req_aad(task)?;
     let mut buf = BytesMut::with_capacity(total);
-    let mut frames = Vec::with_capacity(n);
-    // Empty input still yields one (empty, last) frame.
-    for (i, chunk) in z.chunks(MAX_CHUNK).chain(z.is_empty().then_some(&[][..])).enumerate() {
+    let mut chunks = Vec::with_capacity(n);
+    // Empty input still yields one (empty, last) chunk.
+    for (i, part) in z.chunks(MAX_CHUNK).chain(z.is_empty().then_some(&[][..])).enumerate() {
         let seq = u32::try_from(i).map_err(|_| Error::TooLarge)?;
         let last = i.checked_add(1) == Some(n);
-        let h = Header { kind: Kind::Request, task: *task, attempt: 0, seq, last };
-        buf.extend_from_slice(&h.encode());
-        buf.extend_from_slice(chunk);
+        buf.extend_from_slice(part);
         patch_aad(&mut aad, seq, last);
-        let ct = buf.get_mut(HEADER_LEN..).ok_or(Error::Malformed)?;
-        let tag = aead.encrypt_in_place_detached(&nonce(seq), &aad, ct).map_err(|_| Error::Decrypt)?;
+        let tag = aead.encrypt_in_place_detached(&nonce(seq), &aad, &mut buf).map_err(|_| Error::Decrypt)?;
         buf.extend_from_slice(&tag);
-        frames.push(buf.split().freeze());
+        chunks.push(pb::Chunk { attempt: 0, seq, last, ct: buf.split().freeze() });
     }
-    let body_len = u64::try_from(total.saturating_sub(n.saturating_mul(HEADER_LEN))).map_err(|_| Error::TooLarge)?;
-    Ok(SealedRequest { frames, body_len })
+    Ok(SealedRequest { chunks, body_len: u64::try_from(total).map_err(|_| Error::TooLarge)? })
 }
 
-/// Worker: decrypts `0x01` frames in order and decompresses as they arrive. The zstd window is
+/// Worker: decrypts request chunks in order and decompresses as they arrive. The zstd window is
 /// capped and the output is a hard 32 MiB: a decompression bomb fails on the chunk that crosses
-/// the limit, without ever holding more than `MAX_PAYLOAD + 1` bytes.
+/// the limit, without ever holding more than `MAX_PAYLOAD + 1` bytes. One reusable scratch
+/// buffer: no allocation per chunk.
 pub struct RequestOpener {
     aead: ChaCha20Poly1305,
     aad: [u8; 55],
-    task: TaskId,
     next: u32,
     sealed: usize,
     last_seen: bool,
     zstd_done: bool,
     failed: bool,
     dctx: zstd::zstd_safe::DCtx<'static>,
+    scratch: Vec<u8>,
     out: Vec<u8>,
 }
 
@@ -231,50 +256,54 @@ impl RequestOpener {
         Ok(Self {
             aead: ChaCha20Poly1305::new(k_req(ck, task)?.expose().into()),
             aad: req_aad(task)?,
-            task: *task,
             next: 0,
             sealed: 0,
             last_seen: false,
             zstd_done: false,
             failed: false,
             dctx,
+            scratch: Vec::with_capacity(MAX_CHUNK + TAG_LEN),
             out: Vec::new(),
         })
     }
 
-    /// Feed one whole binary frame (header included). Decrypts in place. Any error poisons the
-    /// opener: every later call fails too.
-    pub fn push(&mut self, frame: &mut [u8]) -> Result<(), Error> {
-        let r = self.push_inner(frame);
+    /// Feed the next body chunk. Any error poisons the opener: every later call fails too.
+    pub fn push(&mut self, c: &pb::Chunk) -> Result<(), Error> {
+        let r = self.push_inner(c);
         if r.is_err() {
             self.failed = true;
         }
         r
     }
 
-    fn push_inner(&mut self, frame: &mut [u8]) -> Result<(), Error> {
+    /// Chunks accepted so far (compare with `Assign.body_chunks`).
+    #[must_use]
+    pub fn chunks(&self) -> u32 {
+        self.next
+    }
+
+    fn push_inner(&mut self, c: &pb::Chunk) -> Result<(), Error> {
         if self.failed || self.last_seen {
             return Err(Error::Sequence);
         }
-        let (h, _) = Header::decode(frame)?;
-        // The attempt byte is not authenticated for request frames and is ignored.
-        if h.kind != Kind::Request || h.task != self.task || h.seq != self.next {
+        if c.attempt != 0 || c.seq != self.next {
             return Err(Error::Sequence);
         }
-        let (_, payload) = frame.split_at_mut_checked(HEADER_LEN).ok_or(Error::Malformed)?;
-        self.sealed = self.sealed.saturating_add(payload.len());
+        self.sealed = self.sealed.saturating_add(c.ct.len());
         if self.sealed > MAX_SEALED {
             return Err(Error::TooLarge);
         }
-        let ct_len = payload.len().checked_sub(TAG_LEN).ok_or(Error::Malformed)?;
-        let (ct, tag) = payload.split_at_mut_checked(ct_len).ok_or(Error::Malformed)?;
-        patch_aad(&mut self.aad, h.seq, h.last);
-        self.aead
-            .decrypt_in_place_detached(&nonce(h.seq), &self.aad, ct, Tag::from_slice(tag))
-            .map_err(|_| Error::Decrypt)?;
-        self.next = self.next.checked_add(1).ok_or(Error::TooLarge)?;
-        self.last_seen = h.last;
-        self.inflate(ct)
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.clear();
+        buf.extend_from_slice(&c.ct);
+        let r = open_in_place(&self.aead, &mut self.aad, c.seq, c.last, &mut buf).and_then(|n| {
+            self.next = c.seq.checked_add(1).ok_or(Error::TooLarge)?;
+            self.last_seen = c.last;
+            self.inflate(buf.get(..n).unwrap_or_default())
+        });
+        buf.zeroize();
+        self.scratch = buf;
+        r
     }
 
     fn inflate(&mut self, src: &[u8]) -> Result<(), Error> {
@@ -292,7 +321,8 @@ impl RequestOpener {
                 let want = self.out.capacity().saturating_mul(2).clamp(1 << 16, MAX_PAYLOAD + 1);
                 self.out.reserve_exact(want.saturating_sub(self.out.len()));
             }
-            let mut ob = OutBuffer::around(&mut self.out);
+            let pos = self.out.len();
+            let mut ob = OutBuffer::around_pos(&mut self.out, pos);
             let hint = self.dctx.decompress_stream(&mut ob, &mut input).map_err(|_| Error::Malformed)?;
             let out_full = ob.pos() == ob.capacity();
             if self.out.len() > MAX_PAYLOAD {
@@ -306,7 +336,7 @@ impl RequestOpener {
         }
     }
 
-    /// The decompressed inner payload. Requires the last frame and a complete zstd frame.
+    /// The decompressed inner payload. Requires the last chunk and a complete zstd frame.
     pub fn finish(mut self) -> Result<Vec<u8>, Error> {
         if self.failed || !self.last_seen || !self.zstd_done {
             return Err(Error::Sequence);
@@ -316,15 +346,16 @@ impl RequestOpener {
 }
 
 /// Worker: seals response chunks under the attempt's RK and keeps the running SHA-256 of the
-/// plaintext (for checkpoints and `resp_commit`).
+/// plaintext (for checkpoints and `resp_commit`). Output comes from one reused arena: once the
+/// previous chunks have been sent and dropped, sealing allocates nothing.
 pub struct ResponseSealer {
     aead: ChaCha20Poly1305,
     aad: [u8; 99],
-    task: TaskId,
     attempt: u8,
     next: u32,
     done: bool,
     hash: Sha256,
+    arena: BytesMut,
 }
 
 impl ResponseSealer {
@@ -332,16 +363,16 @@ impl ResponseSealer {
         Ok(Self {
             aead: ChaCha20Poly1305::new(rk(ck, r, task, worker, attempt)?.expose().into()),
             aad: resp_aad(task, attempt, r)?,
-            task: *task,
             attempt,
             next: 0,
             done: false,
             hash: Sha256::new(),
+            arena: BytesMut::new(),
         })
     }
 
-    /// Append one `0x02` frame (header + ciphertext + tag) to `out`.
-    pub fn seal_into(&mut self, pt: &[u8], last: bool, out: &mut BytesMut) -> Result<(), Error> {
+    /// Append `ct || tag` for the next chunk to `out`; returns its seq.
+    pub fn seal_into(&mut self, pt: &[u8], last: bool, out: &mut BytesMut) -> Result<u32, Error> {
         if self.done {
             return Err(Error::Sequence);
         }
@@ -349,9 +380,7 @@ impl ResponseSealer {
             return Err(Error::TooLarge);
         }
         let seq = self.next;
-        let h = Header { kind: Kind::Response, task: self.task, attempt: self.attempt, seq, last };
-        out.reserve(pt.len().saturating_add(HEADER_LEN + TAG_LEN));
-        out.extend_from_slice(&h.encode());
+        out.reserve(pt.len().saturating_add(TAG_LEN));
         let start = out.len();
         out.extend_from_slice(pt);
         patch_aad(&mut self.aad, seq, last);
@@ -361,17 +390,19 @@ impl ResponseSealer {
         self.hash.update(pt);
         self.next = seq.checked_add(1).ok_or(Error::TooLarge)?;
         self.done = last;
-        Ok(())
+        Ok(seq)
     }
 
-    /// One frame as its own buffer.
-    pub fn seal(&mut self, pt: &[u8], last: bool) -> Result<Bytes, Error> {
-        let mut out = BytesMut::with_capacity(pt.len().saturating_add(HEADER_LEN + TAG_LEN));
-        self.seal_into(pt, last, &mut out)?;
-        Ok(out.freeze())
+    /// The next chunk as a ready-to-send message.
+    pub fn seal(&mut self, pt: &[u8], last: bool) -> Result<pb::Chunk, Error> {
+        let mut arena = std::mem::take(&mut self.arena);
+        let r = self.seal_into(pt, last, &mut arena);
+        let ct = arena.split().freeze();
+        self.arena = arena;
+        Ok(pb::Chunk { attempt: self.attempt.into(), seq: r?, last, ct })
     }
 
-    /// Seq of the most recently sealed frame (for a checkpoint covering it).
+    /// Seq of the most recently sealed chunk (for a checkpoint covering it).
     #[must_use]
     pub fn last_seq(&self) -> Option<u32> {
         self.next.checked_sub(1)
@@ -384,11 +415,10 @@ impl ResponseSealer {
     }
 }
 
-/// Gateway: opens `0x02` frames of exactly one (task, attempt), strictly in order, in place.
+/// Gateway: opens the response chunks of exactly one (task, attempt), strictly in order.
 pub struct ResponseOpener {
     aead: ChaCha20Poly1305,
     aad: [u8; 99],
-    task: TaskId,
     attempt: u8,
     next: u32,
     done: bool,
@@ -401,7 +431,6 @@ impl ResponseOpener {
         Ok(Self {
             aead: ChaCha20Poly1305::new(rk(ck, r, task, worker, attempt)?.expose().into()),
             aad: resp_aad(task, attempt, r)?,
-            task: *task,
             attempt,
             next: 0,
             done: false,
@@ -410,46 +439,51 @@ impl ResponseOpener {
         })
     }
 
-    /// Decrypt one frame in place; returns the plaintext as a zero-copy slice of `frame`.
-    /// Any error poisons the opener (the Gateway fails the task on the first bad frame).
-    pub fn open(&mut self, mut frame: BytesMut) -> Result<(Bytes, bool), Error> {
-        let last = self.open_in_place(&mut frame)?.1;
-        let mut pt = frame.split_off(HEADER_LEN);
-        pt.truncate(pt.len().saturating_sub(TAG_LEN));
-        Ok((pt.freeze(), last))
+    /// Decrypt one chunk. In place and zero-copy when the received buffer is uniquely owned,
+    /// otherwise into one fresh output buffer. Returns the plaintext.
+    /// Any error poisons the opener (the Gateway fails the task on the first bad chunk).
+    pub fn open(&mut self, c: pb::Chunk) -> Result<Bytes, Error> {
+        let mut buf = c.ct.try_into_mut().unwrap_or_else(|b| BytesMut::from(&b[..]));
+        let n = self.guard(c.attempt, c.seq, c.last, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf.freeze())
     }
 
-    /// Like [`Self::open`] on a borrowed buffer: returns (plaintext, last).
-    pub fn open_in_place<'a>(&mut self, frame: &'a mut [u8]) -> Result<(&'a [u8], bool), Error> {
-        let r = self.open_inner(frame);
+    /// Decrypt one chunk, appending the plaintext to a caller-owned (reused) buffer.
+    pub fn open_into(&mut self, c: &pb::Chunk, out: &mut BytesMut) -> Result<(), Error> {
+        let start = out.len();
+        out.extend_from_slice(&c.ct);
+        let r = match out.get_mut(start..) {
+            Some(tail) => self.guard(c.attempt, c.seq, c.last, tail),
+            None => Err(Error::Malformed),
+        };
+        match r {
+            Ok(n) => out.truncate(start.saturating_add(n)),
+            Err(_) => out.truncate(start),
+        }
+        r.map(|_| ())
+    }
+
+    fn guard(&mut self, attempt: u32, seq: u32, last: bool, buf: &mut [u8]) -> Result<usize, Error> {
+        let r = self.open_inner(attempt, seq, last, buf);
         if r.is_err() {
             self.failed = true;
         }
         r
     }
 
-    fn open_inner<'a>(&mut self, frame: &'a mut [u8]) -> Result<(&'a [u8], bool), Error> {
-        if self.failed || self.done {
+    fn open_inner(&mut self, attempt: u32, seq: u32, last: bool, buf: &mut [u8]) -> Result<usize, Error> {
+        if self.failed || self.done || attempt != u32::from(self.attempt) || seq != self.next {
             return Err(Error::Sequence);
         }
-        let (h, _) = Header::decode(frame)?;
-        if h.kind != Kind::Response || h.task != self.task || h.attempt != self.attempt || h.seq != self.next {
-            return Err(Error::Sequence);
-        }
-        let ct_len = frame.len().checked_sub(HEADER_LEN + TAG_LEN).ok_or(Error::Malformed)?;
-        let (_, payload) = frame.split_at_mut_checked(HEADER_LEN).ok_or(Error::Malformed)?;
-        let (ct, tag) = payload.split_at_mut_checked(ct_len).ok_or(Error::Malformed)?;
-        patch_aad(&mut self.aad, h.seq, h.last);
-        self.aead
-            .decrypt_in_place_detached(&nonce(h.seq), &self.aad, ct, Tag::from_slice(tag))
-            .map_err(|_| Error::Decrypt)?;
-        self.hash.update(&*ct);
-        self.next = h.seq.checked_add(1).ok_or(Error::TooLarge)?;
-        self.done = h.last;
-        Ok((ct, h.last))
+        let n = open_in_place(&self.aead, &mut self.aad, seq, last, buf)?;
+        self.hash.update(buf.get(..n).unwrap_or_default());
+        self.next = seq.checked_add(1).ok_or(Error::TooLarge)?;
+        self.done = last;
+        Ok(n)
     }
 
-    /// True once the frame flagged `last` was opened (otherwise the stream was truncated).
+    /// True once the chunk flagged `last` was opened (otherwise the stream was truncated).
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.done && !self.failed
@@ -460,9 +494,6 @@ impl ResponseOpener {
         self.hash.clone().finalize().into()
     }
 }
-
-// Keep MAX_FRAME referenced for readers: a frame never exceeds it (checked in Header::decode).
-const _: () = assert!(HEADER_LEN + MAX_CHUNK + TAG_LEN == MAX_FRAME);
 
 // ---------- HPKE wraps ----------
 

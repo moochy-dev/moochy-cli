@@ -1,15 +1,13 @@
-//! Wire structs (CONTRACT §4–5, plan 03 §5, §7.1, §12.1).
+//! Signed / sealed JSON artifacts (CONTRACT §1, §4; plan 03 §7.1, §12.1; plan 05 §2.2).
 //!
-//! Unknown-field policy:
-//! - **Control messages** ([`Msg`]): unknown fields are **ignored** (CONTRACT §1, forward
-//!   compatibility within v1). Unknown `t` → [`Error::UnknownType`].
-//! - **Signed or sealed artifacts** ([`RouteHeader`], [`InnerPayload`], [`Receipt`],
-//!   [`Projection`]): `deny_unknown_fields`. Their bytes are signed/bound and checked by peers; a
-//!   field a verifier does not understand could carry meaning it cannot check, so it fails closed.
-//!
-//! Every parse goes through [`crate::json::parse`] (duplicate keys etc. rejected first).
+//! Control messages are protobuf ([`crate::pb`], CONTRACT §12). What stays JSON is everything
+//! that is signed or bound as exact bytes: route header, inner payload, receipt, projection,
+//! catalog. All of them are parsed with [`crate::json::parse`] (duplicate keys etc. rejected) and
+//! use `deny_unknown_fields`: a field a verifier does not understand could carry meaning it
+//! cannot check, so it fails closed. Never re-serialize a received artifact; keep its bytes.
 
 use crate::enc::{B, Blob, Sig};
+use crate::money::CatalogEntry;
 use crate::{DeviceId, Error, PledgeId, RepoId, TaskId, json};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -39,13 +37,6 @@ pub mod code {
 }
 
 pub const MAX_ATTEMPTS: u8 = 3;
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Gateway,
-    Worker,
-}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
@@ -210,301 +201,25 @@ pub struct Projection {
     pub receipt_sha256: B<32>,
 }
 
-// ---------- control messages (plan 03 §5) ----------
-
+/// Signed price catalog (plan 05 §2.2), carried as exact bytes in `CatalogUpdate.catalog_json`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Hello {
-    pub nonce: B<32>,
-    pub server_time: u64,
-    pub min_client_version: String,
-    pub relay_release: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_checkpoint: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Auth {
-    pub device_id: DeviceId,
-    pub roles: Vec<Role>,
-    pub sig: Sig,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Welcome {
-    pub session_id: String,
-    pub roles: Vec<Role>,
-    /// Named integer limits (plan 03 §16), e.g. `max_body_bytes`, `max_wraps`.
-    #[serde(default)]
-    pub limits: BTreeMap<String, u64>,
-    pub catalog_version: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PoolWorker {
-    pub worker_device: DeviceId,
-    pub enc_pub: B<32>,
-    pub key_log_index: u64,
-    pub approval_log_index: u64,
-    pub donor_pseudonym: String,
-    pub dialects: Vec<Dialect>,
-    pub models: Vec<String>,
-    pub hint: u8,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PoolSync {
-    pub repo: RepoId,
-    pub workers: Vec<PoolWorker>,
-    /// `true` = full snapshot; `false` = delta (upsert `workers`, drop `removed`).
-    pub full: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub removed: Vec<DeviceId>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Wrap {
-    pub worker_device: DeviceId,
-    pub wrap: B<80>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskSubmit {
-    pub task: TaskId,
-    pub route_b64: Blob,
-    pub wraps: Vec<Wrap>,
-    /// Total sealed bytes (sum of the `0x01` frame payloads, tags included).
-    pub body_len: u64,
-    /// Number of `0x01` frames that follow.
-    pub body_chunks: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskWraps {
-    pub task: TaskId,
-    pub wraps: Vec<Wrap>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskNeedWraps {
-    pub task: TaskId,
-    pub workers: Vec<DeviceId>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskAccepted {
-    pub task: TaskId,
-    pub attempt: u8,
-    pub worker_device: DeviceId,
-    #[serde(rename = "R")]
-    pub r: B<32>,
-}
-
-/// `task.started` and `receipt.ack` share this shape.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskRef {
-    pub task: TaskId,
-    pub attempt: u8,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskCheckpoint {
-    pub task: TaskId,
-    pub attempt: u8,
-    pub seq: u32,
-    pub running_hash: B<32>,
-    pub sig: Sig,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskEnd {
-    pub task: TaskId,
-    pub attempt: u8,
-    pub receipt_b64: Blob,
-    pub donor_sig: Sig,
-    pub projection_b64: Blob,
-    pub projection_sig: Sig,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskFailed {
-    pub task: TaskId,
-    pub code: String,
-    pub retryable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_after_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sealed_detail: Option<Blob>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskCancel {
-    pub task: TaskId,
-    /// Present R → W (attempt to abort); absent G → R (whole task).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attempt: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ReceiptDispute {
-    pub task: TaskId,
-    pub attempt: u8,
-    pub code: String,
-    pub gateway_sig: Sig,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct KnownTask {
-    pub task: TaskId,
-    pub attempt: u8,
-    pub state: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct WorkerKnownTasks {
-    pub tasks: Vec<KnownTask>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct OfferModel {
-    pub dialect: Dialect,
-    pub model: String,
-    /// Rate-limit headroom 0–100.
-    pub rl_headroom: u8,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct WorkerOffer {
-    pub slots_free: u16,
-    pub models: Vec<OfferModel>,
-    pub pledges: Vec<PledgeId>,
-    pub window_open: bool,
-    pub local_cap_left: i64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskAssign {
-    pub task: TaskId,
-    pub attempt: u8,
-    pub route_b64: Blob,
-    pub wrap: B<80>,
-    pub pledge: PledgeId,
-    pub deadline_ack_ms: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskAck {
-    pub task: TaskId,
-    pub attempt: u8,
-    #[serde(rename = "R")]
-    pub r: B<32>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TaskNack {
-    pub task: TaskId,
-    pub attempt: u8,
-    #[serde(rename = "R")]
-    pub r: B<32>,
-    pub code: String,
-    pub retryable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_after_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sealed_detail: Option<Blob>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ReceiptReplaySince {
-    /// ms since the Unix epoch.
-    pub since: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct RelayDraining {
-    pub reconnect_after_ms: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct LogCheckpoint {
-    /// Signed checkpoint note text.
-    pub checkpoint: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct CatalogUpdate {
+#[serde(deny_unknown_fields)]
+pub struct Catalog {
+    /// Monotonic; Nodes reject decreases.
     pub version: u64,
-    pub catalog_b64: Blob,
-    pub sig: Sig,
+    /// Prices apply to tasks started at or after this time (ms since the Unix epoch).
+    pub effective_at_ms: i64,
+    pub entries: Vec<CatalogEntry>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ErrorMsg {
-    pub code: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task: Option<TaskId>,
-}
+impl Catalog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        json::parse(bytes)
+    }
 
-macro_rules! messages {
-    ($($t:literal => $v:ident($ty:ty),)*) => {
-        /// Every control message. Serializes with its `t` tag; parse with [`Msg::parse`].
-        #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-        #[serde(tag = "t")]
-        pub enum Msg {
-            $(#[serde(rename = $t)] $v($ty),)*
-        }
-
-        impl Msg {
-            /// Strict parse. Unknown fields are ignored; unknown `t` → [`Error::UnknownType`].
-            pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
-                #[derive(Deserialize)]
-                struct Head { t: String }
-                json::check(bytes)?;
-                let head: Head = serde_json::from_slice(bytes).map_err(|_| Error::Malformed)?;
-                match head.t.as_str() {
-                    $($t => serde_json::from_slice(bytes).map(Msg::$v).map_err(|_| Error::Malformed),)*
-                    _ => Err(Error::UnknownType),
-                }
-            }
-
-            #[must_use]
-            pub fn t(&self) -> &'static str {
-                match self { $(Msg::$v(_) => $t,)* }
-            }
-
-            pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-                serde_json::to_vec(self).map_err(|_| Error::Malformed)
-            }
-        }
-    };
-}
-
-messages! {
-    "hello" => Hello(Hello),
-    "auth" => Auth(Auth),
-    "welcome" => Welcome(Welcome),
-    "pool.sync" => PoolSync(PoolSync),
-    "task.submit" => TaskSubmit(TaskSubmit),
-    "task.wraps" => TaskWraps(TaskWraps),
-    "task.need_wraps" => TaskNeedWraps(TaskNeedWraps),
-    "task.accepted" => TaskAccepted(TaskAccepted),
-    "task.started" => TaskStarted(TaskRef),
-    "task.checkpoint" => TaskCheckpoint(TaskCheckpoint),
-    "task.end" => TaskEnd(TaskEnd),
-    "task.failed" => TaskFailed(TaskFailed),
-    "task.cancel" => TaskCancel(TaskCancel),
-    "receipt.dispute" => ReceiptDispute(ReceiptDispute),
-    "worker.known_tasks" => WorkerKnownTasks(WorkerKnownTasks),
-    "worker.offer" => WorkerOffer(WorkerOffer),
-    "task.assign" => TaskAssign(TaskAssign),
-    "task.ack" => TaskAck(TaskAck),
-    "task.nack" => TaskNack(TaskNack),
-    "receipt.ack" => ReceiptAck(TaskRef),
-    "receipt.replay_since" => ReceiptReplaySince(ReceiptReplaySince),
-    "relay.draining" => RelayDraining(RelayDraining),
-    "log.checkpoint" => LogCheckpoint(LogCheckpoint),
-    "catalog.update" => CatalogUpdate(CatalogUpdate),
-    "error" => Error(ErrorMsg),
+    /// Entry for a public slug served by `provider`.
+    #[must_use]
+    pub fn entry(&self, model: &str, provider: &str) -> Option<&CatalogEntry> {
+        self.entries.iter().find(|e| e.model == model && e.provider == provider)
+    }
 }

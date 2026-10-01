@@ -14,7 +14,12 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # base64url-no-pad (strict, canonical) for every byte field in JSON.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
-# Zero-copy frame buffers crossing into the data plane.
+# Generated link.proto code (CONTRACT §12): messages (prost) + client/server stubs (tonic
+# codegen only; the Node picks transport/TLS features itself).
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = { version = "0.14", default-features = false }
+# Zero-copy chunk buffers crossing into the data plane.
 bytes = { version = "1", default-features = false, features = ["std"] }
 # SHA-256 / HKDF-SHA256 (CONTRACT §1).
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
@@ -49,3 +54,7 @@ missing_errors_doc = "allow"
 many_single_char_names = "allow"
 similar_names = "allow"
 doc_markdown = "allow"
+
+[dev-dependencies]
+# Counting global allocator for tests/perf.rs (proves zero allocation per chunk, CONTRACT §13).
+stats_alloc = "0.1"

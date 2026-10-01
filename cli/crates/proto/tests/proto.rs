@@ -1,12 +1,13 @@
 //! Roundtrip + negative tests for every primitive of `moochy-proto`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#![allow(clippy::pedantic, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
-use bytes::BytesMut;
-use moochy_proto::crypto::{self, ContentKey, EncSecret, RequestOpener, ResponseOpener, ResponseSealer, SignKey, TaskContext};
-use moochy_proto::frame::{HEADER_LEN, Header, MAX_CHUNK, MAX_FRAME};
+use bytes::{Bytes, BytesMut};
+use prost::Message as _;
+use moochy_proto::crypto::{self, ContentKey, EncSecret, MAX_CHUNK, RequestOpener, ResponseOpener, ResponseSealer, SignKey, TAG_LEN, TaskContext};
+use moochy_proto::pb;
 use moochy_proto::money::{self, CatalogEntry};
-use moochy_proto::msg::{self, CacheTtl, Dialect, InnerPayload, Msg, Receipt, ReceiptStatus, RouteHeader, Usage};
-use moochy_proto::{B, Blob, DeviceId, Error, PledgeId, RepoId, TaskId, Ulid, b64, json, lp, unb64};
+use moochy_proto::msg::{self, CacheTtl, Dialect, InnerPayload, Receipt, ReceiptStatus, RouteHeader, Usage};
+use moochy_proto::{B, DeviceId, Error, PledgeId, RepoId, TaskId, Ulid, b64, json, lp, unb64};
 use std::collections::BTreeMap;
 
 const T0: u64 = 1_790_000_000_000;
@@ -20,12 +21,17 @@ fn dev(s: &str) -> DeviceId {
 fn ck() -> ContentKey {
     ContentKey::from_bytes([0x11; 32])
 }
-fn open_all(ck: &ContentKey, t: &TaskId, frames: &[bytes::Bytes]) -> Result<Vec<u8>, Error> {
+fn open_all(ck: &ContentKey, t: &TaskId, chunks: &[pb::Chunk]) -> Result<Vec<u8>, Error> {
     let mut o = RequestOpener::new(ck, t)?;
-    for f in frames {
-        o.push(&mut f.to_vec())?;
+    for c in chunks {
+        o.push(c)?;
     }
     o.finish()
+}
+fn flip(c: &pb::Chunk, idx: usize, bit: u8) -> pb::Chunk {
+    let mut v = c.ct.to_vec();
+    v[idx] ^= bit;
+    pb::Chunk { ct: Bytes::from(v), ..c.clone() }
 }
 
 #[test]
@@ -61,13 +67,17 @@ fn request_roundtrip_multi_chunk() {
     let mut payload = vec![0u8; 3 * MAX_CHUNK + 17];
     crypto::fill_random(&mut payload).unwrap();
     let s = crypto::seal_request(&ck(), &t, &payload).unwrap();
-    assert!(s.frames.len() >= 4);
-    assert!(s.frames.iter().all(|f| f.len() <= MAX_FRAME));
-    assert_eq!(s.body_len, s.frames.iter().map(|f| (f.len() - HEADER_LEN) as u64).sum::<u64>());
-    assert_eq!(open_all(&ck(), &t, &s.frames).unwrap(), payload);
-    let (h, _) = Header::decode(&s.frames[0]).unwrap();
-    assert_eq!((h.attempt, h.seq, h.last), (0, 0, false));
-    assert!(Header::decode(s.frames.last().unwrap()).unwrap().0.last);
+    assert!(s.chunks.len() >= 4);
+    assert!(s.chunks.iter().all(|c| c.ct.len() <= MAX_CHUNK + TAG_LEN && c.attempt == 0));
+    assert_eq!(s.body_len, s.chunks.iter().map(|c| c.ct.len() as u64).sum::<u64>());
+    assert!(s.chunks.iter().enumerate().all(|(i, c)| c.seq == i as u32 && c.last == (i + 1 == s.chunks.len())));
+    let mut o = RequestOpener::new(&ck(), &t).unwrap();
+    s.chunks.iter().for_each(|c| o.push(c).unwrap());
+    assert_eq!(o.chunks() as usize, s.chunks.len());
+    assert_eq!(o.finish().unwrap(), payload);
+    // Small JSON bodies compress into one chunk.
+    let one = crypto::seal_request(&ck(), &t, &[b'{'; 100_000]).unwrap();
+    assert_eq!(one.chunks.len(), 1);
 }
 
 #[test]
@@ -75,43 +85,43 @@ fn request_negatives() {
     let t = task();
     let mut payload = vec![0u8; 2 * MAX_CHUNK];
     crypto::fill_random(&mut payload).unwrap();
-    let f = crypto::seal_request(&ck(), &t, &payload).unwrap().frames;
+    let f = crypto::seal_request(&ck(), &t, &payload).unwrap().chunks;
     let n = f.len();
-    // Wrong CK, wrong task.
+    // Wrong CK, wrong task (task id is in K_req and the AAD).
     assert_eq!(open_all(&ContentKey::from_bytes([0x12; 32]), &t, &f), Err(Error::Decrypt));
     let other: TaskId = "01K6A0000000000000000000T2".parse().unwrap();
-    assert_eq!(open_all(&ck(), &other, &f), Err(Error::Sequence));
-    // Truncation: last frame dropped.
+    assert_eq!(open_all(&ck(), &other, &f), Err(Error::Decrypt));
+    // Truncation: last chunk dropped.
     assert_eq!(open_all(&ck(), &t, &f[..n - 1]), Err(Error::Sequence));
-    // Reorder / duplicate.
+    // Reorder / duplicate / chunk after last / nonzero attempt.
     let mut sw = f.clone();
     sw.swap(0, 1);
     assert_eq!(open_all(&ck(), &t, &sw), Err(Error::Sequence));
-    let dup = [f[0].clone(), f[0].clone()];
-    assert_eq!(open_all(&ck(), &t, &dup), Err(Error::Sequence));
-    // Frame after last.
+    assert_eq!(open_all(&ck(), &t, &[f[0].clone(), f[0].clone()]), Err(Error::Sequence));
     let mut after = f.clone();
     after.push(f[0].clone());
     assert_eq!(open_all(&ck(), &t, &after), Err(Error::Sequence));
-    // Flip: ciphertext bit, tag bit, last flag (AAD), header seq rewritten (nonce+AAD).
-    for (idx, bit) in [(HEADER_LEN + 5, 1u8), (f[0].len() - 1, 0x80)] {
-        let mut g = f.clone();
-        let mut b = g[0].to_vec();
-        b[idx] ^= bit;
-        g[0] = b.into();
-        assert_eq!(open_all(&ck(), &t, &g), Err(Error::Decrypt));
-    }
+    let mut att = f.clone();
+    att[0].attempt = 1;
+    assert_eq!(open_all(&ck(), &t, &att), Err(Error::Sequence));
+    // Flip a ciphertext bit, a tag bit; relabel seq (nonce+AAD); clear `last` (AAD).
     let mut g = f.clone();
-    let mut b = g[n - 1].to_vec();
-    b[22] = 0; // clear `last` on the final frame
-    g[n - 1] = b.into();
+    g[0] = flip(&f[0], 5, 1);
     assert_eq!(open_all(&ck(), &t, &g), Err(Error::Decrypt));
-    // Poisoned after first failure.
+    g[0] = flip(&f[0], f[0].ct.len() - 1, 0x80);
+    assert_eq!(open_all(&ck(), &t, &g), Err(Error::Decrypt));
+    let relabel = [pb::Chunk { seq: 0, ..f[1].clone() }];
+    assert_eq!(open_all(&ck(), &t, &relabel), Err(Error::Decrypt));
+    let mut g = f.clone();
+    g[n - 1].last = false;
+    assert_eq!(open_all(&ck(), &t, &g), Err(Error::Decrypt));
+    // Short / oversize ct.
+    assert_eq!(open_all(&ck(), &t, &[pb::Chunk { ct: Bytes::from_static(&[0; 15]), ..f[0].clone() }]), Err(Error::TooLarge));
+    assert_eq!(open_all(&ck(), &t, &[pb::Chunk { ct: Bytes::from(vec![0; MAX_CHUNK + TAG_LEN + 1]), ..f[0].clone() }]), Err(Error::TooLarge));
+    // Poisoned after the first failure.
     let mut o = RequestOpener::new(&ck(), &t).unwrap();
-    let mut bad = f[0].to_vec();
-    bad[HEADER_LEN] ^= 1;
-    assert_eq!(o.push(&mut bad), Err(Error::Decrypt));
-    assert_eq!(o.push(&mut f[0].to_vec()), Err(Error::Sequence));
+    assert_eq!(o.push(&flip(&f[0], 0, 1)), Err(Error::Decrypt));
+    assert_eq!(o.push(&f[0]), Err(Error::Sequence));
     // Oversize payload refused by the sealer.
     assert_eq!(crypto::seal_request(&ck(), &t, &vec![0; crypto::MAX_PAYLOAD + 1]).err(), Some(Error::TooLarge));
 }
@@ -122,32 +132,33 @@ fn zstd_bomb_and_trailing_data() {
     // Exactly the cap: accepted.
     let ok = vec![b' '; crypto::MAX_PAYLOAD];
     let s = crypto::seal_request(&ck(), &t, &ok).unwrap();
-    assert_eq!(open_all(&ck(), &t, &s.frames).unwrap().len(), crypto::MAX_PAYLOAD);
+    assert_eq!(open_all(&ck(), &t, &s.chunks).unwrap().len(), crypto::MAX_PAYLOAD);
     // One byte over (a tiny compressed bomb): rejected while streaming.
-    let bomb = zstd::bulk::compress(&vec![b' '; crypto::MAX_PAYLOAD + 1], 19).unwrap();
-    assert!(bomb.len() < 4096, "bomb is small: {}", bomb.len());
+    let bomb = zstd::bulk::compress(&vec![b' '; crypto::MAX_PAYLOAD + 1], 3).unwrap();
+    assert!(bomb.len() < 8192, "bomb is small: {}", bomb.len());
     let s = crypto::seal_compressed(&ck(), &t, &bomb).unwrap();
-    assert_eq!(open_all(&ck(), &t, &s.frames), Err(Error::TooLarge));
-    // A 1 GiB bomb fails just the same, without allocating more than the cap.
-    let mut z = zstd::bulk::Compressor::new(19).unwrap();
-    let big = z.compress(&vec![0u8; 1 << 30]).unwrap();
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::TooLarge));
+    // A 256 MiB bomb fails just the same, without allocating more than the cap.
+    let big = zstd::bulk::compress(&vec![0u8; 1 << 28], 3).unwrap();
     let s = crypto::seal_compressed(&ck(), &t, &big).unwrap();
-    assert_eq!(open_all(&ck(), &t, &s.frames), Err(Error::TooLarge));
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::TooLarge));
     // Trailing bytes after the zstd frame, and two concatenated frames: rejected.
     let mut tr = zstd::bulk::compress(b"{}", 3).unwrap();
     tr.push(0);
     let s = crypto::seal_compressed(&ck(), &t, &tr).unwrap();
-    assert_eq!(open_all(&ck(), &t, &s.frames), Err(Error::Malformed));
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::Malformed));
     let one = zstd::bulk::compress(b"{}", 3).unwrap();
     let s = crypto::seal_compressed(&ck(), &t, &[one.clone(), one].concat()).unwrap();
-    assert_eq!(open_all(&ck(), &t, &s.frames), Err(Error::Malformed));
-    // Garbage that is not zstd.
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::Malformed));
+    // Not zstd; incomplete zstd frame; empty body.
     let s = crypto::seal_compressed(&ck(), &t, b"not zstd at all").unwrap();
-    assert_eq!(open_all(&ck(), &t, &s.frames), Err(Error::Malformed));
-    // Incomplete zstd frame.
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::Malformed));
     let full = zstd::bulk::compress(&[7u8; 1000], 3).unwrap();
     let s = crypto::seal_compressed(&ck(), &t, &full[..full.len() - 2]).unwrap();
-    assert!(open_all(&ck(), &t, &s.frames).is_err());
+    assert!(open_all(&ck(), &t, &s.chunks).is_err());
+    let s = crypto::seal_compressed(&ck(), &t, b"").unwrap();
+    assert_eq!(s.chunks.len(), 1);
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::Sequence));
 }
 
 fn sealer(attempt: u8, r: [u8; 32]) -> ResponseSealer {
@@ -161,55 +172,59 @@ fn opener(attempt: u8, r: [u8; 32]) -> ResponseOpener {
 fn response_roundtrip_and_aad_binding() {
     let r = [0x22; 32];
     let mut s = sealer(1, r);
-    let chunks: [&[u8]; 3] = [b"hello ", &[0xAB; MAX_CHUNK], b""];
-    let frames: Vec<_> = chunks.iter().enumerate().map(|(i, c)| s.seal(c, i == 2).unwrap()).collect();
-    assert_eq!(s.seal(b"x", true), Err(Error::Sequence), "nothing after last");
-    assert_eq!(sealer(1, r).seal(&[0; MAX_CHUNK + 1], false), Err(Error::TooLarge));
+    let parts: [&[u8]; 3] = [b"hello ", &[0xAB; MAX_CHUNK], b""];
+    let chunks: Vec<_> = parts.iter().enumerate().map(|(i, c)| s.seal(c, i == 2).unwrap()).collect();
+    assert!(chunks.iter().all(|c| c.attempt == 1));
+    assert_eq!(s.seal(b"x", true).err(), Some(Error::Sequence), "nothing after last");
+    assert_eq!(sealer(1, r).seal(&[0; MAX_CHUNK + 1], false).err(), Some(Error::TooLarge));
+    // open (zero-copy path) and open_into (caller buffer) agree.
     let mut o = opener(1, r);
     let mut all = Vec::new();
-    for f in &frames {
-        let (pt, _) = o.open(BytesMut::from(&f[..])).unwrap();
-        all.extend_from_slice(&pt);
+    for c in &chunks {
+        all.extend_from_slice(&o.open(c.clone()).unwrap());
     }
     assert!(o.is_complete());
-    assert_eq!(all, chunks.concat());
+    assert_eq!(all, parts.concat());
+    let mut o2 = opener(1, r);
+    let mut out = BytesMut::new();
+    chunks.iter().for_each(|c| o2.open_into(c, &mut out).unwrap());
+    assert_eq!(&out[..], &all[..]);
     assert_eq!(o.running_hash(), crypto::sha256(&all));
     assert_eq!(s.running_hash(), o.running_hash());
 
-    // Two attempts of one task: different RK, cross-open fails.
-    let rk1 = crypto::rk(&ck(), &r, &task(), &dev("d_01K6A0000000000000000000W1"), 1).unwrap();
-    let rk2 = crypto::rk(&ck(), &r, &task(), &dev("d_01K6A0000000000000000000W1"), 2).unwrap();
-    let rk1b = crypto::rk(&ck(), &[0x23; 32], &task(), &dev("d_01K6A0000000000000000000W1"), 1).unwrap();
+    // Two attempts of one task: different RK; cross-open fails.
+    let w = dev("d_01K6A0000000000000000000W1");
+    let rk1 = crypto::rk(&ck(), &r, &task(), &w, 1).unwrap();
+    let rk2 = crypto::rk(&ck(), &r, &task(), &w, 2).unwrap();
+    let rk1b = crypto::rk(&ck(), &[0x23; 32], &task(), &w, 1).unwrap();
     assert_ne!(rk1.expose(), rk2.expose());
     assert_ne!(rk1.expose(), rk1b.expose());
 
-    // Each AAD component, with the header rewritten to match the opener: decryption fails.
-    let f0 = frames[0].to_vec();
-    let rewrite = |f: &[u8], at: usize, v: &[u8]| {
-        let mut f = f.to_vec();
-        f[at..at + v.len()].copy_from_slice(v);
-        BytesMut::from(&f[..])
-    };
-    // attempt (key + AAD)
-    assert_eq!(opener(2, r).open(rewrite(&f0, 17, &[2])).err(), Some(Error::Decrypt));
-    // R (key + AAD)
-    assert_eq!(opener(1, [0x23; 32]).open(rewrite(&f0, 0, &[2])).err(), Some(Error::Decrypt));
-    // task
+    // Each AAD component, with the visible fields relabelled to match the opener: Decrypt.
+    let c0 = chunks[0].clone();
+    assert_eq!(opener(2, r).open(pb::Chunk { attempt: 2, ..c0.clone() }).err(), Some(Error::Decrypt));
+    assert_eq!(opener(1, [0x23; 32]).open(c0.clone()).err(), Some(Error::Decrypt));
     let t2: TaskId = "01K6A0000000000000000000T2".parse().unwrap();
-    let mut o2 = ResponseOpener::new(&ck(), &r, &t2, &dev("d_01K6A0000000000000000000W1"), 1).unwrap();
-    assert_eq!(o2.open(rewrite(&f0, 1, &t2.0.0)).err(), Some(Error::Decrypt));
-    // seq: frame 1 relabelled as seq 0
-    assert_eq!(opener(1, r).open(rewrite(&frames[1], 18, &[0, 0, 0, 0])).err(), Some(Error::Decrypt));
-    // last flag flipped
-    assert_eq!(opener(1, r).open(rewrite(&f0, 22, &[1])).err(), Some(Error::Decrypt));
-    // header mismatch without rewrite → Sequence; truncated stream is not complete
-    assert_eq!(opener(2, r).open(BytesMut::from(&f0[..])).err(), Some(Error::Sequence));
+    let mut o3 = ResponseOpener::new(&ck(), &r, &t2, &w, 1).unwrap();
+    assert_eq!(o3.open(c0.clone()).err(), Some(Error::Decrypt));
+    let w2 = dev("d_01K6A0000000000000000000W2");
+    assert_eq!(ResponseOpener::new(&ck(), &r, &task(), &w2, 1).unwrap().open(c0.clone()).err(), Some(Error::Decrypt));
+    assert_eq!(opener(1, r).open(pb::Chunk { seq: 0, ..chunks[1].clone() }).err(), Some(Error::Decrypt));
+    assert_eq!(opener(1, r).open(pb::Chunk { last: true, ..c0.clone() }).err(), Some(Error::Decrypt));
+    // Visible mismatch → Sequence; poisoned; truncated stream not complete.
+    let mut o4 = opener(2, r);
+    assert_eq!(o4.open(c0.clone()).err(), Some(Error::Sequence));
+    assert_eq!(o4.open(pb::Chunk { attempt: 2, ..c0.clone() }).err(), Some(Error::Sequence), "poisoned");
     let mut tr = opener(1, r);
-    tr.open(BytesMut::from(&f0[..])).unwrap();
+    tr.open(c0.clone()).unwrap();
     assert!(!tr.is_complete());
-    // a request frame is never accepted as a response frame
-    let req = crypto::seal_request(&ck(), &task(), b"{}").unwrap().frames;
-    assert_eq!(opener(1, r).open(BytesMut::from(&req[0][..])).err(), Some(Error::Sequence));
+    let mut o5 = opener(1, r);
+    let mut buf = BytesMut::from(&b"keep"[..]);
+    assert_eq!(o5.open_into(&flip(&c0, 0, 1), &mut buf).err(), Some(Error::Decrypt));
+    assert_eq!(&buf[..], b"keep", "failed open_into leaves the buffer untouched");
+    // A request chunk is never a response chunk (different key and AAD).
+    let req = crypto::seal_request(&ck(), &task(), b"{}").unwrap().chunks;
+    assert_eq!(opener(1, r).open(pb::Chunk { attempt: 1, ..req[0].clone() }).err(), Some(Error::Decrypt));
 }
 
 #[test]
@@ -358,34 +373,23 @@ fn receipts_and_projections() {
 }
 
 #[test]
-fn messages() {
-    let t = task();
-    let all = vec![
-        Msg::Hello(msg::Hello { nonce: B([1; 32]), server_time: T0, min_client_version: "0.1.0".into(), relay_release: "r1".into(), log_checkpoint: None }),
-        Msg::TaskSubmit(msg::TaskSubmit { task: t, route_b64: Blob(route_bytes()), wraps: vec![msg::Wrap { worker_device: dev("d_01K6A0000000000000000000W1"), wrap: B([7; 80]) }], body_len: 100, body_chunks: 1 }),
-        Msg::TaskAck(msg::TaskAck { task: t, attempt: 1, r: B([2; 32]) }),
-        Msg::TaskNack(msg::TaskNack { task: t, attempt: 1, r: B([2; 32]), code: msg::code::FIREWALL.into(), retryable: false, retry_after_ms: None, sealed_detail: Some(Blob(vec![1, 2])) }),
-        Msg::TaskStarted(msg::TaskRef { task: t, attempt: 2 }),
-        Msg::ReceiptAck(msg::TaskRef { task: t, attempt: 2 }),
-        Msg::TaskCancel(msg::TaskCancel { task: t, attempt: None, reason: Some("client_closed".into()) }),
-        Msg::WorkerOffer(msg::WorkerOffer { slots_free: 4, models: vec![msg::OfferModel { dialect: Dialect::OpenAiChat, model: "deepseek/deepseek-chat".into(), rl_headroom: 90 }], pledges: vec![], window_open: true, local_cap_left: 5_000_000 }),
-        Msg::Error(msg::ErrorMsg { code: "unknown_type".into(), message: "x".into(), task: None }),
-    ];
-    for m in all {
-        let b = m.to_bytes().unwrap();
-        assert!(b.starts_with(format!("{{\"t\":\"{}\"", m.t()).as_bytes()), "{}", String::from_utf8_lossy(&b));
-        assert_eq!(Msg::parse(&b).unwrap(), m);
-    }
-    let ack = br#"{"t":"task.ack","task":"01K6A0000000000000000000T1","attempt":1,"R":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI","future":{"x":[1]}}"#;
-    assert!(matches!(Msg::parse(ack), Ok(Msg::TaskAck(_))), "unknown fields ignored");
-    assert_eq!(Msg::parse(br#"{"t":"task.teleport","task":"x"}"#), Err(Error::UnknownType));
-    assert_eq!(Msg::parse(br#"{"t":"task.ack","t":"task.ack"}"#), Err(Error::Json));
-    assert_eq!(Msg::parse(br#"{"task":"01K6A0000000000000000000T1"}"#), Err(Error::Malformed));
-    assert_eq!(Msg::parse(br#"{"t":"task.ack","task":"01K6A0000000000000000000T1","attempt":256,"R":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"}"#), Err(Error::Malformed));
-    assert_eq!(Msg::parse(br#"{"t":"task.ack","task":"01K6A0000000000000000000T1","attempt":1,"R":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"}"#), Err(Error::Malformed), "31-byte R");
+fn protobuf_and_artifacts() {
+    // link.proto messages round-trip; ciphertext stays a zero-copy Bytes.
+    let up = pb::SubmitUp {
+        msg: Some(pb::submit_up::Msg::Open(pb::SubmitOpen {
+            task: task().to_string(),
+            route: Bytes::from(route_bytes()),
+            wraps: vec![pb::Wrap { worker_device: "d_01K6A0000000000000000000W1".into(), wrap: Bytes::from(vec![7; 80]) }],
+            body_len: 100,
+            body_chunks: 1,
+        })),
+    };
+    assert_eq!(pb::SubmitUp::decode(up.encode_to_vec().as_slice()).unwrap(), up);
+    let ch = pb::ServeUp { msg: Some(pb::serve_up::Msg::Chunk(sealer(1, [1; 32]).seal(b"x", true).unwrap())) };
+    assert_eq!(pb::ServeUp::decode(Bytes::from(ch.encode_to_vec())).unwrap(), ch);
     assert!(msg::code::retryable("busy") && !msg::code::retryable("firewall") && !msg::code::retryable("whatever"));
 
-    // Route header: exact fields, unknown and duplicate keys refused.
+    // Route header: exact fields; duplicate, unknown, out-of-enum all refused.
     let r = RouteHeader::parse(&route_bytes()).unwrap();
     assert_eq!(r.cache_ttl, CacheTtl::None);
     assert_eq!(RouteHeader::parse(&r.to_bytes().unwrap()).unwrap(), r);
@@ -393,10 +397,21 @@ fn messages() {
     assert_eq!(RouteHeader::parse(s.replacen("{", r#"{"model":"anthropic/claude-haiku-4.5","#, 1).as_bytes()), Err(Error::Json));
     assert_eq!(RouteHeader::parse(s.replacen("{", r#"{"extra":1,"#, 1).as_bytes()), Err(Error::Malformed));
     assert_eq!(RouteHeader::parse(s.replace("\"none\"", "\"2h\"").as_bytes()), Err(Error::Malformed));
+    assert_eq!(RouteHeader::parse(s.replace("1024", "-1").as_bytes()), Err(Error::Malformed));
+
+    // Catalog: strict, unknown pricing fields refused.
+    let cat = format!(r#"{{"version":3,"effective_at_ms":0,"entries":[{}]}}"#, SONNET);
+    let c = msg::Catalog::parse(cat.as_bytes()).unwrap();
+    assert_eq!(c.entry("anthropic/claude-sonnet-5.5", "anthropic"), Some(&sonnet()));
+    assert!(c.entry("anthropic/claude-sonnet-5.5", "openrouter").is_none());
+    let extra = cat.replacen("\"in\":", "\"long_context_in\":9,\"in\":", 1);
+    assert_eq!(msg::Catalog::parse(extra.as_bytes()), Err(Error::Malformed));
 }
 
+const SONNET: &str = r#"{"model":"anthropic/claude-sonnet-5.5","provider":"anthropic","provider_model_id":"claude-sonnet-5-5","aliases":["claude-sonnet-5-5"],"dialects":["anthropic.messages"],"in":2000000,"out":10000000,"cache_write_5m":2500000,"cache_write_1h":4000000,"cache_read":200000,"max_image_tokens":1600,"max_page_tokens":3000,"fast_multiplier":6,"default_effort":"high","max_output":64000,"source":"curated"}"#;
+
 fn sonnet() -> CatalogEntry {
-    json::parse(br#"{"model":"anthropic/claude-sonnet-5.5","provider":"anthropic","provider_model_id":"claude-sonnet-5-5","aliases":["claude-sonnet-5-5"],"dialects":["anthropic.messages"],"in":2000000,"out":10000000,"cache_write_5m":2500000,"cache_write_1h":4000000,"cache_read":200000,"max_image_tokens":1600,"max_page_tokens":3000,"fast_multiplier":6,"default_effort":"high","max_output":64000,"source":"curated"}"#).unwrap()
+    json::parse(SONNET.as_bytes()).unwrap()
 }
 
 #[test]
@@ -500,34 +515,4 @@ fn body_facts_and_route_check() {
     assert_eq!((f.pages, f.fast, f.text_bytes), (3, true, db.len() as u64));
     assert_eq!(f.flags(), ["documents", "fast"]);
     assert_eq!(f.est_input_tokens(&c).unwrap(), (db.len() as u64).div_ceil(3) + 9000);
-}
-
-/// `cargo test --release -p moochy-proto --test proto -- --ignored --nocapture throughput`
-#[test]
-#[ignore = "benchmark: run in release"]
-fn throughput() {
-    use std::time::Instant;
-    let total: usize = 512 << 20;
-    let n = total / MAX_CHUNK;
-    let pt = vec![0x5Au8; MAX_CHUNK];
-    let r = [0x22; 32];
-    let mut s = sealer(1, r);
-    let mut frames = Vec::with_capacity(n);
-    let t0 = Instant::now();
-    for i in 0..n {
-        frames.push(s.seal(&pt, i + 1 == n).unwrap());
-    }
-    let seal = t0.elapsed();
-    let mut bufs: Vec<BytesMut> = frames.iter().map(|f| BytesMut::from(&f[..])).collect();
-    let mut o = opener(1, r);
-    let t1 = Instant::now();
-    for b in &mut bufs {
-        o.open_in_place(b).unwrap();
-    }
-    let open = t1.elapsed();
-    let mbps = |d: std::time::Duration| (n * MAX_CHUNK) as f64 / d.as_secs_f64() / 1e6;
-    println!("64 KiB chunks, {} MB: seal {:.0} MB/s, open {:.0} MB/s (incl. running SHA-256)", n * MAX_CHUNK / 1_000_000, mbps(seal), mbps(open));
-    if !cfg!(debug_assertions) {
-        assert!(mbps(seal) >= 800.0 && mbps(open) >= 800.0, "below the 800 MB/s target");
-    }
 }
