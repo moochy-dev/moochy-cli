@@ -664,6 +664,83 @@ pub struct DevicePollResponse {
     #[prost(string, tag = "4")]
     pub username: ::prost::alloc::string::String,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDonationsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDonationsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub donations: ::prost::alloc::vec::Vec<Donation>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DonateRequest {
+    /// idempotency key (ULID)
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// "owner/name"
+    #[prost(string, tag = "2")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// monthly limit
+    #[prost(int64, tag = "3")]
+    pub budget_uusd: i64,
+    /// limit per request
+    #[prost(int64, tag = "4")]
+    pub per_task_cap_uusd: i64,
+    /// public model ids; empty = any in the catalog
+    #[prost(string, repeated, tag = "5")]
+    pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub max_effort: ::prost::alloc::string::String,
+    /// public | pseudonymous | anonymous
+    #[prost(string, tag = "7")]
+    pub visibility: ::prost::alloc::string::String,
+    /// always | nights | weekends | nights_weekends
+    #[prost(string, tag = "8")]
+    pub schedule: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DonationActionRequest {
+    #[prost(string, tag = "1")]
+    pub pledge_id: ::prost::alloc::string::String,
+    /// pause | resume | reclaim | update
+    #[prost(string, tag = "2")]
+    pub action: ::prost::alloc::string::String,
+    /// reclaim: > 0 lowers the monthly limit, 0 ends the donation
+    #[prost(int64, tag = "3")]
+    pub amount_uusd: i64,
+    /// action = update
+    #[prost(message, optional, tag = "4")]
+    pub update: ::core::option::Option<DonateRequest>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Donation {
+    #[prost(string, tag = "1")]
+    pub pledge_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// pending | active | paused | ended | declined | frozen
+    #[prost(string, tag = "3")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub budget_uusd: i64,
+    #[prost(int64, tag = "5")]
+    pub per_task_cap_uusd: i64,
+    #[prost(int64, tag = "6")]
+    pub spent_uusd: i64,
+    #[prost(int64, tag = "7")]
+    pub reserved_uusd: i64,
+    #[prost(int64, tag = "8")]
+    pub period_start_ms: i64,
+    #[prost(string, repeated, tag = "9")]
+    pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "10")]
+    pub max_effort: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub visibility: ::prost::alloc::string::String,
+    #[prost(string, tag = "12")]
+    pub schedule: ::prost::alloc::string::String,
+    #[prost(int64, tag = "13")]
+    pub created_at_ms: i64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Role {
@@ -956,6 +1033,76 @@ pub mod node_link_client {
                 .insert(GrpcMethod::new("moochy.v1.NodeLink", "GetLogTile"));
             self.inner.unary(req, path, codec).await
         }
+        /// Donations (the donor's own; integrator 2026-10-02, shape from mo-relay). Authenticated like
+        /// Submit (same connection as the Session + x-moochy-session metadata); the user is always the
+        /// session's user, never a field. Errors: NOT_FOUND, ALREADY_EXISTS (a live donation to that repo),
+        /// INVALID_ARGUMENT, FAILED_PRECONDITION (ended/declined), RESOURCE_EXHAUSTED. A new donation is
+        /// "pending" until the repo owner signs DONOR_APPROVED. Internal ids keep the name "pledge".
+        pub async fn list_donations(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListDonationsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDonationsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/ListDonations",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "ListDonations"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn donate(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DonateRequest>,
+        ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/Donate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("moochy.v1.NodeLink", "Donate"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn donation_action(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DonationActionRequest>,
+        ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/DonationAction",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "DonationAction"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1027,6 +1174,26 @@ pub mod node_link_server {
             &self,
             request: tonic::Request<super::LogTileRequest>,
         ) -> std::result::Result<tonic::Response<super::LogTileResponse>, tonic::Status>;
+        /// Donations (the donor's own; integrator 2026-10-02, shape from mo-relay). Authenticated like
+        /// Submit (same connection as the Session + x-moochy-session metadata); the user is always the
+        /// session's user, never a field. Errors: NOT_FOUND, ALREADY_EXISTS (a live donation to that repo),
+        /// INVALID_ARGUMENT, FAILED_PRECONDITION (ended/declined), RESOURCE_EXHAUSTED. A new donation is
+        /// "pending" until the repo owner signs DONOR_APPROVED. Internal ids keep the name "pledge".
+        async fn list_donations(
+            &self,
+            request: tonic::Request<super::ListDonationsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDonationsResponse>,
+            tonic::Status,
+        >;
+        async fn donate(
+            &self,
+            request: tonic::Request<super::DonateRequest>,
+        ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status>;
+        async fn donation_action(
+            &self,
+            request: tonic::Request<super::DonationActionRequest>,
+        ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct NodeLinkServer<T> {
@@ -1354,6 +1521,139 @@ pub mod node_link_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetLogTileSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/ListDonations" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListDonationsSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::ListDonationsRequest>
+                    for ListDonationsSvc<T> {
+                        type Response = super::ListDonationsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListDonationsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::list_donations(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListDonationsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/Donate" => {
+                    #[allow(non_camel_case_types)]
+                    struct DonateSvc<T: NodeLink>(pub Arc<T>);
+                    impl<T: NodeLink> tonic::server::UnaryService<super::DonateRequest>
+                    for DonateSvc<T> {
+                        type Response = super::Donation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DonateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::donate(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DonateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/DonationAction" => {
+                    #[allow(non_camel_case_types)]
+                    struct DonationActionSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::DonationActionRequest>
+                    for DonationActionSvc<T> {
+                        type Response = super::Donation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DonationActionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::donation_action(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DonationActionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
