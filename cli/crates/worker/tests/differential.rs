@@ -2,7 +2,7 @@
 //! wins, lenient numbers) must read every body the Worker forwards — fixture bodies, prepared
 //! (mutated) provider bodies, re-emitted bodies and SSE event payloads — as exactly the tree our
 //! strict parser validated, with no duplicate keys. Skips when python3 is absent.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, clippy::format_push_string)]
+#![allow(clippy::case_sensitive_file_extension_comparisons, clippy::map_unwrap_or, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, clippy::format_push_string)]
 
 use std::fmt::Write as _;
 use std::io::Write as _;
