@@ -225,15 +225,13 @@ impl Store {
     /// Store a signed receipt and settle its reservation at `cost_uusd` (attributed to the
     /// attempt's start period), then fsync. Call before sending `task.end`.
     pub fn put_receipt(&mut self, key: &[u8], payload: &[u8], cost_uusd: u64, now_ms: u64) -> io::Result<()> {
-        let mut rec = Vec::with_capacity(payload.len().saturating_add(key.len()).saturating_add(64));
-        if self.st.open.contains_key(key) {
-            rec.extend_from_slice(&settle_rec(key, cost_uusd));
-        }
-        rec.extend_from_slice(&frame(PUT, |w| {
+        // One frame = atomic: a torn write loses both the receipt and its settlement.
+        let rec = frame(PUT, |w| {
             w.bytes(key);
             w.u64(now_ms);
+            w.u64(cost_uusd);
             w.bytes(payload);
-        }));
+        });
         self.append(&rec, true)?;
         apply_settle(&mut self.st, key, cost_uusd);
         self.st.receipts.insert(key.to_vec(), Receipt { ts_ms: now_ms, payload: payload.to_vec(), acked_ms: None });
@@ -318,6 +316,7 @@ impl Store {
             out.extend(frame(PUT, |w| {
                 w.bytes(k);
                 w.u64(r.ts_ms);
+                w.u64(0); // already settled into the spent totals above
                 w.bytes(&r.payload);
             }));
             if let Some(a) = r.acked_ms {
@@ -388,7 +387,8 @@ fn apply(body: &[u8], st: &mut State) -> Option<()> {
     let s = |b: &[u8]| String::from_utf8(b.to_vec()).ok();
     match r.u8()? {
         PUT => {
-            let (k, ts, p) = (r.bytes()?.to_vec(), r.u64()?, r.bytes()?.to_vec());
+            let (k, ts, cost, p) = (r.bytes()?.to_vec(), r.u64()?, r.u64()?, r.bytes()?.to_vec());
+            apply_settle(st, &k, cost);
             st.receipts.insert(k, Receipt { ts_ms: ts, payload: p, acked_ms: None });
         }
         ACK => {
