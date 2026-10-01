@@ -278,6 +278,26 @@ impl Gate {
     }
 }
 
+/// Canonical re-emission (CONTRACT §15.4, A162): every byte for the client passes through here
+/// (`task.rs` flush), so no donor byte reaches the agent's parser verbatim.
+/// ponytail: identity until `moochy_worker::reemit::Reemitter` is on main; then `push` feeds it
+/// and returns its canonical output, `finish` flushes it, and an error fails the attempt.
+pub struct Canon;
+
+impl Canon {
+    pub fn new(_dialect: Dialect, _stream: bool) -> Self {
+        Self
+    }
+
+    pub fn push(&mut self, b: Bytes) -> Result<Bytes, &'static str> {
+        Ok(b)
+    }
+
+    pub fn finish(&mut self) -> Result<Bytes, &'static str> {
+        Ok(Bytes::new())
+    }
+}
+
 /// Replace blocked tool calls of a non-streamed body with a visible `[moochy]` text.
 fn rewrite_body(d: Dialect, body: &[u8], blocked: &[Option<String>]) -> Option<Bytes> {
     let mut v = crate::json::parse(body).ok()?;

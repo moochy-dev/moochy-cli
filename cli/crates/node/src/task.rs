@@ -248,6 +248,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         repo_id: pool.repo_id.clone(),
         route,
         gate: Gate::new(req.dialect, req.facts.stream, &req.body, req.release_tools),
+        canon: crate::gate::Canon::new(req.dialect, req.facts.stream),
         pool,
         tx,
         up: up_tx,
@@ -303,6 +304,8 @@ struct Driver {
     repo_id: String,
     route: Bytes,
     gate: Gate,
+    /// Canonical re-emission of everything the client receives (§15.4).
+    canon: crate::gate::Canon,
     pool: RepoPool,
     tx: mpsc::Sender<TaskEv>,
     /// Kept open for `Wraps` / `Cancel`; dropping it half-closes the stream.
@@ -608,9 +611,23 @@ impl Driver {
 
     async fn flush(&mut self, finale: bool) -> Step {
         while let Some(b) = self.gate.pop(self.verified, finale) {
+            let b = match self.canon.push(b) {
+                Ok(b) => b,
+                Err(why) => return retry_fail("provider_error", why),
+            };
+            if b.is_empty() {
+                continue;
+            }
             let s = emit(&self.tx, TaskEv::Bytes(b)).await;
             if !matches!(s, Step::Continue) {
                 return s;
+            }
+        }
+        if finale {
+            match self.canon.finish() {
+                Ok(b) if b.is_empty() => {}
+                Ok(b) => return emit(&self.tx, TaskEv::Bytes(b)).await,
+                Err(why) => return retry_fail("provider_error", why),
             }
         }
         Step::Continue
