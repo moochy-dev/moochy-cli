@@ -188,10 +188,36 @@ impl Refuse<'_> {
     }
 }
 
+/// Deliveries in flight per `(task, attempt)`; the flag flips when the first one is served.
+type Inflight = std::collections::HashMap<(String, u32), tokio::sync::watch::Receiver<bool>>;
+static INFLIGHT: std::sync::LazyLock<Mutex<Inflight>> = std::sync::LazyLock::new(|| Mutex::new(Inflight::new()));
+
 pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
     let Some(link) = node.link() else { return };
     let node = node.clone();
+    // A second delivery of an attempt already in flight (relay replay, 03 §7.2): refuse it once
+    // the first delivery is over, so it can neither win the race nor disturb the live stream.
+    let first = lock(&INFLIGHT).get(&(task.clone(), attempt)).cloned();
+    let (acked_tx, acked_rx) = tokio::sync::watch::channel(false);
+    if first.is_none() {
+        lock(&INFLIGHT).insert((task.clone(), attempt), acked_rx);
+    }
     tokio::spawn(async move {
+        if let Some(mut first) = first {
+            log("warn", "task refused", &json!({"task": task, "attempt": attempt, "code": "unauthorized_task", "detail": "duplicate delivery"}));
+            let _ = timeout(Duration::from_secs(120), first.wait_for(|done| *done)).await;
+            let (tx, rx) = mpsc::channel::<ServeUp>(4);
+            let _ = tx.try_send(up(serve_up::Msg::Open(pb::ServeOpen { task: task.clone(), attempt })));
+            let mut client = link.client.clone();
+            if let Ok(r) = client.serve(crate::link::with_session(&link, ReceiverStream::new(rx))).await {
+                let mut down = r.into_inner();
+                let refuse = Refuse { tx: &tx, r: crypto::random32().unwrap_or([0; 32]), task: &task, task16: [0; 16], worker: "", attempt };
+                refuse.nack(None, &Failure::new("unauthorized_task", false, Some("duplicate delivery".into()))).await;
+                drop(tx);
+                let _ = timeout(Duration::from_secs(5), async { while next(&mut down).await.is_some() {} }).await;
+            }
+            return;
+        }
         let (tx, rx) = mpsc::channel::<ServeUp>(64);
         let _ = tx.try_send(up(serve_up::Msg::Open(pb::ServeOpen { task: task.clone(), attempt })));
         let mut client = link.client.clone();
@@ -207,6 +233,8 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
             let _busy = Busy::new(&node.worker_busy);
             serve(&node, &task, attempt, &mut down, &tx).await
         };
+        acked_tx.send_replace(true);
+        lock(&INFLIGHT).remove(&(task.clone(), attempt));
         // Half-close and let the relay end the stream: dropping `down` first would reset it
         // before the last Nack / End is flushed.
         drop(tx);
@@ -409,7 +437,13 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
 }
 
 /// Returns `(journal status, model, cost)`.
-async fn serve(node: &Arc<Node>, task_s: &str, attempt: u32, down: &mut tonic::Streaming<ServeDown>, tx: &mpsc::Sender<ServeUp>) -> (String, String, i64) {
+async fn serve(
+    node: &Arc<Node>,
+    task_s: &str,
+    attempt: u32,
+    down: &mut tonic::Streaming<ServeDown>,
+    tx: &mpsc::Sender<ServeUp>,
+) -> (String, String, i64) {
     let r = crypto::random32().unwrap_or([0; 32]);
     let task16 = task_s.parse::<TaskId>().map_or([0; 16], |t| t.0.0);
     let device = node.device_id().unwrap_or_default().to_owned();

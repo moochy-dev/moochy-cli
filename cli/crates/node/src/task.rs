@@ -288,7 +288,7 @@ impl Driver {
             }
             Step::Fail(f) => {
                 if f.code == "bad_envelope" {
-                    log("error", "bad_envelope", &json!({"task": self.task_text}));
+                    log("error", "bad_envelope", &json!({"task": self.task_text, "why": f.detail}));
                     let _ = self.up.try_send(up(submit_up::Msg::Cancel(pb::Cancel { reason: "bad_envelope".into() })));
                 }
                 let status = format!("failed:{}", f.code);
@@ -351,19 +351,29 @@ impl Driver {
         if !(1..=moochy_proto::msg::MAX_ATTEMPTS).contains(&attempt) {
             return retry_fail("bad_envelope", "attempt out of range");
         }
+        if let Some(prev) = &self.acc {
+            log("warn", "acceptance replaced", &json!({"task": self.task_text, "old": prev.attempt, "new": attempt, "same_r": prev.r == r}));
+        }
         let Ok(opener) = ResponseOpener::new(&self.ck, &r, &self.task, &dev, attempt) else { return retry_fail("internal", "opener") };
         self.acc = Some(Accepted { attempt, worker: w.clone(), r, opener });
         Step::Continue
     }
 
     async fn on_chunk(&mut self, c: pb::Chunk) -> Step {
-        let Some(a) = &mut self.acc else { return Step::Continue };
+        let Some(a) = &mut self.acc else {
+            log("warn", "chunk before acceptance dropped", &json!({"task": self.task_text, "attempt": c.attempt, "seq": c.seq}));
+            return Step::Continue;
+        };
         if c.attempt != u32::from(a.attempt) {
             return if self.started { retry_fail("bad_envelope", "frames from another attempt") } else { Step::Continue };
         }
         let seq = c.seq;
-        let Ok(pt) = a.opener.open(crate::pb::to_proto(c)) else {
-            return retry_fail("bad_envelope", "response failed authentication; retry");
+        let pt = match a.opener.open(crate::pb::to_proto(c)) {
+            Ok(pt) => pt,
+            Err(e) => {
+                let why = format!("response failed authentication ({e:?} at seq {seq}); retry");
+                return retry_fail("bad_envelope", &why);
+            }
         };
         if self.hashes.len() >= 4096 {
             self.hashes.pop_front();
