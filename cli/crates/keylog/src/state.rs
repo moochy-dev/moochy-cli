@@ -250,8 +250,15 @@ impl State {
                 self.check_signer(signer, &owner, e, check_sigs)?;
                 let member = matches!(e.kind, Kind::MemberAdded | Kind::MemberRemoved);
                 let r = self.repos.get_mut(repo_id).ok_or(Code::Unclaimed)?;
-                let grants = if member { &mut r.members } else { &mut r.donors };
-                if grants.get(subject).is_some_and(|g| issued_at_ms <= g.issued) {
+                let grants = if member {
+                    &mut r.members
+                } else {
+                    &mut r.donors
+                };
+                if grants
+                    .get(subject)
+                    .is_some_and(|g| issued_at_ms <= g.issued)
+                {
                     return Err(Code::Replay);
                 }
                 let active = matches!(e.kind, Kind::DonorApproved | Kind::MemberAdded);
@@ -274,11 +281,19 @@ impl State {
                 self.catalogs.insert(version, *sha256);
             }
             Body::Moderation { .. } => {}
-            Body::OwnerKey { pseudonym, owner_pub, prev, .. } => {
+            Body::OwnerKey {
+                pseudonym,
+                owner_pub,
+                prev,
+                ..
+            } => {
                 if self.pubs.contains_key(owner_pub) {
                     return Err(Code::DupKey);
                 }
-                let cur = self.owner_of.get(pseudonym).and_then(|id| self.owners.get(id));
+                let cur = self
+                    .owner_of
+                    .get(pseudonym)
+                    .and_then(|id| self.owners.get(id));
                 match (cur, prev) {
                     (None, Some(_)) => return Err(Code::UnknownOwnerKey),
                     (Some(c), p) if p != Some(&c.owner_pub) => return Err(Code::OwnerKeyExists),
@@ -288,10 +303,10 @@ impl State {
                 if check_sigs && !verify(owner_pub, &msg, e.sig.get(..64).unwrap_or_default()) {
                     return Err(Code::BadPop);
                 }
-                if let (true, Some(p)) = (check_sigs, prev) {
-                    if !verify(p, &msg, e.sig.get(64..).unwrap_or_default()) {
-                        return Err(Code::BadSig);
-                    }
+                if let (true, Some(p)) = (check_sigs, prev)
+                    && !verify(p, &msg, e.sig.get(64..).unwrap_or_default())
+                {
+                    return Err(Code::BadSig);
                 }
                 let cur_id = cur.map(|c| c.id.clone());
                 let id = owner_key_id(owner_pub);
@@ -301,13 +316,27 @@ impl State {
                 }
                 self.owners.insert(
                     id.clone(),
-                    OwnerKeyInfo { id: id.clone(), pseudonym: pseudonym.to_owned(), owner_pub: *owner_pub, idx, revoked: false },
+                    OwnerKeyInfo {
+                        id: id.clone(),
+                        pseudonym: pseudonym.to_owned(),
+                        owner_pub: *owner_pub,
+                        idx,
+                        revoked: false,
+                    },
                 );
                 self.owner_of.insert(pseudonym.to_owned(), id);
             }
-            Body::OwnerRevoke { pseudonym, owner_pub, .. } => {
+            Body::OwnerRevoke {
+                pseudonym,
+                owner_pub,
+                ..
+            } => {
                 let id = owner_key_id(owner_pub);
-                let k = self.owners.get_mut(&id).filter(|k| k.pseudonym == pseudonym).ok_or(Code::UnknownOwnerKey)?;
+                let k = self
+                    .owners
+                    .get_mut(&id)
+                    .filter(|k| k.pseudonym == pseudonym)
+                    .ok_or(Code::UnknownOwnerKey)?;
                 if k.revoked {
                     return Err(Code::Revoked);
                 }
@@ -320,7 +349,13 @@ impl State {
         Ok(())
     }
 
-    fn check_signer(&self, key_id: &str, owner: &str, e: &Entry<'_>, check_sigs: bool) -> Result<(), Code> {
+    fn check_signer(
+        &self,
+        key_id: &str,
+        owner: &str,
+        e: &Entry<'_>,
+        check_sigs: bool,
+    ) -> Result<(), Code> {
         let k = self.owners.get(key_id).ok_or(Code::UnknownOwnerKey)?;
         if k.revoked {
             return Err(Code::Revoked);
@@ -343,7 +378,9 @@ impl State {
     /// The user's active owner key.
     #[must_use]
     pub fn active_owner_key(&self, pseudonym: &str) -> Option<&OwnerKeyInfo> {
-        self.owner_of.get(pseudonym).and_then(|id| self.owners.get(id))
+        self.owner_of
+            .get(pseudonym)
+            .and_then(|id| self.owners.get(id))
     }
 
     #[must_use]
@@ -409,7 +446,9 @@ impl State {
     pub fn gateway_allowed(&self, gateway: &str, repo_id: &str) -> Result<&Device, Code> {
         let (d, r) = self.usable(gateway, false, repo_id)?;
         if d.pseudonym == r.owner
-            || r.members.get(d.pseudonym.as_str()).is_some_and(|g| g.active)
+            || r.members
+                .get(d.pseudonym.as_str())
+                .is_some_and(|g| g.active)
         {
             Ok(d)
         } else {

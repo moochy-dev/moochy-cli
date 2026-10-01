@@ -247,7 +247,12 @@ fn mirror_monitor_and_fork() {
             .iter()
             .map(h32)
             .collect(),
-        known_owner_keys: mon["known_owner_keys"].as_array().unwrap().iter().map(h32).collect(),
+        known_owner_keys: mon["known_owner_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(h32)
+            .collect(),
     };
 
     let mut m = Mirror::new(origin, key.clone());
@@ -359,23 +364,54 @@ fn cosignature_vectors() {
             Err(e) => assert_eq!((want, e), (0, Error::BadSig), "{}", case["name"]),
         }
     }
-    assert!(moochy_keylog::cosig::CosignerKey::parse(&c["log_vkey"].as_str().unwrap()).is_err(), "alg 0x01 key is not a cosigner key");
+    assert!(
+        moochy_keylog::cosig::CosignerKey::parse(c["log_vkey"].as_str().unwrap()).is_err(),
+        "alg 0x01 key is not a cosigner key"
+    );
 }
 
 #[test]
 fn receipt_log_vectors() {
     let r = load("receipts.json");
     let key = NoteKey::parse(r["vkey"].as_str().unwrap()).unwrap();
-    let cp = open_checkpoint(r["checkpoint"].as_str().unwrap().as_bytes(), r["origin"].as_str().unwrap(), &key).unwrap();
-    let receipts: Vec<Vec<u8>> = r["receipts_hex"].as_array().unwrap().iter().map(|x| unhex(x.as_str().unwrap())).collect();
+    let cp = open_checkpoint(
+        r["checkpoint"].as_str().unwrap().as_bytes(),
+        r["origin"].as_str().unwrap(),
+        &key,
+    )
+    .unwrap();
+    let receipts: Vec<Vec<u8>> = r["receipts_hex"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| unhex(x.as_str().unwrap()))
+        .collect();
     for (i, rc) in receipts.iter().enumerate() {
-        assert_eq!(moochy_keylog::receipts::leaf(rc).to_vec(), unhex(r["leaf_hashes"][i].as_str().unwrap()));
+        assert_eq!(
+            moochy_keylog::receipts::leaf(rc).to_vec(),
+            unhex(r["leaf_hashes"][i].as_str().unwrap())
+        );
     }
     for p in r["inclusion"].as_array().unwrap() {
         let i = p["index"].as_u64().unwrap();
         let proof: Vec<Hash> = p["proof"].as_array().unwrap().iter().map(h32).collect();
-        assert!(moochy_keylog::receipts::verify(&receipts[i as usize], i, &cp, &proof));
-        assert!(!moochy_keylog::receipts::verify(&receipts[(i as usize + 1) % 5], i, &cp, &proof));
-        assert!(!moochy_keylog::receipts::verify(b"forged receipt", i, &cp, &proof));
+        assert!(moochy_keylog::receipts::verify(
+            &receipts[i as usize],
+            i,
+            &cp,
+            &proof
+        ));
+        assert!(!moochy_keylog::receipts::verify(
+            &receipts[(i as usize + 1) % 5],
+            i,
+            &cp,
+            &proof
+        ));
+        assert!(!moochy_keylog::receipts::verify(
+            b"forged receipt",
+            i,
+            &cp,
+            &proof
+        ));
     }
 }

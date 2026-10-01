@@ -208,6 +208,7 @@ impl Mirror {
         Ok(alerts)
     }
 
+    #[allow(clippy::too_many_lines)] // one flat arm per monitor rule
     fn push(&mut self, rec: &[u8], check_sigs: bool, alerts: &mut Vec<Alert>) -> Result<(), Error> {
         if rec.len() > MAX_RECORD {
             return Err(Error::TooLarge);
@@ -241,14 +242,38 @@ impl Mirror {
                 .is_some_and(|k| me.knows_owner(&k.owner_pub))
         };
         match e.body {
-            Body::OwnerKey { pseudonym, owner_pub, .. } if pseudonym == me.pseudonym && !me.knows_owner(owner_pub) => {
-                alerts.push(Alert::UnknownOwnerKey { idx, owner_key: crate::entry::owner_key_id(owner_pub) });
+            Body::OwnerKey {
+                pseudonym,
+                owner_pub,
+                ..
+            } if pseudonym == me.pseudonym && !me.knows_owner(owner_pub) => {
+                alerts.push(Alert::UnknownOwnerKey {
+                    idx,
+                    owner_key: crate::entry::owner_key_id(owner_pub),
+                });
             }
-            Body::OwnerKey { pseudonym, owner_pub, .. } if pseudonym != me.pseudonym && (me.knows_owner(owner_pub) || me.knows(owner_pub)) => {
-                alerts.push(Alert::KeyHijack { idx, device_id: crate::entry::owner_key_id(owner_pub), pseudonym: pseudonym.to_owned() });
+            Body::OwnerKey {
+                pseudonym,
+                owner_pub,
+                ..
+            } if pseudonym != me.pseudonym
+                && (me.knows_owner(owner_pub) || me.knows(owner_pub)) =>
+            {
+                alerts.push(Alert::KeyHijack {
+                    idx,
+                    device_id: crate::entry::owner_key_id(owner_pub),
+                    pseudonym: pseudonym.to_owned(),
+                });
             }
-            Body::OwnerRevoke { pseudonym, owner_pub, .. } if pseudonym == me.pseudonym => {
-                alerts.push(Alert::OwnerKeyRevoked { idx, owner_key: crate::entry::owner_key_id(owner_pub) });
+            Body::OwnerRevoke {
+                pseudonym,
+                owner_pub,
+                ..
+            } if pseudonym == me.pseudonym => {
+                alerts.push(Alert::OwnerKeyRevoked {
+                    idx,
+                    owner_key: crate::entry::owner_key_id(owner_pub),
+                });
             }
             Body::Key {
                 device_id,

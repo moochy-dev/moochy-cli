@@ -290,10 +290,10 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
         return Err(Error::Format("sig length"));
     }
     let body_p = parse_body(kind, body)?;
-    if let Body::OwnerKey { prev, .. } = body_p {
-        if prev.is_some() != (sig.len() == 128) {
-            return Err(Error::Format("OWNER_KEY_ADDED sig count"));
-        }
+    if let Body::OwnerKey { prev, .. } = body_p
+        && prev.is_some() != (sig.len() == 128)
+    {
+        return Err(Error::Format("OWNER_KEY_ADDED sig count"));
     }
     Ok(Entry {
         kind,
@@ -415,7 +415,9 @@ fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
         Kind::OwnerKeyAdded => {
             let [p, k, prev, t] = unlp::<4>(b)?;
             let (p, t) = (s(p)?, u64_of(t)?);
-            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else { return Err(bad) };
+            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else {
+                return Err(bad);
+            };
             let prev = match prev.len() {
                 0 => None,
                 _ => Some(<&[u8; 32]>::try_from(prev).map_err(|_| bad.clone())?),
@@ -423,16 +425,27 @@ fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
             if !is_pseudonym(p) || t == 0 || prev == Some(owner_pub) {
                 return Err(bad);
             }
-            Body::OwnerKey { pseudonym: p, owner_pub, prev, issued_at_ms: t }
+            Body::OwnerKey {
+                pseudonym: p,
+                owner_pub,
+                prev,
+                issued_at_ms: t,
+            }
         }
         Kind::OwnerKeyRevoked => {
             let [p, k, r] = unlp::<3>(b)?;
             let (p, r) = (s(p)?, s(r)?);
-            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else { return Err(bad) };
+            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else {
+                return Err(bad);
+            };
             if !is_pseudonym(p) || !is_token(r, 32) {
                 return Err(bad);
             }
-            Body::OwnerRevoke { pseudonym: p, owner_pub, reason: r }
+            Body::OwnerRevoke {
+                pseudonym: p,
+                owner_pub,
+                reason: r,
+            }
         }
     })
 }
@@ -445,8 +458,12 @@ pub fn owner_key_id(owner_pub: &[u8; 32]) -> String {
     let mut out = String::with_capacity(35);
     out.push_str("ok_");
     for b in d.iter().take(16) {
-        out.push(char::from(HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0')));
-        out.push(char::from(HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0')));
+        out.push(char::from(
+            HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
+        ));
+        out.push(char::from(
+            HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'),
+        ));
     }
     out
 }
@@ -461,8 +478,18 @@ fn is_owner_key_id(s: &str) -> bool {
 /// OWNER_KEY_ADDED body (the user's foreground CLI builds and signs it; on rotation
 /// with both keys: `sig = new.sign(m) ‖ prev.sign(m)`, `m = sig_message(OwnerKeyAdded, body)`).
 #[must_use]
-pub fn owner_key_body(pseudonym: &str, owner_pub: &[u8; 32], prev: Option<&[u8; 32]>, issued_at_ms: u64) -> Vec<u8> {
-    lp(&[pseudonym.as_bytes(), owner_pub, prev.map_or(&[][..], |p| &p[..]), &issued_at_ms.to_be_bytes()])
+pub fn owner_key_body(
+    pseudonym: &str,
+    owner_pub: &[u8; 32],
+    prev: Option<&[u8; 32]>,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    lp(&[
+        pseudonym.as_bytes(),
+        owner_pub,
+        prev.map_or(&[][..], |p| &p[..]),
+        &issued_at_ms.to_be_bytes(),
+    ])
 }
 
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";

@@ -88,7 +88,9 @@ pub struct Checkpoint {
 /// A parsed signed note: the text (ending in '\n') and its signature lines as
 /// (key name, decoded base64 payload). Valid UTF-8, no control characters except
 /// '\n', ≤ [`MAX_NOTE`] bytes, ≤ 100 signature lines.
-pub(crate) fn split(note: &[u8]) -> Result<(&str, Vec<(&str, Vec<u8>)>), Error> {
+pub(crate) type SigLines<'a> = Vec<(&'a str, Vec<u8>)>;
+
+pub(crate) fn split(note: &[u8]) -> Result<(&str, SigLines<'_>), Error> {
     if note.len() > MAX_NOTE {
         return Err(Error::TooLarge);
     }

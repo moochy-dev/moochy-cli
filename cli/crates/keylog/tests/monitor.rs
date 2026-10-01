@@ -5,7 +5,10 @@
     clippy::panic,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::unused_async_trait_impl,
+    clippy::many_single_char_names,
+    clippy::unnested_or_patterns
 )]
 
 use moochy_keylog::{
@@ -21,27 +24,26 @@ use std::{
     future::Future,
     path::Path,
     pin::pin,
-    sync::Arc,
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll, Waker},
 };
 
 fn load(name: &str) -> Value {
-    let p = format!("{}/../../../spec/vectors/keylog/{name}", env!("CARGO_MANIFEST_DIR"));
+    let p = format!(
+        "{}/../../../spec/vectors/keylog/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
     serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
-// Minimal std-only executor: the futures here never wait on I/O.
-struct Noop;
-impl Wake for Noop {
-    fn wake(self: Arc<Self>) {}
-}
 fn block_on<F: Future>(f: F) -> F::Output {
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut f = pin!(f);
     loop {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
@@ -65,7 +67,12 @@ impl LogLink for FakeLink {
             for w in 1..=TILE_WIDTH {
                 if tile_path(None, n, w) == path {
                     let mut out = Vec::new();
-                    for r in self.records.iter().skip((n * TILE_WIDTH) as usize).take(w as usize) {
+                    for r in self
+                        .records
+                        .iter()
+                        .skip((n * TILE_WIDTH) as usize)
+                        .take(w as usize)
+                    {
                         out.extend_from_slice(&(r.len() as u16).to_be_bytes());
                         out.extend_from_slice(r);
                     }
@@ -96,13 +103,34 @@ struct Fx {
 }
 
 fn fx() -> Fx {
-    let (e, t, c, w) = (load("entries.json"), load("tree.json"), load("checkpoint.json"), load("cosignatures.json"));
-    let mut records: Vec<Vec<u8>> = e["entries"].as_array().unwrap().iter().map(|x| unhex(x["record_hex"].as_str().unwrap())).collect();
-    records.extend(t["filler_records_hex"].as_array().unwrap().iter().map(|x| unhex(x.as_str().unwrap())));
+    let (e, t, c, w) = (
+        load("entries.json"),
+        load("tree.json"),
+        load("checkpoint.json"),
+        load("cosignatures.json"),
+    );
+    let mut records: Vec<Vec<u8>> = e["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| unhex(x["record_hex"].as_str().unwrap()))
+        .collect();
+    records.extend(
+        t["filler_records_hex"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| unhex(x.as_str().unwrap())),
+    );
     let s = |v: &Value| v.as_str().unwrap().as_bytes().to_vec();
     let m = &e["monitor"];
     Fx {
-        link: FakeLink { records, notes: VecDeque::new(), anchor: None, fetched: Vec::new() },
+        link: FakeLink {
+            records,
+            notes: VecDeque::new(),
+            anchor: None,
+            fetched: Vec::new(),
+        },
         n23: s(&c["valid"][0]["note"]),
         n300: s(&c["valid"][1]["note"]),
         fork23: s(&c["fork"]["note"]),
@@ -111,10 +139,25 @@ fn fx() -> Fx {
         key: NoteKey::parse(c["vkey"].as_str().unwrap()).unwrap(),
         me: Me {
             pseudonym: m["me"].as_str().unwrap().to_owned(),
-            known_keys: m["known_keys"].as_array().unwrap().iter().map(|k| unhex(k.as_str().unwrap()).try_into().unwrap()).collect(),
-            known_owner_keys: m["known_owner_keys"].as_array().unwrap().iter().map(|k| unhex(k.as_str().unwrap()).try_into().unwrap()).collect(),
+            known_keys: m["known_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| unhex(k.as_str().unwrap()).try_into().unwrap())
+                .collect(),
+            known_owner_keys: m["known_owner_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| unhex(k.as_str().unwrap()).try_into().unwrap())
+                .collect(),
         },
-        witnesses: w["witnesses"].as_array().unwrap().iter().map(|k| CosignerKey::parse(k.as_str().unwrap()).unwrap()).collect(),
+        witnesses: w["witnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| CosignerKey::parse(k.as_str().unwrap()).unwrap())
+            .collect(),
     }
 }
 
@@ -142,7 +185,9 @@ fn run_sync_alerts_persist_stale_fork() {
     let dir = tmpdir("run");
     let mut m = monitor(&f, Some(&dir), 0);
     let view = m.view();
-    f.link.notes.extend([f.n23.clone(), f.n300.clone(), f.n23.clone()]);
+    f.link
+        .notes
+        .extend([f.n23.clone(), f.n300.clone(), f.n23.clone()]);
     f.link.anchor = Some(f.n23.clone());
     let mut events = Vec::new();
     block_on(m.run(&mut f.link, |e| events.push(e.clone())));
@@ -150,19 +195,41 @@ fn run_sync_alerts_persist_stale_fork() {
     let msgs: Vec<String> = events.iter().map(Event::message).collect();
     let all = msgs.join("\n");
     assert!(matches!(events[0], Event::Synced { size: 27 }), "{all}");
-    for needle in ["unknown_key", "unsigned DONOR_APPROVED for your repo", "unsigned or invalid MEMBER_ADDED", "public Git anchor at 27 is consistent", "stale checkpoint", "unknown_owner_key", "your owner key ok_"] {
+    for needle in [
+        "unknown_key",
+        "unsigned DONOR_APPROVED for your repo",
+        "unsigned or invalid MEMBER_ADDED",
+        "public Git anchor at 27 is consistent",
+        "stale checkpoint",
+        "unknown_owner_key",
+        "your owner key ok_",
+    ] {
         assert!(all.contains(needle), "missing {needle:?} in:\n{all}");
     }
     assert!(events.contains(&Event::Synced { size: 300 }));
-    assert!(events.contains(&Event::Stale { served: 27, mirrored: 300 }));
+    assert!(events.contains(&Event::Stale {
+        served: 27,
+        mirrored: 300
+    }));
     assert!(events.iter().filter(|e| e.is_security()).count() >= 12);
     // Incremental: 27 → 300 fetched bundle 0 (partial then full) and bundle 1 partial.
-    assert_eq!(f.link.fetched, vec!["tile/entries/000.p/27", "tile/entries/000", "tile/entries/001.p/44"]);
+    assert_eq!(
+        f.link.fetched,
+        vec![
+            "tile/entries/000.p/27",
+            "tile/entries/000",
+            "tile/entries/001.p/44"
+        ]
+    );
 
     // The view answers from the verified state (same as the vectors' queries).
     let q = &load("entries.json")["queries"];
     for x in q.as_array().unwrap() {
-        let (d, r, want) = (x["device"].as_str().unwrap(), x["repo"].as_str().unwrap(), x["code"].as_str().unwrap());
+        let (d, r, want) = (
+            x["device"].as_str().unwrap(),
+            x["repo"].as_str().unwrap(),
+            x["code"].as_str().unwrap(),
+        );
         let got = if x["q"] == "sealable" {
             view.sealable(d, r).err().map_or("", Code::as_str)
         } else {
@@ -175,7 +242,15 @@ fn run_sync_alerts_persist_stale_fork() {
     drop(m);
     let m2 = monitor(&f, Some(&dir), 0);
     assert_eq!(m2.view().size(), 300);
-    assert_eq!(m2.view().sealable(q[1]["device"].as_str().unwrap(), q[1]["repo"].as_str().unwrap()).is_ok(), q[1]["code"] == "");
+    assert_eq!(
+        m2.view()
+            .sealable(
+                q[1]["device"].as_str().unwrap(),
+                q[1]["repo"].as_str().unwrap()
+            )
+            .is_ok(),
+        q[1]["code"] == ""
+    );
 
     // A forked checkpoint: fork event, the view fails closed, and it stays so after a restart.
     let mut m3 = m2;
@@ -195,7 +270,13 @@ fn fork_vs_anchor_and_rollback() {
     let mut m = monitor(&f, None, 0);
     block_on(m.on_checkpoint(&mut f.link, &f.n23));
     // The relay serves 23, the public anchor already has 300: rollback / withholding.
-    assert_eq!(m.on_anchor(&f.n300), vec![Event::Rollback { anchored: 300, served: 27 }]);
+    assert_eq!(
+        m.on_anchor(&f.n300),
+        vec![Event::Rollback {
+            anchored: 300,
+            served: 27
+        }]
+    );
     // An anchor with another root at 23: fork.
     assert!(matches!(&m.on_anchor(&f.fork23)[..], [Event::Fork { .. }]));
     assert!(m.view().forked());
@@ -210,12 +291,24 @@ fn witness_threshold() {
     let mut f = fx();
     let mut m = monitor(&f, None, 2);
     let ev = block_on(m.on_checkpoint(&mut f.link, &f.n300));
-    assert_eq!(ev, vec![Event::Unwitnessed { size: 300, cosignatures: 0 }]);
+    assert_eq!(
+        ev,
+        vec![Event::Unwitnessed {
+            size: 300,
+            cosignatures: 0
+        }]
+    );
     assert_eq!(m.view().size(), 0);
     let ev = block_on(m.on_checkpoint(&mut f.link, &f.cosigned300));
     assert!(ev.contains(&Event::Synced { size: 300 }), "{ev:?}");
     let mut m3 = monitor(&f, None, 3);
-    assert_eq!(block_on(m3.on_checkpoint(&mut f.link, &f.cosigned300)), vec![Event::Unwitnessed { size: 300, cosignatures: 2 }]);
+    assert_eq!(
+        block_on(m3.on_checkpoint(&mut f.link, &f.cosigned300)),
+        vec![Event::Unwitnessed {
+            size: 300,
+            cosignatures: 2
+        }]
+    );
 }
 
 #[test]
@@ -237,13 +330,23 @@ fn hostile_link() {
     for mode in 0..3 {
         let mut m = monitor(&f, None, 0);
         let ev = block_on(m.on_checkpoint(&mut Evil(mode), &f.n23));
-        assert!(matches!(&ev[..], [Event::Error(_)] | [Event::Fork { .. }]), "{mode}: {ev:?}");
+        assert!(
+            matches!(&ev[..], [Event::Error(_)] | [Event::Fork { .. }]),
+            "{mode}: {ev:?}"
+        );
         assert_eq!(m.view().size(), 0);
     }
     // A note signed by another key is refused.
     let mut m = monitor(&f, None, 0);
-    let bad = load("checkpoint.json")["invalid"]["other key only"].as_str().unwrap().as_bytes().to_vec();
-    assert!(matches!(&block_on(m.on_checkpoint(&mut Evil(2), &bad))[..], [Event::Error(_)]));
+    let bad = load("checkpoint.json")["invalid"]["other key only"]
+        .as_str()
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    assert!(matches!(
+        &block_on(m.on_checkpoint(&mut Evil(2), &bad))[..],
+        [Event::Error(_)]
+    ));
 }
 
 // The monitor future must be Send (the Node spawns it on a multi-threaded runtime).
@@ -262,7 +365,12 @@ fn sealing_gate() {
     let v = m.view();
     let q = &load("entries.json")["queries"];
     // The donor that the vectors' state can seal to (approval by the rogue owner key).
-    let ok = q.as_array().unwrap().iter().find(|x| x["q"] == "sealable" && x["code"] == "").unwrap();
+    let ok = q
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["q"] == "sealable" && x["code"] == "")
+        .unwrap();
     let (w, r) = (ok["device"].as_str().unwrap(), ok["repo"].as_str().unwrap());
     let ai = ok["approval_idx"].as_u64().unwrap();
     assert_eq!(v.gate(), Gate::NoCheckpoint);
@@ -271,12 +379,21 @@ fn sealing_gate() {
     assert_eq!(v.gate(), Gate::Verified { size: 27 });
     let s = v.state(|st| st.sealable(w, r)).unwrap().unwrap();
     assert_eq!(v.seal_check(w, r, s.key_idx, ai), Ok(s));
-    assert_eq!(v.seal_check(w, r, s.key_idx, ai - 1), Err(Code::IndexMismatch));
-    assert_eq!(v.seal_check(w, r, s.key_idx + 1, ai), Err(Code::IndexMismatch));
+    assert_eq!(
+        v.seal_check(w, r, s.key_idx, ai - 1),
+        Err(Code::IndexMismatch)
+    );
+    assert_eq!(
+        v.seal_check(w, r, s.key_idx + 1, ai),
+        Err(Code::IndexMismatch)
+    );
     // Old confirmation: stale; a fresh one reopens the gate.
     let later = Instant::now() + MAX_LOG_AGE + Duration::from_secs(1);
     assert_eq!(v.gate_at(later), Gate::Stale { size: 27 });
-    assert_eq!(v.seal_check_at(later, w, r, s.key_idx, ai), Err(Code::StaleLog));
+    assert_eq!(
+        v.seal_check_at(later, w, r, s.key_idx, ai),
+        Err(Code::StaleLog)
+    );
     block_on(m.on_checkpoint(&mut f.link, &f.n300));
     assert_eq!(v.gate(), Gate::Verified { size: 300 });
     // An older checkpoint closes the gate until a newer consistent one.
@@ -293,7 +410,10 @@ fn sealing_gate() {
     }
     let per = t.elapsed() / n;
     eprintln!("seal_check: {per:?} per call");
-    assert!(per < Duration::from_micros(20), "seal_check too slow: {per:?}");
+    assert!(
+        per < Duration::from_micros(20),
+        "seal_check too slow: {per:?}"
+    );
 
     // Fork: closed for good.
     block_on(m.on_checkpoint(&mut f.link, &f.fork23));

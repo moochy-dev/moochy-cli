@@ -83,7 +83,10 @@ impl Event {
     /// Security events must be shown to the user, not only logged.
     #[must_use]
     pub fn is_security(&self) -> bool {
-        !matches!(self, Self::Synced { .. } | Self::AnchorConsistent { .. } | Self::Error(_))
+        !matches!(
+            self,
+            Self::Synced { .. } | Self::AnchorConsistent { .. } | Self::Error(_)
+        )
     }
 
     /// One log line. Contains stable keywords (`unknown_key`, `rogue`, `unsigned`,
@@ -95,17 +98,27 @@ impl Event {
             Self::Synced { size } => format!("keylog: synced, {size} entries verified"),
             Self::Alert(a) => alert_message(a),
             Self::Fork { size, detail } => {
-                format!("keylog: SECURITY: log fork detected at tree size {size} ({detail}); the relay showed a rewritten history; key-log decisions are refused until resolved")
+                format!(
+                    "keylog: SECURITY: log fork detected at tree size {size} ({detail}); the relay showed a rewritten history; key-log decisions are refused until resolved"
+                )
             }
             Self::Stale { served, mirrored } => {
-                format!("keylog: SECURITY: stale checkpoint: relay served tree size {served} after {mirrored} (rollback or freeze)")
+                format!(
+                    "keylog: SECURITY: stale checkpoint: relay served tree size {served} after {mirrored} (rollback or freeze)"
+                )
             }
             Self::Rollback { anchored, served } => {
-                format!("keylog: SECURITY: rollback: the public Git anchor has tree size {anchored} but the relay serves {served}")
+                format!(
+                    "keylog: SECURITY: rollback: the public Git anchor has tree size {anchored} but the relay serves {served}"
+                )
             }
-            Self::AnchorConsistent { size } => format!("keylog: public Git anchor at {size} is consistent"),
+            Self::AnchorConsistent { size } => {
+                format!("keylog: public Git anchor at {size} is consistent")
+            }
             Self::Unwitnessed { size, cosignatures } => {
-                format!("keylog: SECURITY: checkpoint {size} has {cosignatures} witness cosignatures, below the required threshold; not applied")
+                format!(
+                    "keylog: SECURITY: checkpoint {size} has {cosignatures} witness cosignatures, below the required threshold; not applied"
+                )
             }
             Self::Error(e) => format!("keylog: {e}"),
         }
@@ -117,15 +130,30 @@ fn alert_message(a: &Alert) -> String {
         Alert::UnknownKey { idx, device_id } => format!(
             "keylog: SECURITY: unknown_key: a new device {device_id} was added to your account (log #{idx}) and it is not one of yours; if this wasn't you, run `moochy keys revoke {device_id}`"
         ),
-        Alert::KeyHijack { idx, device_id, pseudonym } => format!(
+        Alert::KeyHijack {
+            idx,
+            device_id,
+            pseudonym,
+        } => format!(
             "keylog: SECURITY: rogue key: your signing key was logged for device {device_id} of another account {pseudonym} (log #{idx})"
         ),
-        Alert::NotSignedByMe { idx, kind, repo_id, signer } => format!(
+        Alert::NotSignedByMe {
+            idx,
+            kind,
+            repo_id,
+            signer,
+        } => format!(
             "keylog: SECURITY: unsigned {} for your repo {repo_id}: signed by device {signer}, which is not one of your devices (log #{idx})",
             kind.name()
         ),
-        Alert::RepoClaimedByOther { idx, repo_id, owner } => {
-            format!("keylog: SECURITY: your repo {repo_id} was claimed by another account {owner} (log #{idx})")
+        Alert::RepoClaimedByOther {
+            idx,
+            repo_id,
+            owner,
+        } => {
+            format!(
+                "keylog: SECURITY: your repo {repo_id} was claimed by another account {owner} (log #{idx})"
+            )
         }
         Alert::Rejected { idx, kind, code } => format!(
             "keylog: SECURITY: unsigned or invalid {} at log #{idx} ({}): the relay appended an entry no valid signer made; it is ignored",
@@ -138,7 +166,9 @@ fn alert_message(a: &Alert) -> String {
         Alert::OwnerKeyRevoked { idx, owner_key } => format!(
             "keylog: SECURITY: your owner key {owner_key} was revoked (log #{idx}); if you did not ask for it, your account may be under takeover"
         ),
-        Alert::Invalid { idx } => format!("keylog: SECURITY: malformed entry at log #{idx}; it is ignored"),
+        Alert::Invalid { idx } => {
+            format!("keylog: SECURITY: malformed entry at log #{idx}; it is ignored")
+        }
     }
 }
 
@@ -206,12 +236,16 @@ impl View {
 
     #[must_use]
     pub fn gate_at(&self, now: Instant) -> Gate {
-        let Ok(g) = self.0.read() else { return Gate::Forked };
+        let Ok(g) = self.0.read() else {
+            return Gate::Forked;
+        };
         let size = g.mirror.size();
         match (&g.fork, g.confirmed_at) {
             (Some(_), _) => Gate::Forked,
             (None, None) => Gate::NoCheckpoint,
-            (None, Some(at)) if g.stale || now.saturating_duration_since(at) > MAX_LOG_AGE => Gate::Stale { size },
+            (None, Some(at)) if g.stale || now.saturating_duration_since(at) > MAX_LOG_AGE => {
+                Gate::Stale { size }
+            }
             (None, Some(_)) => Gate::Verified { size },
         }
     }
@@ -222,16 +256,37 @@ impl View {
     /// ones. Errors: `log_forked`, `no_checkpoint`, `stale_log`, `index_mismatch`, or a
     /// [`State::sealable`] denial. Only `--dev` may fall back to the relay's pool on
     /// `no_checkpoint`. Cost: one read lock + three hash lookups, no allocation.
-    pub fn seal_check(&self, worker: &str, repo: &str, key_log_index: u64, approval_log_index: u64) -> Result<Sealable, Code> {
-        self.seal_check_at(Instant::now(), worker, repo, key_log_index, approval_log_index)
+    pub fn seal_check(
+        &self,
+        worker: &str,
+        repo: &str,
+        key_log_index: u64,
+        approval_log_index: u64,
+    ) -> Result<Sealable, Code> {
+        self.seal_check_at(
+            Instant::now(),
+            worker,
+            repo,
+            key_log_index,
+            approval_log_index,
+        )
     }
 
-    pub fn seal_check_at(&self, now: Instant, worker: &str, repo: &str, key_log_index: u64, approval_log_index: u64) -> Result<Sealable, Code> {
+    pub fn seal_check_at(
+        &self,
+        now: Instant,
+        worker: &str,
+        repo: &str,
+        key_log_index: u64,
+        approval_log_index: u64,
+    ) -> Result<Sealable, Code> {
         let g = self.0.read().map_err(|_| Code::Unavailable)?;
         match (&g.fork, g.confirmed_at) {
             (Some(_), _) => return Err(Code::LogForked),
             (None, None) => return Err(Code::NoCheckpoint),
-            (None, Some(at)) if g.stale || now.saturating_duration_since(at) > MAX_LOG_AGE => return Err(Code::StaleLog),
+            (None, Some(at)) if g.stale || now.saturating_duration_since(at) > MAX_LOG_AGE => {
+                return Err(Code::StaleLog);
+            }
             _ => {}
         }
         let s = g.mirror.state().sealable(worker, repo)?;
@@ -250,7 +305,13 @@ impl View {
     /// Gateway, for each `PoolSync.workers[]` entry: the worker must be sealable AND
     /// the relay's `key_log_index` / `approval_log_index` must be exactly the mirrored
     /// ones (a relay pointing at someone else's approval gets `IndexMismatch`).
-    pub fn check_pool_worker(&self, worker: &str, repo: &str, key_log_index: u64, approval_log_index: u64) -> Result<Sealable, Code> {
+    pub fn check_pool_worker(
+        &self,
+        worker: &str,
+        repo: &str,
+        key_log_index: u64,
+        approval_log_index: u64,
+    ) -> Result<Sealable, Code> {
         let s = self.sealable(worker, repo)?;
         if s.key_idx != key_log_index || s.approval_idx != approval_log_index {
             return Err(Code::IndexMismatch);
@@ -292,7 +353,10 @@ impl Monitor {
         let mut fork = None;
         if let Some(dir) = &cfg.dir {
             fs::create_dir_all(dir).map_err(io_err)?;
-            if let (Ok(recs), Ok(note)) = (fs::read(dir.join("records")), fs::read(dir.join("checkpoint"))) {
+            if let (Ok(recs), Ok(note)) = (
+                fs::read(dir.join("records")),
+                fs::read(dir.join("checkpoint")),
+            ) {
                 let cp = mirror.open_checkpoint(&note)?;
                 let list = parse_records_file(&recs, cp.size)?;
                 mirror = Mirror::restore(&cfg.origin, cfg.key.clone(), list, &cp)?;
@@ -305,7 +369,12 @@ impl Monitor {
         let served = mirror.size();
         Ok(Self {
             cfg,
-            view: View(Arc::new(RwLock::new(Shared { mirror, fork, confirmed_at: None, stale: false }))),
+            view: View(Arc::new(RwLock::new(Shared {
+                mirror,
+                fork,
+                confirmed_at: None,
+                stale: false,
+            }))),
             served,
         })
     }
@@ -337,7 +406,9 @@ impl Monitor {
             return Vec::new();
         }
         let (cp, size) = {
-            let Ok(g) = self.view.0.read() else { return vec![Event::Error("mirror unavailable".into())] };
+            let Ok(g) = self.view.0.read() else {
+                return vec![Event::Error("mirror unavailable".into())];
+            };
             match g.mirror.open_checkpoint(note) {
                 Ok(cp) => (cp, g.mirror.size()),
                 Err(e) => return vec![Event::Error(format!("checkpoint refused: {e}"))],
@@ -346,7 +417,12 @@ impl Monitor {
         if self.cfg.min_cosignatures > 0 {
             match cosignatures(note, &self.cfg.witnesses) {
                 Ok(c) if c.len() >= self.cfg.min_cosignatures => {}
-                Ok(c) => return vec![Event::Unwitnessed { size: cp.size, cosignatures: c.len() }],
+                Ok(c) => {
+                    return vec![Event::Unwitnessed {
+                        size: cp.size,
+                        cosignatures: c.len(),
+                    }];
+                }
                 Err(e) => return vec![Event::Error(format!("bad cosignature: {e}"))],
             }
         }
@@ -357,9 +433,16 @@ impl Monitor {
                     if let Ok(mut g) = self.view.0.write() {
                         g.stale = true;
                     }
-                    vec![Event::Stale { served: cp.size, mirrored: size }]
+                    vec![Event::Stale {
+                        served: cp.size,
+                        mirrored: size,
+                    }]
                 }
-                Ok(_) => vec![self.fork(cp.size, "older checkpoint does not match the mirrored history", note)],
+                Ok(_) => vec![self.fork(
+                    cp.size,
+                    "older checkpoint does not match the mirrored history",
+                    note,
+                )],
                 Err(_) => vec![Event::Error("mirror unavailable".into())],
             };
         }
@@ -375,17 +458,21 @@ impl Monitor {
                 Ok(r) => r,
                 Err(e) => return vec![Event::Error(format!("tile {}: {e}", b.path()))],
             };
-            records.extend(recs.into_iter().skip(usize::try_from(b.skip).unwrap_or(usize::MAX)).map(<[u8]>::to_vec));
+            records.extend(
+                recs.into_iter()
+                    .skip(usize::try_from(b.skip).unwrap_or(usize::MAX))
+                    .map(<[u8]>::to_vec),
+            );
         }
-        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let slices: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
         let res = match self.view.0.write() {
             Ok(mut g) => {
-                let r = g.mirror.update(&cp, &refs);
-                if r.is_ok() {
+                let out = g.mirror.update(&cp, &slices);
+                if out.is_ok() {
                     g.confirmed_at = Some(Instant::now());
                     g.stale = false;
                 }
-                r
+                out
             }
             Err(_) => return vec![Event::Error("mirror unavailable".into())],
         };
@@ -401,7 +488,9 @@ impl Monitor {
                 ev.extend(alerts.into_iter().map(Event::Alert));
                 ev
             }
-            Err(Error::Fork { size }) => vec![self.fork(size, "checkpoint does not match the mirrored history", note)],
+            Err(Error::Fork { size }) => {
+                vec![self.fork(size, "checkpoint does not match the mirrored history", note)]
+            }
             Err(e) => vec![Event::Error(format!("sync: {e}"))],
         }
     }
@@ -409,14 +498,24 @@ impl Monitor {
     /// Compares the newest public Git-anchor checkpoint with the mirror.
     pub fn on_anchor(&mut self, note: &[u8]) -> Vec<Event> {
         let st = match self.view.0.read() {
-            Ok(g) => g.mirror.open_checkpoint(note).map(|cp| (cp, g.mirror.check(&cp))),
+            Ok(g) => g
+                .mirror
+                .open_checkpoint(note)
+                .map(|cp| (cp, g.mirror.check(&cp))),
             Err(_) => return vec![Event::Error("mirror unavailable".into())],
         };
         match st {
             Err(e) => vec![Event::Error(format!("anchor refused: {e}"))],
             Ok((cp, AnchorStatus::Consistent)) => vec![Event::AnchorConsistent { size: cp.size }],
-            Ok((cp, AnchorStatus::Fork)) => vec![self.fork(cp.size, "public Git anchor differs from the relay's history", note)],
-            Ok((cp, AnchorStatus::Behind)) => vec![Event::Rollback { anchored: cp.size, served: self.served }],
+            Ok((cp, AnchorStatus::Fork)) => vec![self.fork(
+                cp.size,
+                "public Git anchor differs from the relay's history",
+                note,
+            )],
+            Ok((cp, AnchorStatus::Behind)) => vec![Event::Rollback {
+                anchored: cp.size,
+                served: self.served,
+            }],
         }
     }
 
@@ -428,18 +527,31 @@ impl Monitor {
             // Keep the conflicting signed note: it is proof of relay misbehavior.
             let _ = fs::write(dir.join("fork-evidence"), evidence);
         }
-        Event::Fork { size, detail: detail.to_owned() }
+        Event::Fork {
+            size,
+            detail: detail.to_owned(),
+        }
     }
 
     /// Appends new records (u16-BE length-prefixed) then replaces the checkpoint note.
     /// A crash in between leaves extra records, which `open` ignores.
     fn persist(&self, records: &[Vec<u8>], note: &[u8]) -> Result<(), Error> {
-        let Some(dir) = &self.cfg.dir else { return Ok(()) };
+        let Some(dir) = &self.cfg.dir else {
+            return Ok(());
+        };
         if !records.is_empty() {
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(dir.join("records")).map_err(io_err)?;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("records"))
+                .map_err(io_err)?;
             let mut buf = Vec::new();
             for r in records {
-                buf.extend_from_slice(&u16::try_from(r.len()).map_err(|_| Error::TooLarge)?.to_be_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(r.len())
+                        .map_err(|_| Error::TooLarge)?
+                        .to_be_bytes(),
+                );
                 buf.extend_from_slice(r);
             }
             f.write_all(&buf).map_err(io_err)?;
@@ -456,7 +568,9 @@ fn parse_records_file(b: &[u8], n: u64) -> Result<Vec<&[u8]>, Error> {
     let mut out = Vec::new();
     let mut rest = b;
     while u64::try_from(out.len()).unwrap_or(u64::MAX) < n {
-        let (len, r) = rest.split_first_chunk::<2>().ok_or(Error::Format("records file truncated"))?;
+        let (len, r) = rest
+            .split_first_chunk::<2>()
+            .ok_or(Error::Format("records file truncated"))?;
         let len = usize::from(u16::from_be_bytes(*len));
         if len > r.len() {
             return Err(Error::Format("records file truncated"));

@@ -1,35 +1,84 @@
-//! `keylog-check`: sync a mirror from a relay's tile endpoints, run the monitor rules,
-//! and compare with the Git anchor. Used by the Go fork test (relay/internal/tlog) and
-//! handy for operators. Prints one JSON line; exit 0 = consistent, 1 = fork or rollback, 2 = error.
+//! `keylog-check`: one monitor round against a relay's tile endpoints (HTTP), with the
+//! same `Monitor` the Node runs over its gRPC link: sync + verify, monitor rules,
+//! persistence, Git-anchor comparison. Used by the Go E2E test in relay/internal/tlog
+//! and handy for operators. Prints one JSON line:
+//! `{"size","gate","events":[messages],"fork","rollback","stale"}`; exit 0 = no fork,
+//! rollback or stale checkpoint, 1 = one of those, 2 = usage.
 //!
 //! keylog-check --base URL --origin O --vkey VKEY [--anchor FILE] [--state DIR]
-//!              [--me PSEUDONYM --known HEX32[,HEX32…]]
+//!              [--me PSEUDONYM --known HEX32,… --known-owner HEX32,…]
+//!              [--witness VKEY --min-cosigs N]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::many_single_char_names,
-    clippy::cast_possible_truncation,
-    clippy::format_collect
+    clippy::unused_async_trait_impl
 )]
 
-use moochy_keylog::{AnchorStatus, Error, Me, Mirror, NoteKey, fetch::Fetcher};
+use moochy_keylog::{
+    Error, Event, LogLink, Me, Monitor, NoteKey,
+    cosig::CosignerKey,
+    fetch::Fetcher,
+    monitor::Config,
+    tiles::{MAX_BUNDLE_BYTES, MAX_CHECKPOINT_BYTES},
+};
 use serde_json::json;
-use std::{collections::HashMap, fs, path::Path, process::ExitCode, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::PathBuf,
+    pin::pin,
+    process::ExitCode,
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
 
-fn hex32(s: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex key");
-    }
-    out
+/// HTTP stand-in for the Node's gRPC link: one checkpoint, then the anchor file.
+struct HttpLink {
+    f: Fetcher,
+    once: bool,
+    anchor: Option<PathBuf>,
 }
 
-fn report(v: &serde_json::Value, code: u8) -> ExitCode {
-    println!("{v}");
-    ExitCode::from(code)
+impl LogLink for HttpLink {
+    async fn get_tile(&mut self, path: &str) -> Result<Vec<u8>, Error> {
+        self.f.get(path, MAX_BUNDLE_BYTES) // blocking: fine for a one-shot CLI
+    }
+    async fn next_checkpoint(&mut self) -> Option<Vec<u8>> {
+        if std::mem::replace(&mut self.once, false) {
+            self.f.get("checkpoint", MAX_CHECKPOINT_BYTES).ok()
+        } else {
+            None
+        }
+    }
+    async fn anchor(&mut self) -> Option<Vec<u8>> {
+        self.anchor.take().and_then(|p| std::fs::read(p).ok())
+    }
+}
+
+fn block_on<F: Future>(f: F) -> F::Output {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut f = pin!(f);
+    loop {
+        if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}
+
+fn hex32s(s: &str) -> Vec<[u8; 32]> {
+    s.split(',')
+        .filter(|k| !k.is_empty())
+        .map(|k| {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&k[2 * i..2 * i + 2], 16).expect("hex key");
+            }
+            out
+        })
+        .collect()
 }
 
 fn main() -> ExitCode {
@@ -40,86 +89,48 @@ fn main() -> ExitCode {
             a.insert(k.trim_start_matches("--").to_owned(), v.clone());
         }
     }
-    let need = |k: &str| a.get(k).cloned().unwrap_or_else(|| panic!("missing --{k}"));
-    let (base, origin) = (need("base"), need("origin"));
-    let key = NoteKey::parse(&need("vkey")).expect("vkey");
-
-    // Restore the persisted mirror (records file + checkpoint note), if any.
-    let state = a.get("state").map(Path::new);
-    let mut m = match state.and_then(|d| {
-        Some((
-            fs::read(d.join("records")).ok()?,
-            fs::read(d.join("checkpoint")).ok()?,
-        ))
-    }) {
-        Some((recs, note)) => {
-            let fresh = Mirror::new(&origin, key.clone());
-            let cp = fresh.open_checkpoint(&note).expect("stored checkpoint");
-            // records file: (u16_be(len) || record)*, the entry-bundle encoding.
-            let mut list = Vec::new();
-            let mut b = &recs[..];
-            while !b.is_empty() {
-                let n = u16::from_be_bytes([b[0], b[1]]) as usize;
-                list.push(&b[2..2 + n]);
-                b = &b[2 + n..];
-            }
-            Mirror::restore(&origin, key.clone(), list, &cp).expect("restore")
-        }
-        None => Mirror::new(&origin, key.clone()),
+    let (Some(base), Some(origin), Some(vkey)) = (a.get("base"), a.get("origin"), a.get("vkey"))
+    else {
+        eprintln!(
+            "usage: keylog-check --base URL --origin O --vkey VKEY [--anchor FILE] [--state DIR] [--me PS --known HEX,… --known-owner HEX,…] [--witness VKEY --min-cosigs N]"
+        );
+        return ExitCode::from(2);
     };
-    if let Some(ps) = a.get("me") {
-        let known = a
-            .get("known")
-            .map(|k| k.split(',').map(hex32).collect())
-            .unwrap_or_default();
-        m.set_me(Some(Me {
-            pseudonym: ps.clone(),
-            known_keys: known,
-        }));
-    }
-
-    let f = Fetcher::new(&base, Duration::from_secs(10)).expect("base url");
-    let synced = match f.sync(&mut m) {
-        Ok(v) => v,
-        Err(e @ Error::Fork { .. }) => {
-            return report(&json!({"fork": true, "error": e.to_string()}), 1);
-        }
-        Err(e) => return report(&json!({"error": e.to_string()}), 2),
+    let me = a.get("me").map(|ps| Me {
+        pseudonym: ps.clone(),
+        known_keys: a.get("known").map(|k| hex32s(k)).unwrap_or_default(),
+        known_owner_keys: a.get("known-owner").map(|k| hex32s(k)).unwrap_or_default(),
+    });
+    let cfg = Config {
+        origin: origin.clone(),
+        key: NoteKey::parse(vkey).expect("vkey"),
+        dir: a.get("state").map(PathBuf::from),
+        me,
+        witnesses: a
+            .get("witness")
+            .map(|w| vec![CosignerKey::parse(w).expect("witness vkey")])
+            .unwrap_or_default(),
+        min_cosignatures: a
+            .get("min-cosigs")
+            .map_or(0, |n| n.parse().expect("min-cosigs")),
     };
-
-    // Persist new records and the checkpoint.
-    if let Some(d) = state {
-        fs::create_dir_all(d).unwrap();
-        let mut recs = fs::read(d.join("records")).unwrap_or_default();
-        for r in &synced.records {
-            recs.extend_from_slice(&(r.len() as u16).to_be_bytes());
-            recs.extend_from_slice(r);
-        }
-        fs::write(d.join("records"), recs).unwrap();
-        fs::write(d.join("checkpoint"), &synced.note).unwrap();
-    }
-    let (cp, alerts) = (synced.checkpoint, synced.alerts);
-
-    let anchor = match a.get("anchor") {
-        None => "none",
-        Some(p) => match fs::read(p)
-            .map_err(|e| Error::Io(e.to_string()))
-            .and_then(|n| m.open_checkpoint(&n))
-        {
-            Err(e) => return report(&json!({"error": format!("anchor: {e}")}), 2),
-            Ok(acp) => match m.check(&acp) {
-                AnchorStatus::Consistent => "consistent",
-                AnchorStatus::Behind => "behind",
-                AnchorStatus::Fork => "fork",
-            },
-        },
+    let mut m = Monitor::open(cfg).expect("open monitor");
+    let mut link = HttpLink {
+        f: Fetcher::new(base, Duration::from_secs(10)).expect("base url"),
+        once: true,
+        anchor: a.get("anchor").map(PathBuf::from),
     };
-    let alerts: Vec<String> = alerts.iter().map(|x| format!("{x:?}")).collect();
-    let root: String = cp.root.iter().map(|b| format!("{b:02x}")).collect();
-    // "behind" after a full sync: the relay serves less than it published (rollback).
-    let bad = !matches!(anchor, "consistent" | "none");
-    report(
-        &json!({"size": cp.size, "root": root, "alerts": alerts, "anchor": anchor, "fork": anchor == "fork"}),
-        u8::from(bad),
-    )
+    let mut events: Vec<Event> = Vec::new();
+    block_on(m.run(&mut link, |e| events.push(e.clone())));
+    let has = |f: fn(&Event) -> bool| events.iter().any(f);
+    let fork = has(|e| matches!(e, Event::Fork { .. })) || m.view().forked();
+    let rollback = has(|e| matches!(e, Event::Rollback { .. }));
+    let stale = has(|e| matches!(e, Event::Stale { .. }));
+    let msgs: Vec<String> = events.iter().map(Event::message).collect();
+    let gate = format!("{:?}", m.view().gate());
+    println!(
+        "{}",
+        json!({"size": m.view().size(), "gate": gate, "events": msgs, "fork": fork, "rollback": rollback, "stale": stale})
+    );
+    ExitCode::from(u8::from(fork || rollback || stale))
 }
