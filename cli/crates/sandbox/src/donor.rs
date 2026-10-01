@@ -35,6 +35,11 @@ pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         return Ok(LockdownReport::default());
     }
 
+    // 0) Not dumpable: no core file / crash report holding provider keys, and
+    //    no same-uid ptrace of the donor (A200).
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| setup("PR_SET_DUMPABLE 0", e.into()))?;
+
     // 1) Landlock FS + network cage, applied to every thread. This also turns on
     //    no_new_privs (required before seccomp TSYNC below).
     let mut report = build_landlock(policy)?;
@@ -78,11 +83,12 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
 
     let created = ruleset.create().map_err(|e| ll("landlock create", e))?;
 
-    // rw on the state dir; ro on CA roots + whatever else the policy lists.
+    // rw on the state dir (no Execute: nothing there is ever run, even if a
+    // seccomp gap appeared); ro on CA roots + whatever else the policy lists.
     let created = created
         .add_rules(path_beneath_rules(
             [policy.state_dir.clone()],
-            AccessFs::from_all(abi),
+            AccessFs::from_all(abi) & !AccessFs::Execute,
         ))
         .map_err(|e| ll("landlock state rule", e))?;
     let created = created
@@ -116,6 +122,8 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
             .map_err(|e| ll("landlock bind gateway", e))?;
     }
 
+    // Counted before the cage closes: /proc is outside it afterwards.
+    let single_threaded = thread_count() == 1;
     let status = created
         .no_new_privs(true)
         .all_threads(true)
@@ -126,7 +134,7 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
     report.no_new_privs = status.no_new_privs;
     // Below ABI 8 the crate (best-effort) drops TSYNC: only this thread would be
     // caged. Fail closed if other threads exist.
-    report.all_threads = status.all_threads || thread_count() == 1;
+    report.all_threads = status.all_threads || single_threaded;
     if !report.all_threads {
         return Err(Error::Unsupported(
             "Landlock ABI < 8 cannot cage existing threads: call lockdown_self before \
@@ -213,21 +221,18 @@ where
         return 71;
     }
     let fd = sys::CHANNEL_FD;
-    // Tight rlimits: no new files, bounded memory, no core.
-    let lim = |res, v| {
-        let _ = setrlimit(
-            res,
-            Rlimit {
-                current: Some(v),
-                maximum: Some(v),
-            },
-        );
-    };
+    // Not dumpable: a crash never writes the decrypted request to a core file
+    // or a crash reporter (A200), and same-uid ptrace is refused.
+    if rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).is_err() {
+        return 71;
+    }
+    // Tight rlimits: no new files, bounded memory, no core. All or nothing.
+    let lim = |res, v| setrlimit(res, Rlimit { current: Some(v), maximum: Some(v) }).is_ok();
     // The socketpair end is already open; cap NOFILE low so the parser cannot
     // acquire many descriptors even before seccomp (defense in depth).
-    lim(Resource::Nofile, 16);
-    lim(Resource::Core, 0);
-    lim(Resource::As, 1 << 30); // 1 GiB
+    if !(lim(Resource::Nofile, 16) && lim(Resource::Core, 0) && lim(Resource::As, 1 << 30)) {
+        return 71;
+    }
 
     // Empty Landlock domain: handle every access but add no rules → no path is
     // reachable at all (the validator needs no filesystem).

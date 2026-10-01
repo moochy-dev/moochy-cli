@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 
 pub const MAX_API_BODY: usize = 32 << 20;
-pub const MAX_MCP_BODY: usize = 4 << 20;
+pub const MAX_MCP_BODY: usize = 8 << 20;
 const MAX_RESPONSE: usize = 16 << 20;
 const MAX_CONNS: usize = 512;
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -74,37 +74,71 @@ pub fn native_error(d: Dialect, f: &Failure) -> Resp {
 
 /// Accept loop. The listener is bound to loopback by the caller.
 pub async fn serve(node: Arc<Node>, listener: TcpListener) {
+    if let Err(e) = crate::run::init_key(&node.home.state_dir()) {
+        crate::util::log("error", "no run key: `moochy run` cannot get a sandboxed session", &json!({"error": e.msg}));
+    }
     let port = listener.local_addr().map_or(0, |a| a.port());
     let allowed: Arc<[String; 3]> = Arc::new([format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")]);
     let conns = Arc::new(Semaphore::new(MAX_CONNS));
+    // Same door on a 0600 Unix socket: `moochy run` bridges it into the sandbox's empty netns,
+    // where the agent reaches it as 127.0.0.1:<port> (same Host allowlist).
+    let unix = gateway_socket(&node);
     let mut shutdown = node.shutdown.subscribe();
     loop {
-        let (stream, peer) = tokio::select! {
-            r = listener.accept() => match r { Ok(x) => x, Err(_) => continue },
+        tokio::select! {
+            r = listener.accept() => {
+                let Ok((stream, peer)) = r else { continue };
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                let _ = stream.set_nodelay(true);
+                conn(&node, &allowed, &conns, stream);
+            }
+            r = async { unix.as_ref()?.accept().await.ok() }, if unix.is_some() => {
+                if let Some((stream, _)) = r {
+                    conn(&node, &allowed, &conns, stream);
+                }
+            }
             _ = shutdown.changed() => return,
-        };
-        if !peer.ip().is_loopback() {
-            continue;
         }
-        let Ok(permit) = conns.clone().try_acquire_owned() else { continue };
-        let _ = stream.set_nodelay(true);
-        let node = node.clone();
-        let allowed = allowed.clone();
-        tokio::spawn(async move {
-            let svc = hyper::service::service_fn(move |req| {
-                let node = node.clone();
-                let allowed = allowed.clone();
-                async move { Ok::<_, Infallible>(handle(node, &allowed, req).await) }
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(10))
-                .max_buf_size(64 * 1024)
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
-            drop(permit);
-        });
     }
+}
+
+/// `<state>/gateway.sock`, mode 0600 (the state dir is 0700 as well).
+pub fn gateway_socket_path(node: &Node) -> std::path::PathBuf {
+    node.home.state_dir().join("gateway.sock")
+}
+
+fn gateway_socket(node: &Node) -> Option<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let p = gateway_socket_path(node);
+    let _ = std::fs::remove_file(&p);
+    let l = tokio::net::UnixListener::bind(&p).ok()?;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok()?;
+    Some(l)
+}
+
+fn conn<S>(node: &Arc<Node>, allowed: &Arc<[String; 3]>, conns: &Arc<Semaphore>, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Ok(permit) = conns.clone().try_acquire_owned() else { return };
+    let node = node.clone();
+    let allowed = allowed.clone();
+    tokio::spawn(async move {
+        let svc = hyper::service::service_fn(move |req| {
+            let node = node.clone();
+            let allowed = allowed.clone();
+            async move { Ok::<_, Infallible>(handle(node, &allowed, req).await) }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(10))
+            .max_buf_size(64 * 1024)
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+        drop(permit);
+    });
 }
 
 fn token(h: &HeaderMap) -> Option<&str> {
@@ -144,8 +178,9 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         r.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
         return r;
     }
-    // 4. Repo-scoped local token.
-    let Some(slug) = token(req.headers()).and_then(|t| node.check_token(t)) else {
+    // 4. A live sandboxed run token (§15.4), else a repo-scoped local token.
+    let caller = token(req.headers()).and_then(|t| crate::run::check(t).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
+    let Some((slug, sandboxed)) = caller else {
         if path == "/mcp" {
             let mut r = json_resp(401, &json!({"error": "unauthorized"}));
             r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -153,15 +188,21 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         }
         return native_error(dialect, &Failure::new("unauthorized", false, "moochy: invalid local token (see `moochy env`)".to_owned()));
     };
+    // Tool calls are released only to sandboxed sessions or projects that opted in (§15.4).
+    let release = sandboxed || node.cfg.unsandboxed_tools_allowed(&slug);
     match (req.method(), path.as_str()) {
+        (&Method::POST, "/moochy/run") if !sandboxed => {
+            let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
+            crate::run::open(slug, key)
+        }
         (_, "/mcp") => crate::mcp::http(node, slug, req).await,
         (&Method::GET, "/v1/models") => {
             node.settle_pool(&slug, |p| !p.models().is_empty()).await;
             models(&node, &slug)
         }
-        (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false).await,
-        (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true).await,
-        (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false).await,
+        (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false, release).await,
+        (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true, release).await,
+        (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false, release).await,
         _ => native_error(dialect, &Failure::new("not_found", false, format!("moochy: no route for {path}"))),
     }
 }
@@ -248,7 +289,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
-    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx })
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false })
 }
 
 fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
@@ -272,7 +313,7 @@ fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::Catalo
     })
 }
 
-async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool) -> Resp {
+async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: bool) -> Resp {
     let t_rx = crate::task::now_us();
     let headers: Vec<(String, String)> = ["anthropic-version", "anthropic-beta"]
         .iter()
@@ -298,7 +339,7 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         };
     }
     let treq = match prepare(&node, slug, dialect, raw, headers, t_rx) {
-        Ok(t) => t,
+        Ok(t) => TaskReq { release_tools: release, ..t },
         Err(f) => return native_error(dialect, &f),
     };
     let stream = treq.facts.stream;

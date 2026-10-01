@@ -35,6 +35,10 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
+  run [--repo OWNER/NAME] [--worktree DIR] [--unsafe-no-sandbox] -- <command> [args]
+                                  Run your coding agent in a sandbox wired to Moochy: it sees only
+                                  this repository (secrets hidden) and reaches only Moochy. Tool
+                                  calls from donated tokens reach only sandboxed agents
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
@@ -42,7 +46,9 @@ COMMANDS:
   config set <KEY> <VALUE> | config show
                                   monthly_limit (dollars, e.g. 20), slots_max (1-64),
                                   gateway_addr, journal_full_text, auto_cache,
-                                  firewall_level (safety checks: strict or paranoid)
+                                  firewall_level (safety checks: strict or paranoid),
+                                  allow_unsandboxed_tools (owner/name list: tool calls reach
+                                  agents outside `moochy run`; warned at every start)
   connect <client> [--repo OWNER/NAME] [--write]
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
@@ -50,9 +56,10 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys and socket
   update --from-file BINARY       Install a signed release (unsigned files are refused)
   pending                         Requests waiting for your signature (maintainers)
-  approve <donor> --repo OWNER/NAME [--revoke] [--yes]
-                                  Accept a donor for your project (--revoke removes them)
-  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N] [--yes]
+  accept <donor> --repo OWNER/NAME [--revoke] [--yes]
+                                  Accept a donor for your project (--revoke removes them);
+                                  `approve` is the same command
+  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
   claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by this device
@@ -106,6 +113,7 @@ struct Opts {
     out: Option<PathBuf>,
     reason: Option<String>,
     from_file: Option<PathBuf>,
+    worktree: Option<PathBuf>,
     config: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
@@ -132,12 +140,14 @@ fn parse() -> Result<Opts> {
             Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-sandbox"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -168,6 +178,10 @@ fn run() -> Result<()> {
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     match w.as_slice() {
         ["login"] => {
+            // A175: a pinned CA replaces the public roots: development and tests only.
+            if o.ca_file.is_some() && !dev_mode() {
+                return Err(usage("--ca-file is only accepted with MOOCHY_INSECURE_DEV=1 (development and tests)"));
+            }
             let relay = o.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
             if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
                 // A135: a lookalike relay could harvest a login; only for development and tests.
@@ -208,6 +222,7 @@ fn run() -> Result<()> {
         }),
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
+        ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
         ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
@@ -224,6 +239,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        // VOICE.md: "accept a donor".
+        ["accept", donor] => owner_ops(&home, &o, &["approve", donor]),
         ["pending"] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             let r = c.pending(crate::pb::local::PendingRequest {}).await.map_err(|s| internal(clean(s.message()).into_owned()))?.into_inner();
@@ -307,7 +324,7 @@ fn slug_or_detect(o: &Opts) -> Result<String> {
 
 /// `owner/name` from the `origin` remote of the current git repository.
 fn detect_repo() -> Option<String> {
-    let out = std::process::Command::new("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
+    let out = crate::util::command("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
     let url = String::from_utf8(out.stdout).ok()?;
     let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let path = url.rsplit_once(':').map_or(url, |(_, p)| p);
@@ -316,6 +333,27 @@ fn detect_repo() -> Option<String> {
     let owner = parts.next()?;
     let slug = format!("{owner}/{name}");
     valid_slug(&slug).then_some(slug)
+}
+
+/// `moochy run -- <cmd…>` (CONTRACT §15.1). Fails closed until `moochy-sandbox` is in the build.
+fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
+    let slug = slug_or_detect(o)?;
+    let r = rt_small()?
+        .block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            c.env(EnvRequest { repo: slug.clone(), rotate: false }).await.map_err(|s| internal(clean(s.message()).into_owned()))
+        })?
+        .into_inner();
+    let cmd: Vec<String> = cmd.iter().map(|s| (*s).to_owned()).collect();
+    if o.has("unsafe-no-sandbox") {
+        let env = crate::run::gateway_env(&r.anthropic_base_url, &r.openai_base_url, &r.mcp_url, &r.token);
+        let st = crate::run::run_unsandboxed(&env, &cmd)?;
+        std::process::exit(st.code().unwrap_or(1));
+    }
+    let gw = crate::run::GatewayInfo { anthropic: r.anthropic_base_url, openai: r.openai_base_url, mcp: r.mcp_url, repo_token: r.token, state_dir: home.state_dir() };
+    let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
+    let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
+    std::process::exit(code);
 }
 
 fn env(home: &Home, o: &Opts) -> Result<()> {
@@ -489,6 +527,25 @@ fn doctor(home: &Home) -> Result<()> {
         line(false, "clock", "unknown: measured when the app connects".into());
     }
     line(true, "safety", format!("checks level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
+    // `moochy run` (§15.1): host support, and what the agent will not see (A163). Informational.
+    let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_ok_and(|v| v.trim() == "1");
+    if restricted {
+        println!("note sandbox   user namespaces are restricted (AppArmor): `moochy run` prints the one-line fix for this binary");
+    } else {
+        println!("ok   sandbox   `moochy run` can build its sandbox here");
+    }
+    println!("     hidden    {}", moochy_sandbox::mask::SECRET_PATTERNS.join(" "));
+    if let Some(root) = std::env::current_dir().ok().and_then(|d| crate::files::git_root(&d)) {
+        match moochy_sandbox::mask::collect(&root) {
+            Ok(v) => {
+                println!("     in this repo, hidden from the agent: {} path(s)", v.len());
+                for p in v.iter().take(50) {
+                    println!("       {}", clean(&p.to_string_lossy()));
+                }
+            }
+            Err(e) => println!("note masks     {}", clean(&e.to_string())),
+        }
+    }
     let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
     match std::fs::metadata(home.socket_path()) {
         Ok(m) => line(Some(m.uid()) == me && m.mode() & 0o777 == 0o600, "socket", format!("node.sock uid {} mode {:o}", m.uid(), m.mode() & 0o777)),
@@ -580,7 +637,7 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
 /// Is `path` tracked by git (in whatever repository contains it)?
 fn git_tracked(path: &std::path::Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
-    std::process::Command::new("git")
+    crate::util::command("git")
         .arg("-C")
         .arg(dir)
         .args(["ls-files", "--error-unmatch", "--"])
@@ -729,6 +786,10 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));
+    if let Some(p) = node.cfg.allow_unsandboxed_tools.as_deref() {
+        eprintln!("WARNING: tool calls from donated tokens reach agents outside `moochy run` for: {}. A donor's model can make such an agent run commands on this machine.", clean(p));
+        log("warn", "allow_unsandboxed_tools is set: tool calls reach unsandboxed clients", &json!({"projects": p}));
+    }
     tokio::spawn(crate::ctl::serve(node.clone(), sock, sock_path.clone()));
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));
@@ -778,9 +839,13 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     Ok(())
 }
 
+/// `moochy mcp`: the stdio shim. It runs on the client side (inside the agent's sandbox) and is
+/// the only place that reads repository files for `moochy_delegate` (CONTRACT §15.2).
 fn mcp(home: &Home, o: &Opts) -> Result<()> {
     let slug = slug_or_detect(o)?;
-    let cwd = std::env::current_dir().ctx("cwd")?.to_string_lossy().into_owned();
+    let cwd_path = std::env::current_dir().ctx("cwd")?;
+    let cwd = cwd_path.to_string_lossy().into_owned();
+    let mut scope = crate::files::Scope { root: crate::files::git_root(&cwd_path), client_roots: None };
     // The shim starts the node when none is running (07 §5); stdout stays the MCP channel.
     if rt_small()?.block_on(crate::ctl::connect(&home.socket_path())).is_err() {
         start_node(home, false)?;
@@ -789,25 +854,61 @@ fn mcp(home: &Home, o: &Opts) -> Result<()> {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<McpUp>(32);
         let _ = tx.send(McpUp { msg: Some(mcp_up::Msg::Open(McpOpen { repo: slug, cwd })) }).await;
+        // Both directions write stdout: node messages and the shim's own refusals.
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        let replies = out_tx.clone();
         tokio::spawn(async move {
+            use crate::mcp::{MAX_LINE, ShimLine, shim_line};
             let mut stdin = tokio::io::stdin();
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
             loop {
-                match stdin.read(&mut buf).await {
+                let n = match stdin.read(&mut chunk).await {
                     Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let data = buf.get(..n).unwrap_or_default().to_vec();
-                        if tx.send(McpUp { msg: Some(mcp_up::Msg::Data(data)) }).await.is_err() {
-                            return;
-                        }
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                while let Some(pos) = buf.iter().position(|c| *c == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = line.trim_ascii().to_vec();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    // File reads (and `git check-ignore`) run off the async reader.
+                    let (act, back) = tokio::task::spawn_blocking(move || {
+                        let a = shim_line(&line, &mut scope);
+                        (a, scope)
+                    })
+                    .await
+                    .unwrap_or_else(|_| (ShimLine::Forward(Vec::new()), crate::files::Scope::default()));
+                    scope = back;
+                    let ok = match act {
+                        ShimLine::Forward(l) => l.is_empty() || tx.send(McpUp { msg: Some(mcp_up::Msg::Data(l)) }).await.is_ok(),
+                        ShimLine::Reply(l) => replies.send(l).await.is_ok(),
+                    };
+                    if !ok {
+                        return;
+                    }
+                }
+                if buf.len() > MAX_LINE {
+                    // Oversized line: hand it over as is; the node refuses it.
+                    if tx.send(McpUp { msg: Some(mcp_up::Msg::Data(std::mem::take(&mut buf))) }).await.is_err() {
+                        return;
                     }
                 }
             }
         });
         let mut down = c.mcp_pipe(tokio_stream::wrappers::ReceiverStream::new(rx)).await.map_err(|s| net(s.message().to_owned()))?.into_inner();
+        tokio::spawn(async move {
+            while let Ok(Some(m)) = down.message().await {
+                if out_tx.send(m.data).await.is_err() {
+                    return;
+                }
+            }
+        });
         let mut stdout = tokio::io::stdout();
-        while let Ok(Some(m)) = down.message().await {
-            stdout.write_all(&m.data).await.ctx("stdout")?;
+        while let Some(d) = out_rx.recv().await {
+            stdout.write_all(&d).await.ctx("stdout")?;
             stdout.flush().await.ctx("stdout")?;
         }
         Ok(())

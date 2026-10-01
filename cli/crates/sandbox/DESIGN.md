@@ -83,7 +83,21 @@ with an allowlist where any other syscall kills it.
   except the gateway".
 - Mount-level read-only (`MS_RDONLY` remount) plus Landlock read-only for `ro_paths`:
   belt and braces.
-- `.git/hooks` and `.git/config` are read-only inside. They are code the *host* runs later.
+- Every `.git` (top-level, nested, a placeholder when there is none) is read-only inside:
+  hooks, config, includes and `commondir` are code or redirections the *host* runs later
+  (A191). A new `.git` planted in a subdirectory can't be blocked by mounts on Linux, so the
+  run ends with a notice when any git metadata changed (macOS blocks it with a regex rule).
+- Masking fails closed at its bounds (1M entries walked, 16k masks) and matches
+  case-insensitively. Git-ignored dependency/build dirs (`node_modules`, `target`, …) stay
+  visible because tools need them; secret-shaped names inside them are still masked.
+- `--allow-host`: exact names only (no wildcards: a user typing `*.example.com` gets an error,
+  not a silently wider allowlist); public addresses only, checked on the address the tunnel
+  uses; CONNECT :443 only.
+- cgroup limits are graceful by contract (no delegated cgroup → rlimits only); rlimits are
+  not: any failure to apply one refuses the run (A202).
+- A view that exposes `/`, `$HOME` or the Moochy home is refused (A197).
+- On x86_64, x32-ABI syscall numbers are refused by a dedicated filter (seccompiler checks the
+  arch and exact numbers only; A196). `io_uring_*` is denied (A195).
 - The run token is minted by the launcher, never by the agent. Minting fails closed; no
   predictable fallback.
 - Donor lockdown requires Landlock FS; the network cage is best-effort with an explicit
@@ -101,7 +115,11 @@ with an allowlist where any other syscall kills it.
 | Write outside the worktree (system dirs, a sibling dir) | ro mounts + Landlock | `e93…` |
 | Read `.env`, `*.pem`, git-ignored files in the worktree | Empty read-only overmount | `e97_secret_files_masked…`, `e97_git_ignored_masked…` |
 | Reach a masked file through a hard link, rename or symlink made inside | Path resolution goes through the top mount (hard link → EXDEV, symlink → empty) | `e97_secret_files_masked_against_read_link_and_symlink` |
-| Get code run later *outside* via git hooks or `core.fsmonitor` | `.git/hooks` and `.git/config` read-only | `e97_git_ignored_masked_and_git_exec_paths_read_only` |
+| Get code run later *outside* via git hooks or `core.fsmonitor` | Every `.git` read-only (placeholder when absent), host `git ls-files` with fsmonitor/hooks off, change notice | `e97_git_ignored_masked_and_git_exec_paths_read_only`, `e97_every_git_read_only_placeholder_and_change_notice`, `e97_linked_worktree_read_only_and_isolated` |
+| Expose the home / keystore by choosing the worktree | View check refuses `/`, `$HOME`, protected dirs | `e93_refuses_to_expose_root_or_home` |
+| Exfiltrate through `--allow-host` (other hosts, rebinding to loopback/metadata) | Exact names, :443, public addresses only, checked address used | `e94_allow_host_proxy_exact_hosts_only`, `proxy::tests` |
+| x32-ABI syscalls slipping past the deny-lists (x86_64) | x32 range → EPERM | `fuzzing::tests` (cBPF interpreter on the compiled tables) |
+| Memory/process exhaustion across many processes | cgroup `memory.max` (swap 0), `pids.max`, `cpu.max` when delegated | `e95_cgroup_limits_when_delegated` |
 | Exfiltrate over the network, DNS, or other loopback services | Empty netns; Landlock connect = gateway port only | `e94_only_gateway_reachable_and_no_host_env` |
 | Provider keys or host secrets in the environment | `env_clear` plus an explicit allowlist | `e94…` |
 | Terminal injection into the user's shell (TIOCSTI/TIOCLINUX) | `setsid` (no controlling tty) + seccomp, low-32-bit compare | `e95_terminal_injection_and_ptrace_denied` |
@@ -125,18 +143,18 @@ with an allowlist where any other syscall kills it.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| `Spec::run` | Implemented and tested here (kernel 7.0, Landlock ABI 8) | `sandbox-exec` + generated profile; compiles (`aarch64-apple-darwin`), **untested** | Fails closed (`Unsupported`) |
-| `lockdown_self` | seccomp TSYNC + Landlock TSYNC; tested | `sandbox_init` profile; untested | — |
-| `spawn_validator` | fork + allowlist; tested | fork + `sandbox_init` `(deny default)`; untested | — |
+| `Spec::run` | Implemented and tested here (kernel 7.0, Landlock ABI 8) | `sandbox-exec` + generated profile; verified on a real Mac at ae9cec7d (`tests/macos-check.sh`); later changes compile-checked only, re-run the script | Fails closed (`Unsupported`) |
+| `lockdown_self` | seccomp TSYNC + Landlock TSYNC; tested | `sandbox_init` profile; verified by `tests/macos-check.sh` | — |
+| `spawn_validator` | fork + allowlist; tested | fork + `sandbox_init` `(deny default)`; verified by `tests/macos-check.sh` | — |
 
 `sandbox-exec` and `sandbox_init` are deprecated by Apple but remain the only third-party
 Seatbelt entry points; Codex and sandbox-runtime use them too.
 
 ## 6. Not done yet
 
-- `--allow-host` CONNECT-proxy allowlist (off by default per §15.1).
-- cgroup v2 limits when a delegated cgroup exists. rlimits are the floor today.
 - Landlock ABI 9/10 rules (pathname Unix sockets, UDP bind) once the crate ceiling allows.
-- Linked git worktrees (gitdir outside the view): mo-node must add the gitdir with hooks
-  and config protected.
-- A fuzz target for the seccomp tables and the mask glob (contract: "reviewed and fuzzed").
+- macOS: a descendant that starts its own session outlives the run (no PID namespace);
+  `RLIMIT_NPROC`/`RLIMIT_AS` not set (per user / not enforced there); `--allow-host`.
+- `core.hooksPath` pointing at a tracked dir (e.g. husky's `.husky/`): those hooks are
+  ordinary repo files the agent may edit; they show in the diff, not in the notice.
+- The masking walk is repeated every run (≈1 s per million entries).
