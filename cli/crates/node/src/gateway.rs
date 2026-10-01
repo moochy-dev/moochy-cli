@@ -189,7 +189,9 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         return native_error(dialect, &Failure::new("unauthorized", false, "moochy: invalid local token (see `moochy env`)".to_owned()));
     };
     // Tool calls are released only to sandboxed sessions or projects that opted in (§15.4).
-    let release = sandboxed || node.cfg.unsandboxed_tools_allowed(&slug);
+    // The project's own setting (PoolSync), or the local override in development only.
+    let repo_allows = crate::node::lock(&node.pools).values().any(|p| p.allow_unsandboxed_tools && p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&slug)));
+    let release = sandboxed || repo_allows || (node.insecure_dev && node.cfg.unsandboxed_tools_allowed(&slug));
     match (req.method(), path.as_str()) {
         (&Method::POST, "/moochy/run") if !sandboxed => {
             let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());

@@ -165,6 +165,25 @@ fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>) ->
     c.into_iter().take(MAX_WRAPS).cloned().collect()
 }
 
+/// §15.4 provider exclusion: never seal to a donor serving through an excluded provider.
+/// ponytail: pool workers do not say which provider serves each model yet, so a model that an
+/// excluded provider can also serve is refused outright (fail closed); filter per worker in
+/// `pick` once `PoolWorker` carries the provider.
+fn excluded_check(cat: &engine::Catalog, model: &str, excluded: &[String]) -> Result<(), Failure> {
+    if excluded.is_empty() {
+        return Ok(());
+    }
+    let hit: Vec<&str> = cat.entries.iter().filter(|e| e.model == model && excluded.iter().any(|x| x == &e.provider)).map(|e| e.provider.as_str()).collect();
+    if hit.is_empty() {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "forbidden",
+        false,
+        format!("moochy: this project does not accept donations through {} for `{model}`, and donors of that model cannot be told apart by provider yet", hit.join(", ")),
+    ))
+}
+
 fn wraps(ws: &[PoolWorker], task: &TaskId, route: &[u8], ck: &ContentKey) -> Vec<pb::Wrap> {
     ws.iter()
         .filter_map(|w| crypto::wrap(&w.enc_pub, task, route, ck).ok().map(|x| pb::Wrap { worker_device: w.worker_device.clone(), wrap: Bytes::copy_from_slice(&x) }))
@@ -188,6 +207,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
     let route = header.to_bytes().map_err(internal)?;
     let sticky = node.session_worker(&aff);
+    excluded_check(&node.catalog(), &req.entry.model, &pool.excluded_providers)?;
     let chosen = pick(&pool, req.dialect, &req.entry.model, sticky.as_deref());
     if chosen.is_empty() {
         return Err(Failure::new("model_not_in_pool", false, format!("moochy: no donor offers `{}` for {}", req.entry.model, req.slug)));
@@ -694,6 +714,24 @@ fn usage_mismatch(u: &moochy_proto::msg::Usage, model: &str, entry: &CatalogEntr
 
 async fn emit(tx: &mpsc::Sender<TaskEv>, ev: TaskEv) -> Step {
     if tx.send(ev).await.is_err() { Step::Gone } else { Step::Continue }
+}
+
+#[cfg(test)]
+mod exclusion {
+    use super::*;
+
+    #[test]
+    fn excluded_providers_fail_closed() {
+        let stub = engine::Catalog::stub();
+        let mut cat = engine::Catalog { entries: stub.entries.clone(), ..engine::Catalog::default() };
+        let mut or = cat.entries[0].clone();
+        or.provider = "openrouter".into();
+        cat.entries.push(or);
+        let m = cat.entries[0].model.clone();
+        assert!(excluded_check(&cat, &m, &[]).is_ok());
+        assert!(excluded_check(&cat, &m, &["deepseek".into()]).is_ok());
+        assert!(excluded_check(&cat, &m, &["openrouter".into()]).is_err(), "an excluded provider can serve it");
+    }
 }
 
 #[cfg(test)]
