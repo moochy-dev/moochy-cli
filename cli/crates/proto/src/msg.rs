@@ -121,7 +121,10 @@ pub struct InnerPayload {
 impl InnerPayload {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let p: Self = json::parse(bytes)?;
-        if p.v != 1 {
+        // Header names: lowercase RFC 9110 token characters only (no case-variant duplicates).
+        let name_ok = |k: &String| !k.is_empty() && k.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&c));
+        let value_ok = |v: &String| v.bytes().all(|c| c == b'\t' || (b' '..=b'~').contains(&c));
+        if p.v != 1 || !p.headers.iter().all(|(k, v)| name_ok(k) && value_ok(v)) {
             return Err(Error::Malformed);
         }
         Ok(p)

@@ -699,7 +699,11 @@ pub fn sign_receipt(key: &SignKey, r: &Receipt) -> Result<(Vec<u8>, [u8; 64]), E
 pub fn open_receipt(donor: &[u8; 32], bytes: &[u8], sig: &[u8; 64]) -> Result<Receipt, Error> {
     verify(donor, &receipt_msg(bytes)?, sig)?;
     let r: Receipt = json::parse(bytes)?;
-    if r.v != 1 {
+    let attempt_ok = (1..=crate::msg::MAX_ATTEMPTS).contains(&r.attempt);
+    // `t_started` is 0 when the provider never answered (`not_started`).
+    let times_ok = r.t_start <= r.t_end && (r.t_started == 0 || (r.t_start..=r.t_end).contains(&r.t_started));
+    let usage_ok = r.usage.provider_cost_uusd.is_none_or(|c| c >= 0);
+    if r.v != 1 || !attempt_ok || r.cost_uusd < 0 || !times_ok || !usage_ok {
         return Err(Error::Malformed);
     }
     Ok(r)
@@ -714,7 +718,7 @@ pub fn sign_projection(key: &SignKey, p: &Projection) -> Result<(Vec<u8>, [u8; 6
 pub fn open_projection(donor: &[u8; 32], bytes: &[u8], sig: &[u8; 64]) -> Result<Projection, Error> {
     verify(donor, &projection_msg(bytes)?, sig)?;
     let p: Projection = json::parse(bytes)?;
-    if p.v != 1 {
+    if p.v != 1 || p.cost_uusd < 0 {
         return Err(Error::Malformed);
     }
     Ok(p)

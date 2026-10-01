@@ -287,6 +287,10 @@ fn signatures_and_inner_payload() {
     extra.pop();
     extra.extend_from_slice(br#","x":1}"#);
     assert_eq!(InnerPayload::parse(&extra), Err(Error::Malformed));
+    let upper = String::from_utf8(bytes.clone()).unwrap().replacen("anthropic-version", "Anthropic-Version", 1);
+    assert_eq!(InnerPayload::parse(upper.as_bytes()), Err(Error::Malformed), "header names are lowercase");
+    let crlf = String::from_utf8(bytes.clone()).unwrap().replacen("2023-06-01", "2023-06-01\\r\\nx: y", 1);
+    assert_eq!(InnerPayload::parse(crlf.as_bytes()), Err(Error::Malformed), "no CR/LF in header values");
     let v2 = String::from_utf8(bytes.clone()).unwrap().replacen("\"v\":1", "\"v\":2", 1);
     assert_eq!(InnerPayload::parse(v2.as_bytes()), Err(Error::Malformed));
 
@@ -351,6 +355,12 @@ fn receipts_and_projections() {
     let dup = String::from_utf8(bytes.clone()).unwrap().replacen("{", r#"{"cost_uusd":1,"#, 1);
     let dsig = k.sign(&crypto::receipt_msg(dup.as_bytes()).unwrap());
     assert_eq!(crypto::open_receipt(&k.public(), dup.as_bytes(), &dsig).err(), Some(Error::Json));
+    // Signed but out of range: attempt 0, negative cost, time going backwards.
+    for (from, to) in [("\"attempt\":1", "\"attempt\":0"), ("\"cost_uusd\":34200", "\"cost_uusd\":-1"), ("\"t_end\":", "\"t_end\":1,\"x\":")] {
+        let b = String::from_utf8(bytes.clone()).unwrap().replacen(from, to, 1);
+        let sig = k.sign(&crypto::receipt_msg(b.as_bytes()).unwrap());
+        assert_eq!(crypto::open_receipt(&k.public(), b.as_bytes(), &sig).err(), Some(Error::Malformed), "{to}");
+    }
     // A receipt signature never verifies as a projection.
     assert_eq!(crypto::open_projection(&k.public(), &bytes, &sig).err(), Some(Error::BadSignature));
     let p = msg::Projection {
