@@ -230,6 +230,23 @@ fn response_roundtrip_and_aad_binding() {
 }
 
 #[test]
+fn sealed_detail() {
+    let (r, w) = ([0x22; 32], dev("d_01K6A0000000000000000000W1"));
+    let sd = crypto::seal_detail(&ck(), &r, &task(), &w, 1, "firewall", "field `mcp_servers` is not allowed").unwrap();
+    assert_eq!(sd.len(), "field `mcp_servers` is not allowed".len() + TAG_LEN);
+    assert_eq!(crypto::open_detail(&ck(), &r, &task(), &w, 1, "firewall", &sd).unwrap(), "field `mcp_servers` is not allowed");
+    // Code, attempt, R, worker, task are all bound.
+    assert_eq!(crypto::open_detail(&ck(), &r, &task(), &w, 1, "busy", &sd).err(), Some(Error::Decrypt));
+    assert_eq!(crypto::open_detail(&ck(), &r, &task(), &w, 2, "firewall", &sd).err(), Some(Error::Decrypt));
+    assert_eq!(crypto::open_detail(&ck(), &[0x23; 32], &task(), &w, 1, "firewall", &sd).err(), Some(Error::Decrypt));
+    assert_eq!(crypto::open_detail(&ck(), &r, &task(), &dev("d_01K6A0000000000000000000W2"), 1, "firewall", &sd).err(), Some(Error::Decrypt));
+    assert_eq!(crypto::open_detail(&ck(), &r, &task(), &w, 1, "firewall", &sd[..10]).err(), Some(Error::TooLarge));
+    assert_eq!(crypto::seal_detail(&ck(), &r, &task(), &w, 1, "firewall", &"x".repeat(1025)).err(), Some(Error::TooLarge));
+    assert!(crypto::seal_detail(&ck(), &r, &task(), &w, 1, "firewall", &"x".repeat(1024)).is_ok());
+    assert_eq!(moochy_proto::b64(&crypto::sha256(b"abc")), "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", "SHA-256 KAT");
+}
+
+#[test]
 fn hpke_wrap() {
     let sk = EncSecret::from_bytes(&[0x33; 32]).unwrap();
     let pk = sk.public();

@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use hkdf::Hkdf;
 use hpke::{Deserializable, Kem as _, OpModeR, OpModeS, Serializable};
 use rand_core::{CryptoRng, RngCore, TryRngCore};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -73,8 +73,10 @@ fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Result<Secret32, Error> {
 }
 
 #[must_use]
+/// SHA-256 through ring (ARMv8 SHA2 instructions: ~1.8 GB/s here vs ~370 MB/s for the portable
+/// sha2 0.10 backend, which needs its `asm` feature on aarch64). Used for body hashes.
 pub fn sha256(b: &[u8]) -> [u8; 32] {
-    Sha256::digest(b).into()
+    ring::digest::digest(&ring::digest::SHA256, b).as_ref().try_into().unwrap_or([0; 32])
 }
 
 /// `K_req = HKDF(salt="", ikm=CK, info=lp("moochy/v1/req", task_id))`.
@@ -531,6 +533,49 @@ impl ResponseOpener {
     pub fn running_hash(&self) -> [u8; 32] {
         self.hash.value()
     }
+}
+
+// ---------- sealed refusal detail (CONTRACT §3) ----------
+
+/// Max plaintext of a sealed detail.
+pub const MAX_DETAIL: usize = 1024;
+
+/// `K_det = HKDF(salt=R, ikm=CK, info=lp("moochy/v1/detail", task_id, worker_device, u64(attempt)))`.
+pub fn k_det(ck: &ContentKey, r: &[u8; 32], task: &TaskId, worker: &DeviceId, attempt: u8) -> Result<Secret32, Error> {
+    let info = lp(&[label::DETAIL, task.text().as_bytes(), worker.text().as_bytes(), &u64be(attempt.into())])?;
+    hkdf32(r, &ck.0, &info)
+}
+
+fn detail_aad(task: &TaskId, attempt: u8, code: &str) -> Result<Vec<u8>, Error> {
+    lp(&[label::DETAIL, &task.0.0, &u64be(attempt.into()), code.as_bytes()])
+}
+
+/// Worker: `sealed_detail = AEAD(K_det, nonce = 12 zero bytes, aad = lp("moochy/v1/detail",
+/// task_id_16B, u64(attempt), code), pt = UTF-8 detail ≤ 1 KiB)` → ciphertext || tag. Seal at
+/// most one detail per attempt (the zero nonce is unique only because of that).
+pub fn seal_detail(ck: &ContentKey, r: &[u8; 32], task: &TaskId, worker: &DeviceId, attempt: u8, code: &str, detail: &str) -> Result<Bytes, Error> {
+    if detail.len() > MAX_DETAIL {
+        return Err(Error::TooLarge);
+    }
+    let aead = ChunkAead::new(&k_det(ck, r, task, worker, attempt)?)?;
+    let mut buf = BytesMut::with_capacity(detail.len().saturating_add(TAG_LEN));
+    buf.extend_from_slice(detail.as_bytes());
+    let tag = aead.seal(0, &detail_aad(task, attempt, code)?, &mut buf)?;
+    buf.extend_from_slice(&tag);
+    Ok(buf.freeze())
+}
+
+/// Gateway: open a `sealed_detail` for the accepted attempt and the visible `code`. Returns the
+/// detail text (still untrusted: escape it before display).
+pub fn open_detail(ck: &ContentKey, r: &[u8; 32], task: &TaskId, worker: &DeviceId, attempt: u8, code: &str, sealed: &[u8]) -> Result<String, Error> {
+    if sealed.len() < TAG_LEN || sealed.len() > MAX_DETAIL + TAG_LEN {
+        return Err(Error::TooLarge);
+    }
+    let aead = ChunkAead::new(&k_det(ck, r, task, worker, attempt)?)?;
+    let mut buf = sealed.to_vec();
+    let n = aead.open(0, &detail_aad(task, attempt, code)?, &mut buf)?;
+    buf.truncate(n);
+    String::from_utf8(buf).map_err(|_| Error::Malformed)
 }
 
 // ---------- HPKE wraps ----------

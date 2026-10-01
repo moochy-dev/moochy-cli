@@ -207,6 +207,13 @@ fn encoding() -> Value {
         "ints": ints,
         "b64_valid": b64_valid,
         "b64_invalid": b64_invalid,
+        "task_id_text": {
+            "rule": "task ids appear in JSON, in protobuf strings and inside lp() as the canonical ULID text: exactly 26 chars of UPPERCASE Crockford base32 (0-9 A-Z without I L O U), first char 0-7; 16-byte binary form = big-endian 128-bit value. Lowercase or any other spelling is rejected, never normalized.",
+            "text": TASK,
+            "bytes": hex(&task().0.0),
+            "lp_field": hex(&lp(&[TASK.as_bytes()]).unwrap()),
+            "lowercase_rejected": TASK.to_ascii_lowercase(),
+        },
         "ulid_valid": ulid_valid,
         "ulid_invalid": ulid_invalid,
         "ids_valid": ids_valid,
@@ -393,11 +400,39 @@ fn envelope() -> Value {
         resp_cases.push(json!({"name": name, "task": task_s, "worker_device": worker, "attempt": attempt, "R": hex(&rr), "seq": seq, "last": last, "ct": hex(&ct), "ok": ok}));
     }
 
+    // Sealed refusal detail (CONTRACT §3): K_det from (CK, R, task, worker, attempt), zero nonce.
+    let detail = "field `mcp_servers` is not allowed by the donor pool";
+    let code = "firewall";
+    let kd = crypto::k_det(&ck, &r, &t, &dev(W1), 1).unwrap();
+    let sd = crypto::seal_detail(&ck, &r, &t, &dev(W1), 1, code, detail).unwrap();
+    let daad = |tt: &TaskId, a: u8, c: &str| lp(&[label::DETAIL, &tt.0.0, &u64be(a.into()), c.as_bytes()]).unwrap();
+    assert!(aead_open(kd.expose(), 0, &daad(&t, 1, code), &sd));
+    assert_eq!(crypto::open_detail(&ck, &r, &t, &dev(W1), 1, code, &sd).unwrap(), detail);
+    let mut detail_cases = vec![json!({"name": "baseline", "task": TASK, "worker_device": W1, "attempt": 1, "R": hex(&r), "code_text": code, "ok": true})];
+    for (name, task_s, worker, attempt, rr, c) in [
+        ("code changed", TASK, W1, 1u8, r, "busy"),
+        ("attempt changed", TASK, W1, 2, r, code),
+        ("R changed", TASK, W1, 1, r2, code),
+        ("worker changed", TASK, W2, 1, r, code),
+        ("task changed", TASK2, W1, 1, r, code),
+    ] {
+        let tt: TaskId = task_s.parse().unwrap();
+        let ok = crypto::open_detail(&ck, &rr, &tt, &dev(worker), attempt, c, &sd).is_ok();
+        assert!(!ok, "{name}");
+        detail_cases.push(json!({"name": name, "task": task_s, "worker_device": worker, "attempt": attempt, "R": hex(&rr), "code_text": c, "ok": ok}));
+    }
+    let sealed_detail = json!({
+        "worker_device": W1, "attempt": 1, "R": hex(&r), "code_text": code, "detail_text": detail,
+        "k_det_info": hex(&lp(&[label::DETAIL, TASK.as_bytes(), W1.as_bytes(), &u64be(1)]).unwrap()),
+        "k_det": hex(kd.expose()), "nonce": hex(&[0u8; 12]), "aad": hex(&daad(&t, 1, code)), "sealed": hex(&sd),
+        "max_detail_bytes": crypto::MAX_DETAIL, "open_cases": detail_cases,
+    });
+
     let s_req = crypto::salt(&s_seed, SaltName::Req).unwrap();
     let s_resp = crypto::salt(&s_seed, SaltName::Resp).unwrap();
     let s_pid = crypto::salt(&s_seed, SaltName::Pid).unwrap();
     json!({
-        "_schema": "Envelope (CONTRACT §3–4). Inputs: ck, task (text; task_id in lp = 26-char text, task_id_16B = ULID bytes), route_text (exact route-header bytes). k_req = HKDF(salt='', ikm=ck, info=k_req_info). request.small/big: compressed (hex zstd frame of the inner payload) → chunks[] {seq, last, ct = ciphertext||tag, aad}; nonce = 8 zero bytes || u32_be(seq); payload_text / payload_sha256 = the decompressed inner payload. request_tamper[]: open ONE chunk with K_req(task), aad(task, seq, last) → ok. wraps[]: HPKE base X25519/HKDF-SHA256/ChaCha20Poly1305, ephemeral = DeriveKeyPair(ephemeral_ikm), info = lp('moochy/v1/wrap', suite_id, task), aad = route bytes; wrap = enc(32)||ct(32)||tag(16); unwrap with route_tampered_text or task_changed MUST fail. responses[]: R, rk = HKDF(salt=R, ikm=ck, info=rk_info); attempts 1 and 2 of one task (same R, same worker) have different rk. response_tamper[]: open one chunk with RK(ck, R, task, worker_device, attempt) and aad(task_16B, u64(attempt), R, u32(seq), last) → ok. salts: S_x = HKDF(salt='', ikm=S, info=lp('moochy/v1/salt', name)).",
+        "_schema": "Envelope (CONTRACT §3–4). Inputs: ck, task (text; task_id in lp = 26-char text, task_id_16B = ULID bytes), route_text (exact route-header bytes). k_req = HKDF(salt='', ikm=ck, info=k_req_info). request.small/big: compressed (hex zstd frame of the inner payload) → chunks[] {seq, last, ct = ciphertext||tag, aad}; nonce = 8 zero bytes || u32_be(seq); payload_text / payload_sha256 = the decompressed inner payload. request_tamper[]: open ONE chunk with K_req(task), aad(task, seq, last) → ok. wraps[]: HPKE base X25519/HKDF-SHA256/ChaCha20Poly1305, ephemeral = DeriveKeyPair(ephemeral_ikm), info = lp('moochy/v1/wrap', suite_id, task), aad = route bytes; wrap = enc(32)||ct(32)||tag(16); unwrap with route_tampered_text or task_changed MUST fail. responses[]: R, rk = HKDF(salt=R, ikm=ck, info=rk_info); attempts 1 and 2 of one task (same R, same worker) have different rk. response_tamper[]: open one chunk with RK(ck, R, task, worker_device, attempt) and aad(task_16B, u64(attempt), R, u32(seq), last) → ok. salts: S_x = HKDF(salt='', ikm=S, info=lp('moochy/v1/salt', name)). sealed_detail: K_det = HKDF(salt=R, ikm=ck, info=k_det_info = lp('moochy/v1/detail', task, worker_device, u64(attempt))); sealed = ChaCha20-Poly1305(K_det, nonce = 12 zero bytes, aad = lp('moochy/v1/detail', task_16B, u64(attempt), code), detail_text) = ct||tag, detail ≤ max_detail_bytes; open_cases[]: open `sealed` with those inputs → ok.",
         "ck": hex(ck.expose()),
         "task": TASK,
         "task_16b": hex(&t.0.0),
@@ -413,6 +448,7 @@ fn envelope() -> Value {
         "wraps": wraps,
         "responses": attempts,
         "response_tamper": resp_cases,
+        "sealed_detail": sealed_detail,
         "salts": {"S": hex(&s_seed), "S_req": hex(s_req.expose()), "S_resp": hex(s_resp.expose()), "S_pid": hex(s_pid.expose())},
     })
 }
@@ -483,6 +519,20 @@ fn signatures() -> Value {
     headers.insert("anthropic-beta".to_owned(), "context-1m-2025-08-07".to_owned());
     headers.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
     let hsha = crypto::headers_sha256(&headers).unwrap();
+    let headers_lp = lp(&[b"anthropic-beta", b"context-1m-2025-08-07", b"anthropic-version", b"2023-06-01"]).unwrap();
+    assert_eq!(crypto::sha256(&headers_lp), hsha);
+    let r1 = det32("R-1");
+    let running = det32("running");
+    let cp_fields: Vec<(&str, Vec<u8>)> = vec![
+        ("label 'moochy/v1/resp-progress'", label::RESP_PROGRESS.to_vec()),
+        ("task_id (26-char text)", TASK.as_bytes().to_vec()),
+        ("u64(attempt = 1)", u64be(1).to_vec()),
+        ("R (32 bytes)", r1.to_vec()),
+        ("u64(seq = 7)", u64be(7).to_vec()),
+        ("running_sha256 (32 bytes)", running.to_vec()),
+    ];
+    let cp_refs: Vec<&[u8]> = cp_fields.iter().map(|(_, b)| b.as_slice()).collect();
+    assert_eq!(lp(&cp_refs).unwrap(), crypto::checkpoint_msg(&t, 1, &r1, 7, &running).unwrap());
     let receipt = Receipt {
         v: 1,
         task_id: t,
@@ -526,14 +576,16 @@ fn signatures() -> Value {
     let s_pid = crypto::salt(&s_seed, SaltName::Pid).unwrap();
     let resp_plain = b"event: message_stop\n\n";
     json!({
-        "_schema": "Ed25519 (RFC 8032 signing, ZIP-215 verification). signer.seed → signer.public. cases[]: msg = the exact lp(...) byte string named by `name` (inputs listed), sig over msg; flipping the last byte of msg MUST fail. receipt/projection: *_text = exact signed JSON bytes, signature over lp(label, bytes); a receipt signature MUST NOT verify as a projection. headers_sha256 = SHA-256(lp(name1, value1, name2, value2, …)) names ascending; commitments: req_commit = SHA-256(lp('moochy/v1/req-commit', S_req, body)); resp_commit = SHA-256(lp('moochy/v1/resp-commit', S_resp, SHA-256(response plaintext))); provider_req_hash = SHA-256(lp('moochy/v1/provider-req', S_pid, request_id)).",
+        "_schema": "Ed25519 (RFC 8032 signing, ZIP-215 verification). signer.seed → signer.public. cases[]: msg = the exact lp(...) byte string named by `name` (inputs listed), sig over msg; flipping the last byte of msg MUST fail. receipt/projection: *_text = exact signed JSON bytes, signature over lp(label, bytes); a receipt signature MUST NOT verify as a projection. headers_sha256 = SHA-256(headers_lp) where headers_lp = lp(name1, value1, name2, value2, …) over lowercase names sorted ascending by bytes (inputs.headers_lp pins the exact bytes); checkpoint_fields pins every field and width of the progress-signature message (u64 attempt, u64 seq); commitments: req_commit = SHA-256(lp('moochy/v1/req-commit', S_req, body)); resp_commit = SHA-256(lp('moochy/v1/resp-commit', S_resp, SHA-256(response plaintext))); provider_req_hash = SHA-256(lp('moochy/v1/provider-req', S_pid, request_id)).",
         "signer": {"seed": hex(&det32("device-sign")), "public": hex(&pk)},
         "inputs": {
             "nonce": hex(&nonce), "dialed_origin_text": origin, "tls_exporter": hex(&exporter), "device_id": W1,
             "task": TASK, "repo_id": REPO, "route_text": route_text(), "body_sha256": hex(&body_sha),
             "headers": headers, "headers_sha256": hex(&hsha), "attempt": 1, "R": hex(&det32("R-1")), "seq": 7, "running_sha256": hex(&det32("running")),
             "dispute_code_text": "resp_commit",
+            "headers_lp": hex(&headers_lp),
         },
+        "checkpoint_fields": cp_fields.iter().map(|(n, b)| json!({"field": n, "len": b.len(), "bytes": hex(b)})).collect::<Vec<_>>(),
         "cases": [
             sig_case("auth = lp('moochy/v1/auth', nonce, dialed_origin, tls_exporter, device_id)", crypto::auth_msg(&nonce, origin, &exporter, &dev(W1)).unwrap()),
             sig_case("task = lp('moochy/v1/task', task, repo_id, route, body_sha256, headers_sha256)", crypto::task_msg(&t, &repo, &route, &body_sha, &hsha).unwrap()),

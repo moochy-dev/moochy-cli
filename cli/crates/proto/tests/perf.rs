@@ -106,6 +106,11 @@ fn perf() {
     println!("AEAD only (no SHA-256): seal {aead_seal:.0} MB/s over {} chunks", sealed.chunks.len());
     drop(sealed);
 
+    // 3c) One-shot SHA-256 (body_sha256 of a large body).
+    let t = Instant::now();
+    let h = crypto::sha256(&raw);
+    println!("crypto::sha256 256 MiB: {:.0} MB/s ({:02x}…)", (256 << 20) as f64 / t.elapsed().as_secs_f64() / 1e6, h[0]);
+
     // 4) Per token-sized chunk: seal + open latency (budget for the whole hop chain: 300 µs p50).
     let mut s = ResponseSealer::new(&ck, &r, &task, &w, 2).unwrap();
     let mut op = ResponseOpener::new(&ck, &r, &task, &w, 2).unwrap();

@@ -24,9 +24,10 @@ pub mod label {
     pub const PROJECTION: &[u8] = b"moochy/v1/projection";
     pub const RESP_PROGRESS: &[u8] = b"moochy/v1/resp-progress";
     pub const DISPUTE: &[u8] = b"moochy/v1/dispute";
-    pub const ALL: [&[u8]; 14] = [
+    pub const DETAIL: &[u8] = b"moochy/v1/detail";
+    pub const ALL: [&[u8]; 15] = [
         AUTH, DEVICE_START, REQ, RESP, WRAP, TASK, SALT, REQ_COMMIT, RESP_COMMIT, PROVIDER_REQ,
-        RECEIPT, PROJECTION, RESP_PROGRESS, DISPUTE,
+        RECEIPT, PROJECTION, RESP_PROGRESS, DISPUTE, DETAIL,
     ];
 }
 
