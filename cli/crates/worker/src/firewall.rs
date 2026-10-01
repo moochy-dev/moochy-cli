@@ -228,7 +228,7 @@ pub struct Prepared {
 /// Worker that only wants the facts). Uses `policy` for gating.
 pub fn analyze(dialect: Dialect, body: &[u8], headers: &[(&str, &str)], policy: &Policy, catalog: &Catalog) -> Result<Facts, Reject> {
     let mut tape = Vec::new();
-    let (facts, _, _) = check(dialect, body, headers, policy, catalog, &mut tape)?;
+    let (facts, _, _) = check(dialect, body, headers, *policy, catalog, &mut tape)?;
     Ok(facts)
 }
 
@@ -241,7 +241,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
         return Err(Reject::new(RejectCode::Unsupported, "", "has no catalog mapping for this provider"));
     }
     let mut tape = Vec::new();
-    let (facts, headers, root) = check(req.dialect, req.body, req.headers, req.policy, req.catalog, &mut tape)?;
+    let (facts, headers, root) = check(req.dialect, req.body, req.headers, *req.policy, req.catalog, &mut tape)?;
 
     let enc = |s: &str| {
         let mut v = Vec::with_capacity(s.len().saturating_add(2));
@@ -303,7 +303,7 @@ fn check<'a>(
     dialect: Dialect,
     body: &'a [u8],
     headers: &[(&str, &str)],
-    policy: &Policy,
+    policy: Policy,
     catalog: &Catalog,
     tape: &'a mut Vec<json::Node>,
 ) -> Result<Checked<'a>, Reject> {
@@ -439,8 +439,8 @@ enum Seg<'a> {
     Idx(usize),
 }
 
-struct Walk<'a, 'p> {
-    policy: &'p Policy,
+struct Walk<'a> {
+    policy: Policy,
     path: Vec<Seg<'a>>,
     acc: Acc,
 }
@@ -472,7 +472,7 @@ fn shown(v: Val<'_>) -> String {
     s
 }
 
-impl<'a> Walk<'a, '_> {
+impl<'a> Walk<'a> {
     fn path_str(&self) -> String {
         let mut s = String::new();
         for seg in &self.path {

@@ -654,7 +654,7 @@ impl OwnedDoc {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::format_collect)]
 mod tests {
     use super::*;
 
