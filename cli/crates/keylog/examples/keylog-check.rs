@@ -15,10 +15,7 @@
     clippy::format_collect
 )]
 
-use moochy_keylog::{
-    AnchorStatus, Error, Me, Mirror, NoteKey,
-    fetch::Fetcher,
-};
+use moochy_keylog::{AnchorStatus, Error, Me, Mirror, NoteKey, fetch::Fetcher};
 use serde_json::json;
 use std::{collections::HashMap, fs, path::Path, process::ExitCode, time::Duration};
 
@@ -49,7 +46,12 @@ fn main() -> ExitCode {
 
     // Restore the persisted mirror (records file + checkpoint note), if any.
     let state = a.get("state").map(Path::new);
-    let mut m = match state.and_then(|d| Some((fs::read(d.join("records")).ok()?, fs::read(d.join("checkpoint")).ok()?))) {
+    let mut m = match state.and_then(|d| {
+        Some((
+            fs::read(d.join("records")).ok()?,
+            fs::read(d.join("checkpoint")).ok()?,
+        ))
+    }) {
         Some((recs, note)) => {
             let fresh = Mirror::new(&origin, key.clone());
             let cp = fresh.open_checkpoint(&note).expect("stored checkpoint");
@@ -66,14 +68,22 @@ fn main() -> ExitCode {
         None => Mirror::new(&origin, key.clone()),
     };
     if let Some(ps) = a.get("me") {
-        let known = a.get("known").map(|k| k.split(',').map(hex32).collect()).unwrap_or_default();
-        m.set_me(Some(Me { pseudonym: ps.clone(), known_keys: known }));
+        let known = a
+            .get("known")
+            .map(|k| k.split(',').map(hex32).collect())
+            .unwrap_or_default();
+        m.set_me(Some(Me {
+            pseudonym: ps.clone(),
+            known_keys: known,
+        }));
     }
 
     let f = Fetcher::new(&base, Duration::from_secs(10)).expect("base url");
     let synced = match f.sync(&mut m) {
         Ok(v) => v,
-        Err(e @ Error::Fork { .. }) => return report(&json!({"fork": true, "error": e.to_string()}), 1),
+        Err(e @ Error::Fork { .. }) => {
+            return report(&json!({"fork": true, "error": e.to_string()}), 1);
+        }
         Err(e) => return report(&json!({"error": e.to_string()}), 2),
     };
 
@@ -92,7 +102,10 @@ fn main() -> ExitCode {
 
     let anchor = match a.get("anchor") {
         None => "none",
-        Some(p) => match fs::read(p).map_err(|e| Error::Io(e.to_string())).and_then(|n| m.open_checkpoint(&n)) {
+        Some(p) => match fs::read(p)
+            .map_err(|e| Error::Io(e.to_string()))
+            .and_then(|n| m.open_checkpoint(&n))
+        {
             Err(e) => return report(&json!({"error": format!("anchor: {e}")}), 2),
             Ok(acp) => match m.check(&acp) {
                 AnchorStatus::Consistent => "consistent",
@@ -104,5 +117,8 @@ fn main() -> ExitCode {
     let alerts: Vec<String> = alerts.iter().map(|x| format!("{x:?}")).collect();
     let root: String = cp.root.iter().map(|b| format!("{b:02x}")).collect();
     let fork = anchor == "fork";
-    report(&json!({"size": cp.size, "root": root, "alerts": alerts, "anchor": anchor, "fork": fork}), u8::from(fork))
+    report(
+        &json!({"size": cp.size, "root": root, "alerts": alerts, "anchor": anchor, "fork": fork}),
+        u8::from(fork),
+    )
 }

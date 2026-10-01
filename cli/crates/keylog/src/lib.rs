@@ -57,7 +57,9 @@ impl std::fmt::Display for Error {
         match self {
             Self::Format(w) => write!(f, "keylog: bad format: {w}"),
             Self::BadSig => f.write_str("keylog: bad signature"),
-            Self::Fork { size } => write!(f, "keylog: FORK: log is inconsistent at tree size {size}"),
+            Self::Fork { size } => {
+                write!(f, "keylog: FORK: log is inconsistent at tree size {size}")
+            }
             Self::TooLarge => f.write_str("keylog: input too large"),
             Self::Io(e) => write!(f, "keylog: io: {e}"),
         }

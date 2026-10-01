@@ -97,7 +97,12 @@ pub struct State {
 }
 
 fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
-    let (Ok(k), Ok(s)) = (VerificationKey::try_from(*pubkey), <[u8; 64]>::try_from(sig)) else { return false };
+    let (Ok(k), Ok(s)) = (
+        VerificationKey::try_from(*pubkey),
+        <[u8; 64]>::try_from(sig),
+    ) else {
+        return false;
+    };
     k.verify(&Signature::from(s), msg).is_ok()
 }
 
@@ -105,9 +110,18 @@ impl State {
     /// Applies entry `idx` if it is valid against the state; on `Err` the state is
     /// unchanged and the entry confers no authority. `check_sigs = false` only for
     /// reloading entries this mirror already verified.
+    #[allow(clippy::too_many_lines)] // one flat arm per entry kind
     pub fn apply(&mut self, idx: u64, e: &Entry<'_>, check_sigs: bool) -> Result<(), Code> {
         match e.body {
-            Body::Key { device_id, pseudonym, sign_pub, enc_pub, suite, roles, repo_scope } => {
+            Body::Key {
+                device_id,
+                pseudonym,
+                sign_pub,
+                enc_pub,
+                suite,
+                roles,
+                repo_scope,
+            } => {
                 if self.devices.contains_key(device_id) {
                     return Err(Code::DupDevice);
                 }
@@ -132,14 +146,29 @@ impl State {
                     },
                 );
             }
-            Body::Revoke { device_id, pseudonym, .. } => {
-                let d = self.devices.get_mut(device_id).filter(|d| d.pseudonym == pseudonym).ok_or(Code::UnknownDevice)?;
+            Body::Revoke {
+                device_id,
+                pseudonym,
+                ..
+            } => {
+                let d = self
+                    .devices
+                    .get_mut(device_id)
+                    .filter(|d| d.pseudonym == pseudonym)
+                    .ok_or(Code::UnknownDevice)?;
                 if d.revoked {
                     return Err(Code::Revoked);
                 }
                 d.revoked = true;
             }
-            Body::Claim { repo_id, provider, provider_repo_id, owner, signer, issued_at_ms } => {
+            Body::Claim {
+                repo_id,
+                provider,
+                provider_repo_id,
+                owner,
+                signer,
+                issued_at_ms,
+            } => {
                 self.check_signer(signer, owner, e, check_sigs)?;
                 if let Some(r) = self.repos.get(repo_id) {
                     if r.provider != provider || r.provider_repo_id != provider_repo_id {
@@ -149,13 +178,16 @@ impl State {
                         return Err(Code::Replay);
                     }
                 }
-                let r = self.repos.entry(repo_id.to_owned()).or_insert_with(|| Repo {
-                    provider: provider.to_owned(),
-                    provider_repo_id: provider_repo_id.to_owned(),
-                    owner: owner.to_owned(),
-                    issued: 0,
-                    grants: HashMap::new(),
-                });
+                let r = self
+                    .repos
+                    .entry(repo_id.to_owned())
+                    .or_insert_with(|| Repo {
+                        provider: provider.to_owned(),
+                        provider_repo_id: provider_repo_id.to_owned(),
+                        owner: owner.to_owned(),
+                        issued: 0,
+                        grants: HashMap::new(),
+                    });
                 if r.owner != owner {
                     // New owner: every approval and membership must be re-signed.
                     r.grants.clear();
@@ -163,8 +195,18 @@ impl State {
                 }
                 r.issued = issued_at_ms;
             }
-            Body::Grant { repo_id, subject, signer, issued_at_ms } => {
-                let owner = self.repos.get(repo_id).ok_or(Code::Unclaimed)?.owner.clone();
+            Body::Grant {
+                repo_id,
+                subject,
+                signer,
+                issued_at_ms,
+            } => {
+                let owner = self
+                    .repos
+                    .get(repo_id)
+                    .ok_or(Code::Unclaimed)?
+                    .owner
+                    .clone();
                 self.check_signer(signer, &owner, e, check_sigs)?;
                 let member = matches!(e.kind, Kind::MemberAdded | Kind::MemberRemoved);
                 let r = self.repos.get_mut(repo_id).ok_or(Code::Unclaimed)?;
@@ -173,9 +215,18 @@ impl State {
                     return Err(Code::Replay);
                 }
                 let active = matches!(e.kind, Kind::DonorApproved | Kind::MemberAdded);
-                r.grants.insert(key, Grant { active, idx, issued: issued_at_ms });
+                r.grants.insert(
+                    key,
+                    Grant {
+                        active,
+                        idx,
+                        issued: issued_at_ms,
+                    },
+                );
             }
-            Body::Catalog { version, sha256, .. } => {
+            Body::Catalog {
+                version, sha256, ..
+            } => {
                 if version <= self.catalog {
                     return Err(Code::CatalogVersion);
                 }
@@ -187,7 +238,13 @@ impl State {
         Ok(())
     }
 
-    fn check_signer(&self, dev: &str, owner: &str, e: &Entry<'_>, check_sigs: bool) -> Result<(), Code> {
+    fn check_signer(
+        &self,
+        dev: &str,
+        owner: &str,
+        e: &Entry<'_>,
+        check_sigs: bool,
+    ) -> Result<(), Code> {
         let d = self.devices.get(dev).ok_or(Code::UnknownDevice)?;
         if d.revoked {
             return Err(Code::Revoked);
@@ -229,7 +286,11 @@ impl State {
         if d.revoked {
             return Err(Code::Revoked);
         }
-        if !(if worker { d.roles.has_worker() } else { d.roles.has_gateway() }) {
+        if !(if worker {
+            d.roles.has_worker()
+        } else {
+            d.roles.has_gateway()
+        }) {
             return Err(Code::Role);
         }
         if d.repo_scope.as_deref().is_some_and(|s| s != repo_id) {
@@ -244,7 +305,11 @@ impl State {
     pub fn sealable(&self, worker: &str, repo_id: &str) -> Result<Sealable, Code> {
         let (d, r) = self.usable(worker, true, repo_id)?;
         match r.grants.get(&(false, d.pseudonym.clone())) {
-            Some(g) if g.active => Ok(Sealable { enc_pub: d.enc_pub, key_idx: d.idx, approval_idx: g.idx }),
+            Some(g) if g.active => Ok(Sealable {
+                enc_pub: d.enc_pub,
+                key_idx: d.idx,
+                approval_idx: g.idx,
+            }),
             _ => Err(Code::NotApproved),
         }
     }
@@ -255,7 +320,11 @@ impl State {
     /// [`Device::sign_pub`].
     pub fn gateway_allowed(&self, gateway: &str, repo_id: &str) -> Result<&Device, Code> {
         let (d, r) = self.usable(gateway, false, repo_id)?;
-        if d.pseudonym == r.owner || r.grants.get(&(true, d.pseudonym.clone())).is_some_and(|g| g.active) {
+        if d.pseudonym == r.owner
+            || r.grants
+                .get(&(true, d.pseudonym.clone()))
+                .is_some_and(|g| g.active)
+        {
             Ok(d)
         } else {
             Err(Code::NotMember)

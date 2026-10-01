@@ -38,11 +38,24 @@ pub enum Alert {
     /// A key was added to my account that I neither created nor acknowledged.
     UnknownKey { idx: u64, device_id: String },
     /// One of my keys was logged for another account.
-    KeyHijack { idx: u64, device_id: String, pseudonym: String },
+    KeyHijack {
+        idx: u64,
+        device_id: String,
+        pseudonym: String,
+    },
     /// A claim, approval or membership on my repo signed by a key I do not know.
-    NotSignedByMe { idx: u64, kind: Kind, repo_id: String, signer: String },
+    NotSignedByMe {
+        idx: u64,
+        kind: Kind,
+        repo_id: String,
+        signer: String,
+    },
     /// A repo I owned was claimed by another account.
-    RepoClaimedByOther { idx: u64, repo_id: String, owner: String },
+    RepoClaimedByOther {
+        idx: u64,
+        repo_id: String,
+        owner: String,
+    },
 }
 
 /// Result of comparing a checkpoint (e.g. the Git anchor) with the mirror.
@@ -85,7 +98,12 @@ impl Mirror {
 
     /// Rebuilds a mirror from records it verified earlier (persisted by the caller)
     /// without re-checking signatures; the hashes must reproduce `cp`.
-    pub fn restore<'a>(origin: &str, key: NoteKey, records: impl IntoIterator<Item = &'a [u8]>, cp: &Checkpoint) -> Result<Self, Error> {
+    pub fn restore<'a>(
+        origin: &str,
+        key: NoteKey,
+        records: impl IntoIterator<Item = &'a [u8]>,
+        cp: &Checkpoint,
+    ) -> Result<Self, Error> {
         let mut m = Self::new(origin, key);
         for r in records {
             let idx = m.size();
@@ -191,33 +209,78 @@ impl Mirror {
             return Ok(());
         };
         let owner_before = match e.body {
-            Body::Claim { repo_id, .. } | Body::Grant { repo_id, .. } => self.state.owner(repo_id).map(str::to_owned),
+            Body::Claim { repo_id, .. } | Body::Grant { repo_id, .. } => {
+                self.state.owner(repo_id).map(str::to_owned)
+            }
             _ => None,
         };
         if let Err(code) = self.state.apply(idx, &e, check_sigs) {
-            alerts.push(Alert::Rejected { idx, kind: e.kind, code });
+            alerts.push(Alert::Rejected {
+                idx,
+                kind: e.kind,
+                code,
+            });
             return Ok(());
         }
         let Some(me) = &self.me else { return Ok(()) };
-        let signer_known = |signer: &str| self.state.device(signer).is_some_and(|d| me.knows(&d.sign_pub));
+        let signer_known = |signer: &str| {
+            self.state
+                .device(signer)
+                .is_some_and(|d| me.knows(&d.sign_pub))
+        };
         match e.body {
-            Body::Key { device_id, pseudonym, sign_pub, .. } => {
+            Body::Key {
+                device_id,
+                pseudonym,
+                sign_pub,
+                ..
+            } => {
                 if pseudonym == me.pseudonym && !me.knows(sign_pub) {
-                    alerts.push(Alert::UnknownKey { idx, device_id: device_id.to_owned() });
+                    alerts.push(Alert::UnknownKey {
+                        idx,
+                        device_id: device_id.to_owned(),
+                    });
                 } else if pseudonym != me.pseudonym && me.knows(sign_pub) {
-                    alerts.push(Alert::KeyHijack { idx, device_id: device_id.to_owned(), pseudonym: pseudonym.to_owned() });
+                    alerts.push(Alert::KeyHijack {
+                        idx,
+                        device_id: device_id.to_owned(),
+                        pseudonym: pseudonym.to_owned(),
+                    });
                 }
             }
-            Body::Claim { repo_id, owner, signer, .. } => {
+            Body::Claim {
+                repo_id,
+                owner,
+                signer,
+                ..
+            } => {
                 if owner == me.pseudonym && !signer_known(signer) {
-                    alerts.push(Alert::NotSignedByMe { idx, kind: e.kind, repo_id: repo_id.to_owned(), signer: signer.to_owned() });
+                    alerts.push(Alert::NotSignedByMe {
+                        idx,
+                        kind: e.kind,
+                        repo_id: repo_id.to_owned(),
+                        signer: signer.to_owned(),
+                    });
                 }
                 if owner_before.as_deref() == Some(me.pseudonym.as_str()) && owner != me.pseudonym {
-                    alerts.push(Alert::RepoClaimedByOther { idx, repo_id: repo_id.to_owned(), owner: owner.to_owned() });
+                    alerts.push(Alert::RepoClaimedByOther {
+                        idx,
+                        repo_id: repo_id.to_owned(),
+                        owner: owner.to_owned(),
+                    });
                 }
             }
-            Body::Grant { repo_id, signer, .. } if owner_before.as_deref() == Some(me.pseudonym.as_str()) && !signer_known(signer) => {
-                alerts.push(Alert::NotSignedByMe { idx, kind: e.kind, repo_id: repo_id.to_owned(), signer: signer.to_owned() });
+            Body::Grant {
+                repo_id, signer, ..
+            } if owner_before.as_deref() == Some(me.pseudonym.as_str())
+                && !signer_known(signer) =>
+            {
+                alerts.push(Alert::NotSignedByMe {
+                    idx,
+                    kind: e.kind,
+                    repo_id: repo_id.to_owned(),
+                    signer: signer.to_owned(),
+                });
             }
             _ => {}
         }

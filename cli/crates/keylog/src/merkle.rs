@@ -61,7 +61,13 @@ pub fn verify_inclusion(index: u64, size: u64, leaf: &Hash, proof: &[Hash], root
 /// Verifies a consistency proof (RFC 9162 §2.1.4.2) that the tree of `size1` leaves with
 /// root `root1` is a prefix of the tree of `size2` leaves with root `root2`.
 #[must_use]
-pub fn verify_consistency(size1: u64, size2: u64, root1: &Hash, root2: &Hash, proof: &[Hash]) -> bool {
+pub fn verify_consistency(
+    size1: u64,
+    size2: u64,
+    root1: &Hash,
+    root2: &Hash,
+    proof: &[Hash],
+) -> bool {
     if size1 > size2 || proof.len() > 128 {
         return false;
     }
@@ -139,7 +145,9 @@ impl CompactRange {
     #[must_use]
     pub fn root(&self) -> Hash {
         let mut it = self.nodes.iter().rev();
-        let Some(last) = it.next() else { return empty_root() };
+        let Some(last) = it.next() else {
+            return empty_root();
+        };
         it.fold(*last, |acc, left| node_hash(left, &acc))
     }
 }

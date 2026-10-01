@@ -32,7 +32,9 @@ fn be32(b: &[u8]) -> Option<u32> {
 }
 
 fn valid_name(n: &str) -> bool {
-    !n.is_empty() && n.chars().all(|c| !c.is_whitespace() && c != '+' && !c.is_control())
+    !n.is_empty()
+        && n.chars()
+            .all(|c| !c.is_whitespace() && c != '+' && !c.is_control())
 }
 
 impl NoteKey {
@@ -42,18 +44,32 @@ impl NoteKey {
             return Err(Error::Format("vkey"));
         };
         let raw = b64::decode(k.as_bytes()).ok_or(Error::Format("vkey base64"))?;
-        let (&[alg], pubkey) = (raw.get(..1).unwrap_or_default(), raw.get(1..).unwrap_or_default()) else {
+        let (&[alg], pubkey) = (
+            raw.get(..1).unwrap_or_default(),
+            raw.get(1..).unwrap_or_default(),
+        ) else {
             return Err(Error::Format("vkey"));
         };
-        let hash = (hex.len() == 8 && hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
-            .then(|| u32::from_str_radix(hex, 16).ok())
-            .flatten()
-            .ok_or(Error::Format("vkey hash"))?;
-        if !valid_name(name) || alg != ALG_ED25519 || pubkey.len() != 32 || key_hash(name, &raw) != hash {
+        let hash = (hex.len() == 8
+            && hex
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+        .then(|| u32::from_str_radix(hex, 16).ok())
+        .flatten()
+        .ok_or(Error::Format("vkey hash"))?;
+        if !valid_name(name)
+            || alg != ALG_ED25519
+            || pubkey.len() != 32
+            || key_hash(name, &raw) != hash
+        {
             return Err(Error::Format("vkey"));
         }
         let key = VerificationKey::try_from(pubkey).map_err(|_| Error::Format("vkey point"))?;
-        Ok(Self { name: name.to_owned(), hash, key })
+        Ok(Self {
+            name: name.to_owned(),
+            hash,
+            key,
+        })
     }
 
     #[must_use]
@@ -81,7 +97,10 @@ pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Check
         return Err(Error::Format("note control char"));
     }
     let split = s.rfind("\n\n").ok_or(Error::Format("note signatures"))?;
-    let (text, sigs) = (s.get(..=split).unwrap_or_default(), s.get(split.saturating_add(2)..).unwrap_or_default());
+    let (text, sigs) = (
+        s.get(..=split).unwrap_or_default(),
+        s.get(split.saturating_add(2)..).unwrap_or_default(),
+    );
     if !sigs.ends_with('\n') {
         return Err(Error::Format("note signatures"));
     }
@@ -90,8 +109,12 @@ pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Check
         if i >= 100 {
             return Err(Error::TooLarge);
         }
-        let rest = line.strip_prefix(SIG_PREFIX).ok_or(Error::Format("note signature line"))?;
-        let (name, b) = rest.split_once(' ').ok_or(Error::Format("note signature line"))?;
+        let rest = line
+            .strip_prefix(SIG_PREFIX)
+            .ok_or(Error::Format("note signature line"))?;
+        let (name, b) = rest
+            .split_once(' ')
+            .ok_or(Error::Format("note signature line"))?;
         let raw = b64::decode(b.as_bytes()).ok_or(Error::Format("note signature base64"))?;
         if !valid_name(name) || raw.len() < 5 {
             return Err(Error::Format("note signature line"));
@@ -101,7 +124,9 @@ pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Check
             continue;
         }
         let sig: [u8; 64] = sig.try_into().map_err(|_| Error::BadSig)?;
-        key.key.verify(&Signature::from(sig), text.as_bytes()).map_err(|_| Error::BadSig)?;
+        key.key
+            .verify(&Signature::from(sig), text.as_bytes())
+            .map_err(|_| Error::BadSig)?;
         ok = true;
     }
     if !ok {
@@ -112,13 +137,23 @@ pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Check
 
 fn parse_text(text: &str, origin: &str) -> Result<Checkpoint, Error> {
     let mut lines = text.split('\n');
-    let (Some(o), Some(n), Some(r), Some(""), None) = (lines.next(), lines.next(), lines.next(), lines.next(), lines.next()) else {
+    let (Some(o), Some(n), Some(r), Some(""), None) = (
+        lines.next(),
+        lines.next(),
+        lines.next(),
+        lines.next(),
+        lines.next(),
+    ) else {
         return Err(Error::Format("checkpoint text"));
     };
     if o != origin {
         return Err(Error::Format("checkpoint origin"));
     }
-    if n.is_empty() || n.len() > 20 || (n.starts_with('0') && n.len() > 1) || !n.bytes().all(|c| c.is_ascii_digit()) {
+    if n.is_empty()
+        || n.len() > 20
+        || (n.starts_with('0') && n.len() > 1)
+        || !n.bytes().all(|c| c.is_ascii_digit())
+    {
         return Err(Error::Format("checkpoint size"));
     }
     let size = n.parse().map_err(|_| Error::Format("checkpoint size"))?;

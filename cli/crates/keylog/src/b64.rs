@@ -4,7 +4,10 @@
 const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn val(c: u8) -> Option<u32> {
-    ALPHA.iter().position(|&a| a == c).and_then(|p| u32::try_from(p).ok())
+    ALPHA
+        .iter()
+        .position(|&a| a == c)
+        .and_then(|p| u32::try_from(p).ok())
 }
 
 /// Strict decode: length multiple of 4, padding only at the end, zero unused bits.
@@ -48,7 +51,14 @@ pub fn encode(b: &[u8]) -> String {
     for c in b.chunks(3) {
         let byte = |i: usize| u32::from(c.get(i).copied().unwrap_or(0));
         let n = byte(0) << 16 | byte(1) << 8 | byte(2);
-        let sym = |shift: u32| char::from(ALPHA.get(((n >> shift) & 63) as usize).copied().unwrap_or(b'='));
+        let sym = |shift: u32| {
+            char::from(
+                ALPHA
+                    .get(((n >> shift) & 63) as usize)
+                    .copied()
+                    .unwrap_or(b'='),
+            )
+        };
         out.push(sym(18));
         out.push(sym(12));
         out.push(if c.len() > 1 { sym(6) } else { '=' });
@@ -68,7 +78,15 @@ mod tests {
             assert_eq!(decode(encode(&v).as_bytes()).unwrap(), v);
         }
         assert_eq!(encode(b"foob"), "Zm9vYg==");
-        for bad in ["Zm9vYh==", "Zm9vYg=", "Zm9=Yg==", "Zm9vY===", "Zm 9", "Zm9vYg==Zm9v", "=AAA"] {
+        for bad in [
+            "Zm9vYh==",
+            "Zm9vYg=",
+            "Zm9=Yg==",
+            "Zm9vY===",
+            "Zm 9",
+            "Zm9vYg==Zm9v",
+            "=AAA",
+        ] {
             assert!(decode(bad.as_bytes()).is_none(), "{bad}");
         }
     }

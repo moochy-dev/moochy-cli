@@ -31,7 +31,11 @@ pub fn tile_path(level: Option<u8>, n: u64, width: u64) -> String {
     };
     let last = groups.len().saturating_sub(1);
     for (i, g) in groups.iter().rev().enumerate() {
-        let _ = if i == last { write!(p, "/{g:03}") } else { write!(p, "/x{g:03}") };
+        let _ = if i == last {
+            write!(p, "/{g:03}")
+        } else {
+            write!(p, "/x{g:03}")
+        };
     }
     if width > 0 && width < TILE_WIDTH {
         let _ = write!(p, ".p/{width}");
@@ -64,7 +68,11 @@ pub fn bundles(from: u64, to: u64) -> Vec<BundleFetch> {
         let n = i / TILE_WIDTH;
         let start = n.saturating_mul(TILE_WIDTH);
         let width = to.saturating_sub(start).min(TILE_WIDTH);
-        out.push(BundleFetch { n, width, skip: i.saturating_sub(start) });
+        out.push(BundleFetch {
+            n,
+            width,
+            skip: i.saturating_sub(start),
+        });
         i = start.saturating_add(width);
     }
     out
@@ -78,7 +86,9 @@ pub fn parse_bundle(data: &[u8], width: u64) -> Result<Vec<&[u8]>, Error> {
     let mut out = Vec::with_capacity(usize::try_from(width.min(TILE_WIDTH)).unwrap_or(0));
     let mut b = data;
     while !b.is_empty() {
-        let (len, rest) = b.split_first_chunk::<2>().ok_or(Error::Format("bundle truncated"))?;
+        let (len, rest) = b
+            .split_first_chunk::<2>()
+            .ok_or(Error::Format("bundle truncated"))?;
         let len = usize::from(u16::from_be_bytes(*len));
         if len > MAX_RECORD || len > rest.len() {
             return Err(Error::Format("bundle entry length"));
@@ -108,20 +118,42 @@ mod tests {
     #[test]
     fn bundle_plan() {
         assert_eq!(bundles(0, 0), vec![]);
-        assert_eq!(bundles(0, 5), vec![BundleFetch { n: 0, width: 5, skip: 0 }]);
+        assert_eq!(
+            bundles(0, 5),
+            vec![BundleFetch {
+                n: 0,
+                width: 5,
+                skip: 0
+            }]
+        );
         assert_eq!(
             bundles(250, 600),
             vec![
-                BundleFetch { n: 0, width: 256, skip: 250 },
-                BundleFetch { n: 1, width: 256, skip: 0 },
-                BundleFetch { n: 2, width: 88, skip: 0 }
+                BundleFetch {
+                    n: 0,
+                    width: 256,
+                    skip: 250
+                },
+                BundleFetch {
+                    n: 1,
+                    width: 256,
+                    skip: 0
+                },
+                BundleFetch {
+                    n: 2,
+                    width: 88,
+                    skip: 0
+                }
             ]
         );
     }
 
     #[test]
     fn bundle_parse_bounds() {
-        assert_eq!(parse_bundle(&[0, 1, 7, 0, 0], 2).unwrap(), vec![&[7u8][..], &[][..]]);
+        assert_eq!(
+            parse_bundle(&[0, 1, 7, 0, 0], 2).unwrap(),
+            vec![&[7u8][..], &[][..]]
+        );
         assert!(parse_bundle(&[0, 1, 7], 2).is_err());
         assert!(parse_bundle(&[0, 2, 7], 1).is_err());
         assert!(parse_bundle(&[4, 1], 1).is_err());

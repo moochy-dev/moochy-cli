@@ -42,37 +42,68 @@ impl Fetcher {
             return Err(Error::Format("url scheme"));
         };
         let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-        if authority.is_empty() || authority.contains(['@', '?', '#']) || path.contains(['?', '#']) || base.chars().any(char::is_control) {
+        if authority.is_empty()
+            || authority.contains(['@', '?', '#'])
+            || path.contains(['?', '#'])
+            || base.chars().any(char::is_control)
+        {
             return Err(Error::Format("url"));
         }
         let host = match authority.strip_prefix('[') {
-            Some(v6) => v6.split_once(']').map(|(h, _)| h).ok_or(Error::Format("url host"))?,
+            Some(v6) => v6
+                .split_once(']')
+                .map(|(h, _)| h)
+                .ok_or(Error::Format("url host"))?,
             None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
         };
-        let has_port = authority.rsplit_once(':').is_some_and(|(h, p)| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) && !h.ends_with(':'));
-        let addr = if has_port { authority.to_owned() } else { format!("{authority}:{}", if tls { 443 } else { 80 }) };
+        let has_port = authority.rsplit_once(':').is_some_and(|(h, p)| {
+            !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) && !h.ends_with(':')
+        });
+        let addr = if has_port {
+            authority.to_owned()
+        } else {
+            format!("{authority}:{}", if tls { 443 } else { 80 })
+        };
         let mut prefix = format!("/{path}");
         if !prefix.ends_with('/') {
             prefix.push('/');
         }
         let tls_config = if tls {
-            let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(io)?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(io)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
             Some(Arc::new(cfg))
         } else {
             None
         };
-        Ok(Self { host: host.to_owned(), authority: authority.to_owned(), addr, prefix, timeout, tls_config })
+        Ok(Self {
+            host: host.to_owned(),
+            authority: authority.to_owned(),
+            addr,
+            prefix,
+            timeout,
+            tls_config,
+        })
     }
 
     /// GET `prefix + path`; 200 only; body ≤ `max` bytes.
     pub fn get(&self, path: &str, max: usize) -> Result<Vec<u8>, Error> {
-        let deadline = Instant::now().checked_add(self.timeout).ok_or(Error::Io("timeout".into()))?;
-        let left = || deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(Error::Io("timeout".into()));
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(Error::Io("timeout".into()))?;
+        let left = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(Error::Io("timeout".into()))
+        };
         let mut last = Error::Io("no address".into());
         let mut sock = None;
         for a in self.addr.to_socket_addrs().map_err(io)? {
@@ -93,11 +124,24 @@ impl Fetcher {
         let limit = max.saturating_add(MAX_HEADER_BYTES);
         let raw = match &self.tls_config {
             Some(cfg) => {
-                let name = rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(io)?;
+                let name =
+                    rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(io)?;
                 let conn = rustls::ClientConnection::new(Arc::clone(cfg), name).map_err(io)?;
-                exchange(rustls::StreamOwned::new(conn, sock.try_clone().map_err(io)?), &sock, req.as_bytes(), limit, left)?
+                exchange(
+                    rustls::StreamOwned::new(conn, sock.try_clone().map_err(io)?),
+                    &sock,
+                    req.as_bytes(),
+                    limit,
+                    left,
+                )?
             }
-            None => exchange(sock.try_clone().map_err(io)?, &sock, req.as_bytes(), limit, left)?,
+            None => exchange(
+                sock.try_clone().map_err(io)?,
+                &sock,
+                req.as_bytes(),
+                limit,
+                left,
+            )?,
         };
         parse_response(&raw, max)
     }
@@ -112,11 +156,21 @@ impl Fetcher {
         for b in bundles(m.size(), checkpoint.size) {
             let data = self.get(&b.path(), MAX_BUNDLE_BYTES)?;
             let skip = usize::try_from(b.skip).map_err(|_| Error::TooLarge)?;
-            records.extend(parse_bundle(&data, b.width)?.into_iter().skip(skip).map(<[u8]>::to_vec));
+            records.extend(
+                parse_bundle(&data, b.width)?
+                    .into_iter()
+                    .skip(skip)
+                    .map(<[u8]>::to_vec),
+            );
         }
         let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
         let alerts = m.update(&checkpoint, &refs)?;
-        Ok(Synced { checkpoint, note, records, alerts })
+        Ok(Synced {
+            checkpoint,
+            note,
+            records,
+            alerts,
+        })
     }
 }
 
@@ -131,7 +185,13 @@ pub struct Synced {
     pub alerts: Vec<Alert>,
 }
 
-fn exchange(mut s: impl Read + Write, sock: &TcpStream, req: &[u8], limit: usize, left: impl Fn() -> Result<Duration, Error>) -> Result<Vec<u8>, Error> {
+fn exchange(
+    mut s: impl Read + Write,
+    sock: &TcpStream,
+    req: &[u8],
+    limit: usize,
+    left: impl Fn() -> Result<Duration, Error>,
+) -> Result<Vec<u8>, Error> {
     sock.set_write_timeout(Some(left()?)).map_err(io)?;
     s.write_all(req).map_err(io)?;
     s.flush().map_err(io)?;
@@ -156,18 +216,35 @@ fn exchange(mut s: impl Read + Write, sock: &TcpStream, req: &[u8], limit: usize
 }
 
 fn parse_response(raw: &[u8], max: usize) -> Result<Vec<u8>, Error> {
-    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or(Error::Io("bad response".into()))?;
-    let head = std::str::from_utf8(raw.get(..end).unwrap_or_default()).map_err(|_| Error::Io("bad response".into()))?;
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or(Error::Io("bad response".into()))?;
+    let head = std::str::from_utf8(raw.get(..end).unwrap_or_default())
+        .map_err(|_| Error::Io("bad response".into()))?;
     let body = raw.get(end.saturating_add(4)..).unwrap_or_default();
     let mut lines = head.split("\r\n");
     let status = lines.next().unwrap_or_default();
-    if !(status.starts_with("HTTP/1.0 200 ") || status.starts_with("HTTP/1.1 200 ") || status == "HTTP/1.1 200" || status == "HTTP/1.0 200") {
-        return Err(Error::Io(format!("status: {}", status.chars().take(40).filter(|c| !c.is_control()).collect::<String>())));
+    if !(status.starts_with("HTTP/1.0 200 ")
+        || status.starts_with("HTTP/1.1 200 ")
+        || status == "HTTP/1.1 200"
+        || status == "HTTP/1.0 200")
+    {
+        return Err(Error::Io(format!(
+            "status: {}",
+            status
+                .chars()
+                .take(40)
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+        )));
     }
     for l in lines {
         let (k, v) = l.split_once(':').ok_or(Error::Io("bad header".into()))?;
         let v = v.trim();
-        if k.eq_ignore_ascii_case("transfer-encoding") || (k.eq_ignore_ascii_case("content-encoding") && v != "identity") {
+        if k.eq_ignore_ascii_case("transfer-encoding")
+            || (k.eq_ignore_ascii_case("content-encoding") && v != "identity")
+        {
             return Err(Error::Io("unsupported encoding".into()));
         }
         if k.eq_ignore_ascii_case("content-length") && v.parse::<usize>().ok() != Some(body.len()) {
