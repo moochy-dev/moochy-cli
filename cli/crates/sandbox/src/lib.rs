@@ -32,6 +32,8 @@ mod donor;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod git;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod mask;
 #[cfg(target_os = "linux")]
 mod seccomp;
@@ -77,6 +79,11 @@ pub struct Spec {
     pub run_token: Option<String>,
     /// Resource limits. Defaults are generous but finite (fork-bomb / OOM safe).
     pub limits: Limits,
+    /// Let the agent write `.git` (commit inside). `hooks/`, `config` and
+    /// `modules/` stay read-only, but a created `.git/commondir` would redirect
+    /// the host's git to agent-written config (DESIGN.md). Default `false`:
+    /// `.git` is read-only inside. Linked worktrees are always read-only.
+    pub git_writable: bool,
     /// Escape hatch for debugging only. When true, [`run`](Spec::run) executes
     /// the command with NO sandbox after printing a loud warning to stderr.
     pub unsafe_no_sandbox: bool,
@@ -152,6 +159,7 @@ impl Spec {
             env: BTreeMap::new(),
             cwd: None,
             run_token: None,
+            git_writable: false,
             limits: Limits::default(),
             unsafe_no_sandbox: false,
         }

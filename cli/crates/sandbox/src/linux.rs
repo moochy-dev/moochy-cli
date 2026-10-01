@@ -50,7 +50,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let masks = mask::collect(&worktree)?;
-    let git_ro = git_protected(&worktree);
+    let git = crate::git::view(&worktree, spec.git_writable);
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
 
     let plan = Plan {
@@ -64,7 +64,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         },
         gateway_port: spec.gateway_loopback_port,
         cwd: spec.cwd.clone(),
-        git_ro,
+        git,
         masks,
         uid_raw: uid.as_raw(),
         gid_raw: gid.as_raw(),
@@ -114,7 +114,7 @@ struct Plan {
     gateway_socket: Option<PathBuf>,
     gateway_port: Option<u16>,
     cwd: Option<PathBuf>,
-    git_ro: Vec<PathBuf>,
+    git: crate::git::GitView,
     masks: Vec<PathBuf>,
     uid_raw: u32,
     gid_raw: u32,
@@ -418,8 +418,11 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     // Git paths whose content the HOST later executes (hooks; `core.fsmonitor`,
     // `core.hooksPath`, aliases in config): read-only inside, so code written by
     // the agent can never run outside the sandbox on the user's next `git`.
-    for p in &plan.git_ro {
+    for p in &plan.git.read_only {
         bind_into(&root, p, false)?;
+    }
+    if let Some(l) = &plan.git.linked {
+        bind_linked_gitdir(&root, l)?;
     }
 
 
@@ -456,20 +459,30 @@ fn write_id_maps(uid: u32, gid: u32) -> Result<(), Error> {
     Ok(())
 }
 
-/// `.git/hooks` (created empty if missing, as git itself would) and
-/// `.git/config` of a worktree whose `.git` is a directory. A linked worktree's
-/// `.git` *file* points at a gitdir outside the view, which stays invisible.
-fn git_protected(worktree: &Path) -> Vec<PathBuf> {
-    let git = worktree.join(".git");
-    if !git.is_dir() {
-        return Vec::new();
+/// Linked worktree: the shared commondir read-only, other worktrees' gitdirs
+/// hidden under an empty read-only tmpfs, this worktree's gitdir read-only.
+fn bind_linked_gitdir(root: &Path, l: &crate::git::Linked) -> Result<(), Error> {
+    if let Some(common) = &l.commondir {
+        bind_into(root, common, false)?;
     }
-    let hooks = git.join("hooks");
-    let _ = std::fs::create_dir(&hooks);
-    [hooks, git.join("config")].into_iter().filter(|p| p.exists()).collect()
+    match &l.worktrees_dir {
+        Some(wts) if l.gitdir.parent() == Some(wts.as_path()) => {
+            let t = root.join(wts.strip_prefix("/").unwrap_or(wts));
+            tmpfs(&t, c"mode=0755")?;
+            bind_into(root, &l.gitdir, false)?;
+            mount_remount(&t, MountFlags::RDONLY, "").map_err(io("remount worktrees ro"))?;
+        }
+        Some(wts) => {
+            let t = root.join(wts.strip_prefix("/").unwrap_or(wts));
+            tmpfs(&t, c"mode=0755")?;
+            mount_remount(&t, MountFlags::RDONLY, "").map_err(io("remount worktrees ro"))?;
+            bind_into(root, &l.gitdir, false)?;
+        }
+        None => bind_into(root, &l.gitdir, false)?,
+    }
+    Ok(())
 }
 
-/// Bind `src` (host absolute path) into `root` at the same absolute path.
 /// A path the caller listed, resolved on the host: `real` is canonical (what we
 /// mount and what Landlock rules name); `link` is the listed path when it went
 /// through a symlink (`/bin -> usr/bin`, `~/tools -> /opt/x`), recreated inside.

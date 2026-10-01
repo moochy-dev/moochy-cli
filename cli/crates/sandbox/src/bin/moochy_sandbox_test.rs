@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         "symlink" => probe_symlink(rest),
         "tiocsti" => probe_tiocsti(),
         "env" => probe_env(rest),
+        "exec-sh" => probe_exec_sh(rest),
         "sleep" => probe_sleep(rest),
         "forkbomb" => probe_forkbomb(),
         "memhog" => probe_memhog(),
@@ -464,6 +465,11 @@ fn run_sandbox(a: &[String]) -> ExitCode {
             "--gw" => spec.gateway_socket = Some(PathBuf::from(val)),
             "--gw-port" => spec.gateway_loopback_port = val.parse().ok(),
             "--token" => spec.run_token = Some(val),
+            "--git-writable" => {
+                spec.git_writable = true;
+                i += 1;
+                continue;
+            }
             "--nproc" => spec.limits.processes = val.parse().unwrap_or(64),
             "--mem" => spec.limits.memory_bytes = val.parse().unwrap_or(1 << 30),
             "--wall" => spec.limits.wall_seconds = val.parse().unwrap_or(0),
@@ -761,4 +767,13 @@ fn validator_fds_and_stream(mode: &str) -> ExitCode {
         _ => code == 0 && out == b"PING",
     };
     if good { ok() } else { no() }
+}
+
+/// `exec-sh <snippet>`: run `/bin/sh -c <snippet>`, forward its exit status.
+fn probe_exec_sh(a: &[String]) -> ExitCode {
+    let Some(snippet) = a.first() else { return ExitCode::from(2) };
+    match std::process::Command::new("/bin/sh").arg("-c").arg(snippet).status() {
+        Ok(s) if s.success() => ok(),
+        _ => no(),
+    }
 }

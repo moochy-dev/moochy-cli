@@ -389,11 +389,58 @@ fn e97_git_ignored_masked_and_git_exec_paths_read_only() {
 
     let o = sandboxed(&f, &[], &["read", &f.path("wt/local.json")]);
     assert!(has(&o, "len=0"), "git-ignored file visible: {}", o.stdout);
-    for rel in [".git/hooks/pre-commit", ".git/config"] {
+    // Default: the whole .git is read-only — no hook, no config, and no
+    // `commondir` (which would redirect the host's git to agent-written config).
+    for rel in [".git/hooks/pre-commit", ".git/config", ".git/commondir", ".git/HEAD.new"] {
         let o = sandboxed(&f, &[], &["write", &f.path(&format!("wt/{rel}"))]);
         assert!(has(&o, "write-fail"), "{rel} writable: {}", o.stdout);
     }
     assert!(!wt.join(".git/hooks/pre-commit").exists());
+    assert!(!wt.join(".git/commondir").exists());
+    // Opt-in git_writable: git can write its own files, hooks/config stay read-only.
+    let o = sandboxed(&f, &["--git-writable"], &["write", &f.path("wt/.git/HEAD.new")]);
+    assert!(has(&o, "write-ok"), "{}", o.stdout);
+    for rel in [".git/hooks/pre-commit", ".git/config"] {
+        let o = sandboxed(&f, &["--git-writable"], &["write", &f.path(&format!("wt/{rel}"))]);
+        assert!(has(&o, "write-fail"), "{rel} writable with git_writable: {}", o.stdout);
+    }
+}
+
+#[test]
+fn e97_linked_worktree_read_only_and_isolated() {
+    require_sandbox!();
+    let f = Fixture::new("e97lw");
+    let main = f.root.join("main");
+    let git = |dir: &Path, args: &[&str]| {
+        Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).output().map(|o| o.status.success()).unwrap_or(false)
+    };
+    std::fs::create_dir_all(&main).unwrap();
+    if !git(&main, &["init", "-q"]) {
+        eprintln!("SKIP pending: git not available");
+        return;
+    }
+    std::fs::write(main.join("main-only.txt"), b"main").unwrap();
+    assert!(git(&main, &["add", "."]) && git(&main, &["commit", "-qm", "init"]));
+    // Our worktree is `wt` (the fixture's worktree path), a sibling is `other`.
+    std::fs::remove_dir_all(f.wt()).unwrap();
+    assert!(git(&main, &["worktree", "add", "-q", f.wt().to_str().unwrap(), "-b", "mine"]));
+    assert!(git(&main, &["worktree", "add", "-q", f.root.join("other").to_str().unwrap(), "-b", "theirs"]));
+
+    // git reads work inside.
+    let wt = f.path("wt");
+    let o = sandboxed(&f, &[], &["exec-sh", &format!("cd {wt} && git status --short && git log --oneline >/dev/null && echo GIT-OK")]);
+    assert!(o.stdout.contains("GIT-OK"), "{}{}", o.stdout, o.stderr);
+    // Other worktrees' gitdirs and the main worktree's files are not visible.
+    let common = main.join(".git").canonicalize().unwrap();
+    for p in [common.join("worktrees/other/HEAD"), main.join("main-only.txt"), f.root.join("other/main-only.txt")] {
+        let o = sandboxed(&f, &[], &["read", p.to_str().unwrap()]);
+        assert_ne!(o.code, 0, "visible inside: {}", p.display());
+    }
+    // Read-only: no write to the shared repo, no rewrite of the `.git` file.
+    for p in [common.join("objects/probe"), common.join("worktrees/wt/HEAD"), f.wt().join(".git")] {
+        let o = sandboxed(&f, &[], &["write", p.to_str().unwrap()]);
+        assert!(has(&o, "write-fail"), "writable: {}: {}", p.display(), o.stdout);
+    }
 }
 
 #[test]
