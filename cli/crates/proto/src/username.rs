@@ -2,8 +2,10 @@
 //!
 //! Pipeline: refuse anything non-ASCII (no homoglyphs, zero-width or bidi tricks) → ASCII
 //! lowercase → format `^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$` without `--` → reserved words.
-//! Taken and tombstoned handles are database lookups on the canonical form; [`verdict`] fixes the
-//! order of all checks so both implementations report the same reason.
+//! ASCII look-alikes (`rnoochy`, `m00chy`, `ange-s`/`anges`) are caught by comparing
+//! [`skeleton`]s: reserved words, taken handles and tombstones all match on the skeleton
+//! (`users.username_skeleton`, UNIQUE). [`verdict`] fixes the order of all checks so both
+//! implementations report the same reason.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -58,18 +60,29 @@ pub fn canonical(input: &str) -> Result<String, Verdict> {
     if !ok {
         return Err(Verdict::Invalid);
     }
-    if RESERVED.contains(&h.as_str()) {
+    let sk = skeleton(&h);
+    if RESERVED.iter().any(|r| skeleton(r) == sk) {
         return Err(Verdict::Reserved);
     }
     Ok(h)
 }
 
-/// Full decision: invalid → reserved → taken → tombstoned → ok. The lookups get the canonical form.
+/// Look-alike key (CONTRACT §11): ASCII-lowercase, then `rn`→`m`, `vv`→`w`, `0`→`o`, `1`→`l`,
+/// then `-` removed — each rule applied left to right over the whole string, in that order
+/// (`rrn`→`rm`, `vvv`→`wv`, `r-n`→`rn`). Identical to Go `oauth.Skeleton`.
+#[must_use]
+pub fn skeleton(handle: &str) -> String {
+    handle.to_ascii_lowercase().replace("rn", "m").replace("vv", "w").replace('0', "o").replace('1', "l").replace('-', "")
+}
+
+/// Full decision: invalid → reserved → taken → tombstoned → ok. The lookups receive the
+/// SKELETON of the canonical form and must answer "does a current / retired handle have this
+/// skeleton?" (`users.username_skeleton`, `username_tombstones` skeletons).
 pub fn verdict(input: &str, taken: impl Fn(&str) -> bool, tombstoned: impl Fn(&str) -> bool) -> Verdict {
-    match canonical(input) {
+    match canonical(input).map(|h| skeleton(&h)) {
         Err(v) => v,
-        Ok(h) if taken(&h) => Verdict::Taken,
-        Ok(h) if tombstoned(&h) => Verdict::Tombstoned,
+        Ok(sk) if taken(&sk) => Verdict::Taken,
+        Ok(sk) if tombstoned(&sk) => Verdict::Tombstoned,
         Ok(_) => Verdict::Ok,
     }
 }
@@ -112,8 +125,16 @@ mod tests {
         }
         assert_eq!(canonical("ADMIN"), Err(Verdict::Reserved));
         assert_eq!((canonical("logout"), canonical("Events")), (Err(Verdict::Reserved), Err(Verdict::Reserved)));
-        let v = |s| verdict(s, |h| h == "alice", |h| h == "old-name");
+        let v = |s| verdict(s, |k| k == skeleton("alice"), |k| k == skeleton("old-name"));
         assert_eq!((v("ALICE"), v("Old-Name"), v("bob")), (Verdict::Taken, Verdict::Tombstoned, Verdict::Ok));
+        assert_eq!((v("a1ice"), v("oldname"), v("o1d-name")), (Verdict::Taken, Verdict::Tombstoned, Verdict::Tombstoned));
+        for (i, o) in [("rnoochy", "moochy"), ("m00chy", "moochy"), ("RNOOCHY", "moochy"), ("ange-s", "anges"), ("ali1ce", "alilce"), ("vvalt", "walt"), ("rnrn", "mm"), ("rrn", "rm"), ("rnn", "mn"), ("vvv", "wv"), ("r-n", "rn"), ("v-v", "vv"), ("r0n", "ron"), ("1o1", "lol")] {
+            assert_eq!(skeleton(i), o, "{i}");
+        }
+        for r in ["rnoochy", "adrnin", "r00t", "a-p-i", "v-1", "dev-ice"] {
+            assert_eq!(canonical(r), Err(Verdict::Reserved), "{r}");
+        }
+        assert_eq!(canonical("dev1ce").as_deref(), Ok("dev1ce"));
         assert_eq!(display_safe("ok"), "ok");
         assert_eq!(display_safe("a\x1b[2Jb\u{202E}c"), "a\\u{001B}[2Jb\\u{202E}c");
     }

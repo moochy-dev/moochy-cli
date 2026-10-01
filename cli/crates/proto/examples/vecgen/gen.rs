@@ -826,9 +826,12 @@ fn money_vectors() -> Value {
 // ------------------------------------------------------------------ usernames
 
 fn usernames() -> Value {
-    let taken = ["alice", "bob-smith", "x9"];
-    let tombstoned = ["old-name", "carol"];
-    let inputs: [(&str, &str); 40] = [
+    // Look-alike targets (CONTRACT §11 skeletons) are part of the same global lists so every
+    // consumer runs them with one store: alilce, ange-s, vvendy, mary, ma; tombstone rnary
+    // shares mary's skeleton to pin "taken is reported before tombstoned".
+    let taken = ["alice", "bob-smith", "x9", "alilce", "ange-s", "vvendy", "mary", "ma"];
+    let tombstoned = ["old-name", "carol", "rnary"];
+    let inputs: [(&str, &str); 62] = [
         ("valid", "abc"),
         ("valid", "alice2"),
         ("valid", "a-b"),
@@ -852,6 +855,28 @@ fn usernames() -> Value {
         ("reserved", "logout"),
         ("reserved", "Events"),
         ("invalid (too short, also reserved)", "u"),
+        ("look-alike of reserved moochy (rn→m)", "rnoochy"),
+        ("look-alike of reserved moochy (0→o)", "m00chy"),
+        ("look-alike of reserved admin (rn→m)", "adrnin"),
+        ("look-alike of reserved root (0→o)", "r00t"),
+        ("look-alike of reserved api (hyphens)", "a-p-i"),
+        ("look-alike of reserved v1 (hyphen)", "v-1"),
+        ("look-alike of reserved device (hyphen)", "dev-ice"),
+        ("not a look-alike: 1→l gives devlce", "dev1ce"),
+        ("not a look-alike: 5→s is not a rule", "5upport"),
+        ("look-alike of taken alice (1→l)", "a1ice"),
+        ("look-alike of taken alice, uppercase", "A1ICE"),
+        ("look-alike of taken alilce", "ali1ce"),
+        ("look-alike of taken ange-s (hyphen)", "anges"),
+        ("look-alike of taken bob-smith", "bobsmith"),
+        ("look-alike of taken bob-smith (0→o)", "b0b-smith"),
+        ("look-alike of taken x9 (hyphen)", "x-9"),
+        ("look-alike of taken vvendy (vv→w)", "wendy"),
+        ("look-alike of taken mary; also tombstoned rnary: taken wins", "rnary"),
+        ("look-alike of tombstone old-name", "oldname"),
+        ("look-alike of tombstone old-name (1→l)", "o1d-name"),
+        ("look-alike of tombstone carol (1→l)", "caro1"),
+        ("hyphens go last: r-n-a → rna, not ma", "r-n-a"),
         ("invalid", "ab"),
         ("invalid", "x9"),
         ("invalid", "abcdefghijklmnopqrstuvwxyz0123456"),
@@ -873,13 +898,18 @@ fn usernames() -> Value {
     let cases: Vec<Value> = inputs
         .iter()
         .map(|(kind, s)| {
-            let v = username::verdict(s, |h| taken.contains(&h), |h| tombstoned.contains(&h));
+            let v = username::verdict(s, |k| taken.iter().any(|t| username::skeleton(t) == k), |k| tombstoned.iter().any(|t| username::skeleton(t) == k));
             json!({"note": kind, "input": s, "canonical": username::canonical(s).ok(), "verdict": v.as_str()})
         })
         .collect();
+    let skeleton_rows: Vec<Value> = ["moochy", "rnoochy", "m00chy", "RNOOCHY", "ange-s", "ali1ce", "vvalt", "rnrn", "rrn", "rnn", "vvv", "r-n", "v-v", "r0n", "a-b-c", "x9", "1o1"]
+        .iter()
+        .map(|i| json!({"input": i, "skeleton": username::skeleton(i)}))
+        .collect();
     json!({
-        "_schema": "Usernames (CONTRACT §11). Format: {cases:[{input, verdict, canonical, note}], taken, tombstoned, reserved}. reserved is THE reserved-handle list (CONTRACT R7): Rust and Go embed a copy and test it against this array. canonical(input): reject any non-ASCII byte (confusables, zero-width, bidi) → ASCII-lowercase → ^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$ with no '--' → not in reserved. verdict(input) = first of: invalid | reserved | taken (canonical ∈ taken) | tombstoned (canonical ∈ tombstoned) | ok. canonical is null when refused before the lookups; note is descriptive only.",
+        "_schema": "Usernames (CONTRACT §11). Format: {cases:[{input, verdict, canonical, note}], taken, tombstoned, reserved, skeletons:[{input, skeleton}]}. skeleton(h) = ASCII-lowercase, then rn→m, vv→w, 0→o, 1→l, then '-' removed (each a left-to-right replace-all, in that order). Reserved words, taken and tombstoned handles all compare on skeletons: reserved iff skeleton(canonical) = skeleton(some reserved word); taken iff it equals skeleton(some taken handle); tombstoned likewise. reserved is THE reserved-handle list (CONTRACT R7): Rust and Go embed a copy and test it against this array. canonical(input): reject any non-ASCII byte (confusables, zero-width, bidi) → ASCII-lowercase → ^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$ with no '--' → not in reserved. verdict(input) = first of: invalid | reserved | taken | tombstoned | ok. canonical is null when refused before the lookups; note is descriptive only.",
         "reserved": username::RESERVED,
+        "skeletons": skeleton_rows,
         "taken": taken,
         "tombstoned": tombstoned,
         "cases": cases,
