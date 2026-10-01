@@ -88,10 +88,10 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     let mut child = cmd.spawn().map_err(Error::Exec)?;
     let status = child.wait().map_err(Error::Exec)?;
     drop(base);
-    Ok(exit_code(&status))
+    Ok(exit_code(status))
 }
 
-fn exit_code(s: &std::process::ExitStatus) -> i32 {
+fn exit_code(s: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     if let Some(c) = s.code() {
         c
@@ -213,7 +213,7 @@ fn supervise(l: Option<&std::net::TcpListener>, agent_pid: i32, wall_seconds: u6
     let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) else {
         return false; // fall back to a plain waitpid in the caller
     };
-    let deadline = (wall_seconds > 0).then(|| Instant::now() + Duration::from_secs(wall_seconds));
+    let deadline = (wall_seconds > 0).then(|| Instant::now().checked_add(Duration::from_secs(wall_seconds))).flatten();
     let mut conns: Vec<Conn> = Vec::new();
     loop {
         let timeout = deadline.map(|d| {
@@ -663,9 +663,7 @@ fn ll(what: &'static str) -> impl Fn(landlock::RulesetError) -> Error {
 /// unprivileged user namespaces are blocked (Ubuntu AppArmor restriction).
 fn preflight() -> Result<(), Error> {
     let restrict = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-        .ok()
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false);
+        .is_ok_and(|s| s.trim() == "1");
     // Probe: can we create a user namespace at all?
     if let Err(e) = probe_userns() {
         if restrict {
@@ -731,7 +729,7 @@ fn run_unsandboxed(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i3
     }
     cmd.current_dir(&spec.worktree);
     let status = cmd.status().map_err(Error::Exec)?;
-    Ok(exit_code(&status))
+    Ok(exit_code(status))
 }
 
 // ───────────────────────── small fs helpers ─────────────────────────
@@ -754,8 +752,7 @@ fn touch(p: &Path) -> Result<(), Error> {
         OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o644),
     ) {
-        Ok(_) => Ok(()),
-        Err(rustix::io::Errno::EXIST) => Ok(()),
+        Ok(_) | Err(rustix::io::Errno::EXIST) => Ok(()),
         Err(e) => Err(setup("touch", e.into())),
     }
 }
@@ -767,7 +764,7 @@ impl ScratchDir {
     fn new() -> Result<Self, Error> {
         let mut buf = [0u8; 8];
         getrandom(&mut buf)?;
-        let name = format!("moochy-run-{}", hex(&buf));
+        let name = format!("moochy-run-{}", crate::hex(&buf));
         let dir = std::env::temp_dir().join(name);
         std::fs::create_dir(&dir).map_err(|e| setup("scratch mkdir", e))?;
         std::fs::create_dir(dir.join("empty")).map_err(|e| setup("scratch empty", e))?;
@@ -790,13 +787,6 @@ fn getrandom(buf: &mut [u8]) -> Result<(), Error> {
     f.read_exact(buf).map_err(|e| setup("urandom read", e))
 }
 
-fn hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len().saturating_mul(2));
-    for byte in b {
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
-}
 
 // Keep the OsStr import used even if future edits drop a usage.
 #[allow(dead_code)]

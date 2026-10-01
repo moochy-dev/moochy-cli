@@ -2,6 +2,7 @@
 //! files hidden from the agent inside `moochy run`. Exposed so `moochy doctor`
 //! can show exactly what is masked.
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
@@ -51,9 +52,8 @@ pub fn collect(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) -> Result<(), Error> {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return Ok(()), // unreadable dir: skip, not fatal
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(()); // unreadable dir: skip, not fatal
     };
     for entry in rd.flatten() {
         if *seen >= WALK_LIMIT || out.len() >= MASK_LIMIT {
@@ -70,7 +70,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) -> Result<(), Erro
             out.push(path.clone());
             continue; // whole subtree masked; no need to descend
         }
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
             walk(&path, out, seen)?;
         }
     }
@@ -116,7 +116,6 @@ fn git_ignored(worktree: &Path, out: &mut Vec<PathBuf>) {
         if rel.is_empty() || out.len() >= MASK_LIMIT {
             continue;
         }
-        use std::os::unix::ffi::OsStrExt as _;
         let p = worktree.join(std::ffi::OsStr::from_bytes(rel));
         out.push(p);
     }

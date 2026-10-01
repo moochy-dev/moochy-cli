@@ -9,7 +9,14 @@
 //! restricted, no Landlock), each test prints `SKIP pending: <reason>` and
 //! returns; see API.md "Host requirements" for the AppArmor fix.
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::collapsible_if
+)]
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +37,9 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("moochy-sbx-{name}-{}", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("moochy-sbx-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("wt")).unwrap();
         std::fs::create_dir_all(root.join("outside")).unwrap();

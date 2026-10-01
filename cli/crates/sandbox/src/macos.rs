@@ -18,6 +18,7 @@
 //! by default and `process-exec*`/`process-fork` on the donor side.
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -85,34 +86,34 @@ pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::Path
     p.push_str("(allow file-read-metadata)\n");
     p.push_str("(allow sysctl-read)\n");
     // Worktree read-write (and the scratch TMPDIR).
-    p.push_str(&format!("(allow file-read* file-write* (subpath {wt}))\n"));
+    let _ = writeln!(p, "(allow file-read* file-write* (subpath {wt}))");
     p.push_str("(allow file-read* file-write* (subpath \"/private/tmp\"))\n");
     p.push_str("(allow file-write* file-read* (subpath \"/private/var/folders\"))\n");
     for p2 in &spec.rw_paths {
-        p.push_str(&format!(
-            "(allow file-read* file-write* (subpath {}))\n",
+        let _ = writeln!(p, 
+            "(allow file-read* file-write* (subpath {}))",
             sbpl_quote(&p2.to_string_lossy())
-        ));
+        );
     }
     // Mask secret-shaped / git-ignored files: explicit deny wins over the
     // worktree allow above.
     for m in masks {
-        p.push_str(&format!(
-            "(deny file-read* file-write* (subpath {}))\n",
+        let _ = writeln!(p, 
+            "(deny file-read* file-write* (subpath {}))",
             sbpl_quote(&m.to_string_lossy())
-        ));
+        );
     }
     // Network: loopback gateway port only (no general outbound).
     if let Some(port) = spec.gateway_loopback_port {
-        p.push_str(&format!(
-            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
-        ));
+        let _ = writeln!(p, 
+            "(allow network-outbound (remote ip \"localhost:{port}\"))"
+        );
     }
     if let Some(sock) = &spec.gateway_socket {
-        p.push_str(&format!(
-            "(allow network-outbound (literal (subpath {})))\n",
+        let _ = writeln!(p, 
+            "(allow network-outbound (literal (subpath {})))",
             sbpl_quote(&sock.to_string_lossy())
-        ));
+        );
     }
     // Denials we make explicit for clarity (already covered by deny default):
     p.push_str("(deny mach-lookup)\n");
@@ -129,22 +130,22 @@ pub fn donor_profile(policy: &DonorPolicy) -> String {
     let mut p = String::new();
     p.push_str("(version 1)\n(deny default)\n");
     p.push_str("(deny process-exec*)\n(deny process-fork)\n");
-    p.push_str(&format!("(allow file-read* file-write* (subpath {state}))\n"));
+    let _ = writeln!(p, "(allow file-read* file-write* (subpath {state}))");
     for ro in &policy.ro_paths {
-        p.push_str(&format!(
-            "(allow file-read* (subpath {}))\n",
+        let _ = writeln!(p, 
+            "(allow file-read* (subpath {}))",
             sbpl_quote(&ro.to_string_lossy())
-        ));
+        );
     }
     p.push_str("(allow file-read* (regex #\"^/(usr/lib|System/Library)/\"))\n");
-    p.push_str(&format!(
-        "(allow network-outbound (remote tcp \"*:443\") (remote tcp \"*:{}\"))\n",
+    let _ = writeln!(p, 
+        "(allow network-outbound (remote tcp \"*:443\") (remote tcp \"*:{}\"))",
         policy.relay_port
-    ));
+    );
     if let Some(gw) = policy.gateway_port {
-        p.push_str(&format!(
-            "(allow network-inbound (local tcp \"localhost:{gw}\"))\n"
-        ));
+        let _ = writeln!(p, 
+            "(allow network-inbound (local tcp \"localhost:{gw}\"))"
+        );
     }
     p.push_str("(deny mach-lookup)\n");
     p
@@ -158,7 +159,7 @@ pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
         return Ok(LockdownReport::default());
     }
     let profile = donor_profile(policy);
-    crate::sys_macos::sandbox_init(&profile).map_err(|e| setup("sandbox_init", e))?;
+    crate::sys_macos::apply_profile(&profile).map_err(|e| setup("sandbox_init", e))?;
     Ok(LockdownReport {
         seccomp: false,
         landlock_fs: true, // Seatbelt FS cage applied
@@ -188,7 +189,7 @@ where
         }
         crate::sys_macos::Fork::Child => {
             drop(parent_sock);
-            let code = match crate::sys_macos::sandbox_init(VALIDATOR_PROFILE) {
+            let code = match crate::sys_macos::apply_profile(VALIDATOR_PROFILE) {
                 Ok(()) => run(child_fd),
                 Err(_) => 71,
             };

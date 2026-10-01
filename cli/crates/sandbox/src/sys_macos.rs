@@ -13,12 +13,12 @@ unsafe extern "C" {
 }
 
 /// Apply an SBPL profile string to the current process. Irreversible.
-pub fn sandbox_init_apply(profile: &str) -> io::Result<()> {
+pub fn apply_profile(profile: &str) -> io::Result<()> {
     let c = CString::new(profile).map_err(|_| io::Error::other("profile has NUL"))?;
     let mut err: *mut libc::c_char = std::ptr::null_mut();
     // SAFETY: `c` is a valid NUL-terminated C string for the call; `err` is a
     // valid out-pointer we free via sandbox_free_error.
-    let r = unsafe { sandbox_init(c.as_ptr(), 0, &mut err) };
+    let r = unsafe { sandbox_init(c.as_ptr(), 0, &raw mut err) };
     if r == 0 {
         Ok(())
     } else {
@@ -36,9 +36,6 @@ pub fn sandbox_init_apply(profile: &str) -> io::Result<()> {
         Err(io::Error::other(msg))
     }
 }
-
-/// Public name used by `macos.rs`.
-pub use sandbox_init_apply as sandbox_init;
 
 pub enum Fork {
     Parent(i32),
@@ -65,7 +62,7 @@ pub fn wait_raw(pid: i32) -> io::Result<i32> {
     let mut status: libc::c_int = 0;
     loop {
         // SAFETY: waitpid writes only into `status`.
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let r = unsafe { libc::waitpid(pid, &raw mut status, 0) };
         if r == -1 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {

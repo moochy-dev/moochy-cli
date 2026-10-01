@@ -119,21 +119,22 @@ pub const GATEWAY_SOCK_PATH: &str = "/run/moochy/gateway.sock";
 /// Environment variable carrying [`Spec::run_token`] inside the sandbox.
 pub const RUN_TOKEN_ENV: &str = "MOOCHY_RUN_TOKEN";
 
-/// Mint a fresh 256-bit run token (hex). Convenience for mo-node.
-#[cfg(target_os = "linux")]
-#[must_use]
-pub fn mint_run_token() -> String {
-    let mut buf = [0u8; 32];
-    // /dev/urandom is always available; fall back to a non-secret marker only if
-    // it somehow is not (the caller should treat token minting as best-effort and
-    // still register whatever it got).
+/// Mint a fresh 256-bit run token (64 hex chars) from the OS CSPRNG. Fails
+/// closed: no randomness, no token (never a predictable fallback).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn mint_run_token() -> std::io::Result<String> {
     use std::io::Read as _;
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
-    let mut s = String::with_capacity(64);
-    for b in buf {
-        s.push_str(&format!("{b:02x}"));
+    let mut buf = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(hex(&buf))
+}
+
+/// Lowercase hex.
+pub(crate) fn hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(b.len().saturating_mul(2));
+    for byte in b {
+        let _ = write!(s, "{byte:02x}");
     }
     s
 }

@@ -84,12 +84,15 @@ pub fn loopback_up() -> io::Result<()> {
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         for (dst, src) in ifr.ifr_name.iter_mut().zip(b"lo\0") {
-            *dst = *src as libc::c_char;
+            *dst = libc::c_char::from_ne_bytes([*src]);
         }
         if libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) == -1 {
             return Err(io::Error::last_os_error());
         }
-        ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        // IFF_UP | IFF_RUNNING = 0x41: fits in c_short.
+        #[allow(clippy::cast_possible_truncation)]
+        let up = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        ifr.ifr_ifru.ifru_flags |= up;
         if libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) == -1 {
             return Err(io::Error::last_os_error());
         }

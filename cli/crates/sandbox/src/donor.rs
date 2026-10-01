@@ -16,6 +16,7 @@ fn setup(what: &'static str, err: std::io::Error) -> Error {
     Error::Setup { what, err }
 }
 
+#[allow(clippy::needless_pass_by_value)] // map_err adapter
 fn ll(what: &'static str, e: landlock::RulesetError) -> Error {
     setup(what, std::io::Error::other(e.to_string()))
 }
@@ -230,15 +231,14 @@ pub fn wait_pid(pid: Pid) -> Result<i32, Error> {
         match waitpid(Some(pid), WaitOptions::empty()) {
             Ok(Some((_, status))) => {
                 if let Some(code) = status.exit_status() {
-                    return Ok(code as i32);
+                    return Ok(code);
                 }
                 if let Some(sig) = status.terminating_signal() {
-                    return Ok(128i32.saturating_add(sig as i32));
+                    return Ok(128i32.saturating_add(sig));
                 }
                 return Ok(-1);
             }
-            Ok(None) => continue,
-            Err(rustix::io::Errno::INTR) => continue,
+            Ok(None) | Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(setup("waitpid", e.into())),
         }
     }

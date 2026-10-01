@@ -9,8 +9,19 @@
 //! this is a test binary, not the library hot path.
 #![allow(unsafe_code)]
 #![allow(clippy::print_stderr, clippy::print_stdout)]
+// Test-only driver (never shipped, never on a hot path): AGENTS.md §3 exempts
+// tests from the slicing/arithmetic/cast denies.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::map_unwrap_or,
+    clippy::items_after_statements
+)]
 
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
 use std::process::ExitCode;
 
@@ -32,6 +43,7 @@ fn main() -> ExitCode {
         "sleep" => probe_sleep(rest),
         "forkbomb" => probe_forkbomb(),
         "memhog" => probe_memhog(),
+        #[cfg(target_os = "linux")]
         "ptrace" => probe_ptrace(rest),
         "run" => run_sandbox(rest),
         #[cfg(target_os = "linux")]
@@ -170,7 +182,7 @@ fn probe_symlink(a: &[String]) -> ExitCode {
 
 fn probe_tiocsti() -> ExitCode {
     const TIOCSTI: libc::c_ulong = 0x5412;
-    let ch: libc::c_char = b'x' as libc::c_char;
+    let ch = libc::c_char::from_ne_bytes(*b"x");
     // SAFETY: attempt the injection ioctl on stdin; seccomp should block it.
     let r = unsafe { libc::ioctl(0, TIOCSTI, std::ptr::addr_of!(ch)) };
     if r == 0 {
@@ -493,6 +505,7 @@ fn probe_memhog() -> ExitCode {
 }
 
 /// Try to ptrace-attach to a pid (e.g. our parent).
+#[cfg(target_os = "linux")]
 fn probe_ptrace(a: &[String]) -> ExitCode {
     let pid: i32 = a.first().and_then(|s| s.parse().ok()).unwrap_or(1);
     // SAFETY: PTRACE_ATTACH with no data pointers; we detach if it worked.
