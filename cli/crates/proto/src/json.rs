@@ -14,6 +14,7 @@ pub const MAX_DEPTH: usize = 64;
 
 /// Validate `bytes` against the parser-differential rule.
 pub fn check(bytes: &[u8]) -> Result<(), Error> {
+    integer_literals_fit_i64(bytes)?;
     let mut de = serde_json::Deserializer::from_slice(bytes);
     Check { depth: 0 }.deserialize(&mut de).map_err(|_| Error::Json)?;
     de.end().map_err(|_| Error::Json)
@@ -28,6 +29,36 @@ pub fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
 /// [`check`] then decode into a generic tree (duplicates already excluded, so no last-key-wins).
 pub fn parse_value(bytes: &[u8]) -> Result<serde_json::Value, Error> {
     parse(bytes)
+}
+
+/// serde_json turns integer literals beyond i64/u64 into floats; the contract wants every
+/// integer literal (no `.`/`e`) to fit i64. One linear pass over the bytes outside strings.
+fn integer_literals_fit_i64(b: &[u8]) -> Result<(), Error> {
+    let (mut i, mut in_str, mut esc) = (0usize, false, false);
+    while let Some(&c) = b.get(i) {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, b'\\') => esc = true,
+                (false, b'"') => in_str = false,
+                _ => {}
+            }
+            i = i.saturating_add(1);
+        } else if c == b'"' {
+            in_str = true;
+            i = i.saturating_add(1);
+        } else if c == b'-' || c.is_ascii_digit() {
+            let len = b.get(i..).unwrap_or_default().iter().take_while(|x| x.is_ascii_digit() || b"+-.eE".contains(x)).count();
+            let tok = b.get(i..i.saturating_add(len)).unwrap_or_default();
+            if !tok.iter().any(|x| b".eE".contains(x)) {
+                std::str::from_utf8(tok).ok().and_then(|t| t.parse::<i64>().ok()).ok_or(Error::Json)?;
+            }
+            i = i.saturating_add(len.max(1));
+        } else {
+            i = i.saturating_add(1);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -113,8 +144,11 @@ mod tests {
         let bad: &[&[u8]] = &[
             br#"{"a":1,"a":2}"#,
             br#"{"x":{"a":1,"a":1}}"#,
-            br#"[{"a":1,"a":2}]"#,
+            br#"[{"a":1,"\u0061":2}]"#,
             br#"{"a":9223372036854775808}"#,
+            br#"{"a":-9223372036854775809}"#,
+            br#"{"a":18446744073709551616}"#,
+            b"[1,-99999999999999999999]",
             br#"{"a":1e400}"#,
             br#"{"a":"\ud800"}"#,
             br#"{"a":"\udc00x"}"#,

@@ -256,4 +256,15 @@ impl TaskId {
     pub fn is_fresh(&self, now_ms: u64, window_ms: u64) -> bool {
         self.0.timestamp_ms().abs_diff(now_ms) <= window_ms
     }
+
+    /// Worker admission by time (plan 03 §7.2 rule 4 + CONTRACT D18): within ±10 minutes of
+    /// `now_ms` AND not earlier than this process's start (`boot_ms`), so a restart can never
+    /// re-open the replay window. The in-memory served set covers the rest of the window.
+    #[must_use]
+    pub fn admissible(&self, now_ms: u64, boot_ms: u64) -> bool {
+        self.is_fresh(now_ms, FRESHNESS_MS) && self.0.timestamp_ms() >= boot_ms
+    }
 }
+
+/// Task-id freshness window (plan 03 §16): ±10 minutes.
+pub const FRESHNESS_MS: u64 = 600_000;

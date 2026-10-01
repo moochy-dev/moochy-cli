@@ -58,6 +58,8 @@ fn lp_and_encodings() {
     assert!(fresh.is_fresh(T0 + 600_000, 600_000));
     assert!(!fresh.is_fresh(T0 + 600_001, 600_000));
     assert!(!fresh.is_fresh(T0 - 600_001, 600_000));
+    assert!(fresh.admissible(T0 + 1, T0) && !fresh.admissible(T0 + 1, T0 + 1), "D18 boot floor");
+    assert!(!fresh.admissible(T0 + 600_001, 0));
 }
 
 #[test]
@@ -158,7 +160,7 @@ fn zstd_bomb_and_trailing_data() {
     assert!(open_all(&ck(), &t, &s.chunks).is_err());
     let s = crypto::seal_compressed(&ck(), &t, b"").unwrap();
     assert_eq!(s.chunks.len(), 1);
-    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::Sequence));
+    assert_eq!(open_all(&ck(), &t, &s.chunks), Err(Error::Malformed));
 }
 
 fn sealer(attempt: u8, r: [u8; 32]) -> ResponseSealer {
@@ -290,10 +292,10 @@ fn signatures_and_inner_payload() {
 
     // Auth, checkpoint, dispute.
     let k = SignKey::from_seed(&[0x46; 32]);
-    let m = crypto::auth_msg(&[1; 32], "wss://127.0.0.1:443", &[2; 32], &dev("d_01K6A0000000000000000000G1")).unwrap();
+    let m = crypto::auth_msg(&[1; 32], "https://127.0.0.1:443", &[2; 32], &dev("d_01K6A0000000000000000000G1")).unwrap();
     let sig = k.sign(&m);
     crypto::verify(&k.public(), &m, &sig).unwrap();
-    let m2 = crypto::auth_msg(&[1; 32], "wss://127.0.0.1:444", &[2; 32], &dev("d_01K6A0000000000000000000G1")).unwrap();
+    let m2 = crypto::auth_msg(&[1; 32], "https://127.0.0.1:444", &[2; 32], &dev("d_01K6A0000000000000000000G1")).unwrap();
     assert_eq!(crypto::verify(&k.public(), &m2, &sig), Err(Error::BadSignature));
     let c = crypto::checkpoint_msg(&t, 1, &[3; 32], 7, &[4; 32]).unwrap();
     crypto::verify(&k.public(), &c, &k.sign(&c)).unwrap();

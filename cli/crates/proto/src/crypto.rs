@@ -373,8 +373,11 @@ impl RequestOpener {
 
     /// The decompressed inner payload. Requires the last chunk and a complete zstd frame.
     pub fn finish(mut self) -> Result<Vec<u8>, Error> {
-        if self.failed || !self.last_seen || !self.zstd_done {
+        if self.failed || !self.last_seen {
             return Err(Error::Sequence);
+        }
+        if !self.zstd_done {
+            return Err(Error::Malformed);
         }
         Ok(std::mem::take(&mut self.out))
     }
@@ -654,7 +657,8 @@ pub fn verify(public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<(), Error
 
 // ---------- signed byte strings ----------
 
-/// `lp("moochy/v1/auth", nonce, dialed_origin, tls_exporter, device_id)`.
+/// `lp("moochy/v1/auth", nonce, dialed_origin, tls_exporter, device_id)`; `dialed_origin` is the
+/// gRPC origin exactly as dialed, scheme included (`https://host:port`, CONTRACT §3 / D5).
 pub fn auth_msg(nonce: &[u8; 32], dialed_origin: &str, tls_exporter: &[u8; 32], device: &DeviceId) -> Result<Vec<u8>, Error> {
     lp(&[label::AUTH, nonce, dialed_origin.as_bytes(), tls_exporter, device.text().as_bytes()])
 }
