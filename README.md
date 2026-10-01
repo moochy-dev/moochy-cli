@@ -1,18 +1,23 @@
 # Moochy
 
-Donate a capped slice of your own LLM API budget to open-source projects. Maintainers use it from any MCP client or any tool with a provider-compatible base URL. Your key never leaves your machine; every request is end-to-end encrypted and accountable.
+Donate tokens to open-source projects from your own LLM API account, with a monthly limit you choose. Maintainers use those tokens from any MCP client, or from any tool that lets them set a provider base URL. Your key never leaves your machine. Every request is end-to-end encrypted, and the relay only sees encrypted bytes.
 
-**Open-source client (Apache-2.0) · closed-source relay and web app · 100% free: no fees, no commission, no paid tier.**
+Donors can use Anthropic, OpenAI, OpenRouter, DeepSeek, or xAI (Grok) API keys.
+
+**Open-source client (Apache-2.0) · 100% free.** No fees, no commission, no paid tier. The relay and web app are closed source.
 
 This development monorepo is internal. At release, the open-source parts (`cli/`, `spec/proto`, `spec/vectors`, `spec/protocol.md`, `docs/guides`) are exported to the public `moochy-cli` repository; everything else stays in the private `moochy-core` repository (see `spec/CONTRACT.md` §0a).
 
+- Guides (public): [`docs/guides/`](docs/guides/README.md)
+- User-facing wording: [`docs/brand/VOICE.md`](docs/brand/VOICE.md)
 - Design: [`docs/plan/00-PLAN.md`](docs/plan/00-PLAN.md)
 - Implementation contract: [`spec/CONTRACT.md`](spec/CONTRACT.md)
 - Agent rules: [`AGENTS.md`](AGENTS.md)
 
 | Path | What |
 |---|---|
-| `cli/` | Rust: the `moochy` binary — gateway, MCP server, worker (open source, Apache-2.0) |
-| `relay/` | Go: the relay and web app (closed source) |
+| `cli/` | Rust: the `moochy` app that runs on donors' and maintainers' machines (open source, Apache-2.0) |
+| `relay/` | Go: the relay and the moochy.dev web app (closed source) |
 | `e2e/` | End-to-end and attack tests with fake providers (closed source) |
-| `spec/` | Internal contract (closed) + public protocol: `proto/`, `vectors/`, `protocol.md` (open source) |
+| `spec/` | Internal contract (closed) and the public protocol: `proto/`, `vectors/`, `protocol.md` (open source) |
+| `docs/` | Public guides (`guides/`, open source); internal plan, brand, ops, and security docs (closed) |
