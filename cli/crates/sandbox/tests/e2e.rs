@@ -151,6 +151,33 @@ fn e93_worktree_rw_secrets_and_outside_invisible() {
     assert!(!Path::new(&f.path("outside/new")).exists());
 }
 
+#[test]
+fn e93_symlinked_paths_and_private_tmp() {
+    require_sandbox!();
+    let f = Fixture::new("e93link");
+    std::fs::create_dir_all(f.root.join("real-rw")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("real-rw"), f.root.join("link-rw")).unwrap();
+    // A listed rw path that is a symlink: the real dir is mounted, the link works.
+    let o = sandboxed(&f, &["--rw", &f.path("link-rw")], &["write", &f.path("link-rw/a")]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(std::fs::read(f.root.join("real-rw/a")).unwrap(), b"moochy");
+
+    // /tmp inside is private: the host's /tmp files are invisible and nothing
+    // written there reaches the host.
+    let host_tmp = std::env::temp_dir().join(format!("moochy-hosttmp-{}", std::process::id()));
+    std::fs::write(&host_tmp, b"host").unwrap();
+    let o = sandboxed(&f, &[], &["read", host_tmp.to_str().unwrap()]);
+    assert_ne!(o.code, 0, "host /tmp visible inside: {}", o.stdout);
+    let inner = format!("/tmp/moochy-inner-{}", std::process::id());
+    let o = sandboxed(&f, &[], &["write", &inner]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(!Path::new(&inner).exists(), "write to /tmp inside reached the host");
+    let _ = std::fs::remove_file(&host_tmp);
+    // /dev/shm exists and is writable (private).
+    let o = sandboxed(&f, &[], &["write", "/dev/shm/moochy-probe"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+}
+
 // ───────────────────────────── E94: network ─────────────────────────────
 
 /// Host-side stand-in for the gateway on a Unix socket: replies 200 to anything.
