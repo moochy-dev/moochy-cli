@@ -7,7 +7,10 @@ pub const LABEL_RECORD: &[u8] = b"moochy/v1/keylog";
 pub const LABEL_SIG: &[u8] = b"moochy/v1/keylog-sig";
 pub const LABEL_POP: &[u8] = b"moochy/v1/key-pop";
 /// Bound on every record (and every entry of an entry bundle).
-pub const MAX_RECORD: usize = 1024;
+/// 256 × (2 + 480) = 123,392 bytes: a full entry bundle fits one 128 KiB gRPC message.
+pub const MAX_RECORD: usize = 480;
+/// Label of receipt-log leaves: `lp("moochy/v1/receipt-log", sha256(receipt))`.
+pub const LABEL_RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -394,11 +397,14 @@ pub fn is_id(s: &str, prefix: &str) -> bool {
     })
 }
 
-/// `ps_` + 16 ASCII alphanumerics.
+/// `ps_` + 16 lowercase Crockford base32 chars (CONTRACT §1).
 #[must_use]
 pub fn is_pseudonym(s: &str) -> bool {
-    s.strip_prefix("ps_")
-        .is_some_and(|u| u.len() == 16 && u.bytes().all(|c| c.is_ascii_alphanumeric()))
+    s.strip_prefix("ps_").is_some_and(|u| {
+        u.len() == 16
+            && u.bytes()
+                .all(|c| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&c))
+    })
 }
 
 fn is_token(s: &str, max: usize) -> bool {

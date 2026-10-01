@@ -327,3 +327,51 @@ fn tiles() {
     assert!(parse_bundle(&b, 4).is_err());
     assert!(parse_bundle(&b[..b.len() - 1], 5).is_err());
 }
+
+#[test]
+fn cosignature_vectors() {
+    let c = load("cosignatures.json");
+    let ws: Vec<moochy_keylog::cosig::CosignerKey> = c["witnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| moochy_keylog::cosig::CosignerKey::parse(k.as_str().unwrap()).unwrap())
+        .collect();
+    let key = NoteKey::parse(c["log_vkey"].as_str().unwrap()).unwrap();
+    for case in c["cases"].as_array().unwrap() {
+        let note = case["note"].as_str().unwrap().as_bytes();
+        // The log's own signature always verifies; witness lines never break it.
+        open_checkpoint(note, c["origin"].as_str().unwrap(), &key).unwrap();
+        let want = case["valid"].as_u64().unwrap() as usize;
+        match moochy_keylog::cosig::cosignatures(note, &ws) {
+            Ok(got) => {
+                assert_eq!(got.len(), want, "{}", case["name"]);
+                if let Some(ts) = case["timestamps"].as_array() {
+                    let ts: Vec<u64> = ts.iter().map(|t| t.as_u64().unwrap()).collect();
+                    assert_eq!(got.iter().map(|c| c.timestamp).collect::<Vec<_>>(), ts);
+                }
+            }
+            // A line claiming a pinned witness that does not verify is refused outright.
+            Err(e) => assert_eq!((want, e), (0, Error::BadSig), "{}", case["name"]),
+        }
+    }
+    assert!(moochy_keylog::cosig::CosignerKey::parse(&c["log_vkey"].as_str().unwrap()).is_err(), "alg 0x01 key is not a cosigner key");
+}
+
+#[test]
+fn receipt_log_vectors() {
+    let r = load("receipts.json");
+    let key = NoteKey::parse(r["vkey"].as_str().unwrap()).unwrap();
+    let cp = open_checkpoint(r["checkpoint"].as_str().unwrap().as_bytes(), r["origin"].as_str().unwrap(), &key).unwrap();
+    let receipts: Vec<Vec<u8>> = r["receipts_hex"].as_array().unwrap().iter().map(|x| unhex(x.as_str().unwrap())).collect();
+    for (i, rc) in receipts.iter().enumerate() {
+        assert_eq!(moochy_keylog::receipts::leaf(rc).to_vec(), unhex(r["leaf_hashes"][i].as_str().unwrap()));
+    }
+    for p in r["inclusion"].as_array().unwrap() {
+        let i = p["index"].as_u64().unwrap();
+        let proof: Vec<Hash> = p["proof"].as_array().unwrap().iter().map(h32).collect();
+        assert!(moochy_keylog::receipts::verify(&receipts[i as usize], i, &cp, &proof));
+        assert!(!moochy_keylog::receipts::verify(&receipts[(i as usize + 1) % 5], i, &cp, &proof));
+        assert!(!moochy_keylog::receipts::verify(b"forged receipt", i, &cp, &proof));
+    }
+}

@@ -27,11 +27,11 @@ fn key_hash(name: &str, alg_and_key: &[u8]) -> u32 {
     be32(&d).unwrap_or_default()
 }
 
-fn be32(b: &[u8]) -> Option<u32> {
+pub(crate) fn be32(b: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(..4)?.try_into().ok()?))
 }
 
-fn valid_name(n: &str) -> bool {
+pub(crate) fn valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.chars()
             .all(|c| !c.is_whitespace() && c != '+' && !c.is_control())
@@ -85,10 +85,10 @@ pub struct Checkpoint {
     pub root: Hash,
 }
 
-/// Verifies a signed checkpoint note: valid UTF-8 without control characters
-/// (except '\n'), text exactly `origin\nsize\nbase64(root)\n`, and at least one valid
-/// signature by `key` (other signers are ignored; a bad signature claiming `key` fails).
-pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Checkpoint, Error> {
+/// A parsed signed note: the text (ending in '\n') and its signature lines as
+/// (key name, decoded base64 payload). Valid UTF-8, no control characters except
+/// '\n', ≤ [`MAX_NOTE`] bytes, ≤ 100 signature lines.
+pub(crate) fn split(note: &[u8]) -> Result<(&str, Vec<(&str, Vec<u8>)>), Error> {
     if note.len() > MAX_NOTE {
         return Err(Error::TooLarge);
     }
@@ -104,7 +104,7 @@ pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Check
     if !sigs.ends_with('\n') {
         return Err(Error::Format("note signatures"));
     }
-    let mut ok = false;
+    let mut out = Vec::new();
     for (i, line) in sigs.lines().enumerate() {
         if i >= 100 {
             return Err(Error::TooLarge);
@@ -119,6 +119,19 @@ pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Check
         if !valid_name(name) || raw.len() < 5 {
             return Err(Error::Format("note signature line"));
         }
+        out.push((name, raw));
+    }
+    Ok((text, out))
+}
+
+/// Verifies a signed checkpoint note: valid UTF-8 without control characters
+/// (except '\n'), text exactly `origin\nsize\nbase64(root)\n`, and at least one valid
+/// signature by `key` (other signers, e.g. witnesses, are ignored; a bad signature
+/// claiming `key` fails).
+pub fn open_checkpoint(note: &[u8], origin: &str, key: &NoteKey) -> Result<Checkpoint, Error> {
+    let (text, sigs) = split(note)?;
+    let mut ok = false;
+    for (name, raw) in sigs {
         let (h, sig) = raw.split_at(4);
         if name != key.name || be32(h) != Some(key.hash) {
             continue;

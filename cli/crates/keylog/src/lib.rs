@@ -7,6 +7,10 @@
 //!   "is this worker key sealable for repo R" / "is this gateway allowed for repo R"
 //! - [`tiles`]: C2SP tlog-tiles paths and bounded entry-bundle parsing
 //! - [`mirror`]: full incremental mirror + monitor rules (own keys, owner actions, forks)
+//! - [`monitor`]: the Node's async monitor loop over the relay link ([`LogLink`]), the
+//!   shared fail-closed [`View`] for Gateways and Workers, persistence (see `WIRING.md`)
+//! - [`cosig`]: witness cosignatures (C2SP tlog-cosignature v1)
+//! - [`receipts`]: receipt transparency log inclusion
 //! - `fetch` (feature `http`): blocking tile fetcher with size limits and timeouts
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -21,18 +25,22 @@
 )]
 
 mod b64;
+pub mod cosig;
 pub mod entry;
 #[cfg(feature = "http")]
 pub mod fetch;
 pub mod merkle;
 pub mod mirror;
+pub mod monitor;
 pub mod note;
+pub mod receipts;
 pub mod state;
 pub mod tiles;
 
 pub use entry::{Entry, Kind};
 pub use merkle::Hash;
 pub use mirror::{Alert, AnchorStatus, Me, Mirror};
+pub use monitor::{Event, LogLink, Monitor, View};
 pub use note::{Checkpoint, NoteKey};
 pub use state::{Code, State};
 

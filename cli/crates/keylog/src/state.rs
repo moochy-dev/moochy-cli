@@ -23,6 +23,12 @@ pub enum Code {
     Scope,
     NotApproved,
     NotMember,
+    /// The mirror saw a forked log: no authority question is answered (fail closed).
+    LogForked,
+    /// The relay's pool.sync / route indexes do not match the mirrored log.
+    IndexMismatch,
+    /// The mirror is unavailable (lock poisoned).
+    Unavailable,
 }
 
 impl Code {
@@ -44,6 +50,9 @@ impl Code {
             Self::Scope => "scope",
             Self::NotApproved => "not_approved",
             Self::NotMember => "not_member",
+            Self::LogForked => "log_forked",
+            Self::IndexMismatch => "index_mismatch",
+            Self::Unavailable => "unavailable",
         }
     }
 }
