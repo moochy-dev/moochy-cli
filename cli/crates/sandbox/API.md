@@ -37,7 +37,10 @@ let code = spec.run(program, &args)?;                // blocks; returns the agen
 | `env` | empty | The **only** variables passed (plus `PATH`, `HOME=/home/sandbox`, `TMPDIR=/tmp`, `USER`, `TERM`). Nothing is inherited. |
 | `cwd` | worktree | Working directory inside. |
 | `run_token` | `None` | Exported as `MOOCHY_RUN_TOKEN` inside the sandbox only. |
-| `limits` | 4 GiB AS, 1024 fds, 512 procs, no core, no CPU/wall cap | rlimits; `wall_seconds` kills the whole sandbox (exit 124). |
+| `limits` | 4 GiB AS, 1024 fds, 512 procs, no core, no CPU/wall cap | rlimits (every one applied or the run fails); `wall_seconds` kills the whole sandbox (exit 124). cgroup v2 (§1.8): `processes` → `pids.max`, `memory_total_bytes` → `memory.max` + swap 0, `cpu_percent` → `cpu.max` (0 = unset). |
+| `allow_hosts` | empty | `--allow-host`: exact host names reachable on :443 through the CONNECT proxy (§1.2b). Linux only (macOS: `Unsupported`). |
+| `protected` | `[$HOME]` | No visible path (worktree, `ro_paths`, `rw_paths`) may be `/` or contain one of these. **mo-node: push the Moochy home dir.** |
+| `git_writable` | `false` | Top-level `.git` writable except `hooks/ config config.worktree modules/ commondir` (§1.6). |
 | `unsafe_no_sandbox` | `false` | `--unsafe-no-sandbox`: runs **without** a sandbox after a loud stderr warning. Debug only. |
 
 Exit code: the agent's own code, `128+N` if killed by signal N, `124` on wall deadline.
@@ -52,7 +55,7 @@ Exit code: the agent's own code, `128+N` if killed by signal N, `124` on wall de
   `/dev` (`null zero full random urandom`), and its own `/proc`. The real home, `~/.ssh`,
   `~/.aws`, other repos and the Moochy keystore/state **do not exist** inside.
 - Secret-shaped and git-ignored files in the worktree are overmounted with an empty
-  read-only file or dir (§1.5). `.git/hooks` and `.git/config` are read-only (§1.6).
+  read-only file or dir (§1.5). Every `.git` is read-only (§1.6).
 - Network: an empty netns with only `lo`. The agent's only route is
   `127.0.0.1:<gateway_loopback_port>` → bridge → gateway socket. Landlock (ABI ≥ 4) also
   restricts TCP `connect` to that port.
@@ -62,6 +65,10 @@ Exit code: the agent's own code, `128+N` if killed by signal N, `124` on wall de
   and seccomp blocks it as well).
 - Lifetime: the launcher → reaper → PID 1 chain uses `PR_SET_PDEATHSIG(SIGKILL)` at each
   step, so killing `moochy run` (even with `kill -9`) kills every process in the sandbox.
+- Own cgroup namespace; terminal resizes (`SIGWINCH`) are forwarded by the reaper to the
+  agent's session (it has no controlling terminal).
+- Refused before anything runs (A197): a worktree / `ro_paths` / `rw_paths` entry that is `/`
+  or contains `$HOME` or a `protected` dir.
 
 ### 1.2 Gateway bridge
 
@@ -76,6 +83,20 @@ agent ──TCP 127.0.0.1:<port>──▶ reaper (in the sandbox netns, outside 
 `<home>/state/` (same HTTP as the TCP door) and pass its path as `gateway_socket`. The bridge
 forwards bytes verbatim, one chunk at a time with no batching (CONTRACT §13). It is
 single-threaded (`poll`), capped at 64 concurrent connections, and dies with the run.
+
+### 1.2b `--allow-host` (off by default)
+
+`spec.allow_hosts = vec!["registry.npmjs.org".into()]`. The launcher serves an HTTP CONNECT
+proxy on a Unix socket in its 0700 scratch dir, bind-mounted at `/run/moochy/proxy.sock`; the
+reaper bridges `127.0.0.1:3128` (`PROXY_LOOPBACK_PORT`) to it, Landlock allows connect to that
+port, and `HTTPS_PROXY`/`https_proxy` point there (`NO_PROXY=127.0.0.1,localhost`; `spec.env`
+can override). Policy, fail closed: `CONNECT <host>:443` only; `host` must equal an entry
+(case-insensitive exact DNS name: no wildcards, no IP literals, invalid entries make `run` fail);
+every resolved address must be public (no loopback/private/link-local/CGNAT/ULA/NAT64…, so DNS
+rebinding onto the gateway or cloud metadata is refused) and the tunnel connects to the checked
+address. Head ≤ 8 KiB in 10 s, connect ≤ 10 s, ≤ 64 tunnels. Refusals print one line
+(`moochy: --allow-host proxy refused <host>:443 (…)`; the host is a validated name). Plain-HTTP
+proxying is refused (405). Test: `e94_allow_host_proxy_exact_hosts_only`.
 
 ### 1.3 Run token ("this session is sandboxed", §15.4)
 
@@ -111,25 +132,36 @@ to `ro_paths`; let users add more in config. Never add the whole home.
 
 ### 1.5 Masking list (show it in `moochy doctor`)
 
-`moochy_sandbox::mask::SECRET_PATTERNS` holds the base-name globs, matched at any depth
-(`.git` is skipped):
-`.env .env.* *.pem *.key id_* .npmrc .netrc .pypirc credentials credentials.* credentials*
-.aws .gcloud .config/gcloud .azure .kube .ssh .docker`,
-plus every git-ignored path (`git ls-files --others --ignored --exclude-standard`).
-`moochy_sandbox::mask::collect(&worktree)` returns the exact absolute paths for one run;
-`doctor` can print it. Each match is overmounted with an empty read-only file or dir.
-Hard links, renames and symlinks made inside resolve through the top mount, so they reach
-the empty file (a hard link fails with EXDEV), never the real inode. Bounded: 50,000
-entries walked, 4,096 masks.
+`moochy_sandbox::mask::SECRET_PATTERNS` holds the globs, matched **case-insensitively** against
+base names at any depth (a pattern with `/`, like `.config/gcloud`, against trailing path
+components): `.env .env.* *.pem *.key *.p12 *.pfx *.jks *.keystore id_rsa* id_dsa* id_ecdsa*
+id_ed25519* .npmrc .netrc .pypirc .pgpass .git-credentials .vault-token *.tfstate *.tfstate.*
+service-account*.json credentials credentials.* credentials* .aws .gcloud .config/gcloud .azure
+.kube .ssh .docker`, plus every git-ignored file and directory (`git ls-files --others --ignored
+--exclude-standard --directory`, run with `core.fsmonitor`/hooks forced off) **except**
+ignored dependency/build dirs (`node_modules target build dist out .venv venv vendor …`, see
+`mask.rs`), which tools need; secret-shaped names inside them are still masked.
+`mask::collect(&worktree)` returns the exact absolute paths for one run; `doctor` can print
+it. Each match is overmounted with an empty read-only file or dir. Hard links, renames and
+symlinks made inside resolve through the top mount, so they reach the empty file (a hard link
+fails with EXDEV), never the real inode. **Fail closed** (A193): more than 1,000,000 entries
+walked or 16,384 masks refuses the run instead of leaving the rest readable.
 
 ### 1.6 Git paths the host later executes
 
-`.git/hooks` (created empty if missing) and `.git/config` (`core.fsmonitor`,
-`core.hooksPath`, aliases) are mounted read-only. Code the agent writes can't run outside
-the sandbox on your next `git commit`. The agent can still commit, and objects, refs and
-the index stay writable. A linked worktree (`.git` is a file) has its gitdir outside the
-view, so git won't work inside until mo-node adds that gitdir to `rw_paths` with hooks
-and config protected. Request below.
+Git trusts files under `.git` that make the *host* run code later (`hooks/`, `config`:
+`core.fsmonitor`, `core.hooksPath`, aliases, includes; `commondir`, which redirects both). So
+(A191): **every `.git` is read-only inside** — the top-level one (unless `git_writable`, which
+still keeps `hooks/ config modules/` read-only), every nested one (submodules, vendored repos),
+and the `.git` file of a linked worktree, whose own gitdir and shared commondir are visible
+read-only (other worktrees' gitdirs hidden; `git status`/`log` work). A worktree with **no**
+`.git` gets an empty read-only placeholder dir (so `git init` inside fails), removed after the
+run. macOS: one Seatbelt rule denies writes to any `.git` path at any depth, which also blocks
+creating one. A `.git` planted in a *new* subdirectory can't be blocked by mounts on Linux;
+after every run `moochy run` compares the git metadata the host trusts (every `.git`, its
+`config`, `config.worktree`, `commondir`, `hooks/` listing) with the state before and prints
+one line: `moochy: notice: git metadata changed during the run ("deep/.git"); review it …`
+(paths escaped). Commits therefore happen outside, after review (same choice as Codex).
 
 ### 1.7 Host requirements and `moochy doctor`
 
@@ -147,8 +179,29 @@ profile moochy /usr/local/bin/moochy flags=(unconfined) {
   include if exists <local/moochy>
 }
 ```
-`sudo apparmor_parser -r /etc/apparmor.d/moochy`. Use the real installed path; the
-package postinst (`deploy/client/**`) should install it.
+`sudo apparmor_parser -r /etc/apparmor.d/moochy`. Use the real installed path. The shipped
+profile is `deploy/client/apparmor/moochy` (`/usr/{,local/}bin/moochy` only: a user-writable
+path would hand `userns` to any program of that user).
+
+### 1.8 cgroup v2 limits (when delegated)
+
+`delegated_cgroup()` (for `moochy doctor`) returns the parent the run's cgroup is created in:
+the parent of the launcher's own cgroup, when it is writable and delegates `memory`/`pids`/
+`cpu` (true under a systemd user manager: terminal/tmux scopes, `systemd-run --user --scope`;
+false under a root-owned login `session-N.scope`, where rlimits stay the only limits). The run
+gets `moochy-run-<pid>-<id>` with the `Limits` above; the sandbox's first process moves into
+it before `unshare`, so every descendant is inside. At the end `cgroup.kill` and `rmdir`; a
+SIGKILLed launcher's empty cgroup is swept by the next run. Graceful by contract: no
+delegated cgroup → no error. Test: `e95_cgroup_limits_when_delegated`.
+
+### 1.9 macOS
+
+`sandbox-exec` with a generated profile, plus: own session (`setsid`, no controlling
+terminal) with `SIGINT SIGTERM SIGHUP SIGQUIT SIGWINCH` forwarded to the run's process group
+while it runs, `RLIMIT_NOFILE/CORE/CPU` (`RLIMIT_NPROC` is per user on macOS and `RLIMIT_AS`
+is not enforced: not set), the wall deadline (exit 124), `killpg(SIGKILL)` of whatever is left
+in the group at the end, `HOME` = a private dir in the scratch dir. Residual: a descendant
+that starts its own session survives the run (no PID namespace). `allow_hosts` → `Unsupported`.
 
 The test suite on this box used the same shape, scoped to the test binary only
 (`/etc/apparmor.d/moochy-sandbox-test`), and the profile was removed afterwards.
@@ -172,7 +225,8 @@ and seccomp TSYNC, so existing threads are covered too. It is irreversible:
   denied: `ptrace`, `process_vm_*`, all mount APIs, `bpf`, `keyctl`/`add_key`/`request_key`,
   `perf_event_open`, `userfaultfd`, `kexec*`, module syscalls, `unshare`, `setns`,
   `clone(CLONE_NEWUSER|CLONE_NEWNS)`, `clone3` (ENOSYS so libc falls back to `clone`),
-  `open_by_handle_at`, `ioctl(TIOCSTI|TIOCLINUX)`, `reboot`, `swap*`, `acct`, clock setting.
+  `open_by_handle_at`, `ioctl(TIOCSTI|TIOCLINUX)`, `reboot`, `swap*`, `acct`, clock setting,
+  `io_uring_*`, and on x86_64 every x32-ABI number (`nr ≥ 0x4000_0000` → EPERM).
 - Landlock FS: `state_dir` rw, `ro_paths` ro, nothing else exists. **Required**: without
   Landlock, `lockdown_self` fails.
 - Landlock net (ABI ≥ 4): TCP connect only to 443 and `relay_port`; bind only
@@ -183,6 +237,9 @@ and seccomp TSYNC, so existing threads are covered too. It is irreversible:
 - macOS: `sandbox_init` with a generated profile: `(deny default)`, `process-exec*` and
   `process-fork` denied, `state_dir` rw, `ro_paths` ro, outbound 443 + relay, and
   `mach-lookup` denied.
+
+Also: `PR_SET_DUMPABLE 0` (no core/crash report with keys, no same-uid ptrace), and
+`state_dir` gets every Landlock right except `Execute`.
 
 `LockdownReport { no_new_privs, seccomp, landlock_fs, landlock_net, abi }` is the
 `moochy doctor` line. `abi` is the kernel's real Landlock ABI (8 on the dev box).
@@ -199,14 +256,15 @@ let v = moochy_sandbox::spawn_validator(|fd| moochy_worker::validate::serve(fd))
 // then v.wait(); spawn the next one.
 ```
 
-Inside the child, after `fork`: rlimits (NOFILE 16, AS 1 GiB, no core), an empty Landlock
+Inside the child, after `fork`: not dumpable, rlimits (NOFILE 16, AS 1 GiB, no core; any
+failure exits 71), an empty Landlock
 domain (no path, no TCP), then a seccomp **allowlist**, where any other syscall kills the
 process with SIGSYS (exit `128+31 = 159`). Allowed:
 
-`read write readv writev close munmap brk futex exit exit_group rt_sigreturn
+`read write sendto recvfrom readv writev close munmap mremap brk futex exit exit_group rt_sigreturn
 rt_sigprocmask sigaltstack getrandom madvise sched_yield sched_getaffinity clock_gettime
-clock_nanosleep ppoll nanosleep restart_syscall rseq`, and `mmap`/`mprotect` **without**
-`PROT_EXEC`.
+clock_nanosleep ppoll nanosleep restart_syscall rseq`, `fcntl(F_GETFD|F_GETFL)`, and
+`mmap`/`mprotect` **without** `PROT_EXEC`.
 
 **Contract for mo-worker's `validate`:** use only the inherited fd (no `open`, `socket`,
 `clone` or threads). Allocation, `HashMap` and pure-Rust `ruzstd` are fine (verified by
@@ -227,7 +285,13 @@ fails, because std only forwards an errno.
 
 ## 4. Test driver
 
-`moochy-sandbox-test` (bin) = probes (`read write stat connect http exec hardlink symlink
+Fuzzing (dev-only, `fuzz/`, not a workspace member): `cargo +nightly fuzz run mask_glob` /
+`seccomp_tables` (from `cli/crates/sandbox`). The oracles live in `src/fuzzing.rs`
+(`cfg(test)`/`cfg(fuzzing)` only) and run deterministically in `cargo test`: the seccomp one
+executes the compiled BPF of all three profiles with a cBPF interpreter against the policy
+restated independently.
+
+`moochy-sandbox-test` (bin) = probes (`read write stat connect http proxy exec hardlink symlink
 tiocsti ptrace env sleep forkbomb memhog`) + launchers (`run …`, `donor …`,
 `validator echo|open|socket`). `tests/e2e.rs` runs it as real subprocesses; mo-e2e can lift
 each `e9x_*` test 1:1 by running the same binary with the same arguments.

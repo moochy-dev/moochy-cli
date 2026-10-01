@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# AppArmor profile for the moochy client (Ubuntu 23.10+, where
+# kernel.apparmor_restrict_unprivileged_userns=1). It grants ONLY the right to
+# create user namespaces (needed by the `moochy run` sandbox, CONTRACT §15.1)
+# to the moochy binary at root-owned install paths; it confines nothing else.
+# Never set the sysctl to 0 instead: that hands the permission to every program.
+#
+# Install:  sudo install -m 0644 moochy /etc/apparmor.d/moochy && sudo apparmor_parser -r /etc/apparmor.d/moochy
+# Installed elsewhere? Edit the path below to the real (root-owned) location;
+# a user-writable path would let any program of that user obtain userns.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile moochy /usr/{,local/}bin/moochy flags=(unconfined) {
+  userns,
+
+  include if exists <local/moochy>
+}
