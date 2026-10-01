@@ -149,8 +149,29 @@ pub fn ulid_from_bytes(b: &[u8; 16]) -> String {
     ulid_encode(u128::from_be_bytes(*b))
 }
 
+/// C0, DEL, C1 (all `is_control`), zero-width and bidi marks/overrides/isolates, ALM, line and
+/// paragraph separators: everything that can hide text or drive a terminal (A46/A47).
 fn bad_char(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    c.is_control()
+        || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{feff}')
+}
+
+/// Like [`clean`] but keeps `\n` and `\t`: for multi-line remote text handed to an agent or a
+/// terminal (`moochy_delegate` results). Escaped, not dropped, so nothing is silently hidden.
+pub fn sanitize_text(s: &str) -> std::borrow::Cow<'_, str> {
+    let bad = |c: char| bad_char(c) && c != '\n' && c != '\t';
+    if !s.chars().any(bad) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut o = String::with_capacity(s.len().saturating_add(16));
+    for c in s.chars() {
+        if bad(c) {
+            let _ = write!(o, "\\u{{{:x}}}", u32::from(c));
+        } else {
+            o.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(o)
 }
 
 /// Escape control, bidi and zero-width characters in a server-provided string (CONTRACT §11).
@@ -219,6 +240,17 @@ mod tests {
         assert_eq!(clean("alice"), "alice");
         assert_eq!(clean("a\u{1b}[31mb"), "a\\u{1b}[31mb");
         assert_eq!(clean("x\u{9b}y\u{202e}z"), "x\\u{9b}y\\u{202e}z");
+    }
+
+    #[test]
+    fn sanitize_keeps_lines_escapes_controls() {
+        let evil = "A \u{1b}]52;c;x\u{7} \u{1b}[2J \u{9b}31m \u{202e}e\u{202c}\nB\tC\r";
+        let s = sanitize_text(evil);
+        for bad in ["\u{1b}", "\u{7}", "\u{9b}", "\u{202e}", "\u{202c}", "\r"] {
+            assert!(!s.contains(bad), "{bad:?} left in {s:?}");
+        }
+        assert!(s.contains("\nB\tC"), "newline and tab kept");
+        assert_eq!(sanitize_text("plain\ntext"), "plain\ntext");
     }
 
     #[test]

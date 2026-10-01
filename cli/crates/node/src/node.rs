@@ -294,8 +294,8 @@ impl Node {
                     enc_pub,
                     sign_pub,
                     donor: clean(&w.donor_pseudonym).into_owned(),
-                    dialects: w.dialects.clone(),
-                    models: w.models.clone(),
+                    dialects: w.dialects.iter().filter(|d| plain_id(d)).cloned().collect(),
+                    models: w.models.iter().filter(|m| plain_id(m)).cloned().collect(),
                     hint: w.hint.min(100),
                 });
             }
@@ -344,6 +344,11 @@ impl Node {
         }
         let _ = self.journal_tx.send(e);
     }
+}
+
+/// Model / dialect ids from the relay: short plain ASCII only (they reach agents and terminals).
+fn plain_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 200 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:/-@+".contains(&c))
 }
 
 /// Worker-role parts built at startup.

@@ -248,9 +248,10 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
-        json!({"repo": self.slug, "repo_id": pool.as_ref().map(|p| p.repo_id.clone()), "link": link,
+        let out = json!({"repo": self.slug, "repo_id": pool.as_ref().map(|p| p.repo_id.clone()), "link": link,
             "donors": pool.as_ref().map_or(0, |p| p.workers.len()), "models": models})
-        .to_string()
+        .to_string();
+        crate::util::sanitize_text(&out).into_owned()
     }
 
     async fn delegate(&self, a: &Map<String, Value>, progress: Option<(Value, Out)>) -> Result<String, String> {
@@ -335,7 +336,10 @@ impl Session {
                     "params":{"progressToken":tok,"progress":n,"message":format!("moochy: receiving ({n} chars)")}}));
             }
         }
-        let text = sse.text.replace("</untrusted-content", "&lt;/untrusted-content");
+        // Remote text: escape terminal/bidi controls before it reaches the agent (A46), and keep
+        // the donor from closing the untrusted frame early.
+        let text = crate::util::sanitize_text(&sse.text).replace("</untrusted-content", "&lt;/untrusted-content");
+        let model = crate::util::clean(&model);
         let donor = crate::util::clean(&donor);
         let mut outp = String::with_capacity(text.len().saturating_add(512));
         if let Some(hit) = moochy_worker::inspect::scan_text(&text) {
