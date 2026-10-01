@@ -34,7 +34,7 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         eprintln!("moochy: WARNING --unsafe-no-sandbox: running WITHOUT a sandbox (debugging only).");
         let mut cmd = Command::new(program);
         cmd.args(args).current_dir(&spec.worktree);
-        apply_env(&mut cmd, spec);
+        apply_env(&mut cmd, spec, Path::new("/tmp"));
         return Ok(code(cmd.status().map_err(Error::Exec)?));
     }
     let worktree = spec
@@ -42,21 +42,44 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let masks = mask::collect(&worktree)?;
-    let profile = maintainer_profile(spec, &worktree, &masks);
+    // A private scratch dir per run: the shared /tmp and the per-user
+    // /var/folders stay out of reach (other apps' files live there).
+    let scratch = make_scratch()?;
+    let profile = maintainer_profile(spec, &worktree, &masks, &scratch);
 
     let mut cmd = Command::new("sandbox-exec");
     cmd.arg("-p").arg(&profile).arg("--").arg(program).args(args);
     cmd.current_dir(&worktree);
     cmd.env_clear();
-    apply_env(&mut cmd, spec);
-    let status = cmd.status().map_err(Error::Exec)?;
-    Ok(code(status))
+    apply_env(&mut cmd, spec, &scratch);
+    let status = cmd.status().map_err(Error::Exec);
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(code(status?))
 }
 
-fn apply_env(cmd: &mut Command, spec: &Spec) {
+fn make_scratch() -> Result<std::path::PathBuf, Error> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let dir = std::env::temp_dir().join(format!("moochy-run-{}-{nanos}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| setup("create scratch dir", e))?;
+    dir.canonicalize().map_err(|e| setup("canonicalize scratch dir", e))
+}
+
+/// Seatbelt matches resolved paths (`/var` is `/private/var`, `/tmp` is
+/// `/private/tmp`): every path in a profile goes through here first.
+fn real(p: &Path) -> String {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
+}
+
+fn apply_env(cmd: &mut Command, spec: &Spec, scratch: &Path) {
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     cmd.env("HOME", &spec.worktree); // no access to the real home
-    cmd.env("TMPDIR", "/tmp");
+    cmd.env("TMPDIR", scratch);
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -74,51 +97,50 @@ fn code(s: std::process::ExitStatus) -> i32 {
 /// Deny-by-default maintainer profile: read system paths, read-write the
 /// worktree + scratch, deny the masked secret files explicitly, network only to
 /// the gateway loopback port, no exec of setuid helpers, no mach services.
-pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::PathBuf]) -> String {
+pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::PathBuf], scratch: &Path) -> String {
     let wt = sbpl_quote(&worktree.to_string_lossy());
     let mut p = String::new();
+    // Rules are matched last-wins: `deny default` first, allows after, the
+    // secret masks last so they beat the worktree allow.
     p.push_str("(version 1)\n(deny default)\n");
     // Diagnostics off; we never want the sandbox to prompt.
     p.push_str("(deny file-write* file-read* (with no-report))\n");
-    // Read system paths and dyld.
-    p.push_str("(allow process-exec* (regex #\"^/(usr|bin|sbin|opt|System|Library)/\"))\n");
-    p.push_str("(allow file-read* (regex #\"^/(usr|bin|sbin|opt|System|Library|private/etc|private/var/db)/\"))\n");
-    p.push_str("(allow file-read-metadata)\n");
+    // An agent runs tools: it may fork and exec, and signal its own processes only.
+    p.push_str("(allow process-fork)\n");
+    p.push_str("(allow signal (target same-sandbox))\n");
     p.push_str("(allow sysctl-read)\n");
-    // Worktree read-write (and the scratch TMPDIR).
-    let _ = writeln!(p, "(allow file-read* file-write* (subpath {wt}))");
-    p.push_str("(allow file-read* file-write* (subpath \"/private/tmp\"))\n");
-    p.push_str("(allow file-write* file-read* (subpath \"/private/var/folders\"))\n");
+    p.push_str("(allow file-read-metadata)\n");
+    // System paths (and dyld): read + exec.
+    p.push_str("(allow process-exec* file-read* (regex #\"^/(usr|bin|sbin|opt|System|Library|Applications)/\"))\n");
+    p.push_str("(allow file-read* (regex #\"^/(private/etc|private/var/db|etc)/\") (literal \"/\") (literal \"/private\"))\n");
+    // Basic devices and the terminal (interactive agents).
+    p.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\") (literal \"/dev/dtracehelper\"))\n");
+    p.push_str("(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\"))\n");
+    // getpwuid() etc.; every other mach service (keychain, pasteboard, launchd
+    // services, Apple Events) stays denied.
+    p.push_str("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
+    // Tool directories the caller allows (read + exec), worktree read-write, scratch.
+    for ro in &spec.ro_paths {
+        let _ = writeln!(p, "(allow process-exec* file-read* (subpath {}))", sbpl_quote(&real(ro)));
+    }
+    let _ = writeln!(p, "(allow process-exec* file-read* file-write* (subpath {wt}))");
+    let _ = writeln!(p, "(allow file-read* file-write* (subpath {}))", sbpl_quote(&real(scratch)));
     for p2 in &spec.rw_paths {
-        let _ = writeln!(p, 
-            "(allow file-read* file-write* (subpath {}))",
-            sbpl_quote(&p2.to_string_lossy())
-        );
+        let _ = writeln!(p, "(allow file-read* file-write* (subpath {}))", sbpl_quote(&real(p2)));
     }
-    // Mask secret-shaped / git-ignored files: explicit deny wins over the
-    // worktree allow above.
-    for m in masks {
-        let _ = writeln!(p, 
-            "(deny file-read* file-write* (subpath {}))",
-            sbpl_quote(&m.to_string_lossy())
-        );
-    }
-    // Network: loopback gateway port only (no general outbound).
+    // Network: the gateway only (loopback port and/or its Unix socket).
     if let Some(port) = spec.gateway_loopback_port {
-        let _ = writeln!(p, 
-            "(allow network-outbound (remote ip \"localhost:{port}\"))"
-        );
+        let _ = writeln!(p, "(allow network-outbound (remote ip \"localhost:{port}\"))");
     }
     if let Some(sock) = &spec.gateway_socket {
-        let _ = writeln!(p, 
-            "(allow network-outbound (literal (subpath {})))",
-            sbpl_quote(&sock.to_string_lossy())
-        );
+        let q = sbpl_quote(&real(sock));
+        let _ = writeln!(p, "(allow network-outbound (remote unix-socket (path-literal {q})))");
+        let _ = writeln!(p, "(allow file-read* file-write* (literal {q}))");
     }
-    // Denials we make explicit for clarity (already covered by deny default):
-    p.push_str("(deny mach-lookup)\n");
-    p.push_str("(deny network-inbound)\n");
-    p.push_str("(allow signal (target same-sandbox))\n");
+    // Mask secret-shaped / git-ignored files last: they beat every allow above.
+    for m in masks {
+        let _ = writeln!(p, "(deny file-read* file-write* process-exec* (subpath {}))", sbpl_quote(&m.to_string_lossy()));
+    }
     p
 }
 
@@ -126,18 +148,22 @@ pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::Path
 /// files to the state dir (rw) + CA roots (ro), network outbound to 443 + relay
 /// (+ loopback gateway bind).
 pub fn donor_profile(policy: &DonorPolicy) -> String {
-    let state = sbpl_quote(&policy.state_dir.to_string_lossy());
+    let state = sbpl_quote(&real(&policy.state_dir));
     let mut p = String::new();
     p.push_str("(version 1)\n(deny default)\n");
     p.push_str("(deny process-exec*)\n(deny process-fork)\n");
     let _ = writeln!(p, "(allow file-read* file-write* (subpath {state}))");
     for ro in &policy.ro_paths {
-        let _ = writeln!(p, 
-            "(allow file-read* (subpath {}))",
-            sbpl_quote(&ro.to_string_lossy())
-        );
+        let _ = writeln!(p, "(allow file-read* (subpath {}))", sbpl_quote(&real(ro)));
     }
     p.push_str("(allow file-read* (regex #\"^/(usr/lib|System/Library)/\"))\n");
+    // Name resolution for provider hosts: getaddrinfo goes through libinfo and
+    // mDNSResponder (mach service + its Unix socket) and reads /etc/hosts.
+    p.push_str("(allow mach-lookup (global-name \"com.apple.dnssd.service\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
+    p.push_str("(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n");
+    p.push_str("(allow file-read-metadata)\n");
+    p.push_str("(allow file-read* (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/var/run/resolv.conf\") (literal \"/Library/Preferences/com.apple.networkd.plist\"))\n");
+    p.push_str("(allow sysctl-read)\n");
     let _ = writeln!(p, 
         "(allow network-outbound (remote tcp \"*:443\") (remote tcp \"*:{}\"))",
         policy.relay_port
@@ -147,7 +173,6 @@ pub fn donor_profile(policy: &DonorPolicy) -> String {
             "(allow network-inbound (local tcp \"localhost:{gw}\"))"
         );
     }
-    p.push_str("(deny mach-lookup)\n");
     p
 }
 
