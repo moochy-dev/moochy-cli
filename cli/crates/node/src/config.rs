@@ -49,6 +49,9 @@ pub struct Config {
     pub log_anchor_url: Option<String>,
     /// Worker: serve only these public models (comma-separated), below what the keys allow.
     pub models_override: Option<String>,
+    /// Projects (`owner/name`, comma-separated) whose clients receive tool calls from donated
+    /// tokens outside `moochy run` (CONTRACT §15.4 opt-in; warned at every start).
+    pub allow_unsandboxed_tools: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -164,6 +167,11 @@ impl Config {
         self.models_override.as_deref().map(|v| v.split(',').map(str::trim).filter(|m| !m.is_empty()).collect())
     }
 
+    /// The §15.4 opt-in: tool calls reach clients of `slug` that are not sandboxed.
+    pub fn unsandboxed_tools_allowed(&self, slug: &str) -> bool {
+        self.allow_unsandboxed_tools.as_deref().is_some_and(|v| v.split(',').any(|s| s.trim().eq_ignore_ascii_case(slug)))
+    }
+
     pub fn has_role(&self, r: &str) -> bool {
         self.roles.iter().any(|x| x == r)
     }
@@ -211,9 +219,15 @@ impl Config {
                 self.log_anchor_url = Some(value.into());
             }
             "models_override" => self.models_override = Some(value.into()).filter(|v: &String| !v.is_empty()),
+            "allow_unsandboxed_tools" => {
+                if !value.is_empty() && !value.split(',').all(|s| valid_slug(s.trim())) {
+                    return Err(usage("allow_unsandboxed_tools is a comma-separated list of owner/name projects (empty to clear)"));
+                }
+                self.allow_unsandboxed_tools = Some(value.into()).filter(|v: &String| !v.is_empty());
+            }
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, log_key, log_anchor_url)"
+                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, log_key, log_anchor_url)"
                 )));
             }
         }

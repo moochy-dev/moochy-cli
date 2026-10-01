@@ -186,10 +186,10 @@ fn probe_symlink(a: &[String]) -> ExitCode {
 }
 
 fn probe_tiocsti() -> ExitCode {
-    const TIOCSTI: libc::c_ulong = 0x5412;
     let ch = libc::c_char::from_ne_bytes(*b"x");
-    // SAFETY: attempt the injection ioctl on stdin; seccomp should block it.
-    let r = unsafe { libc::ioctl(0, TIOCSTI, std::ptr::addr_of!(ch)) };
+    // SAFETY: attempt the injection ioctl on stdin (the platform's own TIOCSTI number);
+    // seccomp (Linux) or the session/profile (macOS) must block it.
+    let r = unsafe { libc::ioctl(0, libc::TIOCSTI, std::ptr::addr_of!(ch)) };
     if r == 0 {
         println!("tiocsti-ok (INJECTION SUCCEEDED — bad)");
         ok()

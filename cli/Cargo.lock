@@ -1054,6 +1054,7 @@ dependencies = [
  "moochy-sandbox",
  "moochy-worker",
  "prost",
+ "rustix",
  "rustls",
  "scrypt",
  "serde",

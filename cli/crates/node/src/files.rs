@@ -1,12 +1,16 @@
-//! `moochy_delegate` `files` (06 §13, T15): the Node reads files itself, under strict rules.
+//! `moochy_delegate` `files` (06 §13, T15, CONTRACT §15.2).
 //!
-//! Allowed root = git top-level (recorded for the token, or the shim's cwd) ∩ the client's MCP
+//! The background process never reads repository files nor spawns `git`: paths are read by the
+//! client side — the stdio shim (`moochy mcp`, inside the agent's own sandbox) with [`read`] —
+//! and reach the node as `file_contents`, which [`inline`] checks again by name. Streamable HTTP
+//! clients send `file_contents` themselves.
+//!
+//! [`read`] rules: allowed root = git top-level (recorded for the token, or the shim's cwd) ∩ the client's MCP
 //! roots (when it sent any). Each path: no `..`, no symlink anywhere below the root, realpath
 //! containment, regular file only, `.git/**` and secret-shaped names denied even when tracked,
 //! git-ignored files refused, UTF-8 text only, total ≤ 2 MiB, secret scrubber applied.
 
 use std::io::Read as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_TOTAL: u64 = 2 << 20;
@@ -34,9 +38,73 @@ fn denied_name(name: &str) -> bool {
         || [".pem", ".key", ".kdbx", ".p12", ".pfx", ".keystore", ".jks"].iter().any(|s| n.ends_with(s))
 }
 
+/// Percent-decode a `file://` URI into a path.
+pub fn file_uri(uri: &str) -> Option<PathBuf> {
+    let p = uri.strip_prefix("file://")?;
+    let p = p.strip_prefix("localhost").unwrap_or(p);
+    let b = p.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while let Some(&c) = b.get(i) {
+        if c == b'%' {
+            let h = std::str::from_utf8(b.get(i.saturating_add(1)..i.saturating_add(3))?).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i = i.saturating_add(3);
+        } else {
+            out.push(c);
+            i = i.saturating_add(1);
+        }
+    }
+    let s = String::from_utf8(out).ok()?;
+    s.starts_with('/').then(|| PathBuf::from(s))
+}
+
+/// Name rules for an inline file: relative, plain components, no `.git`, no secret-shaped name.
+fn check_inline_path(p: &str) -> Result<(), String> {
+    if p.is_empty() || p.len() > 4096 || p.contains('\0') || p.starts_with('/') {
+        return Err("invalid path (relative to the repository root)".into());
+    }
+    // Split by hand: `Path::components` silently drops interior `.` and empty segments.
+    for name in p.split('/') {
+        if matches!(name, "" | "." | "..") || name.contains('\\') {
+            return Err("`..`/`.`/empty components are not allowed".into());
+        }
+        if name == ".git" {
+            return Err(".git is never readable".into());
+        }
+        if denied_name(name) {
+            return Err("secret-shaped file name".into());
+        }
+    }
+    Ok(())
+}
+
+/// `file_contents` = `[{"path", "text"}]`: names checked, ≤ [`MAX_FILES`], ≤ 2 MiB, scrubbed.
+/// All or nothing (fail closed).
+pub fn inline(items: &[serde_json::Value]) -> Result<Vec<FileText>, String> {
+    if items.len() > MAX_FILES {
+        return Err(format!("at most {MAX_FILES} files per call"));
+    }
+    let mut total: u64 = 0;
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let (Some(path), Some(text)) = (it.get("path").and_then(serde_json::Value::as_str), it.get("text").and_then(serde_json::Value::as_str)) else {
+            return Err("`file_contents` items are {\"path\", \"text\"}".into());
+        };
+        check_inline_path(path).map_err(|e| format!("{path}: {e}"))?;
+        total = total.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        if total > MAX_TOTAL {
+            return Err(format!("files exceed the {} MiB total cap", MAX_TOTAL >> 20));
+        }
+        let text = crate::scrub::scrub(text.as_bytes()).and_then(|b| String::from_utf8(b).ok()).unwrap_or_else(|| text.to_owned());
+        out.push(FileText { rel: path.to_owned(), text });
+    }
+    Ok(out)
+}
+
 /// Git top-level of `dir` (canonical), if `dir` is inside a work tree.
 pub fn git_root(dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = crate::util::command("git")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
@@ -54,7 +122,7 @@ pub fn git_root(dir: &Path) -> Option<PathBuf> {
 /// Relative paths (to `root`) that git ignores.
 fn git_ignored(root: &Path, rels: &[String]) -> Result<Vec<String>, String> {
     use std::io::Write as _;
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::util::command("git")
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "-z", "--stdin"])
@@ -112,6 +180,33 @@ fn check(scope_root: &Path, client_roots: Option<&[PathBuf]>, p: &str) -> Result
     Ok((real.clone(), rel.to_str().ok_or("non-UTF-8 path")?.to_owned()))
 }
 
+/// Open `rel` (plain components, already checked) beneath `root`: every component with
+/// `O_NOFOLLOW` relative to the previous directory fd, the last one `O_NONBLOCK`; the opened fd
+/// must be a regular file.
+fn open_beneath(root: &Path, rel: &str) -> Result<std::fs::File, String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = open(root, dir_flags, Mode::empty()).map_err(|_| "cannot open the workspace root".to_owned())?;
+    let mut parts = rel.split('/').peekable();
+    while let Some(name) = parts.next() {
+        if matches!(name, "" | "." | "..") {
+            return Err("invalid path".into());
+        }
+        if parts.peek().is_some() {
+            dir = openat(&dir, name, dir_flags, Mode::empty()).map_err(|_| "a path component changed or is a symlink".to_owned())?;
+            continue;
+        }
+        let fd = openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|_| "cannot open (symlink or changed)".to_owned())?;
+        let st = fstat(&fd).map_err(|_| "cannot stat".to_owned())?;
+        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+            return Err("not a regular file".into());
+        }
+        return Ok(std::fs::File::from(fd));
+    }
+    Err("invalid path".into())
+}
+
 /// Read all requested files or refuse the whole call with the first reason (fail closed).
 pub fn read(scope: &Scope, paths: &[String]) -> Result<Vec<FileText>, String> {
     if paths.is_empty() {
@@ -131,14 +226,11 @@ pub fn read(scope: &Scope, paths: &[String]) -> Result<Vec<FileText>, String> {
     }
     let mut total: u64 = 0;
     let mut out = Vec::with_capacity(checked.len());
-    for (real, rel) in checked {
-        let f = std::fs::File::open(&real).map_err(|_| format!("{rel}: cannot open"))?;
-        let md = f.metadata().map_err(|_| format!("{rel}: cannot stat"))?;
-        let lmd = std::fs::symlink_metadata(&real).map_err(|_| format!("{rel}: cannot stat"))?;
-        // The opened file must be the regular file we checked (no swap in between).
-        if !md.is_file() || md.ino() != lmd.ino() || md.dev() != lmd.dev() {
-            return Err(format!("{rel}: not a regular file"));
-        }
+    for (_real, rel) in checked {
+        // Read from an fd opened beneath the root with no symlink anywhere (A171: a component
+        // swapped after `check` cannot redirect the read), non-blocking (A172: a FIFO cannot
+        // hang the shim), and fstat-checked as a regular file.
+        let f = open_beneath(root, &rel).map_err(|e| format!("{rel}: {e}"))?;
         let left = MAX_TOTAL.saturating_sub(total);
         let mut buf = Vec::new();
         f.take(left.saturating_add(1)).read_to_end(&mut buf).map_err(|_| format!("{rel}: read error"))?;
@@ -157,6 +249,14 @@ pub fn read(scope: &Scope, paths: &[String]) -> Result<Vec<FileText>, String> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn file_uris() {
+        assert_eq!(file_uri("file:///home/a%20b/x"), Some(PathBuf::from("/home/a b/x")));
+        assert_eq!(file_uri("file://localhost/x"), Some(PathBuf::from("/x")));
+        assert_eq!(file_uri("https://x"), None);
+        assert_eq!(file_uri("file://%zz"), None);
+    }
 
     #[test]
     fn rules() {
@@ -189,6 +289,12 @@ mod tests {
         assert!(read(&empty, &["src/a.rs".into()]).is_err(), "empty roots allow nothing");
         assert!(read(&narrow, &["src/a.rs".into()]).is_err(), "outside client roots");
         assert!(read(&Scope::default(), &["src/a.rs".into()]).is_err(), "no root");
+        let inl = |p: &str| inline(&[serde_json::json!({"path": p, "text": "k AKIAABCDEFGHIJKLMNOP"})]);
+        assert!(inl("src/a.rs").unwrap()[0].text.contains("[REDACTED:aws_key]"));
+        for bad in [".env", "src/.git/config", "../x", "/etc/passwd", "a/./b", "id_rsa", ""] {
+            assert!(inl(bad).is_err(), "inline {bad} must be refused");
+        }
+        assert!(inline(&[serde_json::json!({"path": "a", "text": "x".repeat(3 << 20)})]).is_err(), "size cap");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

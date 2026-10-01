@@ -87,13 +87,6 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
     p.ro_paths.extend(ro_paths(home, &boot.cfg));
     p.gateway_port = Some(boot.port());
     p.unsafe_no_lockdown = unsafe_no_lockdown;
-    if !boot.cfg.has_role("worker") && !unsafe_no_lockdown {
-        // ponytail: gateway-only nodes still run `git` for delegate file sharing (files.rs);
-        // lock them too once mo-node's move of file sharing into the stdio shim is on main.
-        log("warn", "gateway-only device: lockdown pending (delegate file sharing still runs git in this process)", &json!({}));
-        record(home, &json!({"locked": false, "reason": "gateway-only: pending file-sharing move"}));
-        return Ok(());
-    }
     // Development provider overrides (`keys add --base-url`, MOOCHY_INSECURE_DEV only) on other
     // ports than 443.
     p.connect_ports = dev_ports(&boot.secrets);
@@ -169,17 +162,6 @@ fn host_support(out: &mut Vec<(bool, &'static str, String)>) {
     out.push((lsm.split(',').any(|l| l == "landlock"), "landlock", if lsm.is_empty() { "unknown (no /sys/kernel/security/lsm)".into() } else { format!("active LSMs: {lsm}") }));
     let seccomp = read("/proc/self/status").is_some_and(|s| s.lines().any(|l| l.starts_with("Seccomp:")));
     out.push((seccomp, "seccomp", if seccomp { "available".into() } else { "not available in this kernel".into() }));
-    let userns_off = read("/proc/sys/kernel/unprivileged_userns_clone").as_deref() == Some("0");
-    let apparmor = read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1");
-    let detail = if userns_off {
-        "unprivileged user namespaces disabled (kernel.unprivileged_userns_clone=0): `moochy run` cannot sandbox".to_owned()
-    } else if apparmor {
-        "restricted by AppArmor: `moochy run` needs a per-binary profile /etc/apparmor.d/moochy granting `userns` to the moochy binary, then `sudo apparmor_parser -r /etc/apparmor.d/moochy` (never the global sysctl)".to_owned()
-    } else {
-        "available".to_owned()
-    };
-    // Advisory: only `moochy run` (maintainer side) needs user namespaces, not this app.
-    out.push((true, "userns", detail));
 }
 
 #[cfg(target_os = "macos")]

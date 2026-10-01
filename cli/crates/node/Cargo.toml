@@ -27,7 +27,7 @@ moochy-proto = { path = "../proto" }
 moochy-worker = { path = "../worker" }
 # Key-log verifier/mirror (spec/KEYLOG.md): KEY_ADDED proof of possession, sealable/gateway_allowed.
 moochy-keylog = { path = "../keylog", features = ["http"] }
-# CONTRACT §15.2: lockdown_self of the background process, validator jail (open, same workspace).
+# CONTRACT §15: `moochy run` jail (15.1), lockdown_self + validator jail of the background process (15.2).
 moochy-sandbox = { path = "../sandbox" }
 # K_det for sealed refusal details (CONTRACT §3); same version moochy-proto already links.
 hkdf = { version = "0.12", default-features = false }
@@ -56,6 +56,9 @@ hmac = { version = "0.12", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
 subtle = { version = "2", default-features = false }
+# MCP `files` (A171/A172): openat with O_NOFOLLOW per component + fstat of the opened fd, without
+# unsafe code. Already in the tree (moochy-sandbox); only the `fs` feature.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [lints.rust]

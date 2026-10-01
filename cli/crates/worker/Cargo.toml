@@ -13,7 +13,7 @@ publish = false
 # Zero-copy request/response buffers handed to the node.
 bytes = { version = "1", default-features = false, features = ["std"] }
 # Async runtime pieces: TCP, timers, the h2 connection mutex.
-tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "sync", "process", "io-util"] }
+tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "sync", "process", "io-util", "macros"] }
 # HTTP/2 (providers) and HTTP/1.1 (loopback dev fakes) client connections.
 hyper = { version = "1.7", default-features = false, features = ["client", "http1", "http2"] }
 # TokioIo + TokioExecutor adapters for hyper (same version as moochy node).

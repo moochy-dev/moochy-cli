@@ -151,7 +151,7 @@ fn adapter(p: Provider, base: String, limits: Limits) -> Adapter {
     .unwrap()
 }
 
-const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600 };
+const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600, max_page_tokens: 3000 };
 const POL: Policy = Policy { level: Level::Strict, flags: Flags::NONE, max_effort: Effort::Max };
 
 fn prepare(p: Provider, d: Dialect, body: &str) -> firewall::Prepared {
