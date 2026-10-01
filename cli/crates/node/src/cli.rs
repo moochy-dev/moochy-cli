@@ -2,9 +2,8 @@
 //! 0 ok, 2 usage, 3 auth/approval refused, 4 network, 10 internal.
 
 use crate::config::{Home, RepoEntry, valid_slug};
-use crate::engine::StubExecutor;
 use crate::keystore::{self, ProviderKey};
-use crate::node::Node;
+use crate::node::{Keys, Node, WorkerParts};
 use crate::pb::local::{EnvRequest, JournalRequest, McpOpen, McpUp, PauseRequest, ShutdownRequest, StatusRequest, mcp_up};
 use crate::util::{Ctx as _, Error, Result, auth, clean, emit, internal, log, net, usage};
 use lexopt::prelude::*;
@@ -17,12 +16,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-const HELP: &str = "moochy — donate and use pooled LLM compute for open source (free, Apache-2.0 OR MIT)
+const HELP: &str = "moochy — donate and use pooled LLM compute for open source (open-source client, Apache-2.0 · 100% free)
 
 USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
 
 COMMANDS:
-  login --relay https://HOST:PORT [--ca-file PEM] [--roles gateway,worker] [--name NAME] [--headless]
+  login [--relay URL] [--ca-file PEM] [--roles gateway,worker] [--name NAME] [--headless]
+                                  Default relay https://relay.moochy.dev:8443; another relay
+                                  needs MOOCHY_INSECURE_DEV=1 and gets its own keystore
   logout                          Wipe this device's keys locally
   up [--foreground]               Start the node (gateway + MCP doors, relay link, worker)
   down                            Stop the running node
@@ -34,9 +35,12 @@ COMMANDS:
   mcp [--repo OWNER/NAME]         stdio MCP server (shim to the running node)
   keys add <anthropic|openrouter|deepseek|openai> --key-stdin [--base-url URL]
   keys list | keys remove <provider>
-  config set <device_monthly_cap_uusd|slots_max|gateway_addr> <VALUE> | config show
-  approve <donor> --repo OWNER/NAME
-  members <add|remove> <user> --repo OWNER/NAME [--cap UUSD]
+  config set <device_monthly_cap_uusd|slots_max|gateway_addr|journal_full_text> <VALUE> | config show
+  connect <client>                Print the MCP / base-URL setup for a client (see `connect list`)
+  pending                         Requests waiting for your signature (repo owners)
+  approve <donor> --repo OWNER/NAME [--revoke] [--yes]
+  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap UUSD] [--yes]
+  claim --repo OWNER/NAME [--yes] Confirm a repo claim with this device's signature
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (dev only)
 ";
@@ -110,7 +114,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -141,7 +145,14 @@ fn run() -> Result<()> {
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     match w.as_slice() {
         ["login"] => {
-            let relay = o.relay.as_deref().ok_or_else(|| usage("--relay is required"))?;
+            let relay = o.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
+            if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
+                // A135: a lookalike relay could harvest a login; only for development and tests.
+                if !dev_mode() {
+                    return Err(usage("a non-default relay requires MOOCHY_INSECURE_DEV=1 (development and tests only)"));
+                }
+                eprintln!("WARNING: logging in to a non-default relay ({}); this device gets a separate keystore for it.", clean(relay));
+            }
             let roles: Vec<String> = o.roles.as_deref().unwrap_or("gateway").split(',').map(|r| r.trim().to_owned()).collect();
             let name = o.name.clone().unwrap_or_else(crate::login::default_name);
             rt_small()?.block_on(crate::login::login(&home, relay, o.ca_file.clone(), roles, name))
@@ -198,7 +209,20 @@ fn run() -> Result<()> {
             println!("{}", crate::util::clean_value(&serde_json::to_value(&cfg).ctx("config")?));
             Ok(())
         }
-        ["approve", _] | ["members", "add" | "remove", _] => owner_ops(&home, &o, &w),
+        ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["pending"] => rt_small()?.block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            let r = c.pending(crate::pb::local::PendingRequest {}).await.map_err(|s| internal(clean(s.message()).into_owned()))?.into_inner();
+            for q in r.requests {
+                emit(&sign_json(&q));
+            }
+            Ok(())
+        }),
+        ["connect", "list"] => {
+            println!("{}", crate::connect::CLIENTS.join("\n"));
+            Ok(())
+        }
+        ["connect", client] => connect(&home, &o, client),
         _ => Err(usage(format!("unknown command `{}` (see --help)", clean(&o.words.join(" "))))),
     }
 }
@@ -309,22 +333,75 @@ fn journal(home: &Home, follow: bool) -> Result<()> {
     })
 }
 
+fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
+    json!({"request_id": q.request_id, "kind": q.kind, "repo": q.repo_slug, "repo_id": q.repo_id, "subject": q.subject,
+        "subject_username": q.subject_username, "signer": q.signer, "issued_at_ms": q.issued_at_ms, "signed": q.signed, "log_index": q.log_index})
+}
+
+/// Owner signatures: show exactly what will be signed, then sign only on explicit consent.
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    use crate::pb::local::{ApproveRequest, ClaimRequest, MembersRequest, members_request::Op};
+    use std::io::IsTerminal as _;
     let slug = slug_or_detect(o)?;
     rt_small()?.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        let r = match w {
-            ["approve", donor] => c.approve(crate::pb::local::ApproveRequest { repo: slug, donor: (*donor).into() }).await.map(|_| ()),
-            ["members", op, user] => {
-                let op = if *op == "add" { crate::pb::local::members_request::Op::Add } else { crate::pb::local::members_request::Op::Remove };
-                c.members(crate::pb::local::MembersRequest { repo: slug, op: op as i32, user: (*user).into(), cap_uusd_month: o.cap.unwrap_or(0) }).await.map(|_| ())
+        let call = |c: &mut crate::pb::local::local_control_client::LocalControlClient<tonic::transport::Channel>, dry_run: bool| {
+            let mut c = c.clone();
+            let (slug, w) = (slug.clone(), w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+            let (revoke, device, cap) = (o.has("revoke"), o.has("device"), o.cap.unwrap_or(0));
+            async move {
+                let r = match w.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                    ["approve", donor] => c.approve(ApproveRequest { repo: slug, donor: (*donor).into(), dry_run, revoke }).await,
+                    ["members", op, user] => {
+                        let op = if *op == "add" { Op::Add } else { Op::Remove };
+                        c.members(MembersRequest { repo: slug, op: op as i32, user: (*user).into(), cap_uusd_month: cap, device, dry_run }).await
+                    }
+                    _ => c.claim(ClaimRequest { repo: slug, dry_run }).await,
+                };
+                r.map(tonic::Response::into_inner).map_err(|s| match s.code() {
+                    tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => usage(clean(s.message()).into_owned()),
+                    _ => internal(clean(s.message()).into_owned()),
+                })
             }
-            _ => return Err(usage("bad owner command")),
         };
-        r.map_err(|s| internal(clean(s.message()).into_owned()))?;
-        emit(&json!({"event": "ok"}));
+        let preview = call(&mut c, true).await?;
+        eprintln!(
+            "You are about to sign {} for {} ({}):\n  subject {} ({})\n  signer  {} (this device)\n  issued  {} ms",
+            preview.kind, preview.repo_slug, preview.repo_id, preview.subject, preview.subject_username, preview.signer, preview.issued_at_ms
+        );
+        if !o.has("yes") {
+            if !std::io::stdin().is_terminal() {
+                return Err(usage("pass --yes to sign non-interactively"));
+            }
+            eprint!("Sign it? [y/N] ");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            if !matches!(line.trim(), "y" | "Y" | "yes") {
+                return Err(usage("not signed"));
+            }
+        }
+        let done = call(&mut c, false).await?;
+        emit(&sign_json(&done));
         Ok(())
     })
+}
+
+fn connect(home: &Home, o: &Opts, client: &str) -> Result<()> {
+    if o.has("write") {
+        return Err(usage("--write is not supported yet: paste the printed snippet into your client's user-level config"));
+    }
+    let slug = slug_or_detect(o)?;
+    let (url, models) = rt_small()?.block_on(async {
+        let mut c = crate::ctl::connect(&home.socket_path()).await?;
+        let st = c.status(StatusRequest {}).await.map_err(|s| internal(s.message().to_owned()))?.into_inner();
+        let models: Vec<String> = st.pools.iter().find(|p| p.slug.eq_ignore_ascii_case(&slug)).map(|p| p.models.clone()).unwrap_or_default();
+        Ok::<_, Error>((st.gateway_url, models))
+    })?;
+    let main = models.first().map_or("MODEL", String::as_str);
+    let small = models.get(1).map_or(main, String::as_str);
+    let s = crate::connect::snippet(client, &url, &slug, &clean(main), &clean(small)).ok_or_else(|| usage(format!("unknown client; one of: {}", crate::connect::CLIENTS.join(", "))))?;
+    print!("{s}");
+    Ok(())
 }
 
 fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
@@ -416,6 +493,29 @@ fn up_foreground(home: Home, offline: bool) -> Result<()> {
     rt.block_on(up(home, offline))
 }
 
+/// Provider adapters (one per stored key) and the outbox store.
+fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts> {
+    use moochy_worker::provider::{Adapter, AdapterConfig, Limits};
+    let mut adapters = Vec::new();
+    for p in &secrets.providers {
+        let Some(provider) = moochy_worker::Provider::parse(&p.provider) else { continue };
+        let cfg = AdapterConfig {
+            provider,
+            api_key: zeroize::Zeroizing::new(p.key.clone()),
+            base_url: p.base_url.clone(),
+            insecure_dev: dev_mode(),
+            dev_root: None,
+            limits: Limits::default(),
+        };
+        match Adapter::new(&cfg) {
+            Ok(a) => adapters.push(Arc::new(a)),
+            Err(e) => log("error", "provider key not usable", &json!({"provider": p.provider, "error": e.to_string()})),
+        }
+    }
+    let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
+    Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))) })
+}
+
 async fn up(home: Home, offline: bool) -> Result<()> {
     home.ensure()?;
     let mut cfg = home.load()?;
@@ -431,19 +531,39 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     let addr = cfg.gateway_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| usage(format!("bind {addr}: {e}")))?;
     let port = listener.local_addr().ctx("local addr")?.port();
+    if cfg.gateway_addr.is_none() {
+        // First start: keep this port so clients keep a stable base URL (CONTRACT §6).
+        cfg.gateway_addr = Some(format!("127.0.0.1:{port}"));
+        home.save(&cfg)?;
+    }
     let sock_path = home.socket_path();
     let sock = crate::ctl::bind(&sock_path).await?;
-    // ponytail: StubExecutor until moochy-worker is wired; sealer None until moochy-proto is.
-    let node = Node::new(home.clone(), cfg, secrets, Arc::new(StubExecutor::default()), None, offline);
+    let keys = match (&secrets.device, cfg.device_id.as_deref()) {
+        (Some(d), Some(id)) => Some(Keys { sign: d.sign_key(), enc: d.enc_key()?, device_id: id.parse().map_err(|_| auth("stored device id is invalid"))? }),
+        _ => None,
+    };
+    let parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
+    let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));
     tokio::spawn(crate::ctl::serve(node.clone(), sock, sock_path.clone()));
+    if !node.adapters.is_empty() {
+        tokio::spawn(crate::worker::warm_loop(node.clone()));
+    }
     if !offline {
         tokio::spawn(crate::link::run(node.clone()));
         match crate::link::wait_first(&node, Duration::from_secs(5)).await {
             Err(e) if e.exit == crate::util::Exit::Auth => return Err(e),
             Err(e) => log("warn", "starting without the relay link", &json!({"error": e.msg})),
-            Ok(()) => {}
+            Ok(()) => {
+                // The relay sends the catalog right after Welcome; give it a moment.
+                for _ in 0..100 {
+                    if node.catalog().version > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
         }
     }
     let url = node.gateway_url();

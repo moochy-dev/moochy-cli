@@ -115,7 +115,7 @@ fn token(h: &HeaderMap) -> Option<&str> {
 
 async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) -> Resp {
     let path = req.uri().path().to_owned();
-    let dialect = if path.ends_with("/chat/completions") || path.ends_with("/models") && req.headers().get("anthropic-version").is_none() {
+    let dialect = if path.ends_with("/chat/completions") || (path.ends_with("/models") && req.headers().get("anthropic-version").is_none()) {
         Dialect::OpenAi
     } else {
         Dialect::Anthropic
@@ -172,7 +172,7 @@ pub async fn read_body(b: Incoming, limit: usize) -> Result<Bytes, Failure> {
 }
 
 /// Validate + scrub a provider-dialect body into a task request.
-pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: Vec<(String, String)>) -> Result<TaskReq, Failure> {
+pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: Vec<(String, String)>, t_client_rx: u64) -> Result<TaskReq, Failure> {
     let bad = |m: String| Failure::new("invalid_request", false, m);
     let mut body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
     let mut parsed = crate::json::parse_object(&body).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
@@ -180,11 +180,22 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         parsed.insert("max_tokens".into(), DEFAULT_MAX_TOKENS.into());
         body = Bytes::from(Value::Object(parsed.clone()).to_string());
     }
-    let facts = node.executor.route_facts(dialect, &parsed, &body).map_err(|e| bad(format!("moochy: {e}")))?;
-    Ok(TaskReq { slug, dialect, body, parsed, facts, headers })
+    let entry = catalog_entry(node, &parsed)?;
+    let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
+    Ok(TaskReq { slug, dialect, body, parsed, facts, entry, headers, t_client_rx })
+}
+
+fn catalog_entry(node: &Node, parsed: &serde_json::Map<String, Value>) -> Result<moochy_proto::money::CatalogEntry, Failure> {
+    let model = parsed.get("model").and_then(Value::as_str).ok_or_else(|| Failure::new("invalid_request", false, "moochy: `model` is required".to_owned()))?;
+    let cat = node.catalog();
+    cat.resolve(model).cloned().ok_or_else(|| {
+        let why = if cat.version == 0 { "moochy: no price catalog from the relay yet".to_owned() } else { format!("moochy: model `{}` is not in the catalog", crate::util::clean(model)) };
+        Failure::new("model_not_in_pool", false, why)
+    })
 }
 
 async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool) -> Resp {
+    let t_rx = crate::task::now_us();
     let headers: Vec<(String, String)> = ["anthropic-version", "anthropic-beta"]
         .iter()
         .filter(|_| dialect == Dialect::Anthropic)
@@ -201,12 +212,13 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
             Err(e) => return native_error(dialect, &Failure::new("invalid_request", false, format!("moochy: invalid JSON body: {e}"))),
         };
         v.entry("max_tokens").or_insert(1.into());
-        return match node.executor.route_facts(dialect, &v, &raw) {
+        let body = Value::Object(v.clone()).to_string();
+        return match catalog_entry(&node, &v).and_then(|e| crate::engine::analyze(&e, dialect, body.as_bytes(), &headers)) {
             Ok(f) => json_resp(200, &json!({"input_tokens": f.est_input_tokens})),
-            Err(e) => native_error(dialect, &Failure::new("invalid_request", false, format!("moochy: {e}"))),
+            Err(f) => native_error(dialect, &f),
         };
     }
-    let treq = match prepare(&node, slug, dialect, raw, headers) {
+    let treq = match prepare(&node, slug, dialect, raw, headers, t_rx) {
         Ok(t) => t,
         Err(f) => return native_error(dialect, &f),
     };

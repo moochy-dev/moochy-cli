@@ -56,7 +56,7 @@ impl<T, E: fmt::Display> Ctx<T> for std::result::Result<T, E> {
 
 pub fn rand_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut b = [0u8; N];
-    getrandom::fill(&mut b).ctx("os random")?;
+    moochy_proto::crypto::fill_random(&mut b).map_err(|_| internal("os random"))?;
     Ok(b)
 }
 

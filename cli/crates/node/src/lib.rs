@@ -8,11 +8,14 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects)
 )]
 
+pub mod approve;
 pub mod cli;
 pub mod config;
 pub mod ctl;
+pub mod connect;
 pub mod engine;
 pub mod files;
+pub mod gate;
 pub mod gateway;
 pub mod json;
 pub mod keystore;

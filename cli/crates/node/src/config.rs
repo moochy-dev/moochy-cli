@@ -33,6 +33,8 @@ pub struct Config {
     pub repos: BTreeMap<String, RepoEntry>,
     /// `file` (default) or `keychain`.
     pub keystore: Option<String>,
+    /// Opt-in: the local journal may keep full request/response text (default off: metadata only).
+    pub journal_full_text: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -42,6 +44,18 @@ pub struct RepoEntry {
 }
 
 pub const DEFAULT_GATEWAY_ADDR: &str = "127.0.0.1:0";
+/// The public relay's gRPC listener (CONTRACT §14b R2).
+pub const DEFAULT_RELAY: &str = "https://relay.moochy.dev:8443";
+
+/// Short stable tag of a relay origin (file names, keychain entries).
+pub fn origin_tag(origin: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(origin.as_bytes()).iter().take(8).fold(String::new(), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 pub const DEFAULT_SLOTS: u32 = 4;
 
 #[derive(Clone, Debug)]
@@ -71,8 +85,14 @@ impl Home {
     pub fn config_path(&self) -> PathBuf {
         self.dir.join("config.json")
     }
-    pub fn keystore_path(&self) -> PathBuf {
-        self.dir.join("keystore.enc")
+    /// Keystore file for a relay origin: the default relay uses `keystore.enc`; any other origin
+    /// gets its own file (A135: a login to another relay never touches the default keys).
+    pub fn keystore_path(&self, relay: Option<&str>) -> PathBuf {
+        match relay {
+            None => self.dir.join("keystore.enc"),
+            Some(r) if r == DEFAULT_RELAY => self.dir.join("keystore.enc"),
+            Some(r) => self.dir.join(format!("keystore-{}.enc", origin_tag(r))),
+        }
     }
     pub fn state_dir(&self) -> PathBuf {
         self.dir.join("state")
@@ -145,7 +165,18 @@ impl Config {
                     return Err(e);
                 }
             }
-            _ => return Err(usage(format!("unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr)"))),
+            "journal_full_text" => {
+                self.journal_full_text = match value {
+                    "true" | "1" | "on" => true,
+                    "false" | "0" | "off" => false,
+                    _ => return Err(usage("journal_full_text is true or false")),
+                };
+            }
+            _ => {
+                return Err(usage(format!(
+                    "unknown config key {key:?} (device_monthly_cap_uusd, slots_max, gateway_addr, journal_full_text)"
+                )));
+            }
         }
         Ok(())
     }

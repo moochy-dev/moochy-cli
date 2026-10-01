@@ -169,7 +169,7 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     }
     let origin_s = origin.url();
     let sig = keys.sign(&lp(&[b"moochy/v1/auth", &hello.nonce, origin_s.as_bytes(), &exporter, device_id.as_bytes()]));
-    let auth_msg = Auth { device_id: device_id.to_owned(), roles: roles(&node.cfg.roles), sig: sig.to_vec(), client_version: env!("CARGO_PKG_VERSION").into() };
+    let auth_msg = Auth { device_id: device_id.to_owned(), roles: roles(&node.cfg.roles), sig: bytes::Bytes::copy_from_slice(&sig), client_version: env!("CARGO_PKG_VERSION").into() };
     up.send(NodeMsg { msg: Some(node_msg::Msg::Auth(auth_msg)) }).await.map_err(|_| End::Net("session closed".into()))?;
     let welcome = match next(&mut down).await? {
         relay_msg::Msg::Welcome(w) => w,
@@ -196,7 +196,18 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                     relay_msg::Msg::Draining(d) => return Ok(End::Reconnect(u64::from(d.reconnect_after_ms).min(BACKOFF_CAP_MS))),
                     relay_msg::Msg::Pong(_) => last_pong = Instant::now(),
                     relay_msg::Msg::Error(e) => log("warn", "relay error", &json!({"code": e.code, "message": e.message, "task": e.task})),
-                    // Outbox replay / acks belong to moochy-worker; checkpoints and catalog to the monitor.
+                    relay_msg::Msg::Catalog(c) => match crate::engine::Catalog::parse(&c.catalog_json) {
+                        Ok(cat) => {
+                            node.set_catalog(cat);
+                            crate::worker::reoffer(node);
+                        }
+                        Err(e) => log("warn", "catalog refused", &json!({"error": e})),
+                    },
+                    relay_msg::Msg::ReceiptAck(a) => crate::worker::on_receipt_ack(node, &a.task, a.attempt),
+                    relay_msg::Msg::ReplaySince(r) => crate::worker::on_replay_since(node, r.since_ms),
+                    relay_msg::Msg::ApprovalRequests(r) => crate::approve::on_requests(node, r),
+                    relay_msg::Msg::LogEntryAck(a) => crate::approve::on_ack(node, a),
+                    // Key-log checkpoints: monitor hook (moochy-keylog), not wired yet.
                     _ => {}
                 },
                 Ok(Some(RelayMsg { msg: None })) => {}
