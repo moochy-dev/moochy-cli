@@ -247,6 +247,13 @@ impl Node {
         pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()
     }
 
+    /// Key-log hook (06 §10): a Gateway seals only to worker keys that are logged, unrevoked, and
+    /// belong to a donor with an owner-signed `DONOR_APPROVED` for the repo. Until the
+    /// `moochy-keylog` mirror is wired this accepts the relay's pool (relay-asserted, like D14).
+    fn worker_approved(_repo_id: &str, _worker_device: &str, _sign_pub: Option<&[u8; 32]>) -> bool {
+        true
+    }
+
     pub fn apply_pool_sync(&self, v: &PoolSync) {
         if v.repo_id.is_empty() || v.repo_id.len() > 64 {
             return;
@@ -264,11 +271,15 @@ impl Node {
             p.workers.retain(|x| !v.removed_worker_devices.contains(&x.worker_device));
             for w in v.workers.iter().take(4096) {
                 let Ok(enc_pub) = <[u8; 32]>::try_from(w.enc_pub.as_ref()) else { continue };
+                let sign_pub = <[u8; 32]>::try_from(w.sign_pub.as_ref()).ok();
+                if !Self::worker_approved(&v.repo_id, &w.worker_device, sign_pub.as_ref()) {
+                    continue;
+                }
                 p.workers.retain(|x| x.worker_device != w.worker_device);
                 p.workers.push(PoolWorker {
                     worker_device: w.worker_device.clone(),
                     enc_pub,
-                    sign_pub: <[u8; 32]>::try_from(w.sign_pub.as_ref()).ok(),
+                    sign_pub,
                     donor: clean(&w.donor_pseudonym).into_owned(),
                     dialects: w.dialects.clone(),
                     models: w.models.clone(),

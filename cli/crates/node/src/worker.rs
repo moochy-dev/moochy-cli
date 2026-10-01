@@ -173,8 +173,11 @@ struct Refuse<'a> {
 
 impl Refuse<'_> {
     async fn nack(&self, ck: Option<&ContentKey>, f: &Failure) {
-        // The detail names fields / short reasons only (never prompt text): fine in the donor's own log.
-        log("warn", "task refused", &json!({"task": self.task, "attempt": self.attempt, "code": f.code, "detail": f.detail.as_deref().map(|d| d.get(..200).unwrap_or(d))}));
+        // Our own refusal reasons name fields only; provider error bodies may echo request
+        // content, so they are sealed to the Gateway but never logged here.
+        let ours = matches!(f.code.as_str(), "firewall" | "route_mismatch" | "unauthorized_task" | "bad_envelope" | "local_cap" | "busy");
+        let detail = f.detail.as_deref().filter(|_| ours).map(|d| d.get(..200).unwrap_or(d));
+        log("warn", "task refused", &json!({"task": self.task, "attempt": self.attempt, "code": f.code, "detail": detail}));
         let sealed_detail = match (ck, &f.detail) {
             (Some(ck), Some(d)) => {
                 let c = DetailCtx { ck: ck.expose(), r: &self.r, task: self.task, task16: &self.task16, worker: self.worker, attempt: self.attempt };
