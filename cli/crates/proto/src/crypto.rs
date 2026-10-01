@@ -278,29 +278,22 @@ pub struct RequestOpener {
     next: u32,
     sealed: usize,
     last_seen: bool,
-    zstd_done: bool,
     failed: bool,
-    dctx: zstd::zstd_safe::DCtx<'static>,
+    inflater: crate::inflate::Inflater,
     scratch: Vec<u8>,
-    out: Vec<u8>,
 }
 
 impl RequestOpener {
     pub fn new(ck: &ContentKey, task: &TaskId) -> Result<Self, Error> {
-        let mut dctx = zstd::zstd_safe::DCtx::create();
-        // 2^25 = 32 MiB: no legitimate payload needs a larger window.
-        dctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(25)).map_err(|_| Error::Malformed)?;
         Ok(Self {
             aead: ChunkAead::new(&k_req(ck, task)?)?,
             aad: req_aad(task)?,
             next: 0,
             sealed: 0,
             last_seen: false,
-            zstd_done: false,
             failed: false,
-            dctx,
+            inflater: crate::inflate::Inflater::new(MAX_PAYLOAD),
             scratch: Vec::with_capacity(MAX_CHUNK + TAG_LEN),
-            out: Vec::new(),
         })
     }
 
@@ -336,52 +329,20 @@ impl RequestOpener {
         let r = open_in_place(&self.aead, &mut self.aad, c.seq, c.last, &mut buf).and_then(|n| {
             self.next = c.seq.checked_add(1).ok_or(Error::TooLarge)?;
             self.last_seen = c.last;
-            self.inflate(buf.get(..n).unwrap_or_default())
+            // Pure-Rust decoder on the stranger's bytes (CONTRACT §15.2).
+            self.inflater.push(buf.get(..n).unwrap_or_default())
         });
         buf.zeroize();
         self.scratch = buf;
         r
     }
 
-    fn inflate(&mut self, src: &[u8]) -> Result<(), Error> {
-        use zstd::zstd_safe::{InBuffer, OutBuffer};
-        let mut input = InBuffer::around(src);
-        loop {
-            if self.zstd_done {
-                // Bytes after the end of the single zstd frame: refuse (parser-differential rule).
-                return if input.pos() == src.len() { Ok(()) } else { Err(Error::Malformed) };
-            }
-            if self.out.len() == self.out.capacity() {
-                if self.out.len() > MAX_PAYLOAD {
-                    return Err(Error::TooLarge);
-                }
-                let want = self.out.capacity().saturating_mul(2).clamp(1 << 16, MAX_PAYLOAD + 1);
-                self.out.reserve_exact(want.saturating_sub(self.out.len()));
-            }
-            let pos = self.out.len();
-            let mut ob = OutBuffer::around_pos(&mut self.out, pos);
-            let hint = self.dctx.decompress_stream(&mut ob, &mut input).map_err(|_| Error::Malformed)?;
-            let out_full = ob.pos() == ob.capacity();
-            if self.out.len() > MAX_PAYLOAD {
-                return Err(Error::TooLarge);
-            }
-            if hint == 0 {
-                self.zstd_done = true;
-            } else if input.pos() == src.len() && !out_full {
-                return Ok(());
-            }
-        }
-    }
-
-    /// The decompressed inner payload. Requires the last chunk and a complete zstd frame.
-    pub fn finish(mut self) -> Result<Vec<u8>, Error> {
+    /// The decompressed inner payload. Requires the last chunk and one complete zstd frame.
+    pub fn finish(self) -> Result<Vec<u8>, Error> {
         if self.failed || !self.last_seen {
             return Err(Error::Sequence);
         }
-        if !self.zstd_done {
-            return Err(Error::Malformed);
-        }
-        Ok(std::mem::take(&mut self.out))
+        self.inflater.finish()
     }
 }
 

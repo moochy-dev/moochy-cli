@@ -49,6 +49,18 @@ fn perf() {
     let z = crypto::seal_request(&ck, &task, &body).unwrap().body_len;
     println!("seal_request 100 KB (→ {z} B sealed): p50 {p50:?} p99 {p99:?} (budget 1 ms / 3 ms)");
 
+    // 1b) Worker: open that 100 KB request (AEAD + pure-Rust zstd decode).
+    let sealed100 = crypto::seal_request(&ck, &task, &body).unwrap();
+    let mut times = Vec::new();
+    for _ in 0..300 {
+        let t = Instant::now();
+        let mut o = RequestOpener::new(&ck, &task).unwrap();
+        sealed100.chunks.iter().for_each(|c| o.push(c).unwrap());
+        assert_eq!(o.finish().unwrap().len(), body.len());
+        times.push(t.elapsed());
+    }
+    println!("open_request 100 KB (ruzstd): p50 {:?} p99 {:?} (Worker budget Assign→Ack 1 ms / 3 ms, whole path)", pct(times.clone(), 50), pct(times, 99));
+
     // 2) Worker: open the same request (decrypt + inflate), allocations per chunk.
     let mut big = vec![0u8; 8 * MAX_CHUNK];
     crypto::fill_random(&mut big).unwrap();
