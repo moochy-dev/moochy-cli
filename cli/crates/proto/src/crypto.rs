@@ -177,13 +177,21 @@ pub fn seal_request(ck: &ContentKey, task: &TaskId, payload: &[u8]) -> Result<Se
         return Err(Error::TooLarge);
     }
     let z = zstd::bulk::compress(payload, ZSTD_LEVEL).map_err(|_| Error::Malformed)?;
+    seal_compressed(ck, task, &z)
+}
+
+/// Seal already-compressed bytes as-is. Only for test vectors (bombs, trailing data); a
+/// Gateway always uses [`seal_request`].
+#[doc(hidden)]
+pub fn seal_compressed(ck: &ContentKey, task: &TaskId, z: &[u8]) -> Result<SealedRequest, Error> {
     let n = z.len().div_ceil(MAX_CHUNK).max(1);
     let total = n.checked_mul(HEADER_LEN + TAG_LEN).and_then(|o| o.checked_add(z.len())).ok_or(Error::TooLarge)?;
     let aead = ChaCha20Poly1305::new(k_req(ck, task)?.expose().into());
     let mut aad = req_aad(task)?;
     let mut buf = BytesMut::with_capacity(total);
     let mut frames = Vec::with_capacity(n);
-    for (i, chunk) in z.chunks(MAX_CHUNK).enumerate() {
+    // Empty input still yields one (empty, last) frame.
+    for (i, chunk) in z.chunks(MAX_CHUNK).chain(z.is_empty().then_some(&[][..])).enumerate() {
         let seq = u32::try_from(i).map_err(|_| Error::TooLarge)?;
         let last = i.checked_add(1) == Some(n);
         let h = Header { kind: Kind::Request, task: *task, attempt: 0, seq, last };
