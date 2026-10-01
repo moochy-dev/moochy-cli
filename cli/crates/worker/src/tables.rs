@@ -78,7 +78,8 @@ const DOCUMENT_BLOCK: R = R::Hook(
                             true,
                         )]),
                     ),
-                    ("base64", R::Deny("PDF documents are not allowed at the strict level")),
+                    // R3: PDFs need the `documents` flag (Document hook) and ≤ 100 pages in total.
+                    ("base64", R::Obj(&[F("media_type", R::Enum(&["application/pdf"]), true), F("data", R::Hook(Hook::Pdf, &R::Str), true)])),
                     ("url", R::Deny("URL sources make the provider fetch URLs")),
                     ("file", R::Deny("file-id sources read the donor's file store")),
                 ],

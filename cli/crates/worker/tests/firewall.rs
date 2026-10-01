@@ -5,7 +5,7 @@
 use moochy_worker::firewall::{self, Catalog, CacheTtl, Level, MaxPrice, Policy, RejectCode, Request, Route};
 use moochy_worker::{Dialect, Effort, Flags, Provider};
 
-const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600 };
+const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600, max_page_tokens: 3000 };
 
 fn policy(flags: Flags) -> Policy {
     Policy { level: Level::Strict, flags, max_effort: Effort::High }
@@ -97,7 +97,7 @@ fn anthropic_denies() {
             "messages[0].content[0].content[0].type",
             "not allowed",
         ),
-        (anth(r#"[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBE"}}]"#, ""), images, "source.type", "PDF"),
+        (anth(r#"[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBE"}}]"#, ""), images, "source.data", "page count"),
         (anth(r#"[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"x"}}]"#, ""), policy(Flags::IMAGES), "messages[0].content[0]", "`documents` opt-in"),
         (anth(r#"[{"type":"server_tool_use","id":"s","name":"web_search","input":{}}]"#, ""), images, "messages[0].content[0].type", "server-side"),
         (anth(r#"[{"type":"web_search_tool_result","tool_use_id":"s","content":[]}]"#, ""), images, "messages[0].content[0].type", "server-side"),
@@ -440,4 +440,45 @@ fn xai_adapter_rules() {
     // No Anthropic-compatible endpoint: not served, retry elsewhere.
     let e = firewall::prepare(&req(Provider::XAi, Dialect::AnthropicMessages, &anth(r#""hi""#, ""), &p, None)).unwrap_err();
     assert_eq!(e.code.nack(), ("model_unavailable", true));
+}
+
+fn pdf_b64(pages: usize) -> String {
+    use base64::Engine as _;
+    let mut pdf = String::from("%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+    pdf.push_str(&format!("2 0 obj << /Type /Pages /Count {pages} >> endobj\n"));
+    for i in 0..pages {
+        pdf.push_str(&format!("{} 0 obj << /Type /Page /Parent 2 0 R >> endobj\n", i + 3));
+    }
+    pdf.push_str("%%EOF");
+    base64::engine::general_purpose::STANDARD.encode(pdf)
+}
+
+/// CONTRACT R3: PDFs need the `documents` flag, ≤ 100 pages; pages × max_page_tokens in the estimate.
+#[test]
+fn r3_pdf_documents() {
+    let doc = |b64: &str| format!(r#"[{{"type":"document","source":{{"type":"base64","media_type":"application/pdf","data":"{b64}"}}}}]"#);
+    let docs = policy(Flags::DOCUMENTS);
+    let body = anth(&doc(&pdf_b64(3)), "");
+    let f = analyze(Dialect::AnthropicMessages, &body, &[], docs).unwrap();
+    assert_eq!((f.pages, f.flags), (3, Flags::DOCUMENTS));
+    assert_eq!(f.text_bytes, body.len() as u64 - pdf_b64(3).len() as u64, "PDF bytes are not text");
+    assert_eq!(f.est_input_tokens, f.text_bytes.div_ceil(3) + 3 * 3000);
+    // Nested in a tool_result: counted the same way, across documents.
+    let nested = anth(&format!(r#"[{{"type":"tool_result","tool_use_id":"t","content":{}}}]"#, doc(&pdf_b64(98))), "");
+    let two = nested.replacen("\"content\":[{\"role\"", "x", 0);
+    assert_eq!(analyze(Dialect::AnthropicMessages, &two, &[], docs).unwrap().pages, 98);
+    let over = anth(&format!(r#"[{}, {}]"#, &doc(&pdf_b64(60))[1..doc(&pdf_b64(60)).len() - 1], &doc(&pdf_b64(41))[1..doc(&pdf_b64(41)).len() - 1]), "");
+    assert!(analyze(Dialect::AnthropicMessages, &over, &[], docs).unwrap_err().to_string().contains("100 pages"));
+    // Refusals: no flag, paranoid, not base64, not a PDF, uncountable, wrong media type.
+    assert!(analyze(Dialect::AnthropicMessages, &body, &[], policy(Flags::NONE)).unwrap_err().to_string().contains("`documents` opt-in"));
+    assert!(analyze(Dialect::AnthropicMessages, &body, &[], Policy { level: Level::Paranoid, ..docs }).is_err());
+    assert!(analyze(Dialect::AnthropicMessages, &anth(&doc("not base64!"), ""), &[], docs).unwrap_err().to_string().contains("base64"));
+    use base64::Engine as _;
+    let enc = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    assert!(analyze(Dialect::AnthropicMessages, &anth(&doc(&enc(b"hello")), ""), &[], docs).is_err());
+    assert!(analyze(Dialect::AnthropicMessages, &anth(&doc(&enc(b"%PDF-1.7 << /Type /ObjStm >>")), ""), &[], docs).is_err());
+    let png = anth(&doc(&pdf_b64(1)).replace("application/pdf", "image/png"), "");
+    assert!(analyze(Dialect::AnthropicMessages, &png, &[], docs).is_err());
+    // The Gateway (PERMISSIVE) and the Worker compute the same facts.
+    assert_eq!(firewall::analyze(Dialect::AnthropicMessages, body.as_bytes(), &[], &Policy::PERMISSIVE, &CAT).unwrap(), f);
 }

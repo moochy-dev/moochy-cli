@@ -13,7 +13,7 @@ use moochy_worker::firewall::{self, CacheTtl, Catalog, Level, Policy, RejectCode
 use moochy_worker::validate::{self, ValidateError, ValidateRequest, Validator, ValidatorLimits};
 use moochy_worker::{Dialect, Effort, Flags, Provider};
 
-const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600 };
+const CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600, max_page_tokens: 3000 };
 const POL: Policy = Policy { level: Level::Strict, flags: Flags::NONE, max_effort: Effort::Max };
 const DEV: &str = "d_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ALIASES: &[&str] = &["anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"];

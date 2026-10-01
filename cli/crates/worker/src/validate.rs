@@ -148,6 +148,7 @@ pub fn encode_request(r: &ValidateRequest<'_>, out: &mut Vec<u8>) {
     w.u8(idx(&EFFORTS, &r.catalog.default_effort));
     w.u64(r.catalog.max_output);
     w.u64(r.catalog.max_image_tokens);
+    w.u64(r.catalog.max_page_tokens);
     match r.max_price {
         Some(p) => {
             w.u8(1);
@@ -204,7 +205,7 @@ fn decode_request(b: &[u8]) -> Option<ChildRequest<'_>> {
     let pflags = Flags(r.u8()?);
     let max_effort = pick(&EFFORTS, r.u8()?)?;
     let default_effort = pick(&EFFORTS, r.u8()?)?;
-    let (max_output, max_image_tokens) = (r.u64()?, r.u64()?);
+    let (max_output, max_image_tokens, max_page_tokens) = (r.u64()?, r.u64()?, r.u64()?);
     let max_price = match r.u8()? {
         0 => None,
         1 => Some(MaxPrice { prompt_uusd_per_mtok: r.u64()?, completion_uusd_per_mtok: r.u64()? }),
@@ -235,7 +236,7 @@ fn decode_request(b: &[u8]) -> Option<ChildRequest<'_>> {
         provider,
         dialect,
         policy: Policy { level, flags: pflags, max_effort },
-        catalog: Catalog { default_effort, max_output, max_image_tokens },
+        catalog: Catalog { default_effort, max_output, max_image_tokens, max_page_tokens },
         max_price,
         model_id,
         pseudonym,
@@ -279,6 +280,7 @@ fn encode_ok(v: &Validated, out: &mut Vec<u8>) {
     w.u8(f.flags.0);
     w.u64(f.text_bytes);
     w.u64(f.images);
+    w.u64(f.pages);
     w.u32(u32::try_from(v.prepared.headers.len()).unwrap_or(u32::MAX));
     for (k, val) in &v.prepared.headers {
         w.bytes(k.as_bytes());
@@ -361,6 +363,7 @@ fn decode_response(buf: &Bytes) -> Result<Validated, ValidateError> {
     let flags = Flags(r.u8().ok_or_else(garbage)?);
     let text_bytes = r.u64().ok_or_else(garbage)?;
     let images = r.u64().ok_or_else(garbage)?;
+    let pages = r.u64().ok_or_else(garbage)?;
     let nf = usize::try_from(r.u32().ok_or_else(garbage)?).map_err(|_| garbage())?;
     if nf > FWD_HEADERS.len() {
         return Err(garbage());
@@ -375,7 +378,7 @@ fn decode_response(buf: &Bytes) -> Result<Validated, ValidateError> {
     if !r.is_empty() {
         return Err(garbage());
     }
-    let facts = Facts { model, max_tokens, effort, est_input_tokens, cache_ttl, stream, flags, text_bytes, images };
+    let facts = Facts { model, max_tokens, effort, est_input_tokens, cache_ttl, stream, flags, text_bytes, images, pages };
     Ok(Validated { s, gateway_device, task_sig, body_sha256, headers, body, prepared: Prepared { facts, body: prepared_body, headers: fwd } })
 }
 
@@ -549,7 +552,7 @@ fn warm_up() -> bool {
         provider: Provider::Anthropic,
         dialect: Dialect::AnthropicMessages,
         policy: Policy::PERMISSIVE,
-        catalog: Catalog { default_effort: Effort::High, max_output: 1024, max_image_tokens: 0 },
+        catalog: Catalog { default_effort: Effort::High, max_output: 1024, max_image_tokens: 0, max_page_tokens: 0 },
         max_price: None,
         model_id: "m",
         pseudonym: "p",
@@ -735,7 +738,7 @@ mod tests {
             provider: Provider::Anthropic,
             dialect: Dialect::AnthropicMessages,
             policy: Policy::PERMISSIVE,
-            catalog: Catalog { default_effort: Effort::High, max_output: 1024, max_image_tokens: 0 },
+            catalog: Catalog { default_effort: Effort::High, max_output: 1024, max_image_tokens: 0, max_page_tokens: 0 },
             max_price: None,
             model_id: "m",
             pseudonym: "p",

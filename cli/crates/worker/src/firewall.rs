@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use base64::Engine as _;
 use bytes::Bytes;
 
 use crate::json::{self, Kind, Patch, Val};
@@ -59,7 +60,12 @@ pub struct Catalog {
     pub default_effort: Effort,
     pub max_output: u64,
     pub max_image_tokens: u64,
+    /// Input-token allowance per PDF page (CONTRACT R3).
+    pub max_page_tokens: u64,
 }
+
+/// Most PDF pages per request (CONTRACT R3).
+pub const MAX_PDF_PAGES: u64 = 100;
 
 /// OpenRouter max-price preference, from the catalog price (µ$ per million tokens).
 #[derive(Clone, Copy, Debug)]
@@ -100,7 +106,7 @@ pub struct Facts {
     pub max_tokens: u64,
     /// Effective effort: the body's, else the catalog default.
     pub effort: Effort,
-    /// `ceil(text_bytes / 3) + images × max_image_tokens` (PDFs are never allowed, so pages = 0).
+    /// `ceil(text_bytes / 3) + images × max_image_tokens + pages × max_page_tokens`.
     pub est_input_tokens: u64,
     pub cache_ttl: CacheTtl,
     pub stream: bool,
@@ -109,6 +115,8 @@ pub struct Facts {
     /// Body bytes minus inline base64 image data.
     pub text_bytes: u64,
     pub images: u64,
+    /// PDF pages across all documents (≤ [`MAX_PDF_PAGES`]).
+    pub pages: u64,
 }
 
 /// The route header fields the Worker checks against the body.
@@ -371,10 +379,10 @@ fn check<'a>(
 
     let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
     let text_bytes = len.saturating_sub(w.acc.excluded);
-    let est_input_tokens = text_bytes
-        .div_ceil(3)
-        .checked_add(w.acc.images.checked_mul(catalog.max_image_tokens).ok_or_else(|| fw("", "has too many images".into()))?)
-        .ok_or_else(|| fw("", "is too large".into()))?;
+    let images = w.acc.images.checked_mul(catalog.max_image_tokens).ok_or_else(|| fw("", "has too many images".into()))?;
+    let pages = w.acc.pages.checked_mul(catalog.max_page_tokens).ok_or_else(|| fw("", "has too many pages".into()))?;
+    let est_input_tokens =
+        text_bytes.div_ceil(3).checked_add(images).and_then(|x| x.checked_add(pages)).ok_or_else(|| fw("", "is too large".into()))?;
     let facts = Facts {
         model,
         max_tokens,
@@ -385,6 +393,7 @@ fn check<'a>(
         flags: w.acc.flags,
         text_bytes,
         images: w.acc.images,
+        pages: w.acc.pages,
     };
     Ok((facts, out_headers, root))
 }
@@ -426,6 +435,8 @@ pub(crate) struct F(pub &'static str, pub R, pub bool);
 pub(crate) enum Hook {
     Image,
     Document,
+    /// Base64 PDF data: strict decode, page count, ≤ 100 pages, excluded from `text_bytes`.
+    Pdf,
     CacheControl,
     /// Inline base64 payload: excluded from `text_bytes`.
     B64,
@@ -441,6 +452,7 @@ pub(crate) enum Hook {
 #[derive(Default)]
 struct Acc {
     images: u64,
+    pages: u64,
     excluded: u64,
     flags: Flags,
     ttl: CacheTtl,
@@ -620,6 +632,21 @@ impl<'a> Walk<'a> {
                     self.acc.images = self.acc.images.saturating_add(1);
                 }
             }
+            Hook::Pdf => {
+                self.need(Flags::DOCUMENTS, "is not allowed: documents need the `documents` opt-in")?;
+                let s = v.as_str().unwrap_or_default();
+                let Ok(pdf) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) else {
+                    return self.fail("is not valid base64");
+                };
+                let Some(pages) = pdf_pages(&pdf) else {
+                    return self.fail("is not allowed: the PDF page count cannot be determined (not a PDF, or pages only in compressed object streams)");
+                };
+                self.acc.pages = self.acc.pages.saturating_add(pages);
+                if self.acc.pages > MAX_PDF_PAGES {
+                    return self.fail(format!("is not allowed: documents exceed {MAX_PDF_PAGES} pages"));
+                }
+                self.acc.excluded = self.acc.excluded.saturating_add(raw_len());
+            }
             Hook::CacheControl => {
                 let ttl = if v.get("ttl").is_some_and(|t| t.is_str("1h")) { CacheTtl::H1 } else { CacheTtl::M5 };
                 self.acc.ttl = self.acc.ttl.max(ttl);
@@ -710,10 +737,65 @@ impl<'a> Walk<'a> {
     }
 }
 
+/// Pages of a PDF, deterministically (the Gateway and the Worker must agree):
+/// `max(number of "/Type /Page" objects, largest "/Count")`. `None` when the bytes are not a
+/// PDF or no page object is visible (page tree only inside compressed object streams): such
+/// documents are refused rather than under-estimated. Over-counting only raises the
+/// reservation.
+pub fn pdf_pages(b: &[u8]) -> Option<u64> {
+    const DELIM: &[u8] = b" \t\r\n\x0c\x00()<>[]{}/%";
+    let head = b.get(..b.len().min(1024))?;
+    head.windows(5).position(|w| w == b"%PDF-")?;
+    let ws = |c: u8| b" \t\r\n\x0c\x00".contains(&c);
+    let skip_ws = |mut i: usize| {
+        while b.get(i).is_some_and(|c| ws(*c)) {
+            i = i.saturating_add(1);
+        }
+        i
+    };
+    let (mut objects, mut count) = (0u64, 0u64);
+    let mut i = 0usize;
+    while let Some(off) = b.get(i..).and_then(|r| r.windows(5).position(|w| w == b"/Type" || w == b"/Coun")) {
+        let at = i.saturating_add(off);
+        i = at.saturating_add(5);
+        if b.get(at..at.saturating_add(5)) == Some(b"/Type") {
+            let j = skip_ws(i);
+            if b.get(j..j.saturating_add(5)) == Some(b"/Page") && b.get(j.saturating_add(5)).is_none_or(|c| DELIM.contains(c)) {
+                objects = objects.saturating_add(1);
+            }
+        } else if b.get(at..at.saturating_add(6)) == Some(b"/Count") {
+            let mut j = skip_ws(at.saturating_add(6));
+            let mut n = 0u64;
+            let start = j;
+            while let Some(d) = b.get(j).filter(|c| c.is_ascii_digit()) {
+                n = n.saturating_mul(10).saturating_add(u64::from(d.wrapping_sub(b'0')));
+                j = j.saturating_add(1);
+            }
+            if j > start {
+                count = count.max(n);
+            }
+        }
+    }
+    let pages = objects.max(count);
+    (pages > 0).then_some(pages)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_page_counting() {
+        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R >> endobj\n4 0 obj <</Type/Page/Parent 2 0 R>> endobj\n%%EOF";
+        assert_eq!(pdf_pages(pdf), Some(2));
+        // /Count larger than the visible page objects (some in object streams): take the max.
+        assert_eq!(pdf_pages(b"%PDF-1.7\n<< /Type /Pages /Count 37 >> << /Type /Page >>"), Some(37));
+        assert_eq!(pdf_pages(b"%PDF-1.7\n<< /Type /ObjStm /N 40 >> stream compressed endstream"), None);
+        assert_eq!(pdf_pages(b"not a pdf /Type /Page"), None);
+        assert_eq!(pdf_pages(b"%PDF-1.4 /Type /Pages"), None, "/Pages is not a page");
+        assert_eq!(pdf_pages(b"%PDF-1.4 /Count 99999999999999999999999 /Type /Page"), Some(u64::MAX));
+    }
 
     #[test]
     fn dollars_format() {
