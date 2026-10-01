@@ -248,6 +248,10 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
     }
     let mut tape = Vec::new();
     let (facts, headers, root) = check(req.dialect, req.body, req.headers, *req.policy, req.catalog, &mut tape)?;
+    // Fields the shared dialect table allows but this provider's API does not have.
+    if let Some((field, why)) = tables::provider_denies(req.provider).iter().find(|(f, _)| root.get(f).is_some()) {
+        return Err(Reject::new(RejectCode::Firewall, *field, format!("is not allowed: {why}")));
+    }
 
     let enc = |s: &str| {
         let mut v = Vec::with_capacity(s.len().saturating_add(2));
@@ -273,6 +277,8 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
                     patches.push(Patch { path: &["user"], json: &user });
                     patches.push(Patch { path: &["usage", "include"], json: b"true" });
                 }
+                // xAI documents `safety_identifier` for end-user attribution.
+                Provider::XAi => patches.push(Patch { path: &["safety_identifier"], json: &user }),
                 Provider::DeepSeek | Provider::Anthropic => {}
             }
         }

@@ -363,7 +363,13 @@ impl StreamParser {
                     provider_cost_uusd: st.anth_cost,
                 }
             }
-            Dialect::OpenAiChat => st.oa.unwrap_or(Usage { estimated: true, ..Usage::default() }),
+            Dialect::OpenAiChat => {
+                // Some providers (xAI) send cumulative usage in every chunk: only a stream
+                // that really ended (`[DONE]`, or a whole JSON body) has final usage.
+                let mut u = st.oa.unwrap_or(Usage { estimated: true, ..Usage::default() });
+                u.estimated |= !st.done;
+                u
+            }
         };
         if st.tainted {
             usage.estimated = true;
@@ -575,6 +581,7 @@ fn oa_usage(st: &mut State, u: Val<'_>) {
     let g = |v: Option<Val<'_>>, k: &str| v.and_then(|v| v.get(k)).and_then(Val::as_u64);
     let prompt = g(Some(u), "prompt_tokens");
     let completion = g(Some(u), "completion_tokens");
+    let total = g(Some(u), "total_tokens");
     let details = u.get("prompt_tokens_details");
     let cached = g(details, "cached_tokens").unwrap_or(0);
     let write = g(details, "cache_write_tokens").unwrap_or(0);
@@ -594,7 +601,7 @@ fn oa_usage(st: &mut State, u: Val<'_>) {
             }
         }
     };
-    let cost = match u.get("cost").filter(|c| !c.is_null()) {
+    let mut cost = match u.get("cost").filter(|c| !c.is_null()) {
         None => None,
         Some(c) => {
             let x = decimal_to_uusd_ceil(c.raw()).filter(|_| c.kind() == Kind::Num);
@@ -602,9 +609,19 @@ fn oa_usage(st: &mut State, u: Val<'_>) {
             x
         }
     };
+    // xAI: integer `cost_in_usd_ticks`, 10^10 ticks per dollar = 10^4 ticks per µ$.
+    if let Some(t) = u.get("cost_in_usd_ticks").filter(|c| !c.is_null()) {
+        let x = t.as_u64().map(|t| t.div_ceil(10_000));
+        est |= x.is_none();
+        cost = cost.max(x);
+    }
+    // Output must include reasoning. OpenAI-style counts it inside `completion_tokens`;
+    // xAI does not (total = prompt + completion + reasoning). `total − prompt` covers both
+    // and never undercounts.
+    let output = completion.unwrap_or(0).max(total.map_or(0, |t| t.saturating_sub(prompt)));
     st.oa = Some(Usage {
         input,
-        output: completion.unwrap_or(0),
+        output,
         cache_write_5m: cache_write,
         cache_write_1h: 0,
         cache_read,

@@ -1,7 +1,7 @@
 //! Firewall allowlists as data (plan 06 §7). Anything not listed is rejected.
 //! Widening an allowlist needs two-person review (06 §7.3): keep diffs here small.
 
-use crate::Flags;
+use crate::{Flags, Provider};
 use crate::firewall::{F, Hook, R};
 
 // --- Anthropic Messages (06 §7.1) ------------------------------------------------------
@@ -385,6 +385,8 @@ pub(crate) static OPENAI: R = R::Obj(&[
     F("prediction", R::Deny("predicted outputs are billed as output"), false),
     F("service_tier", R::Deny("the service tier is the donor's call"), false),
     F("web_search_options", R::Deny("web search runs on the donor's account"), false),
+    F("search_parameters", R::Deny("live search is billed per source on the donor's account"), false),
+    F("deferred", R::Deny("deferred completions are stored and fetched later"), false),
     F("metadata", R::Deny("stored-completion metadata is not allowed"), false),
     F("functions", R::Deny("legacy functions are not allowed"), false),
     F("function_call", R::Deny("legacy functions are not allowed"), false),
@@ -396,3 +398,18 @@ pub(crate) static OPENAI: R = R::Obj(&[
     F("usage", R::Deny("usage reporting is set by the Worker"), false),
     F("reasoning", R::Deny("use `reasoning_effort`"), false),
 ]);
+
+/// Per-provider top-level denies on top of the dialect table (fail closed on fields the
+/// provider does not document; its paid add-ons are already unknown to the table:
+/// `search_parameters`, `web_search_options`, `deferred`, server-side tools).
+pub(crate) fn provider_denies(p: Provider) -> &'static [(&'static str, &'static str)] {
+    match p {
+        Provider::XAi => &[
+            ("store", "not part of the xAI chat completions API"),
+            ("modalities", "not part of the xAI chat completions API"),
+            ("verbosity", "not part of the xAI chat completions API"),
+            ("logit_bias", "unsupported by xAI"),
+        ],
+        _ => &[],
+    }
+}

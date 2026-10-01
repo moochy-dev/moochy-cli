@@ -70,6 +70,7 @@ const ANTH: &str = include_str!("fixtures/anthropic_tool.sse");
 const OAI: &str = include_str!("fixtures/openai_tool.sse");
 const DS: &str = include_str!("fixtures/deepseek.sse");
 const OR: &str = include_str!("fixtures/openrouter.sse");
+const XAI: &str = include_str!("fixtures/xai.sse");
 
 #[test]
 fn anthropic_tool_stream() {
@@ -289,4 +290,31 @@ fn fails_closed_on_unaccountable_events() {
         assert_eq!(run(d, f.as_bytes(), 3).1.invalid, 0);
         assert_eq!(run(d, &crlf(f), 3).1.invalid, 0);
     }
+}
+
+/// xAI (docs.x.ai chat completions): cumulative usage on every chunk, `completion_tokens`
+/// excludes reasoning (total = prompt + completion + reasoning), integer `cost_in_usd_ticks`.
+#[test]
+fn xai_usage_reasoning_and_cost() {
+    let (o, s) = check_all_chunkings(Dialect::OpenAiChat, XAI.as_bytes());
+    // input = 1200 − 1000 cached; output = 30 visible + 250 reasoning; 12,345,678 ticks = 1,234.5678 µ$ → 1,235.
+    assert_eq!(o.usage, Usage { input: 200, output: 280, cache_read: 1000, provider_cost_uusd: Some(1235), ..Usage::default() });
+    assert_eq!(o.model.as_deref(), Some("grok-4.7"));
+    assert_eq!((s.tool_starts.clone(), s.tool_ends.clone(), s.invalid), (vec![(0, "read_file".to_owned())], vec![0], 0));
+    // Cut mid-stream: the cumulative usage seen so far must not pass for final usage.
+    let cut = &XAI[..XAI.find("\"finish_reason\":\"tool_calls\"").unwrap()];
+    let cut = &cut[..cut.rfind("\n\n").unwrap() + 2];
+    let (o, _) = run(Dialect::OpenAiChat, cut.as_bytes(), 7);
+    assert!(o.usage.estimated && !o.complete, "{o:?}");
+    // Same without [DONE] but after the final usage chunk: still not proven final.
+    let (o, _) = run(Dialect::OpenAiChat, XAI.trim_end().trim_end_matches("data: [DONE]").as_bytes(), 7);
+    assert!(o.usage.estimated);
+    // Non-streamed body (docs example shape): 32 + 9 visible + 94 reasoning = 135 total.
+    let body = br#"{"id":"a","object":"chat.completion","created":1,"model":"grok-4.7","choices":[{"index":0,"message":{"role":"assistant","content":"303","refusal":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":9,"total_tokens":135,"prompt_tokens_details":{"text_tokens":32,"audio_tokens":0,"image_tokens":0,"cached_tokens":6},"completion_tokens_details":{"reasoning_tokens":94,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"num_sources_used":0,"cost_in_usd_ticks":10000},"system_fingerprint":"fp"}"#;
+    let mut p = StreamParser::new(Dialect::OpenAiChat, false);
+    p.feed(body, &mut |_, _| {}).unwrap();
+    assert_eq!(p.finish().usage, Usage { input: 26, output: 103, cache_read: 6, provider_cost_uusd: Some(1), ..Usage::default() });
+    // OpenAI semantics unchanged: total = prompt + completion (reasoning inside completion).
+    let (o, _) = run(Dialect::OpenAiChat, OAI.as_bytes(), 9);
+    assert_eq!(o.usage.output, 20);
 }
