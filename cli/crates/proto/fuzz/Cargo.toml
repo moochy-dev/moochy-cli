@@ -1,0 +1,17 @@
+# Fuzzing for moochy-proto's hostile-input decode path (CONTRACT §15.2). Standalone workspace:
+# never part of a product build. Run with ./run.sh [seconds] (stable rustc, no cargo-fuzz).
+# Exception to `forbid(unsafe_code)`: libFuzzer's entry point is an `extern "C"` symbol.
+[package]
+name = "moochy-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+moochy-proto = { path = ".." }
+libfuzzer-sys = "0.4"
+# Test-only oracle (differential check) and seed generator; never in a product binary.
+zstd = { version = "0.14", default-features = false }
