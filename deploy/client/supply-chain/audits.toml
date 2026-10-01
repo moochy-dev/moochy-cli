@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Audits performed by Moochy maintainers (cargo vet certify). Each entry is a
+# human review; never add one without reading the diff.
+
+[criteria]
+
+[audits]

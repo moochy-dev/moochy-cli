@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# cargo-vet store for the open-source client (06 §12, CI-08). Use with
+#   cargo vet --manifest-path cli/Cargo.toml --store-path deploy/client/supply-chain
+# [[exemptions]] are generated per lockfile (`cargo vet regenerate exemptions`)
+# but the crypto/TLS trust base can never be exempted: scripts/supply-chain.sh
+# fails if one is (hpke included, 06 §12). Audit those, or import an audit.
+
+[cargo-vet]
+version = "0.10"
+
+[policy.moochy]
+criteria = "safe-to-deploy"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"

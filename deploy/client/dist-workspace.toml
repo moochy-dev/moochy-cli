@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+# cargo-dist configuration for the open-source `moochy` client (plan 07 §11).
+# Lives at the root of the public moochy-cli repository (the export copies
+# deploy/client/dist-workspace.toml there); the Cargo workspace is cli/.
+# Regenerate .github/workflows/release.yml after any change: `dist generate`.
+[workspace]
+members = ["cargo:cli"]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+# Only the `moochy` binary ships (cli/crates/node: [package.metadata.dist] dist = true).
+installers = ["shell", "powershell", "npm", "homebrew"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+]
+# `npx -y moochy mcp` (plan 07 §5): unscoped package, fetches the signed binary.
+npm-package = "moochy"
+tap = "moochy-dev/homebrew-tap"
+formula = "moochy"
+publish-jobs = ["homebrew", "npm"]
+# Sigstore-signed SLSA build provenance for every artifact (actions/attest-build-provenance);
+# users verify externally: `gh attestation verify <file> --repo moochy-dev/moochy-cli`.
+github-attestations = true
+# No silent auto-update (06 §12): `moochy update` verifies signatures itself.
+install-updater = false
+install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
+checksum = "sha256"
+pr-run-mode = "plan"
+# Reproducible-build flags injected into every build job; relative to
+# .github/workflows/ (file: .github/build-setup.yml, same flags as
+# deploy/client/scripts/repro-check.sh).
+github-build-setup = "../build-setup.yml"
+
+# Native runners for every Linux target (no cross toolchain in the musl
+# artifacts that the reproducibility check rebuilds).
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+x86_64-unknown-linux-musl = "ubuntu-24.04"
+aarch64-pc-windows-msvc = "windows-11-arm"

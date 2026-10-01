@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# After cargo-dist's Release workflow: Sigstore keyless signatures (cosign
+# bundles next to every asset) and an independent rebuild of both Linux musl
+# artifacts that must be bit-identical to the published ones (06 §12, 07 §11).
+# Verify:  gh attestation verify moochy-x86_64-unknown-linux-musl.tar.xz --repo moochy-dev/moochy-cli
+#          cosign verify-blob --bundle moochy-x86_64-unknown-linux-musl.tar.xz.sigstore.json \
+#            --certificate-identity-regexp '^https://github.com/moochy-dev/moochy-cli/\.github/workflows/attest-release\.yml@refs/tags/v' \
+#            --certificate-oidc-issuer https://token.actions.githubusercontent.com moochy-x86_64-unknown-linux-musl.tar.xz
+name: attest-release
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  rebuild:
+    if: github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ github.event.workflow_run.head_branch }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: "${{ github.event.workflow_run.head_sha }}", persist-credentials: false }
+      - run: sudo apt-get install -y musl-tools
+      - run: rustup target add "${{ matrix.target }}"
+      - run: gh release download "$TAG" --pattern "moochy-${{ matrix.target }}.tar.xz" --dir "$RUNNER_TEMP"
+      - name: Independent rebuild must equal the release
+        run: deploy/client/scripts/repro-check.sh --target "${{ matrix.target }}" --against "$RUNNER_TEMP/moochy-${{ matrix.target }}.tar.xz"
+
+  sign:
+    needs: rebuild
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # upload .sigstore.json bundles to the release
+      id-token: write # Sigstore keyless (Fulcio) via GitHub OIDC
+    env:
+      TAG: ${{ github.event.workflow_run.head_branch }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign every release asset
+        run: |
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          for f in *; do
+            case $f in *.sigstore.json) continue ;; esac
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*.sigstore.json

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Headless donor / CI-agent image (plan 07 §8.3–8.4, §11): one static musl
+# `moochy` binary on an empty base, non-root, state in /data.
+#   docker build -f deploy/client/container/Containerfile -t moochy .
+#   docker run -d --name moochy -v moochy-data:/data \
+#     -e MOOCHY_PASSPHRASE_FILE=/run/secrets/moochy_passphrase moochy
+# (MOOCHY_PASSPHRASE_FILE is requested from mo-node; until it lands use the
+# MOOCHY_PASSPHRASE env var from your platform's secret store.)
+# First run: `docker run -it -v moochy-data:/data moochy login --relay … --roles worker --headless`
+# then `docker run … moochy keys add anthropic --key-stdin`. The provider key
+# stays in the encrypted-file keystore on the volume you control.
+# Pin both images by digest when publishing (`@sha256:…`).
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY cli/ cli/
+COPY spec/ spec/
+WORKDIR /src/cli
+ENV CARGO_INCREMENTAL=0 RUSTFLAGS="--remap-path-prefix=/src=/build --remap-path-prefix=/usr/local/cargo=/cargo"
+RUN cargo build --release --locked -p moochy \
+ && install -D -m 0755 target/release/moochy /out/moochy \
+ && install -d -m 0700 -o 65532 -g 65532 /out/data
+
+FROM scratch
+COPY --from=build /out/moochy /moochy
+COPY --from=build --chown=65532:65532 /out/data /data
+USER 65532:65532
+ENV HOME=/data
+VOLUME ["/data"]
+# Gateway/MCP doors bind loopback inside the container (06 §13); a donor
+# Worker only dials out to the relay, so nothing is exposed.
+ENTRYPOINT ["/moochy", "--home", "/data"]
+CMD ["up", "--foreground"]
