@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 
 pub const MAX_API_BODY: usize = 32 << 20;
-pub const MAX_MCP_BODY: usize = 4 << 20;
+pub const MAX_MCP_BODY: usize = 8 << 20;
 const MAX_RESPONSE: usize = 16 << 20;
 const MAX_CONNS: usize = 512;
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);

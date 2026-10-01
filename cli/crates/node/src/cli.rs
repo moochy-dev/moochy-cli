@@ -808,9 +808,13 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     Ok(())
 }
 
+/// `moochy mcp`: the stdio shim. It runs on the client side (inside the agent's sandbox) and is
+/// the only place that reads repository files for `moochy_delegate` (CONTRACT §15.2).
 fn mcp(home: &Home, o: &Opts) -> Result<()> {
     let slug = slug_or_detect(o)?;
-    let cwd = std::env::current_dir().ctx("cwd")?.to_string_lossy().into_owned();
+    let cwd_path = std::env::current_dir().ctx("cwd")?;
+    let cwd = cwd_path.to_string_lossy().into_owned();
+    let mut scope = crate::files::Scope { root: crate::files::git_root(&cwd_path), client_roots: None };
     // The shim starts the node when none is running (07 §5); stdout stays the MCP channel.
     if rt_small()?.block_on(crate::ctl::connect(&home.socket_path())).is_err() {
         start_node(home, false)?;
@@ -819,25 +823,61 @@ fn mcp(home: &Home, o: &Opts) -> Result<()> {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<McpUp>(32);
         let _ = tx.send(McpUp { msg: Some(mcp_up::Msg::Open(McpOpen { repo: slug, cwd })) }).await;
+        // Both directions write stdout: node messages and the shim's own refusals.
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        let replies = out_tx.clone();
         tokio::spawn(async move {
+            use crate::mcp::{MAX_LINE, ShimLine, shim_line};
             let mut stdin = tokio::io::stdin();
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
             loop {
-                match stdin.read(&mut buf).await {
+                let n = match stdin.read(&mut chunk).await {
                     Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let data = buf.get(..n).unwrap_or_default().to_vec();
-                        if tx.send(McpUp { msg: Some(mcp_up::Msg::Data(data)) }).await.is_err() {
-                            return;
-                        }
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                while let Some(pos) = buf.iter().position(|c| *c == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = line.trim_ascii().to_vec();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    // File reads (and `git check-ignore`) run off the async reader.
+                    let (act, back) = tokio::task::spawn_blocking(move || {
+                        let a = shim_line(&line, &mut scope);
+                        (a, scope)
+                    })
+                    .await
+                    .unwrap_or_else(|_| (ShimLine::Forward(Vec::new()), crate::files::Scope::default()));
+                    scope = back;
+                    let ok = match act {
+                        ShimLine::Forward(l) => l.is_empty() || tx.send(McpUp { msg: Some(mcp_up::Msg::Data(l)) }).await.is_ok(),
+                        ShimLine::Reply(l) => replies.send(l).await.is_ok(),
+                    };
+                    if !ok {
+                        return;
+                    }
+                }
+                if buf.len() > MAX_LINE {
+                    // Oversized line: hand it over as is; the node refuses it.
+                    if tx.send(McpUp { msg: Some(mcp_up::Msg::Data(std::mem::take(&mut buf))) }).await.is_err() {
+                        return;
                     }
                 }
             }
         });
         let mut down = c.mcp_pipe(tokio_stream::wrappers::ReceiverStream::new(rx)).await.map_err(|s| net(s.message().to_owned()))?.into_inner();
+        tokio::spawn(async move {
+            while let Ok(Some(m)) = down.message().await {
+                if out_tx.send(m.data).await.is_err() {
+                    return;
+                }
+            }
+        });
         let mut stdout = tokio::io::stdout();
-        while let Ok(Some(m)) = down.message().await {
-            stdout.write_all(&m.data).await.ctx("stdout")?;
+        while let Some(d) = out_rx.recv().await {
+            stdout.write_all(&d).await.ctx("stdout")?;
             stdout.flush().await.ctx("stdout")?;
         }
         Ok(())
