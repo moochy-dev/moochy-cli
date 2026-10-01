@@ -409,7 +409,7 @@ impl Node {
 }
 
 /// Model / dialect ids from the relay: short plain ASCII only (they reach agents and terminals).
-fn plain_id(s: &str) -> bool {
+pub fn plain_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 200 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:/-@+".contains(&c))
 }
 

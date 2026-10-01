@@ -129,6 +129,9 @@ pub fn on_welcome(node: &Arc<Node>) {
     }
     let node = node.clone();
     tokio::spawn(async move {
+        if let Some(keys) = &node.keys {
+            recover_inflight(&node, keys).await;
+        }
         let unacked = with_store(&node, |s| s.unacked().map(|(_, p)| p.to_vec()).collect::<Vec<_>>()).await.unwrap_or_default();
         let receipts: Vec<pb::SignedReceipt> = unacked.iter().filter_map(|p| pb::SignedReceipt::decode(p.as_slice()).ok()).collect();
         let tasks = receipts.iter().map(|r| pb::KnownTask { task: r.task.clone(), attempt: r.attempt, state: "outbox".into() }).collect();
@@ -535,8 +538,16 @@ async fn serve(
     };
     drop(body);
     let _ = tx.send(up(serve_up::Msg::Ack(pb::Ack { r: Bytes::copy_from_slice(&r) }))).await;
+    let reserved = money::reserve_for_route(&a.entry, &a.route).unwrap_or(0);
+    let record = provisional(keys, &a, u8::try_from(attempt).unwrap_or(0), t_start).and_then(|rc| write_inflight(node, &rc, &a.route.model, reserved));
     log("info", "timing", &json!({"task": task_s, "attempt": attempt, "t_assign_rx": t_assign_rx, "t_ack_tx": now_us()}));
-    run_provider(node, keys, a, attempt, r, t_start, down, &refuse).await
+    let out = run_provider(node, keys, a, attempt, r, t_start, down, &refuse).await;
+    // The attempt is settled (receipt in the outbox): the record has served its purpose.
+    if let Some(h) = record {
+        let _ = h.await;
+        drop_inflight(node, task_s, attempt);
+    }
+    out
 }
 
 /// Steps 6–9: provider call, sealed streaming, receipt.
@@ -687,7 +698,7 @@ struct Ending {
 #[allow(clippy::too_many_arguments)]
 async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer: &ResponseSealer, e: Ending, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) {
     let ucost = u64::try_from(e.local).unwrap_or(0);
-    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times, a.catalog_version) else {
+    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times) else {
         log("error", "receipt signing failed", &json!({"task": refuse.task}));
         return;
     };
@@ -739,10 +750,28 @@ fn build_receipt(
     status: ReceiptStatus,
     model: &str,
     (t_start, t_started): (u64, u64),
-    catalog_version: u64,
 ) -> Option<pb::SignedReceipt> {
     let s = &a.inner.s.0;
-    let rc = Receipt {
+    let mut rc = provisional(keys, a, attempt, t_start)?;
+    rc.model_reported = model.into();
+    rc.usage = usage;
+    rc.cost_uusd = cost;
+    rc.resp_commit = moochy_proto::B(crypto::resp_commit(&crypto::salt(s, SaltName::Resp).ok()?, &sealer.running_hash()).ok()?);
+    rc.provider_req_hash = moochy_proto::B(crypto::provider_req_hash(&crypto::salt(s, SaltName::Pid).ok()?, provider_req_id).ok()?);
+    rc.status = status;
+    rc.t_started = if status == ReceiptStatus::NotStarted { 0 } else { t_started };
+    sign_receipt(keys, &rc, &a.route.model)
+}
+
+/// The receipt as known at the Ack: what a crash mid-stream settles at (05 §5.2): usage
+/// unknown (estimated), cost = the reservation, status `partial`.
+fn provisional(keys: &Keys, a: &Admitted, attempt: u8, t_start: u64) -> Option<Receipt> {
+    let s = &a.inner.s.0;
+    let reserved = money::reserve_for_route(&a.entry, &a.route).ok()?;
+    let usage = Usage { estimated: true, provider_cost_uusd: (a.entry.provider == "openrouter").then_some(reserved), ..Usage::default() };
+    // The relay recomputes cost from usage and settles estimated receipts at the reservation.
+    let cost = money::cost_uusd(&a.entry, &usage, a.route.flags.iter().any(|f| f == "fast")).ok()?;
+    Some(Receipt {
         v: 1,
         task_id: a.task,
         attempt,
@@ -752,38 +781,112 @@ fn build_receipt(
         gateway_device: a.inner.gateway_device,
         dialect: a.route.dialect,
         provider: a.entry.provider.clone(),
-        model_reported: model.into(),
+        model_reported: String::new(),
         usage,
-        catalog_version,
+        catalog_version: a.catalog_version,
         cost_uusd: cost,
         req_commit: moochy_proto::B(crypto::req_commit(&crypto::salt(s, SaltName::Req).ok()?, &a.inner.body_b64.0).ok()?),
-        resp_commit: moochy_proto::B(crypto::resp_commit(&crypto::salt(s, SaltName::Resp).ok()?, &sealer.running_hash()).ok()?),
-        provider_req_hash: moochy_proto::B(crypto::provider_req_hash(&crypto::salt(s, SaltName::Pid).ok()?, provider_req_id).ok()?),
-        status,
+        resp_commit: moochy_proto::B(crypto::resp_commit(&crypto::salt(s, SaltName::Resp).ok()?, &crypto::sha256(b"")).ok()?),
+        provider_req_hash: moochy_proto::B(crypto::provider_req_hash(&crypto::salt(s, SaltName::Pid).ok()?, "").ok()?),
+        status: ReceiptStatus::Partial,
         t_start,
-        t_started: if status == ReceiptStatus::NotStarted { 0 } else { t_started },
-        t_end: now_ms(),
-    };
+        t_started: t_start,
+        t_end: 0,
+    })
+}
+
+/// Sign a receipt and its public projection (`model` = the public model id).
+fn sign_receipt(keys: &Keys, rc: &Receipt, model: &str) -> Option<pb::SignedReceipt> {
+    let mut rc = rc.clone();
+    rc.t_end = now_ms();
     let (rbytes, rsig) = crypto::sign_receipt(&keys.sign, &rc).ok()?;
     let p = Projection {
         v: 1,
         receipt_ref: moochy_proto::B(crate::util::rand_bytes::<16>().ok()?),
-        repo_id: a.route.repo_id,
+        repo_id: rc.repo_id,
         donor: None,
-        model: a.route.model.clone(),
-        cost_uusd: cost,
+        model: model.into(),
+        cost_uusd: rc.cost_uusd,
         day: utc_day(now_ms()),
         receipt_sha256: moochy_proto::B(crypto::sha256(&rbytes)),
     };
     let (pbytes, psig) = crypto::sign_projection(&keys.sign, &p).ok()?;
     Some(pb::SignedReceipt {
-        task: a.task.text(),
-        attempt: attempt.into(),
+        task: rc.task_id.text(),
+        attempt: rc.attempt.into(),
         receipt: Bytes::from(rbytes),
         donor_sig: Bytes::copy_from_slice(&rsig),
         projection: Bytes::from(pbytes),
         projection_sig: Bytes::copy_from_slice(&psig),
     })
+}
+
+// ---- durable in-flight record (E37) ----
+//
+// Written right after the Ack (off the Ack path, no fsync: it must survive a crash of this
+// process, not a power loss, where the relay settles at the reservation after 24 h anyway) and
+// removed once the real receipt is in the outbox. A record left over at start means the process
+// died mid-attempt: its provisional receipt goes to the outbox and is replayed on Welcome, so the
+// relay replaces its pessimistic settlement.
+
+fn inflight_dir(node: &Node) -> std::path::PathBuf {
+    node.home.state_dir().join("inflight")
+}
+
+fn inflight_path(node: &Node, task: &str, attempt: u32) -> std::path::PathBuf {
+    inflight_dir(node).join(format!("{task}-{attempt}"))
+}
+
+/// Record: `<public model> <reserved µ$>\n<receipt JSON>`; the donor's own cap settles at the
+/// reservation.
+fn write_inflight(node: &Node, rc: &Receipt, model: &str, reserved: i64) -> Option<tokio::task::JoinHandle<()>> {
+    let path = inflight_path(node, &rc.task_id.text(), rc.attempt.into());
+    let mut data = format!("{model} {reserved}\n").into_bytes();
+    data.extend_from_slice(&serde_json::to_vec(rc).ok()?);
+    Some(tokio::task::spawn_blocking(move || {
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        // A torn write (crash mid-write) fails to parse at recovery and is discarded.
+        if std::fs::write(&path, &data).is_err() {
+            log("warn", "in-flight record write failed", &json!({}));
+        }
+    }))
+}
+
+fn drop_inflight(node: &Node, task: &str, attempt: u32) {
+    let path = inflight_path(node, task, attempt);
+    tokio::task::spawn_blocking(move || std::fs::remove_file(path));
+}
+
+/// At start: turn every leftover in-flight record into an outbox receipt (bounded).
+async fn recover_inflight(node: &Arc<Node>, keys: &Keys) {
+    let dir = inflight_dir(node);
+    let files = tokio::task::spawn_blocking(move || {
+        let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+        rd.filter_map(Result::ok).take(1024).filter_map(|e| Some((e.path(), std::fs::read(e.path()).ok().filter(|b| b.len() <= 64 << 10)?))).collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (path, data) in files {
+        let parsed = data.iter().position(|b| *b == b'\n').and_then(|i| {
+            let (head, json) = (std::str::from_utf8(data.get(..i)?).ok()?, data.get(i.checked_add(1)?..)?);
+            let (model, reserved) = head.split_once(' ')?;
+            Some((model.to_owned(), reserved.parse::<u64>().ok()?, serde_json::from_slice::<Receipt>(json).ok()?))
+        });
+        let signed = parsed
+            .as_ref()
+            .filter(|(m, _, rc)| crate::node::plain_id(m) && rc.worker_device == keys.device_id)
+            .and_then(|(m, reserved, rc)| Some((sign_receipt(keys, rc, m)?, *reserved, rc)));
+        if let Some((signed, cost, rc)) = signed {
+            let (key, payload) = (attempt_key(&rc.task_id.text(), rc.attempt.into()), signed.encode_to_vec());
+            if with_store(node, move |s| s.put_receipt(&key, &payload, cost, now_ms())).await.is_none_or(|r| r.is_err()) {
+                continue; // keep the record: retried at the next start
+            }
+            log("warn", "recovered an attempt interrupted by a crash: estimated receipt queued", &json!({"task": rc.task_id.text(), "attempt": rc.attempt}));
+        }
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+    }
 }
 
 /// `YYYY-MM-DD` (UTC) of a Unix time in ms (Howard Hinnant's civil_from_days).
