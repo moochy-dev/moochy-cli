@@ -35,9 +35,10 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
-  run [--repo OWNER/NAME] -- <command> [args]
-                                  Run your coding agent in a sandbox wired to Moochy. Tool calls
-                                  from donated tokens reach only sandboxed agents
+  run [--repo OWNER/NAME] [--unsafe-no-sandbox] -- <command> [args]
+                                  Run your coding agent in a sandbox wired to Moochy: it sees only
+                                  this repository (secrets hidden) and reaches only Moochy. Tool
+                                  calls from donated tokens reach only sandboxed agents
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
@@ -334,11 +335,6 @@ fn detect_repo() -> Option<String> {
 
 /// `moochy run -- <cmd…>` (CONTRACT §15.1). Fails closed until `moochy-sandbox` is in the build.
 fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
-    if !o.has("unsafe-no-sandbox") {
-        return Err(usage(
-            "moochy run needs the built-in sandbox, which this version does not include yet, and it never runs a command unsandboxed. Use `moochy env` for a plain setup (tool calls stay withheld), or --unsafe-no-sandbox for debugging",
-        ));
-    }
     let slug = slug_or_detect(o)?;
     let r = rt_small()?
         .block_on(async {
@@ -346,10 +342,15 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
             c.env(EnvRequest { repo: slug.clone(), rotate: false }).await.map_err(|s| internal(clean(s.message()).into_owned()))
         })?
         .into_inner();
-    let env = crate::run::gateway_env(&r.anthropic_base_url, &r.openai_base_url, &r.mcp_url, &r.token);
     let cmd: Vec<String> = cmd.iter().map(|s| (*s).to_owned()).collect();
-    let st = crate::run::run_unsandboxed(&env, &cmd)?;
-    std::process::exit(st.code().unwrap_or(1));
+    if o.has("unsafe-no-sandbox") {
+        let env = crate::run::gateway_env(&r.anthropic_base_url, &r.openai_base_url, &r.mcp_url, &r.token);
+        let st = crate::run::run_unsandboxed(&env, &cmd)?;
+        std::process::exit(st.code().unwrap_or(1));
+    }
+    let gw = crate::run::GatewayInfo { anthropic: r.anthropic_base_url, openai: r.openai_base_url, mcp: r.mcp_url, repo_token: r.token, state_dir: home.state_dir() };
+    let code = crate::run::run_sandboxed(&gw, &cmd)?;
+    std::process::exit(code);
 }
 
 fn env(home: &Home, o: &Opts) -> Result<()> {
@@ -523,6 +524,25 @@ fn doctor(home: &Home) -> Result<()> {
         line(false, "clock", "unknown: measured when the app connects".into());
     }
     line(true, "safety", format!("checks level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
+    // `moochy run` (§15.1): host support, and what the agent will not see (A163). Informational.
+    let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_ok_and(|v| v.trim() == "1");
+    if restricted {
+        println!("note sandbox   user namespaces are restricted (AppArmor): `moochy run` prints the one-line fix for this binary");
+    } else {
+        println!("ok   sandbox   `moochy run` can build its sandbox here");
+    }
+    println!("     hidden    {}", moochy_sandbox::mask::SECRET_PATTERNS.join(" "));
+    if let Some(root) = std::env::current_dir().ok().and_then(|d| crate::files::git_root(&d)) {
+        match moochy_sandbox::mask::collect(&root) {
+            Ok(v) => {
+                println!("     in this repo, hidden from the agent: {} path(s)", v.len());
+                for p in v.iter().take(50) {
+                    println!("       {}", clean(&p.to_string_lossy()));
+                }
+            }
+            Err(e) => println!("note masks     {}", clean(&e.to_string())),
+        }
+    }
     let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
     match std::fs::metadata(home.socket_path()) {
         Ok(m) => line(Some(m.uid()) == me && m.mode() & 0o777 == 0o600, "socket", format!("node.sock uid {} mode {:o}", m.uid(), m.mode() & 0o777)),

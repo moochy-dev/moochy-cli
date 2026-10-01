@@ -80,34 +80,65 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
     let port = listener.local_addr().map_or(0, |a| a.port());
     let allowed: Arc<[String; 3]> = Arc::new([format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")]);
     let conns = Arc::new(Semaphore::new(MAX_CONNS));
+    // Same door on a 0600 Unix socket: `moochy run` bridges it into the sandbox's empty netns,
+    // where the agent reaches it as 127.0.0.1:<port> (same Host allowlist).
+    let unix = gateway_socket(&node);
     let mut shutdown = node.shutdown.subscribe();
     loop {
-        let (stream, peer) = tokio::select! {
-            r = listener.accept() => match r { Ok(x) => x, Err(_) => continue },
+        tokio::select! {
+            r = listener.accept() => {
+                let Ok((stream, peer)) = r else { continue };
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                let _ = stream.set_nodelay(true);
+                conn(&node, &allowed, &conns, stream);
+            }
+            r = async { unix.as_ref()?.accept().await.ok() }, if unix.is_some() => {
+                if let Some((stream, _)) = r {
+                    conn(&node, &allowed, &conns, stream);
+                }
+            }
             _ = shutdown.changed() => return,
-        };
-        if !peer.ip().is_loopback() {
-            continue;
         }
-        let Ok(permit) = conns.clone().try_acquire_owned() else { continue };
-        let _ = stream.set_nodelay(true);
-        let node = node.clone();
-        let allowed = allowed.clone();
-        tokio::spawn(async move {
-            let svc = hyper::service::service_fn(move |req| {
-                let node = node.clone();
-                let allowed = allowed.clone();
-                async move { Ok::<_, Infallible>(handle(node, &allowed, req).await) }
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(10))
-                .max_buf_size(64 * 1024)
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
-            drop(permit);
-        });
     }
+}
+
+/// `<state>/gateway.sock`, mode 0600 (the state dir is 0700 as well).
+pub fn gateway_socket_path(node: &Node) -> std::path::PathBuf {
+    node.home.state_dir().join("gateway.sock")
+}
+
+fn gateway_socket(node: &Node) -> Option<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let p = gateway_socket_path(node);
+    let _ = std::fs::remove_file(&p);
+    let l = tokio::net::UnixListener::bind(&p).ok()?;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok()?;
+    Some(l)
+}
+
+fn conn<S>(node: &Arc<Node>, allowed: &Arc<[String; 3]>, conns: &Arc<Semaphore>, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Ok(permit) = conns.clone().try_acquire_owned() else { return };
+    let node = node.clone();
+    let allowed = allowed.clone();
+    tokio::spawn(async move {
+        let svc = hyper::service::service_fn(move |req| {
+            let node = node.clone();
+            let allowed = allowed.clone();
+            async move { Ok::<_, Infallible>(handle(node, &allowed, req).await) }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(10))
+            .max_buf_size(64 * 1024)
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+        drop(permit);
+    });
 }
 
 fn token(h: &HeaderMap) -> Option<&str> {

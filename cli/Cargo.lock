@@ -1051,6 +1051,7 @@ dependencies = [
  "lexopt",
  "moochy-keylog",
  "moochy-proto",
+ "moochy-sandbox",
  "moochy-worker",
  "prost",
  "rustix",

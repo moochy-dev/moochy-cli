@@ -27,6 +27,8 @@ moochy-proto = { path = "../proto" }
 moochy-worker = { path = "../worker" }
 # Key-log verifier/mirror (spec/KEYLOG.md): KEY_ADDED proof of possession, sealable/gateway_allowed.
 moochy-keylog = { path = "../keylog", features = ["http"] }
+# `moochy run` (CONTRACT §15.1): the maintainer-side jail.
+moochy-sandbox = { path = "../sandbox" }
 # K_det for sealed refusal details (CONTRACT §3); same version moochy-proto already links.
 hkdf = { version = "0.12", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal", "process", "fs"] }

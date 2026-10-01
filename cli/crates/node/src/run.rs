@@ -1,4 +1,4 @@
-//! `moochy run` (CONTRACT §15.1) and its sandboxed run tokens (§15.4).
+//! `moochy run` (CONTRACT §15.1, on `moochy-sandbox`) and its sandboxed run tokens (§15.4).
 //!
 //! Tool calls from donated tokens are released only to sandboxed sessions. A session proves it is
 //! sandboxed with a run token, minted by the gateway door `POST /moochy/run` for the `moochy run`
@@ -122,10 +122,108 @@ pub fn gateway_env(anthropic: &str, openai: &str, mcp: &str, token: &str) -> Vec
     ]
 }
 
-/// `moochy run [--unsafe-no-sandbox] -- <cmd…>`. The sandbox crate (`moochy-sandbox`) is not in
-/// this build yet, so without `--unsafe-no-sandbox` this fails closed (§15.1: never silently
-/// unsandboxed). The unsafe mode runs the command with the plain repo token: tool calls stay
-/// withheld (§15.4), only text flows.
+/// What `moochy run` needs from the running node (`moochy env` answer).
+pub struct GatewayInfo {
+    pub anthropic: String,
+    pub openai: String,
+    pub mcp: String,
+    pub repo_token: String,
+    pub state_dir: std::path::PathBuf,
+}
+
+/// `moochy run -- <cmd…>` (§15.1): mint a sandboxed run token, run the command in
+/// `moochy-sandbox` with only the gateway reachable, revoke the token when it ends (also when
+/// this process is killed: the minting response closes). Returns the command's exit code.
+/// Fails closed: no sandbox, no run.
+pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String]) -> Result<i32> {
+    let (prog, args) = cmd.split_first().ok_or_else(|| usage("moochy run -- <command> [args…]"))?;
+    let port: u16 = gw.anthropic.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).ok_or_else(|| internal("gateway URL without a port"))?;
+    let key = std::fs::read_to_string(gw.state_dir.join(RUN_KEY_FILE)).map_err(|_| internal("no run key: restart the Moochy app (`moochy down`, `moochy up`)"))?;
+    let cwd = std::env::current_dir().map_err(|e| internal(format!("cwd: {e}")))?;
+    let worktree = crate::files::git_root(&cwd).unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or(cwd.clone()));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
+    rt.block_on(async {
+        // The minting response stays open for the whole run: the token dies with it.
+        let (token, hold) = mint(port, &gw.repo_token, key.trim()).await?;
+        let mut spec = moochy_sandbox::Spec::new(worktree.clone());
+        spec.cwd = cwd.starts_with(&worktree).then_some(cwd);
+        spec.gateway_socket = Some(gw.state_dir.join("gateway.sock"));
+        spec.gateway_loopback_port = Some(port);
+        for (k, v) in gateway_env(&gw.anthropic, &gw.openai, &gw.mcp, &token) {
+            spec.env.insert(k.into(), v.into());
+        }
+        spec.run_token = Some(token);
+        // Agents installed outside the system dirs (e.g. ~/.local/bin): their install dir, ro.
+        if let Some(dirs) = install_dirs(prog) {
+            spec.ro_paths.extend(dirs);
+        }
+        let (prog, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = (prog.into(), args.iter().map(Into::into).collect());
+        let r = tokio::task::spawn_blocking(move || spec.run(&prog, &args)).await.map_err(|_| internal("sandbox launcher failed"))?;
+        drop(hold);
+        r.map_err(|e| usage(format!("the sandbox could not be set up, nothing ran: {e}")))
+    })
+}
+
+/// POST /moochy/run → the run token, plus what keeps it alive (connection + body drain).
+async fn mint(port: u16, repo_token: &str, key: &str) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    use http_body_util::BodyExt as _;
+    let tcp = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .map_err(|_| internal("gateway timeout"))?
+        .map_err(|e| internal(format!("gateway: {e}")))?;
+    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp)).await.map_err(|e| internal(format!("gateway: {e}")))?;
+    let conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = hyper::Request::post("/moochy/run")
+        .header(hyper::header::HOST, format!("127.0.0.1:{port}"))
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {repo_token}"))
+        .header(RUN_KEY_HEADER, key)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|e| internal(format!("request: {e}")))?;
+    let resp = tokio::time::timeout(Duration::from_secs(10), send.send_request(req)).await.map_err(|_| internal("gateway timeout"))?.map_err(|e| internal(format!("gateway: {e}")))?;
+    if resp.status() != 200 {
+        return Err(internal(format!("the Moochy app refused a sandboxed session ({})", resp.status())));
+    }
+    let mut body = resp.into_body();
+    let mut line = Vec::new();
+    while !line.contains(&b'\n') {
+        let f = tokio::time::timeout(Duration::from_secs(10), body.frame()).await.map_err(|_| internal("gateway timeout"))?;
+        let Some(Ok(f)) = f else { return Err(internal("gateway closed the session")) };
+        if let Ok(d) = f.into_data() {
+            line.extend_from_slice(&d);
+        }
+        if line.len() > 4096 {
+            return Err(internal("bad run-token answer"));
+        }
+    }
+    let v: serde_json::Value = serde_json::from_slice(line.split(|b| *b == b'\n').next().unwrap_or_default()).map_err(|_| internal("bad run-token answer"))?;
+    let token = v.get("token").and_then(serde_json::Value::as_str).filter(|t| t.starts_with(TOKEN_PREFIX)).ok_or_else(|| internal("bad run-token answer"))?.to_owned();
+    // Drain heartbeats until the run ends; aborting this task (or dying) closes the session.
+    let hold = tokio::spawn(async move {
+        while let Some(Ok(_)) = body.frame().await {}
+        conn.abort();
+        drop(send);
+    });
+    Ok((token, hold))
+}
+
+/// The resolved install dir(s) of `prog` when it lives outside the default read-only system dirs.
+fn install_dirs(prog: &str) -> Option<Vec<std::path::PathBuf>> {
+    let found = if prog.contains('/') {
+        std::path::PathBuf::from(prog)
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(prog)).find(|p| p.is_file())?
+    };
+    let real = std::fs::canonicalize(&found).ok()?;
+    let system = |p: &Path| ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"].iter().any(|s| p.starts_with(s));
+    let mut out: Vec<std::path::PathBuf> = [found.parent(), real.parent()].into_iter().flatten().filter(|d| !system(d)).map(Path::to_path_buf).collect();
+    out.dedup();
+    Some(out)
+}
+
+/// `moochy run --unsafe-no-sandbox`: debugging only. Runs the command with the plain repo
+/// token, so tool calls stay withheld (§15.4) and only text flows.
 pub fn run_unsandboxed(env: &[(&'static str, String)], cmd: &[String]) -> Result<std::process::ExitStatus> {
     let (prog, args) = cmd.split_first().ok_or_else(|| usage("moochy run -- <command> [args…]"))?;
     eprintln!(
