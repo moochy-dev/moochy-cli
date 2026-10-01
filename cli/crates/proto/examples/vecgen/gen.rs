@@ -509,6 +509,7 @@ fn signatures() -> Value {
         assert!(crypto::verify(&pk, &bad, &sig).is_err());
         json!({"name": name, "msg": hex(&msg), "sig": hex(&sig), "msg_last_byte_flipped_valid": false})
     };
+    let enc_pub = EncSecret::from_bytes(&det32("enc-sk-0")).unwrap().public();
     let nonce = det32("hello-nonce");
     let exporter = det32("tls-exporter");
     let origin = "https://relay.moochy.dev:443";
@@ -583,11 +584,13 @@ fn signatures() -> Value {
             "task": TASK, "repo_id": REPO, "route_text": route_text(), "body_sha256": hex(&body_sha),
             "headers": headers, "headers_sha256": hex(&hsha), "attempt": 1, "R": hex(&det32("R-1")), "seq": 7, "running_sha256": hex(&det32("running")),
             "dispute_code_text": "resp_commit",
+            "enc_pub": hex(&enc_pub), "roles_csv_text": "gateway,worker", "device_name_text": "laptop", "suite_text": std::str::from_utf8(crypto::SUITE_ID).unwrap(),
             "headers_lp": hex(&headers_lp),
         },
         "checkpoint_fields": cp_fields.iter().map(|(n, b)| json!({"field": n, "len": b.len(), "bytes": hex(b)})).collect::<Vec<_>>(),
         "cases": [
             sig_case("auth = lp('moochy/v1/auth', nonce, dialed_origin, tls_exporter, device_id)", crypto::auth_msg(&nonce, origin, &exporter, &dev(W1)).unwrap()),
+            sig_case("device-start = lp('moochy/v1/device-start', sign_pub, enc_pub, roles_csv, name, suite) with sign_pub = signer.public, enc_pub = inputs.enc_pub", crypto::device_start_msg(&pk, &enc_pub, "gateway,worker", "laptop", std::str::from_utf8(crypto::SUITE_ID).unwrap()).unwrap()),
             sig_case("task = lp('moochy/v1/task', task, repo_id, route, body_sha256, headers_sha256)", crypto::task_msg(&t, &repo, &route, &body_sha, &hsha).unwrap()),
             sig_case("checkpoint = lp('moochy/v1/resp-progress', task, u64(attempt), R, u64(seq), running_sha256)", crypto::checkpoint_msg(&t, 1, &det32("R-1"), 7, &det32("running")).unwrap()),
             sig_case("dispute = lp('moochy/v1/dispute', task, u64(attempt), code)", crypto::dispute_msg(&t, 1, "resp_commit").unwrap()),

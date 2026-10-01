@@ -708,6 +708,12 @@ pub fn auth_msg(nonce: &[u8; 32], dialed_origin: &str, tls_exporter: &[u8; 32], 
     lp(&[label::AUTH, nonce, dialed_origin.as_bytes(), tls_exporter, device.text().as_bytes()])
 }
 
+/// `lp("moochy/v1/device-start", sign_pub, enc_pub, roles_csv, name, suite)` (DeviceStartRequest.sig;
+/// `roles_csv` e.g. `gateway,worker`, `suite` = [`SUITE_ID`] as text).
+pub fn device_start_msg(sign_pub: &[u8; 32], enc_pub: &[u8; 32], roles_csv: &str, name: &str, suite: &str) -> Result<Vec<u8>, Error> {
+    lp(&[label::DEVICE_START, sign_pub, enc_pub, roles_csv.as_bytes(), name.as_bytes(), suite.as_bytes()])
+}
+
 /// `lp("moochy/v1/task", task_id, repo_id, route_header_bytes, body_sha256, headers_sha256)`.
 pub fn task_msg(task: &TaskId, repo: &RepoId, route: &[u8], body_sha256: &[u8; 32], headers_sha256: &[u8; 32]) -> Result<Vec<u8>, Error> {
     lp(&[label::TASK, task.text().as_bytes(), repo.text().as_bytes(), route, body_sha256, headers_sha256])
