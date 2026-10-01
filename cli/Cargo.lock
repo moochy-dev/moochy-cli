@@ -1058,6 +1058,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moochy-keylog"
+version = "0.1.0"
+dependencies = [
+ "ed25519-zebra",
+ "rustls",
+ "serde_json",
+ "sha2",
+ "webpki-roots",
+]
+
+[[package]]
 name = "moochy-proto"
 version = "0.1.0"
 dependencies = [
