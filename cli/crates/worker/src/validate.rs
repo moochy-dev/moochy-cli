@@ -136,7 +136,8 @@ fn utf8(b: &[u8]) -> Option<&str> {
 // ---------------------------------------------------------------------------------------
 // Wire encoding
 
-fn encode_request(r: &ValidateRequest<'_>, out: &mut Vec<u8>) {
+/// The parent's wire encoding of a request (exposed for tests and fuzzing).
+pub fn encode_request(r: &ValidateRequest<'_>, out: &mut Vec<u8>) {
     let mut w = W(out);
     w.u8(VERSION);
     w.u8(idx(&PROVIDERS, &r.provider));
@@ -706,9 +707,68 @@ impl Validator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::items_after_statements)]
 mod tests {
     use super::*;
+
+    /// The parent decodes responses from a possibly compromised child: no input may panic,
+    /// and only well-formed OK responses decode.
+    #[test]
+    fn fuzz_parent_response_decoder() {
+        let mut x: u64 = 0x5EED_0005;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // A real OK response from the warm-up pipeline.
+        const BODY: &[u8] = br#"{"model":"m","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"x"}]}"#;
+        let z = URL_SAFE_NO_PAD.encode([0u8; 32]);
+        let inner = format!(
+            r#"{{"v":1,"body_b64":"{}","body_sha256":"{z}","headers":{{"anthropic-version":"2023-06-01"}},"S":"{z}","gateway_device":"d_00000000000000000000000000","task_sig":"{}"}}"#,
+            URL_SAFE_NO_PAD.encode(BODY),
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        );
+        let frame = ruzstd::encoding::compress_to_vec(inner.as_bytes(), ruzstd::encoding::CompressionLevel::Fastest);
+        let req = ChildRequest {
+            provider: Provider::Anthropic,
+            dialect: Dialect::AnthropicMessages,
+            policy: Policy::PERMISSIVE,
+            catalog: Catalog { default_effort: Effort::High, max_output: 1024, max_image_tokens: 0 },
+            max_price: None,
+            model_id: "m",
+            pseudonym: "p",
+            route_dialect: Dialect::AnthropicMessages,
+            effort: Effort::High,
+            max_tokens: 16,
+            est_input: u64::try_from(BODY.len()).unwrap().div_ceil(3),
+            ttl: CacheTtl::None,
+            stream: true,
+            flags: Flags::NONE,
+            aliases: vec!["m"],
+            payload: &frame,
+        };
+        let mut good = Vec::new();
+        encode_ok(&run(&req).unwrap(), &mut good);
+        assert!(decode_response(&Bytes::from(good.clone())).is_ok());
+        let n = std::env::var("MOOCHY_FUZZ_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000usize);
+        for _ in 0..n * 4 {
+            let mut b = good.clone();
+            for _ in 0..=(rnd() % 4) {
+                let i = usize::try_from(rnd() % (b.len() as u64 + 1)).unwrap();
+                match rnd() % 4 {
+                    0 if i < b.len() => b[i] ^= 1 << (rnd() % 8),
+                    1 if i < b.len() => {
+                        b.truncate(i);
+                    }
+                    2 => b.insert(i, u8::try_from(rnd() & 0xff).unwrap()),
+                    _ => b.splice(i..i, [0xff, 0xff, 0xff, 0xff]).for_each(drop),
+                }
+            }
+            let _ = decode_response(&Bytes::from(b));
+        }
+    }
 
     #[test]
     fn warm_up_runs_the_full_pipeline() {
