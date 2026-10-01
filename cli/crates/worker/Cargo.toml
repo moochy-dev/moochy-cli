@@ -1,0 +1,45 @@
+[package]
+name = "moochy-worker"
+version = "0.1.0"
+description = "Moochy worker: provider firewall, safe mutations, adapters, SSE/usage parsing, tool-call inspection, outbox"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# No serde, no regex, no hyper-util client pool: the strict JSON tape, the
+# firewall tables and the h2 connection holder are all in-crate.
+[dependencies]
+# Zero-copy request/response buffers handed to the node.
+bytes = { version = "1", default-features = false, features = ["std"] }
+# Async runtime pieces: TCP, timers, the h2 connection mutex.
+tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "sync"] }
+# HTTP/2 (providers) and HTTP/1.1 (loopback dev fakes) client connections.
+hyper = { version = "1.7", default-features = false, features = ["client", "http1", "http2"] }
+# TokioIo + TokioExecutor adapters for hyper (same version as moochy node).
+hyper-util = { version = "0.1.17", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+# TLS: rustls with ring, Mozilla roots baked in (no OpenSSL, no OS store).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = { version = "1", default-features = false }
+# Wipe the provider API key copy we own.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
