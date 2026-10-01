@@ -124,6 +124,12 @@ pub struct PoolSync {
     /// repo setting: Gateway adds top-level automatic caching to multi-turn Anthropic requests (plan 07 §4.2)
     #[prost(bool, tag = "7")]
     pub auto_cache: bool,
+    /// repo setting (§15.4): the Gateway never seals to a worker serving through these providers
+    #[prost(string, repeated, tag = "8")]
+    pub excluded_providers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// repo setting (§15.4): release pooled tool calls to clients outside `moochy run` (default false)
+    #[prost(bool, tag = "9")]
+    pub allow_unsandboxed_tools: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PoolWorker {
