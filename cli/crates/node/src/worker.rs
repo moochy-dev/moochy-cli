@@ -373,6 +373,7 @@ struct Admitted {
     prepared: firewall::Prepared,
     pledge: PledgeId,
     key: Vec<u8>,
+    catalog_version: u64,
 }
 
 /// Steps 1–4 of 07 §6.1. `Err((ck, failure))` = NACK (with CK when known, to seal the detail).
@@ -425,7 +426,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
     // 3. Adapter + catalog entry, firewall, route/body consistency.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
-    let cat = node.catalog();
+    let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
     let Some((adapter, entry)) = node.adapters.iter().find_map(|a| {
         let e = cat.entry(&route.model, a.provider().as_str())?;
         (a.provider().serves(dialect.worker()) && e.dialects.contains(&route.dialect)).then(|| (a.clone(), e.clone()))
@@ -496,7 +497,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         Some(Err(StoreError::Cap(w))) => return Err(with_ck("local_cap", true, Some(w.into()))),
         _ => return Err(with_ck("busy", true, None)),
     }
-    Ok(Admitted { ck, task, inner, route, entry, adapter, prepared, pledge, key })
+    Ok(Admitted { ck, task, inner, route, entry, adapter, prepared, pledge, key, catalog_version: cat.version })
 }
 
 /// Returns `(journal status, model, cost)`.
@@ -563,12 +564,12 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
             fl.retry_after_ms = f.retry_after_ms;
             refuse.nack(Some(&a.ck), &fl).await;
             // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
-            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
+            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
             finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
             return (format!("refused:{code}"), String::new(), 0, None);
         }
         None => {
-            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
+            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
             finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
             return ("cancelled".into(), String::new(), 0, None);
         }
@@ -650,9 +651,13 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let fast = a.route.flags.iter().any(|f| f == "fast");
     // Fallback when a cost cannot be computed (e.g. OpenRouter without a reported cost): the reservation.
     let cost = money::cost_uusd(&a.entry, &usage, fast).unwrap_or(reserved);
+    // xAI bills reasoning beyond `max_tokens` and reports the charge (`cost_in_usd_ticks`). The
+    // receipt stays catalog-priced (only OpenRouter may carry a provider cost today), but the
+    // donor's own cap settles at what xAI actually charged when that is higher.
+    let local = if a.entry.provider == "xai" { out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok()).map_or(cost, |c| c.max(cost)) } else { cost };
     let model = clean(out.model.as_deref().unwrap_or("")).into_owned();
     let req_id = request_id.or(out.id).unwrap_or_default();
-    let end = Ending { status, usage, cost, model: model.clone(), req_id, times: (t_start, t_started) };
+    let end = Ending { status, usage, cost, local, model: model.clone(), req_id, times: (t_start, t_started) };
     finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
     let st = match status {
         ReceiptStatus::Ok => "ok",
@@ -670,6 +675,8 @@ struct Ending {
     status: ReceiptStatus,
     usage: Usage,
     cost: i64,
+    /// What the donor's local cap settles at (≥ `cost`).
+    local: i64,
     model: String,
     req_id: String,
     times: (u64, u64),
@@ -679,8 +686,8 @@ struct Ending {
 /// the Serve stream, hand it to the session (`ReplayReceipt`) so it is never lost.
 #[allow(clippy::too_many_arguments)]
 async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer: &ResponseSealer, e: Ending, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) {
-    let ucost = u64::try_from(e.cost).unwrap_or(0);
-    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times, node.catalog().version) else {
+    let ucost = u64::try_from(e.local).unwrap_or(0);
+    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times, a.catalog_version) else {
         log("error", "receipt signing failed", &json!({"task": refuse.task}));
         return;
     };

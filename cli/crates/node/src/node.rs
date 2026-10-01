@@ -100,6 +100,8 @@ pub struct Node {
     /// Process start (ms): the served-task boot floor (D18).
     pub boot_ms: u64,
     pub catalog: Mutex<Arc<Catalog>>,
+    /// Recent catalog versions (bounded): a Worker prices with the version named in `Assign`.
+    pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
     /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
@@ -126,6 +128,8 @@ pub struct Node {
     pub journal: Mutex<VecDeque<JournalEntry>>,
     pub journal_tx: broadcast::Sender<JournalEntry>,
     pub shutdown: watch::Sender<bool>,
+    /// When the relay link last came up (ms): the relay's pools refill as donors reconnect.
+    pub link_up_ms: AtomicU64,
     /// Relay server_time − node clock at the last Hello.
     pub clock_skew_ms: std::sync::atomic::AtomicI64,
     /// Evidence of the last consumed tasks, for `moochy report` (bounded).
@@ -135,6 +139,9 @@ pub struct Node {
 }
 
 const MAX_SESSIONS: usize = 4096;
+const MAX_CATALOGS: usize = 8;
+/// Relays ask workers to reconnect within 10 s of a drain (jitter), plus backoff.
+const POOL_REFILL_MS: u64 = 20_000;
 const JOURNAL_KEEP: usize = 512;
 
 impl Node {
@@ -150,6 +157,7 @@ impl Node {
             insecure_dev: std::env::var("MOOCHY_INSECURE_DEV").as_deref() == Ok("1"),
             boot_ms: now_ms(),
             catalog: Mutex::new(if offline { Catalog::stub() } else { Arc::new(Catalog::default()) }),
+            catalogs: Mutex::new(VecDeque::new()),
             adapters: w.adapters,
             store: w.store,
             approvals: Mutex::new(Vec::new()),
@@ -169,6 +177,7 @@ impl Node {
             journal: Mutex::new(VecDeque::new()),
             journal_tx: broadcast::channel(64).0,
             shutdown: watch::channel(false).0,
+            link_up_ms: AtomicU64::new(0),
             clock_skew_ms: std::sync::atomic::AtomicI64::new(0),
             evidence: Mutex::new(VecDeque::new()),
             keylog,
@@ -201,12 +210,50 @@ impl Node {
         .await;
     }
 
-    /// Accept a newer catalog (versions never go down).
-    pub fn set_catalog(&self, c: Catalog) {
+    /// Accept a newer catalog: versions never go down and a version, once seen, never changes
+    /// content (a relay could otherwise swap prices under the same number). `false` = refused.
+    pub fn set_catalog(&self, c: Catalog) -> bool {
         let mut cur = lock(&self.catalog);
-        if c.version >= cur.version {
-            *cur = Arc::new(c);
+        if c.version <= cur.version {
+            return false;
         }
+        let c = Arc::new(c);
+        let mut h = lock(&self.catalogs);
+        if h.len() >= MAX_CATALOGS {
+            h.pop_front();
+        }
+        h.push_back(c.clone());
+        *cur = c;
+        true
+    }
+
+    /// The catalog a Worker prices an `Assign` with: its `catalog_version` (0 = current, older relay).
+    pub fn catalog_v(&self, version: u64) -> Option<Arc<Catalog>> {
+        if version == 0 {
+            return Some(self.catalog());
+        }
+        lock(&self.catalogs).iter().find(|c| c.version == version).cloned()
+    }
+
+    /// The relay's catalog key = the pinned key-log key (`log_key`, `<name>+<hash>+<b64(0x01‖pub)>`).
+    pub fn catalog_key(&self) -> Option<[u8; 32]> {
+        let vkey = self.cfg.log_key.as_deref()?;
+        moochy_keylog::NoteKey::parse(vkey).ok()?;
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, vkey.splitn(3, '+').nth(2)?).ok()?;
+        match raw.split_first() {
+            Some((1, k)) => k.try_into().ok(),
+            _ => None,
+        }
+    }
+
+    /// `CatalogUpdate.sig` = Ed25519(catalog key, lp("moochy/v1/catalog", catalog_json)) (E41).
+    /// Without a pinned key the catalog is relay-asserted: accepted only in insecure dev mode.
+    pub fn catalog_trusted(&self, json: &[u8], sig: &[u8]) -> Result<(), &'static str> {
+        let Some(pk) = self.catalog_key() else {
+            return if self.insecure_dev { Ok(()) } else { Err("no pinned key-log key to verify the catalog") };
+        };
+        let sig = <[u8; 64]>::try_from(sig).map_err(|_| "catalog signature missing")?;
+        moochy_proto::crypto::verify(&pk, &crate::util::lp(&[b"moochy/v1/catalog", json]), &sig).map_err(|_| "bad catalog signature")
     }
 
     pub fn device_id(&self) -> Option<&str> {
@@ -259,7 +306,11 @@ impl Node {
             return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true });
         }
         let pools = lock(&self.pools);
-        pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()
+        let p = pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()?;
+        // Right after a (re)connect, e.g. a relay restart, donors are still reconnecting: an empty
+        // pool then means "not loaded yet" (retryable), not "nobody donates this model".
+        let fresh = now_ms().saturating_sub(self.link_up_ms.load(Ordering::Relaxed)) < POOL_REFILL_MS;
+        (!(p.workers.is_empty() && fresh)).then_some(p)
     }
 
     /// Whether the repo behind `slug` allows auto-caching (no clone of the pool).

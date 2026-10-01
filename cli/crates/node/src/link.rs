@@ -26,6 +26,9 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 const DEAD_AFTER: Duration = Duration::from_secs(31);
 const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_CAP_MS: u64 = 30_000;
+/// The relay gives started streams 30 s to finish on drain (10 §3); we give up a bit later.
+const DRAIN_MAX: Duration = Duration::from_secs(35);
+const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 enum End {
     /// Clean close or drain: reconnect after the given delay.
@@ -144,6 +147,7 @@ async fn next(down: &mut tonic::Streaming<RelayMsg>) -> std::result::Result<rela
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End, End> {
     let origin = Origin::parse(relay).map_err(|e| End::Refused(e.msg))?;
     let (Some(device_id), Some(keys)) = (node.device_id(), node.secrets.device.as_ref()) else {
@@ -181,6 +185,7 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     };
     let session = welcome.session_id.parse().map_err(|_| End::Refused("bad session id".into()))?;
     *lock(&node.link) = Some(LinkHandle { client, session, up: up.clone() });
+    node.link_up_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     node.link_state.send_replace(LinkState::Up);
     log("info", "relay link up", &json!({"session": welcome.session_id}));
     if node.cfg.has_role("worker") {
@@ -196,6 +201,10 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     let mut ping = interval(PING_EVERY);
     ping.tick().await;
     let mut last_pong = Instant::now();
+    // Draining (03 §14, 10 §3): no new work on this session, but it stays open (with every
+    // in-flight Serve/Submit stream) until our started tasks end, then we reconnect.
+    let mut draining: Option<(u64, Instant)> = None;
+    let mut idle = interval(DRAIN_POLL);
     loop {
         tokio::select! {
             m = down.message() => match m {
@@ -207,14 +216,27 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                             tokio::spawn(async move { l.sync(h.client, c.note.to_vec()).await });
                         }
                     }
-                    relay_msg::Msg::Draining(d) => return Ok(End::Reconnect(u64::from(d.reconnect_after_ms).min(BACKOFF_CAP_MS))),
+                    relay_msg::Msg::Draining(d) => {
+                        let ms = u64::from(d.reconnect_after_ms).min(BACKOFF_CAP_MS);
+                        if busy(node) == 0 {
+                            return Ok(End::Reconnect(ms));
+                        }
+                        log("info", "relay draining: finishing in-flight tasks before reconnecting", &json!({"in_flight": busy(node)}));
+                        *lock(&node.link) = None;
+                        node.link_state.send_replace(LinkState::Down);
+                        draining = Some((ms, Instant::now()));
+                    }
                     relay_msg::Msg::Pong(_) => last_pong = Instant::now(),
                     relay_msg::Msg::Error(e) => log("warn", "relay error", &json!({"code": e.code, "message": e.message, "task": e.task})),
-                    relay_msg::Msg::Catalog(c) => match crate::engine::Catalog::parse(&c.catalog_json) {
-                        Ok(cat) => {
-                            node.set_catalog(cat);
-                            crate::worker::reoffer(node);
+                    relay_msg::Msg::Catalog(c) => match node.catalog_trusted(&c.catalog_json, &c.sig).map_err(str::to_owned).and_then(|()| crate::engine::Catalog::parse(&c.catalog_json)) {
+                        Ok(cat) if cat.version == c.version => {
+                            if node.set_catalog(cat) {
+                                crate::worker::reoffer(node);
+                            } else {
+                                log("warn", "catalog refused", &json!({"error": "version not newer than the current catalog", "version": c.version}));
+                            }
                         }
+                        Ok(_) => log("warn", "catalog refused", &json!({"error": "version field mismatch"})),
                         Err(e) => log("warn", "catalog refused", &json!({"error": e})),
                     },
                     relay_msg::Msg::ReceiptAck(a) => crate::worker::on_receipt_ack(node, &a.task, a.attempt),
@@ -225,9 +247,15 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                     _ => {}
                 },
                 Ok(Some(RelayMsg { msg: None })) => {}
-                Ok(None) => return Ok(End::Reconnect(0)),
+                Ok(None) => return Ok(End::Reconnect(draining.map_or(0, |d| d.0))),
                 Err(s) => return Err(status_end(&s)),
             },
+            _ = idle.tick(), if draining.is_some() => {
+                if let Some((ms, t0)) = draining && (busy(node) == 0 || t0.elapsed() > DRAIN_MAX) {
+                    let spent = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    return Ok(End::Reconnect(ms.saturating_sub(spent)));
+                }
+            }
             _ = ping.tick() => {
                 if last_pong.elapsed() > DEAD_AFTER {
                     return Err(End::Net("relay missed 2 pongs".into()));
@@ -239,6 +267,11 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
             }
         }
     }
+}
+
+/// Tasks this node has in flight on the relay, either role.
+fn busy(node: &Node) -> u32 {
+    node.worker_busy.load(std::sync::atomic::Ordering::Relaxed).saturating_add(node.gateway_tasks.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Wait for the first link outcome (up / refused), at most `wait`.
