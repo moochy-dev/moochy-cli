@@ -112,6 +112,7 @@ fn fx() -> Fx {
         me: Me {
             pseudonym: m["me"].as_str().unwrap().to_owned(),
             known_keys: m["known_keys"].as_array().unwrap().iter().map(|k| unhex(k.as_str().unwrap()).try_into().unwrap()).collect(),
+            known_owner_keys: m["known_owner_keys"].as_array().unwrap().iter().map(|k| unhex(k.as_str().unwrap()).try_into().unwrap()).collect(),
         },
         witnesses: w["witnesses"].as_array().unwrap().iter().map(|k| CosignerKey::parse(k.as_str().unwrap()).unwrap()).collect(),
     }
@@ -148,15 +149,15 @@ fn run_sync_alerts_persist_stale_fork() {
 
     let msgs: Vec<String> = events.iter().map(Event::message).collect();
     let all = msgs.join("\n");
-    assert!(matches!(events[0], Event::Synced { size: 23 }), "{all}");
-    for needle in ["unknown_key", "unsigned DONOR_APPROVED for your repo", "unsigned or invalid MEMBER_ADDED", "public Git anchor at 23 is consistent", "stale checkpoint"] {
+    assert!(matches!(events[0], Event::Synced { size: 27 }), "{all}");
+    for needle in ["unknown_key", "unsigned DONOR_APPROVED for your repo", "unsigned or invalid MEMBER_ADDED", "public Git anchor at 27 is consistent", "stale checkpoint", "unknown_owner_key", "your owner key ok_"] {
         assert!(all.contains(needle), "missing {needle:?} in:\n{all}");
     }
     assert!(events.contains(&Event::Synced { size: 300 }));
-    assert!(events.contains(&Event::Stale { served: 23, mirrored: 300 }));
+    assert!(events.contains(&Event::Stale { served: 27, mirrored: 300 }));
     assert!(events.iter().filter(|e| e.is_security()).count() >= 12);
-    // Incremental: 23 → 300 fetched bundle 0 (partial then full) and bundle 1 partial.
-    assert_eq!(f.link.fetched, vec!["tile/entries/000.p/23", "tile/entries/000", "tile/entries/001.p/44"]);
+    // Incremental: 27 → 300 fetched bundle 0 (partial then full) and bundle 1 partial.
+    assert_eq!(f.link.fetched, vec!["tile/entries/000.p/27", "tile/entries/000", "tile/entries/001.p/44"]);
 
     // The view answers from the verified state (same as the vectors' queries).
     let q = &load("entries.json")["queries"];
@@ -179,7 +180,7 @@ fn run_sync_alerts_persist_stale_fork() {
     // A forked checkpoint: fork event, the view fails closed, and it stays so after a restart.
     let mut m3 = m2;
     let ev = block_on(m3.on_checkpoint(&mut f.link, &f.fork23));
-    assert!(matches!(&ev[..], [Event::Fork { size: 23, .. }]), "{ev:?}");
+    assert!(matches!(&ev[..], [Event::Fork { size: 27, .. }]), "{ev:?}");
     assert!(ev[0].message().contains("fork"));
     assert_eq!(m3.view().sealable("d_x", "r_x"), Err(Code::LogForked));
     drop(m3);
@@ -194,7 +195,7 @@ fn fork_vs_anchor_and_rollback() {
     let mut m = monitor(&f, None, 0);
     block_on(m.on_checkpoint(&mut f.link, &f.n23));
     // The relay serves 23, the public anchor already has 300: rollback / withholding.
-    assert_eq!(m.on_anchor(&f.n300), vec![Event::Rollback { anchored: 300, served: 23 }]);
+    assert_eq!(m.on_anchor(&f.n300), vec![Event::Rollback { anchored: 300, served: 27 }]);
     // An anchor with another root at 23: fork.
     assert!(matches!(&m.on_anchor(&f.fork23)[..], [Event::Fork { .. }]));
     assert!(m.view().forked());
@@ -250,4 +251,52 @@ fn hostile_link() {
 fn assert_send<L: LogLink>(m: &mut Monitor, l: &mut L) {
     fn is_send<T: Send>(_: T) {}
     is_send(m.run(l, |_| {}));
+}
+
+#[test]
+fn sealing_gate() {
+    use moochy_keylog::monitor::{Gate, MAX_LOG_AGE};
+    use std::time::{Duration, Instant};
+    let mut f = fx();
+    let mut m = monitor(&f, None, 0);
+    let v = m.view();
+    let q = &load("entries.json")["queries"];
+    // The donor that the vectors' state can seal to (approval by the rogue owner key).
+    let ok = q.as_array().unwrap().iter().find(|x| x["q"] == "sealable" && x["code"] == "").unwrap();
+    let (w, r) = (ok["device"].as_str().unwrap(), ok["repo"].as_str().unwrap());
+    let ai = ok["approval_idx"].as_u64().unwrap();
+    assert_eq!(v.gate(), Gate::NoCheckpoint);
+    assert_eq!(v.seal_check(w, r, 17, ai), Err(Code::NoCheckpoint));
+    block_on(m.on_checkpoint(&mut f.link, &f.n23));
+    assert_eq!(v.gate(), Gate::Verified { size: 27 });
+    let s = v.state(|st| st.sealable(w, r)).unwrap().unwrap();
+    assert_eq!(v.seal_check(w, r, s.key_idx, ai), Ok(s));
+    assert_eq!(v.seal_check(w, r, s.key_idx, ai - 1), Err(Code::IndexMismatch));
+    assert_eq!(v.seal_check(w, r, s.key_idx + 1, ai), Err(Code::IndexMismatch));
+    // Old confirmation: stale; a fresh one reopens the gate.
+    let later = Instant::now() + MAX_LOG_AGE + Duration::from_secs(1);
+    assert_eq!(v.gate_at(later), Gate::Stale { size: 27 });
+    assert_eq!(v.seal_check_at(later, w, r, s.key_idx, ai), Err(Code::StaleLog));
+    block_on(m.on_checkpoint(&mut f.link, &f.n300));
+    assert_eq!(v.gate(), Gate::Verified { size: 300 });
+    // An older checkpoint closes the gate until a newer consistent one.
+    block_on(m.on_checkpoint(&mut f.link, &f.n23));
+    assert_eq!(v.seal_check(w, r, s.key_idx, ai), Err(Code::StaleLog));
+    block_on(m.on_checkpoint(&mut f.link, &f.n300));
+    assert_eq!(v.seal_check(w, r, s.key_idx, ai), Ok(s));
+
+    // Cost on the submit path.
+    let t = Instant::now();
+    let n = 200_000u32;
+    for _ in 0..n {
+        assert!(v.seal_check(w, r, s.key_idx, ai).is_ok());
+    }
+    let per = t.elapsed() / n;
+    eprintln!("seal_check: {per:?} per call");
+    assert!(per < Duration::from_micros(20), "seal_check too slow: {per:?}");
+
+    // Fork: closed for good.
+    block_on(m.on_checkpoint(&mut f.link, &f.fork23));
+    assert_eq!(v.gate(), Gate::Forked);
+    assert_eq!(v.seal_check(w, r, s.key_idx, ai), Err(Code::LogForked));
 }

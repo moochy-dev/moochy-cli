@@ -21,11 +21,18 @@ pub struct Me {
     /// Signing keys the user created on their devices or acknowledged after an
     /// [`Alert::UnknownKey`] ("yes, that was me").
     pub known_keys: Vec<[u8; 32]>,
+    /// Owner keys the user created (CONTRACT §15.4) or acknowledged after an
+    /// [`Alert::UnknownOwnerKey`]. Approvals on the user's repos signed by any
+    /// other key raise [`Alert::NotSignedByMe`].
+    pub known_owner_keys: Vec<[u8; 32]>,
 }
 
 impl Me {
     fn knows(&self, k: &[u8; 32]) -> bool {
         self.known_keys.contains(k)
+    }
+    fn knows_owner(&self, k: &[u8; 32]) -> bool {
+        self.known_owner_keys.contains(k)
     }
 }
 
@@ -56,6 +63,11 @@ pub enum Alert {
         repo_id: String,
         owner: String,
     },
+    /// An owner key was registered on my account that I neither created nor acknowledged.
+    UnknownOwnerKey { idx: u64, owner_key: String },
+    /// One of my owner keys was revoked by the relay (first step of an account takeover,
+    /// or a recovery I asked for).
+    OwnerKeyRevoked { idx: u64, owner_key: String },
 }
 
 /// Result of comparing a checkpoint (e.g. the Git anchor) with the mirror.
@@ -225,10 +237,19 @@ impl Mirror {
         let Some(me) = &self.me else { return Ok(()) };
         let signer_known = |signer: &str| {
             self.state
-                .device(signer)
-                .is_some_and(|d| me.knows(&d.sign_pub))
+                .owner_key(signer)
+                .is_some_and(|k| me.knows_owner(&k.owner_pub))
         };
         match e.body {
+            Body::OwnerKey { pseudonym, owner_pub, .. } if pseudonym == me.pseudonym && !me.knows_owner(owner_pub) => {
+                alerts.push(Alert::UnknownOwnerKey { idx, owner_key: crate::entry::owner_key_id(owner_pub) });
+            }
+            Body::OwnerKey { pseudonym, owner_pub, .. } if pseudonym != me.pseudonym && (me.knows_owner(owner_pub) || me.knows(owner_pub)) => {
+                alerts.push(Alert::KeyHijack { idx, device_id: crate::entry::owner_key_id(owner_pub), pseudonym: pseudonym.to_owned() });
+            }
+            Body::OwnerRevoke { pseudonym, owner_pub, .. } if pseudonym == me.pseudonym => {
+                alerts.push(Alert::OwnerKeyRevoked { idx, owner_key: crate::entry::owner_key_id(owner_pub) });
+            }
             Body::Key {
                 device_id,
                 pseudonym,

@@ -22,6 +22,7 @@ use std::{
     io::Write as _,
     path::PathBuf,
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 
 /// What the monitor needs from the relay link. The Node implements it on its own
@@ -131,6 +132,12 @@ fn alert_message(a: &Alert) -> String {
             kind.name(),
             code.as_str()
         ),
+        Alert::UnknownOwnerKey { idx, owner_key } => format!(
+            "keylog: SECURITY: unknown_owner_key: an owner key {owner_key} you did not create was registered on your account (log #{idx}); approvals it signs are not yours"
+        ),
+        Alert::OwnerKeyRevoked { idx, owner_key } => format!(
+            "keylog: SECURITY: your owner key {owner_key} was revoked (log #{idx}); if you did not ask for it, your account may be under takeover"
+        ),
         Alert::Invalid { idx } => format!("keylog: SECURITY: malformed entry at log #{idx}; it is ignored"),
     }
 }
@@ -139,6 +146,31 @@ fn alert_message(a: &Alert) -> String {
 struct Shared {
     mirror: Mirror,
     fork: Option<String>,
+    /// When the relay's current checkpoint last verified against the mirror.
+    confirmed_at: Option<Instant>,
+    /// The relay served an older checkpoint than it served before (until a newer
+    /// consistent one arrives).
+    stale: bool,
+}
+
+/// How long a verified checkpoint keeps the sealing gate open without a fresh
+/// confirmation (the relay pushes a checkpoint on growth; the Node also polls
+/// `GetLogTile("checkpoint")` every [`POLL_EVERY`] when no push arrived).
+pub const MAX_LOG_AGE: Duration = Duration::from_secs(10 * 60);
+/// Suggested polling period of the relay checkpoint when nothing was pushed.
+pub const POLL_EVERY: Duration = Duration::from_secs(60);
+
+/// The sealing gate's state (CONTRACT §15.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// No checkpoint verified yet: nothing may be sealed (outside `--dev`).
+    NoCheckpoint,
+    /// Verified and confirmed within [`MAX_LOG_AGE`]: seal to `sealable` workers only.
+    Verified { size: u64 },
+    /// The last confirmation is too old, or the relay served an older checkpoint.
+    Stale { size: u64 },
+    /// A fork was seen: nothing may be sealed, ever, until the user resolves it.
+    Forked,
 }
 
 /// A cheap, cloneable, thread-safe handle on the verified key-log state. Every
@@ -166,7 +198,51 @@ impl View {
         self.0.read().map_or(true, |g| g.fork.is_some())
     }
 
-    /// Gateway, before sealing to `worker` for `repo` (06 §10.1).
+    /// The sealing gate now.
+    #[must_use]
+    pub fn gate(&self) -> Gate {
+        self.gate_at(Instant::now())
+    }
+
+    #[must_use]
+    pub fn gate_at(&self, now: Instant) -> Gate {
+        let Ok(g) = self.0.read() else { return Gate::Forked };
+        let size = g.mirror.size();
+        match (&g.fork, g.confirmed_at) {
+            (Some(_), _) => Gate::Forked,
+            (None, None) => Gate::NoCheckpoint,
+            (None, Some(at)) if g.stale || now.saturating_duration_since(at) > MAX_LOG_AGE => Gate::Stale { size },
+            (None, Some(_)) => Gate::Verified { size },
+        }
+    }
+
+    /// THE sealing rule (Gateway, for each pool worker, on the submit path): the gate
+    /// must be [`Gate::Verified`], the worker sealable for `repo` in the verified log,
+    /// and the relay's `key_log_index` / `approval_log_index` exactly the mirrored
+    /// ones. Errors: `log_forked`, `no_checkpoint`, `stale_log`, `index_mismatch`, or a
+    /// [`State::sealable`] denial. Only `--dev` may fall back to the relay's pool on
+    /// `no_checkpoint`. Cost: one read lock + three hash lookups, no allocation.
+    pub fn seal_check(&self, worker: &str, repo: &str, key_log_index: u64, approval_log_index: u64) -> Result<Sealable, Code> {
+        self.seal_check_at(Instant::now(), worker, repo, key_log_index, approval_log_index)
+    }
+
+    pub fn seal_check_at(&self, now: Instant, worker: &str, repo: &str, key_log_index: u64, approval_log_index: u64) -> Result<Sealable, Code> {
+        let g = self.0.read().map_err(|_| Code::Unavailable)?;
+        match (&g.fork, g.confirmed_at) {
+            (Some(_), _) => return Err(Code::LogForked),
+            (None, None) => return Err(Code::NoCheckpoint),
+            (None, Some(at)) if g.stale || now.saturating_duration_since(at) > MAX_LOG_AGE => return Err(Code::StaleLog),
+            _ => {}
+        }
+        let s = g.mirror.state().sealable(worker, repo)?;
+        if s.key_idx != key_log_index || s.approval_idx != approval_log_index {
+            return Err(Code::IndexMismatch);
+        }
+        Ok(s)
+    }
+
+    /// Gateway, before sealing to `worker` for `repo` (06 §10.1). Prefer
+    /// [`View::seal_check`], which also enforces the gate.
     pub fn sealable(&self, worker: &str, repo: &str) -> Result<Sealable, Code> {
         self.with(|m| m.state().sealable(worker, repo))
     }
@@ -227,7 +303,11 @@ impl Monitor {
         }
         mirror.set_me(cfg.me.clone());
         let served = mirror.size();
-        Ok(Self { cfg, view: View(Arc::new(RwLock::new(Shared { mirror, fork }))), served })
+        Ok(Self {
+            cfg,
+            view: View(Arc::new(RwLock::new(Shared { mirror, fork, confirmed_at: None, stale: false }))),
+            served,
+        })
     }
 
     /// The shared view for Gateways and Workers.
@@ -273,7 +353,12 @@ impl Monitor {
         if cp.size < size {
             let st = self.view.0.read().map(|g| g.mirror.check(&cp));
             return match st {
-                Ok(AnchorStatus::Consistent) => vec![Event::Stale { served: cp.size, mirrored: size }],
+                Ok(AnchorStatus::Consistent) => {
+                    if let Ok(mut g) = self.view.0.write() {
+                        g.stale = true;
+                    }
+                    vec![Event::Stale { served: cp.size, mirrored: size }]
+                }
                 Ok(_) => vec![self.fork(cp.size, "older checkpoint does not match the mirrored history", note)],
                 Err(_) => vec![Event::Error("mirror unavailable".into())],
             };
@@ -294,7 +379,14 @@ impl Monitor {
         }
         let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
         let res = match self.view.0.write() {
-            Ok(mut g) => g.mirror.update(&cp, &refs),
+            Ok(mut g) => {
+                let r = g.mirror.update(&cp, &refs);
+                if r.is_ok() {
+                    g.confirmed_at = Some(Instant::now());
+                    g.stale = false;
+                }
+                r
+            }
             Err(_) => return vec![Event::Error("mirror unavailable".into())],
         };
         match res {

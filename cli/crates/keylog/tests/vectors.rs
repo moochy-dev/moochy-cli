@@ -54,6 +54,8 @@ fn alert_str(a: &Alert) -> String {
         Alert::KeyHijack { idx, .. } => format!("KeyHijack:{idx}"),
         Alert::NotSignedByMe { idx, .. } => format!("NotSignedByMe:{idx}"),
         Alert::RepoClaimedByOther { idx, .. } => format!("RepoClaimedByOther:{idx}"),
+        Alert::UnknownOwnerKey { idx, .. } => format!("UnknownOwnerKey:{idx}"),
+        Alert::OwnerKeyRevoked { idx, .. } => format!("OwnerKeyRevoked:{idx}"),
     }
 }
 
@@ -245,6 +247,7 @@ fn mirror_monitor_and_fork() {
             .iter()
             .map(h32)
             .collect(),
+        known_owner_keys: mon["known_owner_keys"].as_array().unwrap().iter().map(h32).collect(),
     };
 
     let mut m = Mirror::new(origin, key.clone());
@@ -289,13 +292,14 @@ fn mirror_monitor_and_fork() {
     assert_eq!(m.update(&bad_mid, &[]), Err(Error::Fork { size: 10 }));
 
     // Same answers as the state-machine vectors.
-    assert!(
+    assert_eq!(
         m.state()
             .sealable(
                 v["queries"][1]["device"].as_str().unwrap(),
                 v["queries"][1]["repo"].as_str().unwrap()
             )
-            .is_err()
+            .is_err(),
+        v["queries"][1]["code"] != ""
     );
 
     // Restore from persisted records: same root, no signature checks needed.
