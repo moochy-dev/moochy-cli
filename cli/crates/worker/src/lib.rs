@@ -51,6 +51,8 @@ pub enum Provider {
     OpenRouter,
     DeepSeek,
     OpenAi,
+    /// xAI (Grok): OpenAI-compatible chat completions only.
+    XAi,
 }
 
 impl Provider {
@@ -60,6 +62,7 @@ impl Provider {
             "openrouter" => Some(Self::OpenRouter),
             "deepseek" => Some(Self::DeepSeek),
             "openai" => Some(Self::OpenAi),
+            "xai" => Some(Self::XAi),
             _ => None,
         }
     }
@@ -70,6 +73,7 @@ impl Provider {
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
             Self::OpenAi => "openai",
+            Self::XAi => "xai",
         }
     }
 

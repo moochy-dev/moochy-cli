@@ -399,3 +399,45 @@ fn prepare_latency_100kb() {
         assert!(best < std::time::Duration::from_millis(1));
     }
 }
+
+/// xAI (Grok): OpenAI-compatible chat only; live search, deferred, server-side tools,
+/// file references, URL images and undocumented fields refused.
+#[test]
+fn xai_adapter_rules() {
+    let p = policy(Flags::IMAGES);
+    let x = |body: &str| firewall::prepare(&req(Provider::XAi, Dialect::OpenAiChat, body, &p, None));
+    let ok = r#"{"model":"xai/grok-4.7","max_completion_tokens":256,"stream":true,"reasoning_effort":"low","prompt_cache_key":"conv-1","messages":[{"role":"system","content":"s"},{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA","detail":"high"}}]}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}"#;
+    let out = x(ok).unwrap();
+    let body = std::str::from_utf8(&out.body).unwrap();
+    assert!(body.contains(r#""model":"vendor-model-1""#) && body.contains(r#""stream_options":{"include_usage":true}"#));
+    assert!(body.contains(r#""safety_identifier":"ps_abc""#) && !body.contains("store"), "{body}");
+    for (extra, path, reason) in [
+        (r#","search_parameters":{"mode":"on"}"#, "search_parameters", "live search"),
+        (r#","web_search_options":{"search_context_size":"high"}"#, "web_search_options", "web search"),
+        (r#","deferred":true"#, "deferred", "deferred"),
+        (r#","service_tier":"priority""#, "service_tier", "donor's call"),
+        (r#","n":2"#, "n", "multiplies output"),
+        (r#","tools":[{"type":"web_search"}]"#, "tools[0].type", "hosted tools"),
+        (r#","tools":[{"type":"x_search"}]"#, "tools[0].type", "not allowed"),
+        (r#","tools":[{"type":"code_execution"}]"#, "tools[0].type", "not allowed"),
+        (r#","tools":[{"type":"mcp","server_url":"https://x"}]"#, "tools[0].type", "MCP"),
+        (r#","store":false"#, "store", "xAI"),
+        (r#","logit_bias":{"1":1}"#, "logit_bias", "xAI"),
+        (r#","verbosity":"low""#, "verbosity", "xAI"),
+    ] {
+        let e = x(&oai(r#""hi""#, extra)).expect_err(extra);
+        assert_eq!(e.code, RejectCode::Firewall);
+        assert!(e.path.ends_with(path) && e.to_string().contains(reason), "{extra}: {e}");
+    }
+    for content in [
+        r#"[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]"#,
+        r#"[{"type":"input_file","file_url":"https://x/doc.pdf"}]"#,
+        r#"[{"type":"input_file","file_id":"file-abc"}]"#,
+        r#"[{"type":"file","file":{"file_id":"file-abc"}}]"#,
+    ] {
+        assert!(x(&oai(content, "")).is_err(), "{content}");
+    }
+    // No Anthropic-compatible endpoint: not served, retry elsewhere.
+    let e = firewall::prepare(&req(Provider::XAi, Dialect::AnthropicMessages, &anth(r#""hi""#, ""), &p, None)).unwrap_err();
+    assert_eq!(e.code.nack(), ("model_unavailable", true));
+}
