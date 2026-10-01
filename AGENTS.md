@@ -41,7 +41,7 @@ Moochy is **100% open source (Apache-2.0 OR MIT) and 100% free**. Read `spec/CON
 
 ## 6. Web palette (fixed)
 
-White `#FFFFFF`, dark `#0B1220`, light blue `#7DD3FC` (accent), `#0369A1` for small text links on white. Dark theme: bg `#0B1220`, text `#F8FAFC`, accent `#7DD3FC`. No other brand colours.
+White `#FFFFFF`, dark `#0B1220`, light blue `#7DD3FC` (accent), `#0369A1` for small text links on white. Dark theme: bg `#0B1220`, text `#F8FAFC`, accent `#7DD3FC`. No other brand colours. Design ambition is maximal (CONTRACT §9: motion system, scroll-driven storytelling, view transitions, micro-interactions), within the §9 performance and accessibility budgets.
 
 ## 7. Final report (always, even when blocked)
 
