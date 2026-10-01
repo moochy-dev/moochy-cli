@@ -83,10 +83,15 @@ fn unavailable() -> Option<String> {
     let f = Fixture::new("probe");
     let o = sandboxed(&f, &[], &["stat", "/"]);
     if o.code == 0 {
-        None
-    } else {
-        Some(format!("sandbox unavailable on this host: {}", o.stderr.trim()))
+        return None;
     }
+    // Only a genuine host limitation may skip; any other setup failure is a bug.
+    let err = o.stderr.trim();
+    assert!(
+        err.contains("restricted") || err.contains("unsupported"),
+        "sandbox setup failed (not a host limitation): {err}"
+    );
+    Some(format!("sandbox unavailable on this host: {err}"))
 }
 
 macro_rules! require_sandbox {

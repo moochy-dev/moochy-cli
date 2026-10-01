@@ -384,6 +384,14 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     // tmpfs as the new root skeleton.
     tmpfs(&root, c"mode=0755")?;
 
+    // Private tmpfs home + tmp FIRST, so a worktree that lives under /tmp (or
+    // any bind below) is mounted on top of them, not hidden underneath.
+    for (dir, opts) in [("tmp", c"mode=1777"), ("home/sandbox", c"mode=0700"), ("run/moochy", c"mode=0755")] {
+        let t = root.join(dir);
+        mkdir_p(&t)?;
+        tmpfs(&t, opts)?;
+    }
+
     // Read-only system paths (visibility only; Landlock enforces read-only).
     for p in &plan.ro_paths {
         bind_into(&root, p, false)?;
@@ -403,12 +411,6 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
         bind_into(&root, p, false)?;
     }
 
-    // Private tmpfs home + tmp.
-    for (dir, opts) in [("tmp", c"mode=1777"), ("home/sandbox", c"mode=0700"), ("run/moochy", c"mode=0755")] {
-        let t = root.join(dir);
-        mkdir_p(&t)?;
-        tmpfs(&t, opts)?;
-    }
 
     // Minimal /dev.
     setup_dev(&root)?;
