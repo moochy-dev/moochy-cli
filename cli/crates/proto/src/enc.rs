@@ -25,15 +25,14 @@ pub mod label {
     pub const RESP_PROGRESS: &[u8] = b"moochy/v1/resp-progress";
     pub const DISPUTE: &[u8] = b"moochy/v1/dispute";
     pub const DETAIL: &[u8] = b"moochy/v1/detail";
-    /// Key log (spec/KEYLOG.md §3; records and their checks live in the `keylog` crate).
+    /// Key log (spec/KEYLOG.md §3). Builders/verifiers: `moochy_keylog::entry`, `::receipts`.
     pub const KEYLOG: &[u8] = b"moochy/v1/keylog";
     pub const KEYLOG_SIG: &[u8] = b"moochy/v1/keylog-sig";
     pub const KEY_POP: &[u8] = b"moochy/v1/key-pop";
-    /// PENDING (CONTRACT §15.4, awaiting spec/KEYLOG.md): binding of a user's OWNER key.
-    pub const OWNER_KEY: &[u8] = b"moochy/v1/owner-key";
+    pub const RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
     pub const ALL: [&[u8]; 19] = [
         AUTH, DEVICE_START, REQ, RESP, WRAP, TASK, SALT, REQ_COMMIT, RESP_COMMIT, PROVIDER_REQ,
-        RECEIPT, PROJECTION, RESP_PROGRESS, DISPUTE, DETAIL, KEYLOG, KEYLOG_SIG, KEY_POP, OWNER_KEY,
+        RECEIPT, PROJECTION, RESP_PROGRESS, DISPUTE, DETAIL, KEYLOG, KEYLOG_SIG, KEY_POP, RECEIPT_LOG,
     ];
 }
 

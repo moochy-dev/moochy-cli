@@ -8,9 +8,12 @@ generator for `spec/vectors/`.
 - Build/test: `cargo test -p moochy-proto` (includes `tests/vectors.rs`: the committed vectors
   must equal what the library produces). Regenerate vectors from `cli/`:
   `cargo run -p moochy-proto --example vecgen -- ../spec/vectors`.
-- Perf: `cargo test --release -p moochy-proto --test perf -- --ignored --nocapture`.
-- Fuzz: `fuzz/run.sh [seconds] [workers]` (stable rustc, libFuzzer + ASan, dev-only).
-- Regenerate `src/pb/`: `cd pbgen && PROTOC=$HOME/.local/bin/protoc cargo run`.
+- Perf: runs in every `cargo test`; budgets (CONTRACT R6, §13) are enforced in release:
+  `cargo test --release -p moochy-proto --test perf -- --nocapture`.
+- Fuzz: `fuzz/run.sh [seconds] [workers] [inflate|json]` (stable rustc, libFuzzer + ASan, dev-only).
+- Regenerate `src/pb/`: `cd pbgen && PROTOC=$HOME/.local/bin/protoc cargo run`; CI check:
+  `cargo run -- --check` (exit 1 when `src/pb` is stale).
+- Key log, owner keys (kinds 10/11) and receipt inclusion proofs: `moochy_keylog` (not here).
 
 ## Request opening: which API production uses
 
