@@ -135,7 +135,16 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
             return native_error(dialect, &Failure::new("forbidden", false, "moochy: cross-origin requests are not allowed".to_owned()));
         }
     }
-    // 3. Repo-scoped local token.
+    // 3. Bounded bodies (A35): refuse a declared length over the cap at the headers, before any
+    //    read; chunked bodies are capped by `read_body` at the same limit.
+    let cap = if path == "/mcp" { MAX_MCP_BODY } else { MAX_API_BODY };
+    let declared = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > cap as u64) {
+        let mut r = native_error(dialect, &Failure::new("too_large", false, format!("moochy: request body larger than {cap} bytes")));
+        r.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+        return r;
+    }
+    // 4. Repo-scoped local token.
     let Some(slug) = token(req.headers()).and_then(|t| node.check_token(t)) else {
         if path == "/mcp" {
             let mut r = json_resp(401, &json!({"error": "unauthorized"}));
