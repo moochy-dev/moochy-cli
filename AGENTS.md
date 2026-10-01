@@ -20,13 +20,16 @@ Moochy is **100% open source (Apache-2.0 OR MIT) and 100% free**. Read `spec/CON
 - `#![forbid(unsafe_code)]` in every crate. `clippy -D warnings` with `clippy::pedantic` on; deny `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `arithmetic_side_effects` outside tests. Integer money math is checked (`checked_*`), never wrapping.
 - Release profile (workspace root, already set): `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip=true`.
 - Hot path: zero-copy (`bytes::Bytes`), no per-chunk allocation you can avoid, no `String` building in the data plane, bounded channels everywhere, no blocking calls on the runtime.
+- gRPC: `tonic` (no default TLS features; our own `tokio-rustls` connector for channel binding) + `prost`; generated code committed, never built from `.proto` at compile time.
 - Crypto and TLS: `rustls` (ring provider), `ed25519-zebra` (ZIP-215), `x25519-dalek`, `hpke`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize` on every secret, `subtle` for every token/MAC comparison. No OpenSSL. No home-made crypto.
 - Dependency budget: every new crate must justify itself in the commit message; prefer `default-features = false`. Commit `Cargo.lock`. Target: release binary ≤ 15 MB, idle RSS ≤ 20 MB.
 - Every external input is hostile: lengths bounded before allocation, JSON parsed into typed structs with `deny_unknown_fields` where the contract says so, timeouts on every network operation.
 
+**Responsiveness is a hard requirement** (CONTRACT §13 budgets, measured by E22): flush every chunk immediately, `TCP_NODELAY`, warm connections, no avoidable allocation or lock per chunk, no fsync in the per-chunk path.
+
 ## 4. Go (`relay/`, `e2e/`)
 
-- Go 1.25, stdlib first. Allowed third-party: `github.com/coder/websocket`, `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later).
+- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later).
 - `http.Server` with `ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`, `MaxHeaderBytes`; `http.MaxBytesReader` on every body; bounded queues; context deadlines everywhere. `go vet` and `-race` clean.
 - No content (prompts/outputs) ever written to the DB or logs. The Scheduler owns its state in one goroutine (docs/plan/04).
 
