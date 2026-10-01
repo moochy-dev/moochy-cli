@@ -164,24 +164,8 @@ impl W<'_> {
                 self.out.push(b']');
             }
             T::Obj(members) => self.obj(members, v)?,
-            T::Tag(key, cases) => {
-                if v.kind() != Kind::Obj {
-                    return fail("expected an object");
-                }
-                let tag = v.get(key).ok_or(ReemitError("missing type tag"))?;
-                let (_, case) = cases.iter().find(|(name, _)| tag.is_str(name)).ok_or(ReemitError("unknown event or block type"))?;
-                self.emit(case, v)?;
-            }
-            T::AnyObj(max) => {
-                if v.kind() != Kind::Obj {
-                    return fail("expected an object");
-                }
-                let start = self.out.len();
-                json::write(v, self.out);
-                if self.out.len().saturating_sub(start) > *max {
-                    return fail("object too large");
-                }
-            }
+            T::Tag(key, cases) => self.tagged(key, cases, v)?,
+            T::AnyObj(max) => self.any_obj(*max, v)?,
             T::EmptyObj => {
                 if v.kind() != Kind::Obj || v.entries().next().is_some() {
                     return fail("expected an empty object");
@@ -194,6 +178,27 @@ impl W<'_> {
                 }
                 self.out.extend_from_slice(b"[]");
             }
+        }
+        Ok(())
+    }
+
+    fn tagged(&mut self, key: &str, cases: &[(&'static str, T)], v: Val<'_>) -> Result<(), ReemitError> {
+        if v.kind() != Kind::Obj {
+            return fail("expected an object");
+        }
+        let tag = v.get(key).ok_or(ReemitError("missing type tag"))?;
+        let (_, case) = cases.iter().find(|(name, _)| tag.is_str(name)).ok_or(ReemitError("unknown event or block type"))?;
+        self.emit(case, v)
+    }
+
+    fn any_obj(&mut self, max: usize, v: Val<'_>) -> Result<(), ReemitError> {
+        if v.kind() != Kind::Obj {
+            return fail("expected an object");
+        }
+        let start = self.out.len();
+        json::write(v, self.out);
+        if self.out.len().saturating_sub(start) > max {
+            return fail("object too large");
         }
         Ok(())
     }
