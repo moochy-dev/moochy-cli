@@ -80,6 +80,11 @@ impl LogMirror {
         lock(&self.m).state().sealable(worker, repo_id).ok().map(|s| s.enc_pub)
     }
 
+    /// The logged device whose signing key this is (`moochy verify`).
+    pub fn device_by_key(&self, sign_pub: &[u8; 32]) -> Option<String> {
+        lock(&self.m).state().device_by_key(sign_pub).map(str::to_owned)
+    }
+
     /// Bring the mirror up to a relay checkpoint. Tiles come over the authenticated link.
     pub async fn sync(self: &Arc<Self>, mut client: NodeLinkClient<Channel>, note: Vec<u8>) {
         if self.syncing.swap(true, Ordering::AcqRel) {

@@ -178,6 +178,17 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         r.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
         return r;
     }
+    // Local-only endpoints for the CLI, authenticated by the 0600 run key (no repo needed).
+    if let Some(r) = path.strip_prefix("/moochy/verify/") {
+        let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
+        if !crate::run::key_ok(key) {
+            return json_resp(403, &json!({"error": "run_key_required"}));
+        }
+        return match crate::task::verify(&node, r) {
+            Ok(v) => json_resp(200, &v),
+            Err(e) => json_resp(422, &json!({"verified": false, "error": e})),
+        };
+    }
     // 4. A live sandboxed run token (§15.4), else a repo-scoped local token.
     let caller = token(req.headers()).and_then(|t| crate::run::check(t).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
     let Some((slug, sandboxed)) = caller else {

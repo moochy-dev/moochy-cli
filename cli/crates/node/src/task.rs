@@ -84,11 +84,41 @@ pub struct Evidence {
     pub task: String,
     pub attempt: u32,
     pub worker_device: String,
+    /// The worker's signing key the receipt was verified with (for `moochy verify`).
+    pub worker_sign_pub: Option<[u8; 32]>,
     pub receipt: pb::SignedReceipt,
     pub checkpoints: Vec<pb::Checkpoint>,
     pub response: Vec<Bytes>,
     pub truncated: bool,
     pub s_resp: [u8; 32],
+}
+
+/// `moochy verify <receipt_ref>`: check a public receipt (projection) of a task this Gateway
+/// consumed: the donor's signature over it, that it commits to the signed receipt, and, with a
+/// pinned key log, that the signing key is a logged key of that donor device.
+pub fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
+    let want = crate::util::b64d(receipt_ref.strip_prefix("r_").unwrap_or(receipt_ref)).filter(|b| b.len() == 16).ok_or("not a receipt reference")?;
+    let ev = crate::node::lock(&node.evidence);
+    for e in ev.iter() {
+        let (Some(pk), Ok(psig)) = (e.worker_sign_pub, <[u8; 64]>::try_from(e.receipt.projection_sig.as_ref())) else { continue };
+        let Ok(p) = crypto::open_projection(&pk, &e.receipt.projection, &psig) else { continue };
+        if p.receipt_ref.0[..] != want[..] {
+            continue;
+        }
+        let sig = <[u8; 64]>::try_from(e.receipt.donor_sig.as_ref()).map_err(|_| "bad receipt signature")?;
+        crypto::open_receipt(&pk, &e.receipt.receipt, &sig).map_err(|_| "the receipt signature does not verify")?;
+        if p.receipt_sha256.0 != crypto::sha256(&e.receipt.receipt) {
+            return Err("the public receipt does not commit to the signed receipt".into());
+        }
+        let key_log = match node.keylog.as_ref().filter(|l| l.active()) {
+            Some(l) if l.device_by_key(&pk).as_deref() == Some(e.worker_device.as_str()) => "logged",
+            Some(_) => return Err("the donor key is not in the public key log".into()),
+            None => "not checked (no key log pinned)",
+        };
+        return Ok(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": p.donor, "model": p.model,
+            "cost_uusd": p.cost_uusd, "day": p.day, "worker_device": e.worker_device, "key_log": key_log}));
+    }
+    Err("no receipt with this reference among this device's recent requests".into())
 }
 
 impl Evidence {
@@ -415,6 +445,7 @@ impl Driver {
             task: self.task_text.clone(),
             attempt: u32::from(a.attempt),
             worker_device: a.worker.worker_device.clone(),
+            worker_sign_pub: a.worker.sign_pub,
             receipt,
             checkpoints: std::mem::take(&mut self.checkpoints),
             response: std::mem::take(&mut self.resp),

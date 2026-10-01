@@ -52,7 +52,7 @@ pub fn check(token: &str) -> Option<String> {
     runs().get(&<[u8; 32]>::from(Sha256::digest(token.as_bytes()))).cloned()
 }
 
-fn key_ok(presented: Option<&str>) -> bool {
+pub fn key_ok(presented: Option<&str>) -> bool {
     let key = *RUN_KEY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match (key, presented.and_then(crate::util::b64d32)) {
         (Some(k), Some(p)) => ct_eq(&k, &p),
@@ -165,6 +165,31 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
         let r = tokio::task::spawn_blocking(move || spec.run(&prog, &args)).await.map_err(|_| internal("sandbox launcher failed"))?;
         drop(hold);
         r.map_err(|e| usage(format!("the sandbox could not be set up, nothing ran: {e}")))
+    })
+}
+
+/// `GET path` on the local gateway with the run key (CLI-only endpoints). Returns (status, body).
+pub fn local_get(state_dir: &Path, gateway_url: &str, path: &str) -> Result<(u16, Vec<u8>)> {
+    use http_body_util::BodyExt as _;
+    let port: u16 = gateway_url.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).ok_or_else(|| internal("gateway URL without a port"))?;
+    let key = std::fs::read_to_string(state_dir.join(RUN_KEY_FILE)).map_err(|_| internal("the Moochy app is not running (start it with `moochy up`)"))?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
+    rt.block_on(async {
+        let tcp = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .map_err(|_| internal("gateway timeout"))?
+            .map_err(|_| internal("the Moochy app is not running (start it with `moochy up`)"))?;
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp)).await.map_err(|e| internal(format!("gateway: {e}")))?;
+        tokio::spawn(conn);
+        let req = hyper::Request::get(path)
+            .header(hyper::header::HOST, format!("127.0.0.1:{port}"))
+            .header(RUN_KEY_HEADER, key.trim())
+            .body(http_body_util::Empty::<Bytes>::new())
+            .map_err(|e| internal(format!("request: {e}")))?;
+        let resp = tokio::time::timeout(Duration::from_secs(10), send.send_request(req)).await.map_err(|_| internal("gateway timeout"))?.map_err(|e| internal(format!("gateway: {e}")))?;
+        let status = resp.status().as_u16();
+        let body = http_body_util::Limited::new(resp.into_body(), 1 << 20).collect().await.map_err(|_| internal("gateway answer too large"))?.to_bytes();
+        Ok((status, body.to_vec()))
     })
 }
 

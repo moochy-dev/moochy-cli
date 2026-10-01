@@ -53,6 +53,8 @@ COMMANDS:
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
   report <task> [--reason TEXT]   Save signed evidence about a bad response
+  verify <receipt_ref>            Check a public receipt of your request: donor signature,
+                                  link to the signed receipt, public key log
   doctor                          Check the keystore, connection, clock, provider keys and socket
   update --from-file BINARY       Install a signed release (unsigned files are refused)
   pending                         Requests waiting for your signature (maintainers)
@@ -223,6 +225,7 @@ fn run() -> Result<()> {
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
+        ["verify", r] => verify(&home, r),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
         ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
@@ -354,6 +357,22 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
     let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
     let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
     std::process::exit(code);
+}
+
+/// `moochy verify <receipt_ref>` (07 §2): a public receipt of a request this device made.
+fn verify(home: &Home, receipt_ref: &str) -> Result<()> {
+    if receipt_ref.is_empty() || receipt_ref.len() > 64 || !receipt_ref.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+        return Err(usage("verify <receipt_ref> (e.g. r_… from the receipt page)"));
+    }
+    let ready: serde_json::Value = std::fs::read(home.node_json()).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| usage("the Moochy app is not running (start it with `moochy up`)"))?;
+    let url = ready.get("gateway_url").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let (status, body) = crate::run::local_get(&home.state_dir(), url, &format!("/moochy/verify/{receipt_ref}"))?;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    emit(&v);
+    match status {
+        200 => Ok(()),
+        _ => Err(auth(format!("not verified: {}", clean(v.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error"))))),
+    }
 }
 
 fn env(home: &Home, o: &Opts) -> Result<()> {
