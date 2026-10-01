@@ -188,7 +188,7 @@ fn encoding() -> Value {
     for s in ulid_invalid {
         assert!(s.parse::<TaskId>().is_err(), "{s}");
     }
-    let ids_valid = [GW, "u_01K6A0000000000000000000U1", REPO, "p_01K6A0000000000000000000P1"];
+    let ids_valid = [GW, "u_01K6A0000000000000000000V1", REPO, "p_01K6A0000000000000000000P1"];
     let ids_invalid = [
         ("d_", "01K6A0000000000000000000G1"),
         ("d_", "D_01K6A0000000000000000000G1"),
@@ -823,9 +823,9 @@ fn money_vectors() -> Value {
 // ------------------------------------------------------------------ usernames
 
 fn usernames() -> Value {
-    let existing = ["alice", "bob-smith", "x9"];
-    let tombstones = ["old-name", "carol"];
-    let inputs: [(&str, &str); 37] = [
+    let taken = ["alice", "bob-smith", "x9"];
+    let tombstoned = ["old-name", "carol"];
+    let inputs: [(&str, &str); 40] = [
         ("valid", "abc"),
         ("valid", "alice2"),
         ("valid", "a-b"),
@@ -846,6 +846,9 @@ fn usernames() -> Value {
         ("reserved", "moochy"),
         ("invalid (too short, also reserved)", "v1"),
         ("reserved", "anonymous"),
+        ("reserved", "logout"),
+        ("reserved", "Events"),
+        ("invalid (too short, also reserved)", "u"),
         ("invalid", "ab"),
         ("invalid", "x9"),
         ("invalid", "abcdefghijklmnopqrstuvwxyz0123456"),
@@ -867,21 +870,16 @@ fn usernames() -> Value {
     let cases: Vec<Value> = inputs
         .iter()
         .map(|(kind, s)| {
-            let v = username::verdict(s, |h| existing.contains(&h), |h| tombstones.contains(&h));
-            json!({"kind": kind, "input": s, "input_hex": hex(s.as_bytes()), "canonical": username::canonical(s).ok(), "verdict": v.as_str()})
+            let v = username::verdict(s, |h| taken.contains(&h), |h| tombstoned.contains(&h));
+            json!({"note": kind, "input": s, "canonical": username::canonical(s).ok(), "verdict": v.as_str()})
         })
         .collect();
-    let display: Vec<Value> = ["plain", "a\u{1b}[2Jb", "rtl\u{202E}txt", "zero\u{200B}width", "tab\tnl\n", "café ✓"]
-        .iter()
-        .map(|s| json!({"input": s, "display": username::display_safe(s)}))
-        .collect();
     json!({
-        "_schema": "Usernames (CONTRACT §11). canonical(input): reject any non-ASCII byte (confusables, zero-width, bidi) → ASCII-lowercase → ^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$ with no '--' → not in reserved. verdict(input) = first of: invalid | reserved | taken (canonical ∈ existing) | tombstoned (canonical ∈ tombstones) | ok. cases[]: kind is descriptive only; check canonical (null when refused before lookup) and verdict. display[]: Rust display_safe escapes C0/C1 controls, bidi controls, zero-width and other invisible format characters as \\u{XXXX}.",
+        "_schema": "Usernames (CONTRACT §11). Format: {cases:[{input, verdict, canonical, note}], taken, tombstoned, reserved}. reserved is THE reserved-handle list (CONTRACT R7): Rust and Go embed a copy and test it against this array. canonical(input): reject any non-ASCII byte (confusables, zero-width, bidi) → ASCII-lowercase → ^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$ with no '--' → not in reserved. verdict(input) = first of: invalid | reserved | taken (canonical ∈ taken) | tombstoned (canonical ∈ tombstoned) | ok. canonical is null when refused before the lookups; note is descriptive only.",
         "reserved": username::RESERVED,
-        "existing": existing,
-        "tombstones": tombstones,
+        "taken": taken,
+        "tombstoned": tombstoned,
         "cases": cases,
-        "display": display,
     })
 }
 

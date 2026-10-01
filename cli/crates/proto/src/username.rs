@@ -8,11 +8,13 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-/// First path segments of web/API routes, then staff/system words (CONTRACT §11).
+/// CONTRACT §11 reserved handles: first path segments of web/API routes, then staff/system words.
+/// Defined once in `spec/vectors/usernames.json` (`reserved`, CONTRACT R7); `tests/vectors.rs`
+/// fails if this copy and the file ever differ.
 pub const RESERVED: &[&str] = &[
-    "api", "dev", "p", "r", "log", "open", "connect", "explore", "station", "console", "device", "devices", "claim",
-    "leaderboard", "auth", "admin", "static", "mcp", "v1", "moochy", "root", "support", "security", "staff",
-    "official", "system", "null", "undefined", "anonymous", "relay", "node", "bot",
+    "api", "dev", "p", "r", "u", "log", "logout", "events", "open", "connect", "explore", "station", "console",
+    "device", "devices", "claim", "leaderboard", "auth", "admin", "static", "mcp", "v1", "moochy", "root", "support",
+    "security", "staff", "official", "system", "null", "undefined", "anonymous", "relay", "node", "bot",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +111,7 @@ mod tests {
             assert_eq!(canonical(bad), Err(Verdict::Invalid), "{bad:?}");
         }
         assert_eq!(canonical("ADMIN"), Err(Verdict::Reserved));
+        assert_eq!((canonical("logout"), canonical("Events")), (Err(Verdict::Reserved), Err(Verdict::Reserved)));
         let v = |s| verdict(s, |h| h == "alice", |h| h == "old-name");
         assert_eq!((v("ALICE"), v("Old-Name"), v("bob")), (Verdict::Taken, Verdict::Tombstoned, Verdict::Ok));
         assert_eq!(display_safe("ok"), "ok");
