@@ -119,8 +119,8 @@ impl LogMirror {
             Err(e) => return Err(format!("update: {e}")),
         };
         self.persist(&recs, note).map_err(|e| format!("persist: {e}"))?;
-        for a in alerts {
-            log("error", "key log alert", &json!({"alert": clean(&format!("{a:?}"))}));
+        for a in &alerts {
+            log("error", "public key log alert", &alert_fields(a));
         }
         Ok(())
     }
@@ -165,6 +165,19 @@ impl LogMirror {
                 _ = stop.changed() => return,
             }
         }
+    }
+}
+
+/// Stable machine fields for a mirror alert (codes, wire kind names), never Rust `Debug` text.
+fn alert_fields(a: &moochy_keylog::mirror::Alert) -> serde_json::Value {
+    use moochy_keylog::mirror::Alert;
+    match a {
+        Alert::Invalid { idx } => json!({"alert": "invalid_record", "idx": idx}),
+        Alert::Rejected { idx, kind, code } => json!({"alert": "rejected", "idx": idx, "kind": kind.name(), "code": code.as_str()}),
+        Alert::UnknownKey { idx, device_id } => json!({"alert": "unknown_key", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id)}),
+        Alert::KeyHijack { idx, device_id, pseudonym } => json!({"alert": "key_hijack", "idx": idx, "device_id": clean(device_id), "pseudonym": clean(pseudonym)}),
+        Alert::NotSignedByMe { idx, kind, repo_id, signer } => json!({"alert": "unsigned", "idx": idx, "kind": kind.name(), "repo_id": clean(repo_id), "signer": clean(signer)}),
+        Alert::RepoClaimedByOther { idx, repo_id, owner } => json!({"alert": "repo_claimed_by_other", "idx": idx, "repo_id": clean(repo_id), "owner": clean(owner)}),
     }
 }
 
