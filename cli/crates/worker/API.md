@@ -12,7 +12,7 @@ out. No dependency on `moochy-proto`: the node does sealing, signing and the gRP
 | 4. local reservation | `Store::reserve(&Reservation{..})` → `Cap(_)` = NACK `local_cap` (retryable). In memory + written, **no fsync** (CONTRACT §13) |
 | 6. call the provider | `Adapter::send(dialect, prepared.body, &prepared.headers)` → `Response` once headers arrive (= `task.started`), or `Failure` (`failure.nack()`; `failure.body` = native error to seal) |
 | 7. stream | loop `response.next()` → forward each `Bytes` **as-is, immediately** (seal + send per chunk); `parser.feed(&chunk, sink)?.tool_ends > 0` → sign a progress checkpoint after this chunk |
-| 8. end | `parser.finish()` → `Outcome{usage, model, id, complete, provider_error, forbidden, tail}`; build/sign the receipt → `Store::put_receipt(key, receipt_bytes, cost_uusd, now)` (settles + **fsync**) → `task.end` |
+| 8. end | `parser.finish()` → `Outcome{usage, model, id, complete, provider_error, forbidden, malformed, tail}`; build/sign the receipt → `Store::put_receipt(key, receipt_bytes, cost_uusd, now)` (settles + **fsync**) → `task.end` |
 | 9. cancel / link lost | drop the `Response` (h2 `RST_STREAM` / h1 socket closed: the provider stops at once), then `finish()` → `usage.estimated` if final usage never came |
 | NACK before the provider call | `Store::release(key)` |
 | `receipt.ack` | `Store::ack(key, now)`; replay with `unacked()`, `since(ms)` (`receipt.replay_since`) |
@@ -57,7 +57,8 @@ Client-supplied `provider`, `usage`, `models`, `route`, `plugins` are refused.
 
 ### `stream`
 - `StreamParser::new(dialect, stream)`, `feed(&chunk, &mut sink) -> Result<Chunk{tool_ends, events}, StreamError>`, `finish() -> Outcome`.
-- `sink(Span{start,end}, Event)`: spans are contiguous byte ranges of whole SSE events (comments included), so the Gateway can forward byte-identical output and hold exactly the tool-call events. Events: `Other`, `ToolStart{index,id,name}`, `ToolArgs{index,json}` (a `json::Val` string, decode with `as_str`), `ToolEnd{index}`, `Forbidden{block_type}`, `Error`, `Stop`. One event may yield several items with the same span.
+- `sink(Span{start,end}, Event)`: spans are contiguous byte ranges of whole SSE events (comments included), so the Gateway can forward byte-identical output and hold exactly the tool-call events. Events: `Other`, `ToolStart{index,id,name}`, `ToolArgs{index,json}` (a `json::Val` string, decode with `as_str`), `ToolEnd{index}`, `Forbidden{block_type}`, `Error`, `Stop`, `Invalid`. One event may yield several items with the same span.
+- **Fail closed (Gateway):** on `Invalid` (unparsable/duplicate-key JSON, a stray `\r` or BOM, tool input in `content_block_start` or `message_start`, a delta for a closed/unknown tool block, a re-started index, an OpenAI choice ≠ 0, an unindexed/reopened tool call, a second name fragment, legacy `function_call`) do not forward the event and fail the task; `Outcome.malformed` is set and usage becomes estimated. Real provider streams never trigger it (fixtures, CRLF variants tested).
 - Usage mapping (05 §3): Anthropic `message_start` + cumulative `message_delta`, `cache_creation` TTL split (else all 5m), `usage.iterations` summed when present; OpenAI `prompt − cached − cache_write`, DeepSeek `prompt_cache_miss/hit_tokens`, OpenRouter `usage.cost` → µ$ by exact decimal ceil (`decimal_to_uusd_ceil`). Any unparsable/duplicate-key event ⇒ `estimated`.
 - Non-streamed responses: `stream = false`, feed the body, `finish()`. Tool calls of a non-streamed body: `inspect::response_tool_calls`.
 
@@ -73,7 +74,8 @@ reservation counters. Torn tails are truncated on open (tested at every byte off
 everything else is written without fsync (survives a process crash; after a power loss a
 reservation whose settlement was lost is settled at its amount after 24 h). Device
 counters use UTC calendar months; pledge periods are caller-supplied ids (anchored per
-pledge, 05 §9); open reservations always count.
+pledge, 05 §9); open reservations always count. Bit rot in the middle of the log truncates
+everything after it (lost unacked receipts settle pessimistically at the Relay).
 
 ### `json`
 Strict tape parser (`parse`, `OwnedDoc`), views (`Val`), minified `write`, `write_patched`.
@@ -97,7 +99,7 @@ Reusable by the node for every security/money JSON parse (route header, receipts
 
 | What | Result |
 |---|---|
-| SSE parse, smallest realistic events, one event per chunk | Anthropic 458–490 MB/s (≈300 ns/chunk), OpenAI 344 MB/s (≈565 ns/chunk) |
+| SSE parse, smallest realistic events, one event per chunk | Anthropic 423–490 MB/s (300–345 ns/chunk), OpenAI 312–346 MB/s (565–625 ns/chunk) |
 | h2+TLS loopback, 50k events: read + parse | ≈1 µs/event incl. the fake's TLS |
 | warm h2 request → response headers (loopback) | ≈200 µs |
 | cancel (drop) → provider sees `RST_STREAM` | 20–30 µs |
