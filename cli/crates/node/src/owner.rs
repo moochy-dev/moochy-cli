@@ -206,6 +206,8 @@ fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
         say("the server refused an owner key without proof: this server does not offer the email confirmation yet (add a passkey on moochy.dev first, then run `moochy owner init` again so the passkey approves it)")
     } else if e.msg.contains("email_changed_recently") {
         say("your email address changed less than 72 hours ago: for your safety the server binds a first owner key by email only after that (or approve it with a passkey you already have)")
+    } else if e.msg.contains(": refused") {
+        say("you (or someone signed in to your account) refused this owner key on moochy.dev; if that was not you, secure your account")
     } else if e.msg.contains("skew") {
         say("the confirmation came too late (more than 10 minutes): run `moochy owner init` again and confirm the new email")
     } else if e.msg.contains("did not acknowledge") {
@@ -727,6 +729,7 @@ mod tests {
         assert!(r("owner_key_proof").contains("without proof") && r("owner_key_proof").contains("nothing was registered"));
         assert!(r("email_changed_recently").contains("72 hours"));
         assert!(r("skew").contains("too late"));
+        assert!(r("refused").contains("refused this owner key"));
         assert!(proof_refusal(crate::util::net("relay did not acknowledge the entry")).msg.contains("within 10 minutes"));
         assert_eq!(r("bad_sig"), "relay refused the entry: bad_sig");
         assert_eq!(proof_name(OwnerKeyProof::Email), "email");
