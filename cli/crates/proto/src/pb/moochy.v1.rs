@@ -612,6 +612,9 @@ pub struct Assign {
     /// catalog version in effect at attempt start
     #[prost(uint64, tag = "13")]
     pub catalog_version: u64,
+    /// the requesting Gateway device (verified by the Worker against the key log); lets the donor give each member its own provider pseudonym
+    #[prost(string, tag = "14")]
+    pub gateway_device: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeviceStartRequest {
