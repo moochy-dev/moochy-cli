@@ -348,3 +348,93 @@ fn money_vectors_responses_usage() {
         }
     }
 }
+
+/// One streamed `response.completed` carrying `usage`.
+fn completed_with(usage: &str) -> String {
+    format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r\",\"object\":\"response\",\"output\":[]}}}}\n\n\
+         event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r\",\"object\":\"response\",\"status\":\"completed\",\"usage\":{usage}}}}}\n\n"
+    )
+}
+
+/// mo-sec A251 (§14i): the Responses gate cases, on the same `StreamParser` the worker and the
+/// gateway run and on the canonical re-emitter (whose `Err` the gateway turns into the native
+/// `error` event).
+#[test]
+fn a251_responses_gate_cases() {
+    // 1. Final `done` arguments differing from the streamed ones: the attempt fails.
+    let args = r#"{\"command\":[\"cargo\",\"test\"],\"workdir\":\"/repo\"}"#;
+    for (name, s) in [
+        ("function_call_arguments.done", tamper(&format!(r#""output_index":2,"arguments":"{args}""#), r#""output_index":2,"arguments":"{\"command\":[\"rm\",\"-rf\",\"/\"]}""#)),
+        ("output_item.done", tamper(&format!(r#""status":"completed","arguments":"{args}""#), r#""status":"completed","arguments":"{\"command\":[\"rm\",\"-rf\",\"/\"]}""#)),
+    ] {
+        let (seen, o) = parse(&s, 64);
+        assert!(seen.invalid >= 1 && o.malformed, "{name}: a done copy unlike the streamed bytes must fail the attempt");
+    }
+
+    // 2. A hosted-tool item in the output fails closed: streamed (added or done) and in a body.
+    for (name, from, to) in [
+        ("added", r#""item":{"id":"rs_02","type":"reasoning","summary":[]}"#, r#""item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}"#),
+        ("done", r#""output_index":1,"item":{"id":"msg_02","type":"message","status":"completed""#, r#""output_index":1,"item":{"id":"ci_1","type":"code_interpreter_call","status":"completed""#),
+    ] {
+        let s = tamper(from, to);
+        let (seen, o) = parse(&s, 64);
+        assert!((seen.forbidden >= 1 && o.forbidden) || seen.invalid >= 1, "{name}: hosted item not flagged: {seen:?}");
+        assert_eq!(canon(&s).unwrap_err().0, "unknown event or block type", "{name}");
+    }
+    let body = BODY.replacen(r#""type":"reasoning""#, r#""type":"file_search_call""#, 1);
+    let mut p = StreamParser::new(R, false);
+    p.feed(body.as_bytes(), &mut |_, _| {}).unwrap();
+    assert!(p.finish().forbidden, "hosted item in a body");
+    assert!(reemit::reemit(R, false, body.as_bytes()).is_err());
+
+    // 3. Pre-filled output: refused in a client request, invalid in `response.created`.
+    let e = req(Provider::OpenAi, &with("output", r#"[{"type":"function_call","call_id":"c","name":"shell","arguments":"{}"}]"#)).unwrap_err();
+    assert_eq!((e.code, e.path.as_str()), (RejectCode::Firewall, "output"), "{e}");
+    let s = tamper(r#""output":[],"parallel_tool_calls""#, r#""output":[{"type":"function_call","call_id":"c","name":"shell","arguments":"{}"}],"parallel_tool_calls""#);
+    let (seen, o) = parse(&s, 64);
+    assert!(seen.invalid >= 1 && o.malformed, "pre-filled response.created.output");
+
+    // 4. Negative and absurd usage counts: an explicit refusal by the re-emitter (the gateway
+    // sends the native error event), and the parser never wraps: the counts it cannot trust are
+    // absent, so the receipt is estimated and settles at the reservation.
+    for (usage, why) in [
+        (r#"{"input_tokens":-5,"output_tokens":10}"#, "expected a non-negative integer"),
+        (r#"{"input_tokens":10,"output_tokens":-1}"#, "expected a non-negative integer"),
+        (r#"{"input_tokens":10,"output_tokens":1,"total_tokens":-20}"#, "expected a non-negative integer"),
+        (r#"{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":-3}}"#, "expected a non-negative integer"),
+        (r#"{"input_tokens":1.5,"output_tokens":1}"#, "expected a non-negative integer"),
+        (r#"{"input_tokens":1e30,"output_tokens":1}"#, "expected a non-negative integer"),
+        (r#"{"input_tokens":"10","output_tokens":1}"#, "field has the wrong type"),
+        (r#"{"input_tokens":18446744073709551616,"output_tokens":1}"#, "event is not strict JSON"),
+        (r#"{"input_tokens":-9223372036854775808,"output_tokens":1}"#, "expected a non-negative integer"),
+    ] {
+        assert_eq!(canon(&completed_with(usage)).unwrap_err().0, why, "{usage}");
+        let (_, o) = parse(&completed_with(usage), 64);
+        assert!(o.usage.estimated, "{usage}: untrusted counts must give an estimated receipt");
+        assert!(o.usage.input <= 10 && o.usage.output <= 10 && o.usage.cache_read <= 10, "{usage}: wrapped: {:?}", o.usage);
+    }
+    // Absurd but in range: forwarded, no wrap (cached > input is estimated; total < input ignored).
+    for (usage, input, output, cached, estimated) in [
+        (r#"{"input_tokens":9223372036854775807,"output_tokens":9223372036854775807,"total_tokens":0}"#, i64::MAX as u64, i64::MAX as u64, 0, false),
+        (r#"{"input_tokens":5,"output_tokens":1,"input_tokens_details":{"cached_tokens":9223372036854775807}}"#, 5, 1, i64::MAX as u64, true),
+        (r#"{"input_tokens":9223372036854775807,"output_tokens":0,"total_tokens":3}"#, i64::MAX as u64, 0, 0, false),
+    ] {
+        canon(&completed_with(usage)).unwrap_or_else(|e| panic!("{usage}: {e}"));
+        let (_, o) = parse(&completed_with(usage), 64);
+        assert_eq!((o.usage.input, o.usage.output, o.usage.cache_read, o.usage.estimated), (input, output, cached, estimated), "{usage}");
+    }
+
+    // The same rule for chat completions: a present but invalid count is never read as 0.
+    let chat = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":-4}}}\n\ndata: [DONE]\n\n";
+    let mut p = StreamParser::new(Dialect::OpenAiChat, true);
+    p.feed(chat.as_bytes(), &mut |_, _| {}).unwrap();
+    let o = p.finish();
+    assert!(o.usage.estimated && o.usage.input <= 10, "chat: {:?}", o.usage);
+
+    // 5. Unknown event type: the parser fails the attempt and the re-emitter says why.
+    let s = tamper("event: response.in_progress\ndata: {\"type\":\"response.in_progress\"", "event: response.surprise\ndata: {\"type\":\"response.surprise\"");
+    let (seen, o) = parse(&s, 64);
+    assert!(seen.invalid >= 1 && o.malformed);
+    assert_eq!(canon(&s).unwrap_err().0, "unknown event or block type");
+}

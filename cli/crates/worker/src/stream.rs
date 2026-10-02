@@ -622,6 +622,11 @@ fn timings_usage((prompt, cache, predicted): (u64, Option<u64>, u64)) -> Usage {
     }
 }
 
+/// The member is present, not null, and not a non-negative integer.
+fn bad_count(v: Option<Val<'_>>, k: &str) -> bool {
+    v.and_then(|v| v.get(k)).is_some_and(|x| !x.is_null() && x.as_u64().is_none())
+}
+
 fn oa_usage(st: &mut State, u: Val<'_>) {
     let g = |v: Option<Val<'_>>, k: &str| v.and_then(|v| v.get(k)).and_then(Val::as_u64);
     let prompt = g(Some(u), "prompt_tokens");
@@ -631,7 +636,10 @@ fn oa_usage(st: &mut State, u: Val<'_>) {
     let cached = g(details, "cached_tokens").unwrap_or(0);
     let write = g(details, "cache_write_tokens").unwrap_or(0);
     let (hit, miss) = (g(Some(u), "prompt_cache_hit_tokens"), g(Some(u), "prompt_cache_miss_tokens"));
-    let mut est = prompt.is_none() || completion.is_none();
+    let mut est = prompt.is_none()
+        || completion.is_none()
+        || ["total_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"].iter().any(|k| bad_count(Some(u), k))
+        || ["cached_tokens", "cache_write_tokens"].iter().any(|k| bad_count(details, k));
     let prompt = prompt.unwrap_or(0);
     let (input, cache_read, cache_write) = if hit.is_some() || miss.is_some() {
         // DeepSeek: cache-miss tokens are the uncached input.
@@ -838,7 +846,13 @@ fn rs_usage(st: &mut State, u: Val<'_>) {
     let output = g(Some(u), "output_tokens");
     let total = g(Some(u), "total_tokens");
     let cached = g(u.get("input_tokens_details"), "cached_tokens").unwrap_or(0);
-    let mut est = input.is_none() || output.is_none();
+    // A count that is present but not a non-negative integer (negative, fractional, a string)
+    // is untrusted: estimated, never read as 0 (A251).
+    let mut est = input.is_none()
+        || output.is_none()
+        || bad_count(Some(u), "total_tokens")
+        || bad_count(u.get("input_tokens_details"), "cached_tokens")
+        || bad_count(u.get("output_tokens_details"), "reasoning_tokens");
     let input = input.unwrap_or(0);
     let uncached = input.checked_sub(cached).unwrap_or_else(|| {
         est = true;
