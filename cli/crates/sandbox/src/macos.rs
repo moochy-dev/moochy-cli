@@ -333,10 +333,16 @@ where
             let code = if crate::sys_macos::isolate_fds(child_fd).is_err() {
                 71
             } else {
-                match crate::sys_macos::apply_profile(VALIDATOR_PROFILE) {
-                    Ok(()) => run(crate::sys_macos::CHANNEL_FD),
-                    Err(_) => 71,
-                }
+                // A zygote already caged by ZYGOTE_PROFILE cannot stack a second profile
+                // (macOS refuses nested sandbox_init): the child inherits that cage and
+                // loses fork + CPU with rlimits instead (A219).
+                let caged = if ZYGOTE_CAGED.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::sys_macos::limit_validator_child().is_ok()
+                } else {
+                    crate::sys_macos::apply_profile(VALIDATOR_PROFILE).is_ok()
+                        && crate::sys_macos::limit_validator_child().is_ok()
+                };
+                if caged { run(crate::sys_macos::CHANNEL_FD) } else { 71 }
             };
             crate::sys_macos::exit_immediately(code);
         }
@@ -344,6 +350,20 @@ where
 }
 
 const VALIDATOR_PROFILE: &str = "(version 1)\n(deny default)\n(deny process-exec*)\n(deny process-fork)\n(deny file*)\n(deny network*)\n";
+
+/// The validator zygote's cage (macOS): the validator profile, except that it may fork its
+/// single-use children (each then drops fork with rlimits), make their socketpairs, and
+/// open `/dev/null` (each child points its stdio there before running).
+const ZYGOTE_PROFILE: &str = "(version 1)\n(deny default)\n(allow process-fork)\n(allow system-socket (socket-domain AF_UNIX))\n(deny process-exec*)\n(deny file*)\n(deny network*)\n(allow file-read* file-write* (literal \"/dev/null\"))\n";
+
+static ZYGOTE_CAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Cage the validator zygote (§15.2b, macOS): no files, no network, no exec, fork allowed.
+pub fn lockdown_zygote() -> Result<(), Error> {
+    crate::sys_macos::apply_profile(ZYGOTE_PROFILE).map_err(|e| setup("sandbox_init (zygote)", e))?;
+    ZYGOTE_CAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
 
 /// SBPL string literal with escaping of `"` and `\`.
 fn sbpl_quote(s: &str) -> String {

@@ -382,6 +382,21 @@ pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
     }
 }
 
+/// Cage the process that forks validator children (the "zygote", CONTRACT §15.2b). Linux:
+/// the donor lockdown with `policy`. macOS: one Seatbelt profile with no files, network or
+/// exec but fork allowed, because macOS cannot stack a stricter profile in each child (A219).
+pub fn lockdown_zygote(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        donor::lockdown_self(policy)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = policy;
+        macos::lockdown_zygote().map(|()| LockdownReport { landlock_fs: true, landlock_net: Some(true), no_new_privs: true, all_threads: true, ..LockdownReport::default() })
+    }
+}
+
 /// A single-use validator child (CONTRACT §15.2b): no filesystem, no network, no
 /// keys, a seccomp allowlist (Linux) / `(deny default)` Seatbelt (macOS) and
 /// tight rlimits. The only place a stranger's bytes are parsed.

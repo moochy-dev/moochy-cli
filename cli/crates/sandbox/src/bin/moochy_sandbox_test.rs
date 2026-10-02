@@ -56,6 +56,8 @@ fn main() -> ExitCode {
         "donor" => donor_selftest_macos(rest),
         #[cfg(target_os = "macos")]
         "validator" => validator_selftest_macos(rest),
+        #[cfg(target_os = "macos")]
+        "zygote" => zygote_selftest_macos(),
         other => {
             eprintln!("unknown subcommand: {other}");
             ExitCode::from(2)
@@ -705,6 +707,16 @@ fn validator_selftest_macos(a: &[String]) -> ExitCode {
                 let _ = sock.write_all(if r { b"EXEC-ALLOWED" } else { b"EXEC-DENIED" });
                 0
             }
+            "fork" => {
+                // SAFETY (test-only): a bare fork; a child that appears exits at once.
+                let pid = unsafe { libc::fork() };
+                if pid == 0 {
+                    // SAFETY: immediate exit in the forked child.
+                    unsafe { libc::_exit(0) };
+                }
+                let _ = sock.write_all(if pid > 0 { b"FORK-ALLOWED" } else { b"FORK-DENIED" });
+                0
+            }
             _ => {
                 let mut hdr = [0u8; 4];
                 if sock.read_exact(&mut hdr).is_err() {
@@ -807,4 +819,21 @@ fn probe_exec_sh(a: &[String]) -> ExitCode {
         Ok(s) if s.success() => ok(),
         _ => no(),
     }
+}
+
+/// macOS validator zygote (A219): cage this process like the node's zygote, then fork several
+/// single-use validators from it. `echo` must work; open/socket/exec/fork must be denied.
+#[cfg(target_os = "macos")]
+fn zygote_selftest_macos() -> ExitCode {
+    let policy = moochy_sandbox::DonorPolicy::new(std::path::PathBuf::from("/dev/null"), 0);
+    if let Err(e) = moochy_sandbox::lockdown_zygote(&policy) {
+        println!("zygote-lockdown-fail {e}");
+        return ExitCode::from(71);
+    }
+    let mut all = true;
+    for mode in ["echo", "open", "socket", "exec", "fork", "echo"] {
+        let ok = validator_selftest_macos(&[mode.to_owned()]) == ok();
+        all &= ok;
+    }
+    if all { ok() } else { no() }
 }
