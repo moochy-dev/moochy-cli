@@ -21,6 +21,8 @@ pub const LABEL_RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
 /// Device-signed requests (spec/KEYLOG.md §2a): authenticate a request, never a log entry.
 pub const LABEL_KEY_REVOKE: &[u8] = b"moochy/v1/key-revoke";
 pub const LABEL_KEY_ROTATE: &[u8] = b"moochy/v1/key-rotate";
+/// Owner-key request for `POST /api/lookup` (spec/KEYLOG.md §3), never a log signature.
+pub const LABEL_LOOKUP: &[u8] = b"moochy/v1/lookup";
 /// Label of donor-signed projections (CONTRACT §2).
 pub const LABEL_PROJECTION: &[u8] = b"moochy/v1/projection";
 
@@ -305,6 +307,24 @@ pub fn key_body(
         suite.as_bytes(),
         roles.as_bytes(),
         repo_scope.as_bytes(),
+    ])
+}
+
+/// What the owner CLI signs with its Ed25519 owner key for `POST /api/lookup` (A218):
+/// `lp("moochy/v1/lookup", handle, repo_slug, owner_pseudonym, decimal(issued_at_ms))`.
+#[must_use]
+pub fn lookup_request_message(
+    handle: &str,
+    repo_slug: &str,
+    owner_pseudonym: &str,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    lp(&[
+        LABEL_LOOKUP,
+        handle.as_bytes(),
+        repo_slug.as_bytes(),
+        owner_pseudonym.as_bytes(),
+        issued_at_ms.to_string().as_bytes(),
     ])
 }
 
