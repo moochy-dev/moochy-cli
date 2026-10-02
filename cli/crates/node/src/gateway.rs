@@ -262,12 +262,16 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     // Drop what a pooled donor refuses but the client can do without (Claude Code `safeguards`,
     // unknown betas, extra headers) before anything else; the client is told (x-moochy-note).
     let hdr: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let pool = moochy_worker::firewall::pool_compatible(dialect.worker(), &body, &hdr).map_err(|r| Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)")))?;
+    // The body is re-serialized only when it can hold a stripped member (CONTRACT §13: no extra
+    // pass over a large body otherwise); headers are always filtered.
+    let strip_body = body.windows(12).any(|w| w == b"\"safeguards\"");
+    let pool = moochy_worker::firewall::pool_compatible(dialect.worker(), if strip_body { &body } else { b"{}" }, &hdr)
+        .map_err(|r| Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)")))?;
     drop(hdr);
     if !pool.stripped.is_empty() {
         crate::util::log("info", "removed what donors refuse", &json!({"stripped": pool.stripped}));
     }
-    let (mut body, headers, stripped) = (Bytes::from(pool.body), pool.headers, pool.stripped);
+    let (mut body, headers, stripped) = (if strip_body { Bytes::from(pool.body) } else { body }, pool.headers, pool.stripped);
     // Strict tape parse (no tree allocation): this is the per-request hot path (CONTRACT §13).
     let mut tape = Vec::new();
     let (inject_max, auto_cache) = {

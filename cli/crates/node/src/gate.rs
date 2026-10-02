@@ -59,6 +59,8 @@ pub struct Gate {
     warning: Option<&'static str>,
     /// Highest Anthropic content-block index seen (the warning block goes after it).
     max_index: Option<u32>,
+    /// Reused parse tape for the per-event text scan (no per-chunk allocation).
+    tape: Vec<moochy_worker::json::Node>,
 }
 
 const MAX_TOOL_INPUT: usize = 4 << 20;
@@ -90,12 +92,14 @@ impl Gate {
             scanner: TextScanner::new(),
             warning: None,
             max_index: None,
+            tape: Vec::new(),
         }
     }
 
     /// Feed one streamed event's text to the tripwire and track block indices.
-    fn scan_event(&mut self, ev: &[u8]) {
-        let (text, index) = event_text(self.dialect, ev);
+    fn scan_event(&mut self, start: u64, end: u64) {
+        let ev = self.buf.get(rel(start, self.base)..rel(end, self.base)).unwrap_or_default();
+        let (text, index) = event_text(self.dialect, ev, &mut self.tape);
         if let Some(i) = index {
             self.max_index = Some(self.max_index.map_or(i, |m| m.max(i)));
         }
@@ -190,8 +194,7 @@ impl Gate {
             match k {
                 K::Fail(why) => return Err(why),
                 K::Pass => {
-                    let ev = self.buf.get(rel(start, self.base)..rel(end, self.base)).map(<[u8]>::to_vec).unwrap_or_default();
-                    self.scan_event(&ev);
+                    self.scan_event(start, end);
                     if self.hold.is_none() {
                         emit_to = emit_to.max(end);
                     }
@@ -390,11 +393,20 @@ fn rel(abs: u64, base: u64) -> usize {
 }
 
 /// Text carried by one SSE event, and the content-block index it names (Anthropic).
-fn event_text(d: Dialect, ev: &[u8]) -> (Option<String>, Option<u32>) {
+fn event_text(d: Dialect, ev: &[u8], tape: &mut Vec<moochy_worker::json::Node>) -> (Option<String>, Option<u32>) {
+    // Hot path (CONTRACT §13): only events that can carry text or open a block are parsed.
+    let has = |n: &[u8]| ev.windows(n.len()).any(|w| w == n);
+    let relevant = match d {
+        Dialect::Anthropic => has(b"text_delta") || has(b"content_block_start"),
+        Dialect::OpenAi => has(b"\"content\":\""),
+    };
+    if !relevant {
+        return (None, None);
+    }
     let Some(data) = ev.split(|b| *b == b'\n').find_map(|l| l.strip_prefix(b"data:")) else { return (None, None) };
     let data = data.trim_ascii();
-    let mut tape = Vec::new();
-    let Ok(doc) = moochy_worker::json::parse(data, &mut tape) else { return (None, None) };
+    tape.clear();
+    let Ok(doc) = moochy_worker::json::parse(data, tape) else { return (None, None) };
     let v = doc.root();
     let s = |x: Option<moochy_worker::json::Val<'_>>| x.and_then(moochy_worker::json::Val::as_str).map(std::borrow::Cow::into_owned);
     match d {
@@ -598,6 +610,39 @@ mod tests {
         let w = o.find("[moochy] warning").expect("warning shown");
         assert!(w < o.find("message_stop").unwrap(), "before message_stop");
         assert!(o.contains(r#""index":1"#), "a new block after the last one");
+    }
+
+    /// `cargo test --release -p moochy -- --ignored --nocapture per_event_cost`: what the gate,
+    /// the text tripwire and canonical re-emission add per streamed text event (CONTRACT §13).
+    #[test]
+    #[ignore = "benchmark"]
+    fn per_event_cost() {
+        let ev = sse("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" provider"}}"#);
+        let head = [
+            sse("message_start", r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"x","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#),
+            sse("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+        ];
+        let n = 20_000u32;
+        for canon in [false, true] {
+            let mut g = Gate::new(Dialect::Anthropic, true, REQ, false);
+            let mut c = Canon::new(Dialect::Anthropic, true);
+            for (i, h) in head.iter().enumerate() {
+                g.push(u32::try_from(i).unwrap(), h.as_bytes()).unwrap();
+                while let Some(b) = g.pop(None, false) {
+                    let _ = c.push(&b).unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                g.push(i + 2, ev.as_bytes()).unwrap();
+                while let Some(b) = g.pop(None, false) {
+                    if canon {
+                        let _ = c.push(&b).unwrap();
+                    }
+                }
+            }
+            println!("gate+scan{}: {} ns/event", if canon { "+reemit" } else { "" }, t.elapsed().as_nanos() / u128::from(n));
+        }
     }
 
     #[test]
