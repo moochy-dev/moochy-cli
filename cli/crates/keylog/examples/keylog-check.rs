@@ -40,6 +40,7 @@ struct HttpLink {
     f: Fetcher,
     once: bool,
     anchor: Option<PathBuf>,
+    anchored: bool,
 }
 
 impl LogLink for HttpLink {
@@ -55,6 +56,9 @@ impl LogLink for HttpLink {
     }
     async fn anchor(&mut self) -> Option<Vec<u8>> {
         self.anchor.take().and_then(|p| std::fs::read(p).ok())
+    }
+    fn anchor_configured(&self) -> bool {
+        self.anchored
     }
 }
 
@@ -119,6 +123,7 @@ fn main() -> ExitCode {
         f: Fetcher::new(base, Duration::from_secs(10)).expect("base url"),
         once: true,
         anchor: a.get("anchor").map(PathBuf::from),
+        anchored: a.contains_key("anchor"),
     };
     let mut events: Vec<Event> = Vec::new();
     block_on(m.run(&mut link, |e| events.push(e.clone())));
