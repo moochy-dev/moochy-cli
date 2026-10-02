@@ -129,7 +129,13 @@ fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -
         Err(e) if prev.is_none() && e.msg.contains("owner_key_exists") => {
             let authorizer = match crate::keylog::KeyLog::passkey_authorizer(home, &cfg, &pseudonym) {
                 Some(Some(a)) => a,
-                Some(None) => return Err(usage("this account already has an owner key: if it is a passkey you added on the web, trust it here first (`moochy owner trust ok_…`, from the key-log alert) and run this again; if it is a key of this CLI, use `moochy owner rotate`")),
+                Some(None) => {
+                    return Err(match crate::keylog::KeyLog::active_owner_key(home, &cfg, &pseudonym) {
+                        // A224: a CLI owner key this device did not create (init checked there is none here).
+                        Some(Some(id)) => auth(format!("the public key log already lists an owner key {id} for your account that was not created on this device. If you made it on another machine, sign there; if not, the app here or your account is compromised: revoke {id} on moochy.dev")),
+                        _ => usage("this account already has an owner key: if it is a passkey you added on the web, trust it here first (`moochy owner trust ok_…`, from the key-log alert) and run this again"),
+                    });
+                }
                 None => return Err(usage("this account already has an owner key (the public key log, needed to check its passkeys, is not configured here)")),
             };
             let body = authorized_owner_key_body(&pseudonym, &new.public(), now_ms(), &authorizer);
@@ -140,7 +146,13 @@ fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -
         r => r?,
     };
     store(home, cfg.relay.as_deref(), &new, &pass)?;
-    crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": owner_key_id(&new.public()), "log_index": r.log_index}));
+    let id = owner_key_id(&new.public());
+    if prev.is_none() {
+        // A224: the residual, said plainly. The log took this key on the session's word.
+        eprintln!("Owner key {id} registered at #{} as an owner key of your account, on this device's word only (trust on first use).", r.log_index);
+        eprintln!("Check on moochy.dev that your account lists exactly this owner key; your other devices alert on any owner key they did not see created.");
+    }
+    crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": id, "log_index": r.log_index, "first": prev.is_none()}));
     Ok(new)
 }
 
@@ -176,7 +188,7 @@ struct Ask<'a> {
 }
 
 /// The exact fields one signature will cover, after binding.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Bound {
     kind: Kind,
     repo_id: String,
@@ -184,6 +196,12 @@ struct Bound {
     subject: String,
     /// Claims only: provider and provider repo id from the claim request.
     claim: Option<(String, String)>,
+    /// Who the confirmation names, from a source the app cannot forge (A218): the pseudonym or
+    /// device id typed, or the handle as the server's `Lookup` resolved it. Empty: a handle not
+    /// yet confirmed by the server, which is never signed.
+    name: String,
+    /// The project as typed, then as the server's `Lookup` names it.
+    slug: String,
 }
 
 /// Check one previewed entry against the command and this account; `Err` = never sign it.
@@ -203,20 +221,25 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
             if repo_id != p.repo_id || me != Some(owner) || p.subject != owner {
                 return Err(refuse("a claim naming another account or project"));
             }
-            Ok(Bound { kind, repo_id: repo_id.into(), subject: owner.into(), claim: Some((provider.into(), provider_repo_id.into())) })
+            Ok(Bound { kind, repo_id: repo_id.into(), subject: owner.into(), claim: Some((provider.into(), provider_repo_id.into())), name: owner.into(), slug: ask.repo_slug.into() })
         }
         (Ok(Body::Grant { repo_id, subject, .. }), Some(arg)) => {
             if repo_id != p.repo_id || subject != p.subject {
                 return Err(refuse("a body that differs from what it shows"));
             }
-            // Device ids and pseudonyms are matched exactly; a handle against the label.
-            let ok = arg == subject
-                || (!arg.starts_with("d_") && !arg.starts_with("ps_") && arg.eq_ignore_ascii_case(&p.subject_username))
-                || (ask.device && arg.starts_with("d_") && arg == p.subject_username && ask.device_owner.is_none_or(|o| o == subject) && subject.starts_with("ps_"));
+            // Pseudonyms and device ids are matched exactly. A handle is bound by the server's
+            // `Lookup` (`check_lookup`), never by the app's label: unconfirmed until then.
+            let (ok, name) = if arg.starts_with("ps_") {
+                (arg == subject, arg)
+            } else if arg.starts_with("d_") {
+                (ask.device && arg == p.subject_username && ask.device_owner.is_none_or(|o| o == subject) && subject.starts_with("ps_"), arg)
+            } else {
+                (true, "")
+            };
             if !ok {
-                return Err(refuse(&format!("subject {} ({})", clean(&p.subject_username), clean(subject))));
+                return Err(refuse(&format!("subject {}", clean(subject))));
             }
-            Ok(Bound { kind, repo_id: repo_id.into(), subject: subject.into(), claim: None })
+            Ok(Bound { kind, repo_id: repo_id.into(), subject: subject.into(), claim: None, name: name.into(), slug: ask.repo_slug.into() })
         }
         _ => Err(refuse("a malformed entry")),
     }
@@ -252,8 +275,9 @@ fn lookup(cfg: &crate::config::Config, rt: &tokio::runtime::Runtime, slug: &str,
     rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(20), call).await.map_err(|_| crate::util::net("the Moochy server did not answer the lookup"))? })
 }
 
-/// A218: the bound entry must name what the server answered, not only what the app labelled.
-fn check_lookup(b: &Bound, handle: Option<&str>, l: &LookupResponse) -> Result<()> {
+/// A218: the bound entry must name what the server answered; the confirmation then shows the
+/// server's names (handle, project), never the app's labels.
+fn check_lookup(b: &mut Bound, handle: Option<&str>, l: &LookupResponse) -> Result<()> {
     let refuse = |what: String| usage(format!("refusing to sign: the app and the server disagree on {what}"));
     if l.repo_id != b.repo_id {
         return Err(refuse(format!("the project ({} vs {})", clean(&b.repo_id), clean(&l.repo_id))));
@@ -263,11 +287,18 @@ fn check_lookup(b: &Bound, handle: Option<&str>, l: &LookupResponse) -> Result<(
     {
         return Err(refuse(format!("who {} is ({} vs {})", clean(h), clean(&b.subject), clean(&l.pseudonym))));
     }
+    if handle.is_some() {
+        b.name.clone_from(&l.handle);
+    }
+    b.slug.clone_from(&l.repo_slug);
     Ok(())
 }
 
 /// Show every signed field of one entry and ask (A217): `--yes` skips only the question.
-fn confirm(b: &Bound, p: &SignResponse, signer: &str, extra: &str, yes: bool) -> Result<()> {
+fn confirm(b: &Bound, signer: &str, extra: &str, yes: bool) -> Result<()> {
+    if b.name.is_empty() || b.slug.is_empty() {
+        return Err(usage("refusing to sign: the server did not confirm who or which project this is"));
+    }
     let meaning = match b.kind {
         Kind::DonorApproved => "may donate tokens to (and see the requests of)",
         Kind::DonorRevoked => "may no longer donate to",
@@ -276,12 +307,17 @@ fn confirm(b: &Bound, p: &SignResponse, signer: &str, extra: &str, yes: bool) ->
         _ => "is the owner of",
     };
     eprintln!("Owner signature {}:", b.kind.name());
-    if p.subject_username.starts_with("d_") && b.claim.is_none() {
+    let who = if b.claim.is_some() {
+        format!("your account ({})", clean(&b.subject))
+    } else if b.name.starts_with("d_") {
         // A device as a member: the signature covers the device's whole account.
-        eprintln!("  the account {} (all its devices, including {}) {meaning} {} ({})", clean(&b.subject), clean(&p.subject_username), clean(&p.repo_slug), clean(&b.repo_id));
+        format!("the account {} (all its devices, including {})", clean(&b.subject), clean(&b.name))
+    } else if b.name == b.subject {
+        format!("the account {}", clean(&b.subject))
     } else {
-        eprintln!("  {} ({}) {meaning} {} ({})", clean(&p.subject_username), clean(&b.subject), clean(&p.repo_slug), clean(&b.repo_id));
-    }
+        format!("{} ({}, as the Moochy server says)", clean(&b.name), clean(&b.subject))
+    };
+    eprintln!("  {who} {meaning} {} ({})", clean(&b.slug), clean(&b.repo_id));
     if let Some((prov, id)) = &b.claim {
         eprintln!("  project at {} (id {})", clean(prov), clean(id));
     }
@@ -304,9 +340,27 @@ fn sign_one(home: &Home, rt: &tokio::runtime::Runtime, key: &SignKey, b: &Bound,
     rt.block_on(submit(home, SubmitEntryRequest { request_id: p.request_id.clone(), kind: b.kind.name().into(), body, sigs: vec![sig.to_vec()] }))
 }
 
-fn emit_signed(done: &SignResponse) {
-    crate::util::emit(&json!({"request_id": done.request_id, "kind": done.kind, "repo": done.repo_slug, "repo_id": done.repo_id, "subject": done.subject,
-        "subject_username": done.subject_username, "signer": done.signer, "issued_at_ms": done.issued_at_ms, "signed": done.signed, "log_index": done.log_index}));
+/// What was signed, named as the CLI bound it (not the app's labels).
+fn emit_signed(done: &SignResponse, b: &Bound) {
+    crate::util::emit(&json!({"request_id": done.request_id, "kind": b.kind.name(), "repo": b.slug, "repo_id": b.repo_id, "subject": b.subject,
+        "subject_username": b.name, "signer": done.signer, "issued_at_ms": done.issued_at_ms, "signed": done.signed, "log_index": done.log_index}));
+}
+
+/// A224: sign only with the account's active owner key as the public key log shows it. A first
+/// owner key is trust-on-first-use (the log takes it on the session's word): if the app on this
+/// machine registered a key of its own instead of ours, the log names that one, and this refuses.
+fn check_own_key(home: &Home, cfg: &crate::config::Config, me: Option<&str>, key: &SignKey) -> Result<()> {
+    let mine = owner_key_id(&key.public());
+    match me.map(|me| crate::keylog::KeyLog::active_owner_key(home, cfg, me)) {
+        Some(Some(Some(id))) if id != mine => Err(auth(format!(
+            "refusing to sign: the public key log says your account's owner key is {id}, not this device's {mine}. If you just rotated it, wait a minute for the log and retry; otherwise the app on this machine or your account is compromised: do not approve anything, revoke {id} on moochy.dev and run `moochy owner rotate`"
+        ))),
+        Some(None) | None => {
+            eprintln!("WARNING: no public key log on this machine: your owner key {mine} is not checked against it");
+            Ok(())
+        }
+        Some(Some(_)) => Ok(()),
+    }
 }
 
 /// `moochy approve|members|claim`: preview what the relay asks, show it, get an explicit yes and
@@ -350,10 +404,10 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
         _ => Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false, device_owner: None },
     };
     let me = cfg.pseudonym.as_deref();
-    let main = bind(&want, me, &preview)?;
+    let mut main = bind(&want, me, &preview)?;
     // An approval needs an owner-signed claim of the same project naming this account
     // (KEYLOG §5): offered as its own entry, shown in full, confirmed on its own.
-    let claim = (want.kind != Kind::RepoClaimed)
+    let mut claim = (want.kind != Kind::RepoClaimed)
         .then(|| rt.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
             c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await.ok().map(tonic::Response::into_inner)
@@ -370,6 +424,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let signer = if has_key { "(existing)".to_owned() } else { "(new)".to_owned() };
     // The key signs the handle lookup (A218) before anything is shown; entries only after yes.
     let key = if has_key { load(home, cfg.relay.as_deref())? } else { register(home, &rt, None)? };
+    check_own_key(home, &cfg, me, &key)?;
     if want.kind != Kind::RepoClaimed {
         let handle = want.subject.filter(|s| !s.starts_with("ps_") && !s.starts_with("d_"));
         let who = match (handle, me) {
@@ -378,21 +433,24 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
             _ => None,
         };
         let l = lookup(&cfg, &rt, slug, who)?;
-        check_lookup(&main, handle, &l)?;
+        check_lookup(&mut main, handle, &l)?;
+        if let Some((b, _)) = claim.as_mut() {
+            b.slug.clone_from(&l.repo_slug);
+        }
         let person = handle.map(|h| format!("; {} is {}", clean(h), clean(&l.pseudonym))).unwrap_or_default();
         eprintln!("Checked with the Moochy server (not through the app): {} is {}{person}", clean(&l.repo_slug), clean(&l.repo_id));
     }
-    if let Some((b, p)) = &claim {
-        confirm(b, p, &signer, "", yes)?;
+    if let Some((b, _)) = &claim {
+        confirm(b, &signer, "", yes)?;
     }
     let extra = if want.kind == Kind::MemberAdded && cap > 0 { format!("; monthly limit {} (a project setting, not signed)", crate::util::fmt_dollars(u64::try_from(cap).unwrap_or(0))) } else { String::new() };
-    confirm(&main, &preview, &signer, &extra, yes)?;
+    confirm(&main, &signer, &extra, yes)?;
     if let Some((b, p)) = &claim {
-        emit_signed(&sign_one(home, &rt, &key, b, p)?);
+        emit_signed(&sign_one(home, &rt, &key, b, p)?, b);
     }
     let done = sign_one(home, &rt, &key, &main, &preview)?;
     drop(key);
-    emit_signed(&done);
+    emit_signed(&done, &main);
     Ok(())
 }
 
@@ -465,7 +523,17 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
         })
     };
     let d = call(true)?;
-    eprintln!("Owner key {id} of your account, registered in the public key log at #{}{}.", d.log_index, if d.revoked { " (since revoked)" } else { "" });
+    // A224: how the key got in, from this machine's verified copy of the log (not the app's word).
+    let cfg = home.load()?;
+    let how = match cfg.pseudonym.as_deref().and_then(|me| crate::keylog::KeyLog::owner_key_row(home, &cfg, me, id)) {
+        Some(Some((idx, _, _))) if idx != d.log_index => return Err(auth(format!("refusing: the app says {id} is at #{}, the key log at #{idx}", d.log_index))),
+        Some(Some((_, _, Some(true)))) => "a passkey registered with only an emailed link (trust on first use: whoever read that email could have made it)",
+        Some(Some((_, _, Some(false)))) => "a passkey approved by another owner key of yours",
+        Some(Some((_, _, None))) => "a CLI owner key (Ed25519)",
+        Some(None) => return Err(usage(format!("{id} is not an owner key of your account in the public key log"))),
+        None => "not checked: no public key log on this machine",
+    };
+    eprintln!("Owner key {id} of your account, registered in the public key log at #{}{}: {how}.", d.log_index, if d.revoked { " (since revoked)" } else { "" });
     eprintln!("Trust it only if YOU registered it (e.g. a passkey you added on moochy.dev). If not, your account may be compromised.");
     if !yes && !matches!(ask("Type yes to trust it: ", false)?.as_str(), "yes" | "y") {
         return Err(usage("not trusted"));
@@ -497,6 +565,18 @@ mod tests {
         }
     }
 
+    /// The server's `Lookup` answer for `handle` on the project.
+    fn server(handle: &str, ps: &str) -> LookupResponse {
+        LookupResponse { repo_slug: "acme/widget".into(), repo_id: R.into(), handle: handle.into(), pseudonym: ps.into() }
+    }
+
+    /// What `sign` does before showing anything: bind to the command, then to the server's answer.
+    fn verified(ask: &Ask<'_>, p: &SignResponse, l: &LookupResponse) -> Result<Bound> {
+        let mut b = bind(ask, Some(ME), p)?;
+        check_lookup(&mut b, ask.subject.filter(|s| !s.starts_with("ps_") && !s.starts_with("d_")), l)?;
+        Ok(b)
+    }
+
     fn approve(who: &str) -> Ask<'_> {
         Ask { kind: Kind::DonorApproved, repo_slug: "acme/widget", subject: Some(who), device: false, device_owner: None }
     }
@@ -506,14 +586,25 @@ mod tests {
     #[test]
     fn owner_signs_only_what_was_asked() {
         // The honest case: handle or pseudonym.
-        assert!(bind(&approve("alice"), Some(ME), &grant("DONOR_APPROVED", ALICE, "alice", ALICE)).is_ok());
-        assert!(bind(&approve(ALICE), Some(ME), &grant("DONOR_APPROVED", ALICE, "alice", ALICE)).is_ok());
+        let b = verified(&approve("alice"), &grant("DONOR_APPROVED", ALICE, "alice", ALICE), &server("alice", ALICE)).unwrap();
+        assert_eq!((b.name.as_str(), b.subject.as_str(), b.slug.as_str()), ("alice", ALICE, "acme/widget"));
+        let b = verified(&approve(ALICE), &grant("DONOR_APPROVED", ALICE, "alice", ALICE), &server("", "")).unwrap();
+        assert_eq!(b.name, ALICE, "a pseudonym argument is shown as typed, never with the app's label");
+        // A218 residual: a handle is never bound by the app's label. Unconfirmed until the
+        // server answers, and an unconfirmed entry is never shown or signed.
+        let unconfirmed = bind(&approve("alice"), Some(ME), &grant("DONOR_APPROVED", MALLORY, "alice", MALLORY)).unwrap();
+        assert!(unconfirmed.name.is_empty() && confirm(&unconfirmed, "", "", true).is_err());
+        // The app labels mallory as "alice": the server says alice is ALICE.
+        assert!(verified(&approve("alice"), &grant("DONOR_APPROVED", MALLORY, "alice", MALLORY), &server("alice", ALICE)).is_err());
+        // The server's canonical handle is what is shown, whatever the label says.
+        let b = verified(&approve("Alice"), &grant("DONOR_APPROVED", ALICE, "someone-else", ALICE), &server("alice", ALICE)).unwrap();
+        assert_eq!(b.name, "alice");
         // Another kind than the command (members add proposed for `approve`).
         assert!(bind(&approve("alice"), Some(ME), &grant("MEMBER_ADDED", ALICE, "alice", ALICE)).is_err());
         // Another subject than the argument.
-        assert!(bind(&approve("alice"), Some(ME), &grant("DONOR_APPROVED", MALLORY, "mallory", MALLORY)).is_err());
+        assert!(verified(&approve("alice"), &grant("DONOR_APPROVED", MALLORY, "mallory", MALLORY), &server("alice", ALICE)).is_err());
         // Shows alice, the body signs mallory.
-        assert!(bind(&approve("alice"), Some(ME), &grant("DONOR_APPROVED", ALICE, "alice", MALLORY)).is_err());
+        assert!(verified(&approve("alice"), &grant("DONOR_APPROVED", ALICE, "alice", MALLORY), &server("alice", ALICE)).is_err());
         // Another project.
         let mut p = grant("DONOR_APPROVED", ALICE, "alice", ALICE);
         p.repo_slug = "evil/repo".into();
@@ -537,7 +628,8 @@ mod tests {
     /// A218: a compromised app labels mallory as "alice"; the server's own answer catches it.
     #[test]
     fn lookup_must_agree() {
-        let b = Bound { kind: Kind::DonorApproved, repo_id: R.into(), subject: MALLORY.into(), claim: None };
+        let b = Bound { kind: Kind::DonorApproved, repo_id: R.into(), subject: MALLORY.into(), claim: None, name: String::new(), slug: "acme/widget".into() };
+        let check_lookup = |b: &Bound, h: Option<&str>, l: &LookupResponse| check_lookup(&mut b.clone(), h, l);
         let l = |repo: &str, ps: &str| LookupResponse { repo_slug: "acme/widget".into(), repo_id: repo.into(), handle: "alice".into(), pseudonym: ps.into() };
         assert!(check_lookup(&b, Some("alice"), &l(R, MALLORY)).is_ok());
         assert!(check_lookup(&b, Some("Alice"), &l(R, MALLORY)).is_ok(), "handles are case-insensitive");

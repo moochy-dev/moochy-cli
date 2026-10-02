@@ -176,6 +176,23 @@ impl KeyLog {
         Some(Self::mirror(home, cfg)?.state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
     }
 
+    /// Owner commands (A224): the account's active Ed25519 owner key id in the mirror. Outer
+    /// `None`: no key log on this node; inner `None`: none logged (yet).
+    pub fn active_owner_key(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Option<String>> {
+        Some(Self::mirror(home, cfg)?.state(|s| s.active_owner_key(pseudonym).map(|k| k.id.clone())).ok().flatten())
+    }
+
+    /// `moochy owner trust` (A224): an owner key of `pseudonym` as the mirror shows it:
+    /// `(log index, revoked, Some(email_proof) for a passkey)`. Outer `None`: no key log.
+    pub fn owner_key_row(home: &Home, cfg: &Config, pseudonym: &str, id: &str) -> Option<Option<(u64, bool, Option<bool>)>> {
+        Some(
+            Self::mirror(home, cfg)?
+                .state(|s| s.owner_key(id).filter(|k| k.pseudonym == pseudonym).map(|k| (k.idx, k.revoked, k.passkey.as_ref().map(|p| p.email_proof))))
+                .ok()
+                .flatten(),
+        )
+    }
+
     /// `moochy box list` (§17.1, WIRING §9b): this account's boxes in the mirror, in log order,
     /// revoked and expired ones included. `None`: no key log on this node (or not logged in).
     pub fn boxes(home: &Home, cfg: &Config) -> Option<Vec<BoxRow>> {
