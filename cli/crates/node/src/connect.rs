@@ -401,3 +401,207 @@ mod write_tests {
         assert!(super::yaml_edit("mcp_servers: {}\n", &plan).is_err(), "flow style is left to the human");
     }
 }
+
+// ------------------------------------------------------------------ safe --write (A248)
+
+/// Where `--write` may write: a trusted base directory (the user's home, XDG config directory,
+/// repository root, or the parent of an explicit `--config` outside all of them) and the plain
+/// components below it, none of which is ever followed if it is a symbolic link.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Target {
+    pub base: std::path::PathBuf,
+    pub dirs: Vec<String>,
+    pub file: String,
+}
+
+impl Target {
+    /// The path as shown to the user.
+    pub fn shown(&self) -> std::path::PathBuf {
+        let mut p = self.base.clone();
+        p.extend(&self.dirs);
+        p.push(&self.file);
+        p
+    }
+}
+
+/// Pure path rule: `path` (absolute) split under the longest `anchor` it lies in, or, for an
+/// explicit `--config` (`explicit`) outside every anchor, under its own parent. Refuses `..`,
+/// `.`, empty, root or non-UTF-8 components below the base, and a default target outside the
+/// anchors (a client's documented location is always under one of them).
+pub fn split_target(path: &std::path::Path, anchors: &[std::path::PathBuf], explicit: bool) -> Result<Target, String> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(format!("{}: not an absolute path", path.display()));
+    }
+    let anchor = anchors.iter().filter(|a| a.is_absolute() && path.starts_with(a) && path != a.as_path()).max_by_key(|a| a.components().count());
+    let (base, rest) = match anchor {
+        Some(a) => (a.clone(), path.strip_prefix(a).map_err(|_| format!("{}: bad path", path.display()))?),
+        None if explicit => {
+            let parent = path.parent().ok_or_else(|| format!("{}: no parent directory", path.display()))?;
+            let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
+            (parent.to_path_buf(), std::path::Path::new(name))
+        }
+        None => return Err(format!("{}: outside this client's config locations", path.display())),
+    };
+    let mut parts = Vec::new();
+    for c in rest.components() {
+        match c {
+            Component::Normal(s) => parts.push(s.to_str().filter(|s| !s.is_empty()).ok_or_else(|| format!("{}: a path component is not UTF-8", path.display()))?.to_owned()),
+            _ => return Err(format!("{}: '..', '.' or a root inside the target path", path.display())),
+        }
+    }
+    let file = parts.pop().ok_or_else(|| format!("{}: no file name", path.display()))?;
+    Ok(Target { base, dirs: parts, file })
+}
+
+/// An opened target directory (every component below the base opened with `O_NOFOLLOW`).
+pub struct Opened {
+    dir: rustix::fd::OwnedFd,
+    pub shown: std::path::PathBuf,
+    file: String,
+}
+
+const MAX_CONFIG: u64 = 4 << 20;
+
+fn symlink_refusal(shown: &std::path::Path) -> String {
+    format!(
+        "{}: a symbolic link; `moochy connect --write` never follows one (a repository or another program may have placed it). Pass --config with the real file path, or edit the file by hand",
+        shown.display()
+    )
+}
+
+/// Open the target's directory without following a symbolic link below the trusted base;
+/// missing directories are created (0700). Same calls on Linux and macOS (`openat` with
+/// `O_NOFOLLOW | O_DIRECTORY` per component, `mkdirat`).
+pub fn open_target(t: &Target) -> Result<Opened, String> {
+    use rustix::fs::{Mode, OFlags};
+    let dflags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = rustix::fs::open(&t.base, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(|e| format!("{}: {e}", t.base.display()))?;
+    let mut shown = t.base.clone();
+    for d in &t.dirs {
+        shown.push(d);
+        let next = match rustix::fs::openat(&dir, d.as_str(), dflags, Mode::empty()) {
+            Err(rustix::io::Errno::NOENT) => {
+                rustix::fs::mkdirat(&dir, d.as_str(), Mode::from_raw_mode(0o700)).map_err(|e| format!("{}: {e}", shown.display()))?;
+                rustix::fs::openat(&dir, d.as_str(), dflags, Mode::empty())
+            }
+            r => r,
+        };
+        dir = match next {
+            Ok(fd) => fd,
+            Err(e) if is_symlink(&dir, d) => return Err(format!("{} ({e})", symlink_refusal(&shown))),
+            Err(e) => return Err(format!("{}: {e}", shown.display())),
+        };
+    }
+    shown.push(&t.file);
+    Ok(Opened { dir, shown, file: t.file.clone() })
+}
+
+fn is_symlink(dir: &rustix::fd::OwnedFd, name: &str) -> bool {
+    rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink)
+}
+
+impl Opened {
+    /// The current file ("" when absent): a regular file opened with `O_NOFOLLOW`, at most 4 MiB.
+    pub fn read(&self) -> Result<String, String> {
+        use rustix::fs::{Mode, OFlags};
+        use std::io::Read as _;
+        let fd = match rustix::fs::openat(&self.dir, self.file.as_str(), OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(String::new()),
+            Err(e) if is_symlink(&self.dir, &self.file) => return Err(format!("{} ({e})", symlink_refusal(&self.shown))),
+            Err(e) => return Err(format!("{}: {e}", self.shown.display())),
+        };
+        let st = rustix::fs::fstat(&fd).map_err(|e| format!("{}: {e}", self.shown.display()))?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+            return Err(format!("{}: not a regular file", self.shown.display()));
+        }
+        let mut buf = Vec::new();
+        std::fs::File::from(fd).take(MAX_CONFIG.saturating_add(1)).read_to_end(&mut buf).map_err(|e| format!("{}: {e}", self.shown.display()))?;
+        if buf.len() as u64 > MAX_CONFIG {
+            return Err(format!("{}: larger than 4 MiB", self.shown.display()));
+        }
+        String::from_utf8(buf).map_err(|_| format!("{}: not UTF-8", self.shown.display()))
+    }
+
+    /// Write `name` in the target directory atomically: a fresh temporary file (`O_EXCL |
+    /// O_NOFOLLOW`, 0600) in the same directory, then `renameat` over the name (a symbolic
+    /// link there is replaced, never followed).
+    pub fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        use rustix::fs::{Mode, OFlags};
+        use std::io::Write as _;
+        let shown = self.shown.with_file_name(name);
+        let rnd = crate::util::rand_bytes::<8>().map_err(|e| e.msg)?;
+        let tmp = format!(".{name}.moochy-tmp-{}", crate::util::b64e(&rnd));
+        let fd = rustix::fs::openat(&self.dir, tmp.as_str(), OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::from_raw_mode(0o600))
+            .map_err(|e| format!("{}: {e}", shown.display()))?;
+        let mut f = std::fs::File::from(fd);
+        let done = f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| e.to_string()).and_then(|()| rustix::fs::renameat(&self.dir, tmp.as_str(), &self.dir, name).map_err(|e| e.to_string()));
+        if let Err(e) = done {
+            let _ = rustix::fs::unlinkat(&self.dir, tmp.as_str(), rustix::fs::AtFlags::empty());
+            return Err(format!("{}: {e}", shown.display()));
+        }
+        Ok(())
+    }
+
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+}
+
+#[cfg(test)]
+mod safe_write_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn path_rules() {
+        let anchors = [PathBuf::from("/home/u"), PathBuf::from("/home/u/.config"), PathBuf::from("/src/proj")];
+        let t = split_target(Path::new("/home/u/.config/zed/settings.json"), &anchors, false).unwrap();
+        assert_eq!(t, Target { base: "/home/u/.config".into(), dirs: vec!["zed".into()], file: "settings.json".into() }, "the longest anchor");
+        let t = split_target(Path::new("/src/proj/.trae/mcp.json"), &anchors, false).unwrap();
+        assert_eq!((t.base.as_path(), t.dirs.as_slice(), t.file.as_str()), (Path::new("/src/proj"), &[".trae".to_owned()][..], "mcp.json"));
+        assert!(split_target(Path::new("/etc/passwd"), &anchors, false).is_err(), "a default target outside every anchor");
+        let t = split_target(Path::new("/tmp/x/client.json"), &anchors, true).unwrap();
+        assert_eq!(t, Target { base: "/tmp/x".into(), dirs: vec![], file: "client.json".into() }, "explicit --config outside: its own parent");
+        let t = split_target(Path::new("/src/proj/.trae/mcp.json"), &anchors, true).unwrap();
+        assert_eq!(t.base, Path::new("/src/proj"), "explicit --config inside the repo: still walked from the repo root");
+        // (std already drops interior "." components; ".." stays and is refused.)
+        for bad in ["/home/u/../etc/x.json", "/home/u/.config/../../etc/a.json", "relative/a.json"] {
+            assert!(split_target(Path::new(bad), &anchors, true).is_err(), "{bad}");
+        }
+        assert!(split_target(Path::new("/home/u/../etc/x.json"), &anchors, false).is_err());
+    }
+
+    #[test]
+    fn symlinks_are_never_followed_and_writes_are_atomic() {
+        let root = std::env::temp_dir().join(format!("moochy-safewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (repo, outside) = (root.join("repo"), root.join("outside"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("mcp.json"), "secret").unwrap();
+        // A248: a symlinked directory component inside the repository.
+        std::os::unix::fs::symlink(&outside, repo.join(".trae")).unwrap();
+        let t = Target { base: repo.clone(), dirs: vec![".trae".into()], file: "mcp.json".into() };
+        let e = open_target(&t).err().unwrap();
+        assert!(e.contains("symbolic link") && e.contains(".trae"), "{e}");
+        // A symlinked config file.
+        std::fs::create_dir_all(repo.join(".cfg")).unwrap();
+        std::os::unix::fs::symlink(outside.join("mcp.json"), repo.join(".cfg/mcp.json")).unwrap();
+        let o = open_target(&Target { base: repo.clone(), dirs: vec![".cfg".into()], file: "mcp.json".into() }).unwrap();
+        assert!(o.read().unwrap_err().contains("symbolic link"));
+        // Writes replace a symlinked name (and backup) instead of following it; 0600; new dirs made.
+        o.write("mcp.json.moochy-backup", b"old").unwrap();
+        std::os::unix::fs::symlink(outside.join("mcp.json"), repo.join(".cfg/x.json")).unwrap();
+        o.write("x.json", b"{}").unwrap();
+        assert_eq!(std::fs::read_to_string(outside.join("mcp.json")).unwrap(), "secret", "nothing written through a link");
+        assert_eq!(std::fs::read_to_string(repo.join(".cfg/x.json")).unwrap(), "{}");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(repo.join(".cfg/x.json")).unwrap().permissions()) & 0o777, 0o600);
+        let n = open_target(&Target { base: repo.clone(), dirs: vec!["a".into(), "b".into()], file: "c.json".into() }).unwrap();
+        assert_eq!(n.read().unwrap(), "");
+        n.write("c.json", b"1").unwrap();
+        assert!(std::fs::read_dir(repo.join("a/b")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("moochy-tmp")), "no temp file left");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

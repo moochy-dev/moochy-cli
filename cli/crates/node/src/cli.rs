@@ -778,16 +778,25 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
     let user_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| usage("HOME is not set"))?;
     let (default_path, plan) = crate::connect::write_plan(client, &user_home, slug, url, main, small)
         .ok_or_else(|| usage(format!("--write is not supported for {client} (its settings are environment variables or typed into the app): paste the snippet from `moochy connect {client}`")))?;
-    let path = o.config.clone().unwrap_or(default_path);
-    let path = std::path::absolute(&path).ctx("config path")?;
+    // A248: the target is walked from a trusted base (home, XDG config dir, the repository root,
+    // or an explicit --config's own parent outside them) without following any symbolic link
+    // below it; project files (Trae) are relative to the repository root, not the cwd.
+    let cwd = std::env::current_dir().ctx("cwd")?;
+    let project = crate::files::git_root(&cwd).unwrap_or_else(|| cwd.clone());
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| user_home.join(".config"), PathBuf::from);
+    let (path, explicit) = match &o.config {
+        Some(p) => (std::path::absolute(p).ctx("config path")?, true),
+        None if default_path.is_relative() => (project.join(&default_path), false),
+        None => (default_path, false),
+    };
+    let target = crate::connect::split_target(&path, &[user_home.clone(), xdg, project], explicit).map_err(|e| usage(format!("refusing to write: {e}")))?;
+    let opened = crate::connect::open_target(&target).map_err(|e| usage(format!("refusing to write: {e}")))?;
+    let path = opened.shown.clone();
+    // No symbolic link below the base, so git looks at this very file.
     if git_tracked(&path) {
         return Err(usage(format!("refusing to write {}: the file is tracked by git (tokens and machine paths do not belong in a repository)", path.display())));
     }
-    let old = match std::fs::read(&path) {
-        Ok(b) => String::from_utf8(b).map_err(|_| usage("config file is not UTF-8"))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(internal(format!("read {}: {e}", path.display()))),
-    };
+    let old = opened.read().map_err(|e| usage(format!("refusing to write: {e}")))?;
     // The file's format follows its extension (the agents' own files: TOML for Codex, YAML for
     // Hermes, JSON otherwise); TOML and YAML are edited in place, JSON merged and re-printed.
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -824,15 +833,14 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
             return Err(usage("not written"));
         }
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ctx("create config dir")?;
-    }
-    // The previous file is kept next to it (0600) before anything changes.
-    let backup = (!old.is_empty()).then(|| PathBuf::from(format!("{}.moochy-backup", path.display())));
+    // The previous file is kept next to it (0600) before anything changes; both writes are
+    // atomic (temp file + rename in the same directory, never through a symbolic link).
+    let backup = (!old.is_empty()).then(|| format!("{}.moochy-backup", opened.file()));
     if let Some(b) = &backup {
-        crate::config::write_private(b, old.as_bytes())?;
+        opened.write(b, old.as_bytes()).map_err(|e| internal(format!("backup: {e}")))?;
     }
-    crate::config::write_private(&path, new.as_bytes())?;
+    opened.write(opened.file(), new.as_bytes()).map_err(internal)?;
+    let backup = backup.map(|b| path.with_file_name(b));
     emit(&json!({"event": "connect", "client": client, "path": path.display().to_string(), "changed": true, "backup": backup.map(|b| b.display().to_string())}));
     Ok(())
 }
