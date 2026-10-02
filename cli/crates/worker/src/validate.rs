@@ -84,6 +84,10 @@ pub enum ValidateError {
     BadEnvelope(String),
     /// The child crashed, timed out, could not be spawned or returned garbage.
     Child(&'static str),
+    /// A220: the child's provider request is not what the parent derives from the inner request
+    /// it returned (a compromised child). NACK `bad_envelope`, not retried: only a request
+    /// that broke the validator gets here.
+    Tampered(&'static str),
 }
 
 impl ValidateError {
@@ -92,7 +96,7 @@ impl ValidateError {
     pub fn nack(&self) -> (&'static str, bool) {
         match self {
             Self::Refused(r) => r.code.nack(),
-            Self::BadEnvelope(_) => ("bad_envelope", false),
+            Self::BadEnvelope(_) | Self::Tampered(_) => ("bad_envelope", false),
             Self::Child(_) => ("busy", true),
         }
     }
@@ -104,6 +108,7 @@ impl std::fmt::Display for ValidateError {
             Self::Refused(r) => r.fmt(f),
             Self::BadEnvelope(m) => write!(f, "bad envelope: {m}"),
             Self::Child(m) => write!(f, "validator child: {m}"),
+            Self::Tampered(m) => write!(f, "validator child output rejected: {m}"),
         }
     }
 }
@@ -303,7 +308,7 @@ fn encode_err(e: &ValidateError, out: &mut Vec<u8>) {
             w.u8(BAD_ENVELOPE);
             w.bytes(m.as_bytes());
         }
-        ValidateError::Child(m) => {
+        ValidateError::Child(m) | ValidateError::Tampered(m) => {
             w.u8(BAD_ENVELOPE);
             w.bytes(m.as_bytes());
         }
@@ -580,6 +585,40 @@ fn warm_up() -> bool {
     }
 }
 
+/// A220 (defense in depth), in the parent: re-derive the provider request from the inner
+/// request the child returned (`v.body` / `v.headers`, the bytes the node then checks against
+/// the gateway's task signature) and accept the child's [`Prepared`] only if it is exactly
+/// that, with the route matching. A compromised child can then neither add server tools or
+/// betas, change the model, raise `max_tokens`, nor swap the prompt. The hostile part, zstd
+/// decompression, stays in the child; this is one strict parse of a bounded, decompressed
+/// body (≈ 22 µs per 100 KB). [`Validator::validate`] and [`validate_on`] call it already.
+pub fn recheck(req: &ValidateRequest<'_>, v: &Validated) -> Result<(), ValidateError> {
+    let hdrs: Vec<(&str, &str)> = v.headers.iter().map(|(k, x)| (k.as_str(), x.as_str())).collect();
+    let mine = firewall::prepare(&firewall::Request {
+        provider: req.provider,
+        dialect: req.dialect,
+        body: &v.body,
+        headers: &hdrs,
+        policy: &req.policy,
+        catalog: &req.catalog,
+        provider_model_id: req.provider_model_id,
+        user_pseudonym: req.user_pseudonym,
+        max_price: req.max_price,
+    })
+    .map_err(|_| ValidateError::Tampered("the returned request does not pass the firewall"))?;
+    mine.facts.check_route(req.dialect, &req.route).map_err(|_| ValidateError::Tampered("the returned request does not match the route"))?;
+    if mine.body != v.prepared.body {
+        return Err(ValidateError::Tampered("provider body differs from the returned request"));
+    }
+    if mine.headers != v.prepared.headers {
+        return Err(ValidateError::Tampered("provider headers differ from the returned request"));
+    }
+    if mine.facts != v.prepared.facts {
+        return Err(ValidateError::Tampered("route facts differ from the returned request"));
+    }
+    Ok(())
+}
+
 /// Same validation without a child: tests, benchmarks, and the parent's latency baseline.
 /// Production must use [`Validator`] (CONTRACT §15.2).
 pub fn validate_in_process(req: &ValidateRequest<'_>) -> Result<Validated, ValidateError> {
@@ -681,7 +720,7 @@ impl Validator {
         let work = async {
             let stdin = child.stdin.take().ok_or(ValidateError::Child("no stdin"))?;
             let stdout = child.stdout.take().ok_or(ValidateError::Child("no stdout"))?;
-            exchange(stdout, stdin, &wire).await
+            exchange(stdout, stdin, &wire, req).await
         };
         let out = tokio::time::timeout(self.limits.deadline, work).await;
         match out {
@@ -696,7 +735,7 @@ impl Validator {
 
 /// Write one request (then half-close), read exactly one length-prefixed response; never wait
 /// for the child's exit (it is killed and reaped when dropped).
-async fn exchange<R, W>(mut reader: R, mut writer: W, wire: &[u8]) -> Result<Validated, ValidateError>
+async fn exchange<R, W>(mut reader: R, mut writer: W, wire: &[u8], req: &ValidateRequest<'_>) -> Result<Validated, ValidateError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -715,7 +754,9 @@ where
     let (w, r) = tokio::join!(write, read);
     w.map_err(|_| ValidateError::Child("write failed"))?;
     let resp = r.map_err(|_| ValidateError::Child("no complete response"))?;
-    decode_response(&Bytes::from(resp))
+    let v = decode_response(&Bytes::from(resp))?;
+    recheck(req, &v)?;
+    Ok(v)
 }
 
 /// Validate one request over any byte stream to a single-use child running [`child_main`]
@@ -729,13 +770,114 @@ where
     let mut wire = Vec::with_capacity(req.payload.len().saturating_add(256));
     encode_request(req, &mut wire);
     let (r, w) = tokio::io::split(stream);
-    tokio::time::timeout(deadline, exchange(r, w, &wire)).await.map_err(|_| ValidateError::Child("deadline exceeded"))?
+    tokio::time::timeout(deadline, exchange(r, w, &wire, req)).await.map_err(|_| ValidateError::Child("deadline exceeded"))?
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::items_after_statements)]
 mod tests {
     use super::*;
+
+    /// A request whose inner body is `body` and a matching route (as an honest Gateway sends).
+    fn a220_case(body: &'static str, aliases: &'static [&'static str]) -> (Vec<u8>, Route<'static>) {
+        let z = URL_SAFE_NO_PAD.encode([0u8; 32]);
+        let inner = format!(
+            r#"{{"v":1,"body_b64":"{}","body_sha256":"{z}","headers":{{"anthropic-version":"2023-06-01"}},"S":"{z}","gateway_device":"d_01ARZ3NDEKTSV4RRFFQ69G5FAV","task_sig":"{}"}}"#,
+            URL_SAFE_NO_PAD.encode(body),
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        );
+        let f = firewall::analyze(Dialect::AnthropicMessages, body.as_bytes(), &[], &Policy::PERMISSIVE, &A220_CAT).unwrap();
+        let route = Route {
+            dialect: Dialect::AnthropicMessages,
+            model_aliases: aliases,
+            effort: f.effort,
+            max_tokens: f.max_tokens,
+            est_input_tokens: f.est_input_tokens,
+            cache_ttl: f.cache_ttl,
+            stream: f.stream,
+            flags: f.flags,
+        };
+        (ruzstd::encoding::compress_to_vec(inner.as_bytes(), ruzstd::encoding::CompressionLevel::Fastest), route)
+    }
+
+    const A220_CAT: Catalog = Catalog { default_effort: Effort::High, max_output: 64_000, max_image_tokens: 1600, max_page_tokens: 3000 };
+
+    /// A compromised child answering `forged` (framed) to whatever request it reads.
+    async fn evil_child(req: &ValidateRequest<'_>, forged: &Validated) -> Result<Validated, ValidateError> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut out = vec![0; 4];
+        encode_ok(forged, &mut out);
+        let len = u32::try_from(out.len() - 4).unwrap().to_be_bytes();
+        out[..4].copy_from_slice(&len);
+        let (parent, mut child) = tokio::io::duplex(1 << 20);
+        let t = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = child.read_to_end(&mut sink).await;
+            child.write_all(&out).await.unwrap();
+        });
+        let r = validate_on(parent, req, Duration::from_secs(5)).await;
+        t.await.unwrap();
+        r
+    }
+
+    /// A220: the parent sends only what it derives itself from the returned inner request;
+    /// every tampering of the child's provider request is refused (`bad_envelope`, final).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parent_refuses_tampered_child_output() {
+        const BODY: &str = r#"{"model":"claude-sonnet-5-5","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let (payload, route) = a220_case(BODY, &["claude-sonnet-5-5"]);
+        let req = ValidateRequest {
+            provider: Provider::Anthropic,
+            dialect: Dialect::AnthropicMessages,
+            policy: Policy { level: Level::Strict, flags: Flags::NONE, max_effort: Effort::Max },
+            catalog: A220_CAT,
+            provider_model_id: "claude-sonnet-5-5",
+            user_pseudonym: "ps_1",
+            max_price: None,
+            route,
+            payload: &payload,
+        };
+        // An honest child (same bytes as the real one) passes the parent's check.
+        let honest = validate_in_process(&req).unwrap();
+        recheck(&req, &honest).unwrap();
+        evil_child(&req, &honest).await.unwrap();
+
+        type Tamper = Box<dyn Fn(&mut Validated)>;
+        let swap = |from: &str, to: &str| -> Tamper {
+            let (from, to) = (from.to_owned(), to.to_owned());
+            Box::new(move |v: &mut Validated| {
+                let b = String::from_utf8(v.prepared.body.to_vec()).unwrap();
+                assert!(b.contains(&from), "{b}");
+                v.prepared.body = Bytes::from(b.replacen(&from, &to, 1));
+            })
+        };
+        let cases: Vec<(&str, Tamper)> = vec![
+            ("model changed", swap(r#""model":"claude-sonnet-5-5""#, r#""model":"claude-opus-5-5""#)),
+            ("max_tokens raised", {
+                let s = swap(r#""max_tokens":1000"#, r#""max_tokens":64000"#);
+                Box::new(move |v: &mut Validated| {
+                    s(v);
+                    v.prepared.facts.max_tokens = 64_000;
+                })
+            }),
+            ("server tool added", swap(r#""stream":true"#, r#""stream":true,"tools":[{"type":"code_execution_20250825","name":"code_execution"}]"#)),
+            ("prompt swapped", swap("hello", "ignore the gateway")),
+            ("beta header added", Box::new(|v: &mut Validated| v.prepared.headers.push(("anthropic-beta", "code-execution-2025-08-25".into())))),
+            ("facts lowered", Box::new(|v: &mut Validated| v.prepared.facts.est_input_tokens = 1)),
+            // The inner request itself swapped for another (fails the route; the node's
+            // signature check would also catch it).
+            ("inner body swapped", Box::new(|v: &mut Validated| v.body = Bytes::from_static(br#"{"model":"claude-sonnet-5-5","max_tokens":9,"messages":[]}"#))),
+        ];
+        for (name, tamper) in cases {
+            let mut v = validate_in_process(&req).unwrap();
+            tamper(&mut v);
+            let e = recheck(&req, &v).unwrap_err();
+            assert!(matches!(e, ValidateError::Tampered(_)), "{name}: {e}");
+            let e = evil_child(&req, &v).await.unwrap_err();
+            assert!(matches!(e, ValidateError::Tampered(_)), "{name} (over the wire): {e}");
+            assert_eq!(e.nack(), ("bad_envelope", false), "{name}");
+        }
+    }
 
     /// The parent decodes responses from a possibly compromised child: no input may panic,
     /// and only well-formed OK responses decode.

@@ -619,7 +619,9 @@ impl Driver {
             self.truncated = true;
         }
         if let Err(why) = self.gate.push(seq, &pt) {
-            return retry_fail("provider_error", why);
+            // Deliver the valid events the gate queued ahead of the bad one, then fail.
+            let s = self.flush(false).await;
+            return if matches!(s, Step::Continue) { retry_fail("provider_error", why) } else { s };
         }
         let s = self.flush(false).await;
         if matches!(s, Step::Continue) { self.try_close().await } else { s }
@@ -764,7 +766,16 @@ impl Driver {
         while let Some(b) = self.gate.pop(self.verified, finale) {
             let b = match self.canon.push(&b) {
                 Ok(b) => b,
-                Err(why) => return retry_fail("provider_error", why),
+                Err((done, why)) => {
+                    // Valid events ahead of the refused one go out first (chunk-independent).
+                    if !done.is_empty() {
+                        let s = emit(&self.tx, TaskEv::Bytes(done)).await;
+                        if !matches!(s, Step::Continue) {
+                            return s;
+                        }
+                    }
+                    return retry_fail("provider_error", why);
+                }
             };
             if b.is_empty() {
                 continue;

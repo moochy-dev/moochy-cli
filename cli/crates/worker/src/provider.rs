@@ -10,11 +10,11 @@ use std::future::{Future, poll_fn};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use bytes::{Bytes, BytesMut};
+use http_body_util::Full;
 use hyper::body::{Body, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::header::{HeaderMap, HeaderValue};
@@ -22,7 +22,6 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
@@ -505,7 +504,7 @@ impl Adapter {
     }
 
     fn h1_idle_count(&self) -> usize {
-        self.h1_idle.lock().map_or(0, |g| g.iter().filter(|c| !c.sender.is_closed()).count())
+        self.h1_idle.lock().map_or(0, |g| g.iter().filter(|c| !c.is_dead()).count())
     }
 
     fn h1_return(&self, c: H1Conn) {
@@ -516,10 +515,7 @@ impl Adapter {
         let tcp = self.tcp().await?;
         let (sender, conn) =
             http1::handshake(TokioIo::new(tcp)).await.map_err(|_| Failure::new(FailKind::Network, "HTTP/1 handshake failed"))?;
-        let task = AbortOnDrop(tokio::spawn(async move {
-            let _ = conn.await;
-        }));
-        Ok(H1Conn { sender, _task: task })
+        Ok(H1Conn { sender, conn: Some(conn) })
     }
 
     /// An idle keep-alive connection that is still usable, else a fresh one.
@@ -527,10 +523,13 @@ impl Adapter {
         loop {
             let idle = self.h1_idle.lock().ok().and_then(|mut g| g.pop());
             let Some(mut c) = idle else { break };
-            if c.sender.is_closed() {
+            // An idle connection is not driven: one poll lets it notice a server close.
+            c.drive(&mut Context::from_waker(Waker::noop()));
+            if c.is_dead() {
                 continue;
             }
-            if c.sender.ready().await.is_ok() {
+            let H1Conn { sender, conn } = &mut c;
+            if drive(conn, sender.ready()).await.is_ok() {
                 return Ok((c, true));
             }
         }
@@ -627,12 +626,14 @@ impl Adapter {
                 // on a fresh connection only when hyper proves it was never sent (a reused
                 // connection closed by the server in between): no double execution.
                 let (mut c, reused) = self.h1_conn().await?;
-                let resp = match c.sender.try_send_request(req).await {
+                let sent = c.sender.try_send_request(req);
+                let resp = match drive(&mut c.conn, sent).await {
                     Ok(r) => r,
                     Err(mut e) => match e.take_message() {
                         Some(req) if reused => {
                             c = self.dial_h1().await?;
-                            c.sender.send_request(req).await.map_err(|_| Failure::new(FailKind::Network, "request failed before headers"))?
+                            let sent = c.sender.send_request(req);
+                            drive(&mut c.conn, sent).await.map_err(|_| Failure::new(FailKind::Network, "request failed before headers"))?
                         }
                         _ => return Err(Failure::new(FailKind::Network, "request failed before headers")),
                     },
@@ -640,12 +641,12 @@ impl Adapter {
                 Ok((resp, Some(H1Lease { conn: Some(c), pool: self.h1_idle.clone(), reusable: false })))
             }
         };
-        let (resp, conn) =
+        let (resp, mut conn) =
             tokio::time::timeout(self.limits.headers, fut).await.map_err(|_| Failure::new(FailKind::Timeout, "no response headers in time"))??;
         let (parts, body) = resp.into_parts();
         let status = parts.status.as_u16();
         if !parts.status.is_success() {
-            return Err(self.error(status, &parts.headers, body).await);
+            return Err(self.error(status, &parts.headers, body, conn.as_mut().and_then(|l| l.conn.as_mut())).await);
         }
         let now = Instant::now();
         Ok(Response {
@@ -653,15 +654,18 @@ impl Adapter {
             request_id: header_str(&parts.headers, &["request-id", "x-request-id"]),
             rate_limit: RateLimit::from_headers(&parts.headers),
             body,
-            idle: Box::pin(tokio::time::sleep(self.limits.idle)),
+            idle: Box::pin(tokio::time::sleep_until(now.checked_add(self.limits.idle).unwrap_or(now).min(now.checked_add(self.limits.total).unwrap_or(now)))),
             deadline: now.checked_add(self.limits.total).unwrap_or(now),
+            last: now,
             limits: self.limits,
             read: 0,
             lease: conn,
+            ended: None,
+            handed: false,
         })
     }
 
-    async fn error(&self, status: u16, headers: &HeaderMap, mut body: Incoming) -> Failure {
+    async fn error(&self, status: u16, headers: &HeaderMap, mut body: Incoming, mut conn: Option<&mut H1Conn>) -> Failure {
         let kind = match status {
             429 => FailKind::RateLimited,
             503 | 529 => FailKind::Overloaded,
@@ -673,7 +677,7 @@ impl Adapter {
         let mut buf = Vec::new();
         let cap = self.limits.max_error_body;
         let read = async {
-            while let Some(Ok(f)) = body.frame().await {
+            while let Some(Ok(f)) = poll_fn(|cx| poll_body(&mut body, conn.as_deref_mut(), cx)).await {
                 if let Ok(d) = f.into_data() {
                     let room = cap.saturating_sub(buf.len());
                     buf.extend_from_slice(d.get(..room.min(d.len())).unwrap_or_default());
@@ -780,23 +784,67 @@ fn header_u64(h: &HeaderMap, names: &[&str]) -> Option<u64> {
     names.iter().find_map(|n| h.get(*n)).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse().ok())
 }
 
-struct AbortOnDrop(JoinHandle<()>);
-
-/// Most idle keep-alive connections kept per adapter (dev `http://` targets).
+/// Most idle keep-alive connections kept per adapter (`http://` targets).
 const H1_MAX_IDLE: usize = 16;
 
+type H1Driver = http1::Connection<TokioIo<TcpStream>, Full<Bytes>>;
+
+/// An HTTP/1.1 connection driven from the task that uses it (no connection task): a body
+/// chunk reaches the reader without a cross-thread wake, and every chunk already in the
+/// read buffer is taken in the same poll. Dropping it closes the socket (cancellation).
 struct H1Conn {
     sender: http1::SendRequest<Full<Bytes>>,
-    /// Dropping the connection aborts its task, which closes the socket (cancellation).
-    _task: AbortOnDrop,
+    /// `None` once the connection has finished.
+    conn: Option<H1Driver>,
+}
+
+impl H1Conn {
+    fn drive(&mut self, cx: &mut Context<'_>) {
+        drive_conn(&mut self.conn, cx);
+    }
+
+    fn is_dead(&self) -> bool {
+        self.conn.is_none() || self.sender.is_closed()
+    }
+}
+
+fn drive_conn(conn: &mut Option<H1Driver>, cx: &mut Context<'_>) {
+    if let Some(c) = conn
+        && Pin::new(c).poll(cx).is_ready()
+    {
+        *conn = None;
+    }
+}
+
+/// Await `f` while driving the connection it depends on.
+async fn drive<F: Future>(conn: &mut Option<H1Driver>, f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    poll_fn(|cx| {
+        if let Poll::Ready(v) = f.as_mut().poll(cx) {
+            return Poll::Ready(v);
+        }
+        drive_conn(conn, cx);
+        f.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// Next body frame, driving the HTTP/1.1 connection (if any) in this task.
+fn poll_body(body: &mut Incoming, conn: Option<&mut H1Conn>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+    if let Poll::Ready(f) = Pin::new(&mut *body).poll_frame(cx) {
+        return Poll::Ready(f);
+    }
+    let Some(c) = conn else { return Poll::Pending };
+    c.drive(cx);
+    Pin::new(body).poll_frame(cx)
 }
 
 fn return_h1(pool: &StdMutex<Vec<H1Conn>>, c: H1Conn) {
-    if c.sender.is_closed() {
+    if c.is_dead() {
         return;
     }
     if let Ok(mut g) = pool.lock() {
-        g.retain(|c| !c.sender.is_closed());
+        g.retain(|c| !c.is_dead());
         if g.len() < H1_MAX_IDLE {
             g.push(c);
         }
@@ -820,10 +868,15 @@ impl Drop for H1Lease {
     }
 }
 
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+/// Largest run of already-received body frames merged into one chunk.
+const COALESCE_MAX: usize = 16 << 10;
+
+/// How a body ended, kept while a merged chunk in front of it is handed out first.
+#[derive(Debug, Clone, Copy)]
+enum Ended {
+    Clean,
+    Broken,
+    TooLarge,
 }
 
 /// A streaming 2xx response. Dropping it aborts the provider request immediately.
@@ -834,12 +887,20 @@ pub struct Response {
     /// Rate-limit headers of this response (`rate_limit.headroom_pct()` → `rl_headroom`).
     pub rate_limit: RateLimit,
     body: Incoming,
+    /// Fires at the earliest possible stall; re-armed from `last` only when it fires, so the
+    /// per-chunk path never touches the timer wheel.
     idle: Pin<Box<Sleep>>,
     deadline: Instant,
+    /// When body bytes last arrived.
+    last: Instant,
     limits: Limits,
     read: u64,
     /// HTTP/1.1 connection, returned to the keep-alive pool only after the body ended.
     lease: Option<H1Lease>,
+    /// End of body seen behind the chunk handed out last.
+    ended: Option<Ended>,
+    /// A chunk was handed out by the previous call.
+    handed: bool,
 }
 
 impl std::fmt::Debug for Response {
@@ -849,44 +910,99 @@ impl std::fmt::Debug for Response {
 }
 
 impl Response {
-    /// Next body chunk exactly as received (forward it at once: no batching), `None` at the
-    /// end. Enforces the idle timeout, the total deadline and the size cap.
+    /// Next body bytes, `None` at the end. Never waits to batch: it returns as soon as one
+    /// frame is there, merged with every further frame already received (up to 16 KiB), so
+    /// a burst costs one chunk downstream instead of one per frame. Enforces the idle
+    /// timeout, the total deadline and the size cap.
     pub async fn next(&mut self) -> Result<Option<Bytes>, Failure> {
-        loop {
-            let now = Instant::now();
-            let idle_at = now.checked_add(self.limits.idle).unwrap_or(now).min(self.deadline);
-            self.idle.as_mut().reset(idle_at);
-            let (body, idle) = (&mut self.body, &mut self.idle);
-            let frame = poll_fn(|cx| {
-                if let Poll::Ready(f) = Pin::new(&mut *body).poll_frame(cx) {
-                    return Poll::Ready(Ok(f));
+        if std::mem::take(&mut self.handed) {
+            // The caller just passed the previous chunk to another task (the link writer),
+            // which tokio parks in this worker's LIFO slot: let it run before reading more,
+            // or a burst is read and sealed in full before its first byte is written.
+            tokio::task::yield_now().await;
+        }
+        if self.ended.is_none() {
+            let Self { body, idle, deadline, last, limits, read, lease, ended, .. } = self;
+            let mut conn = lease.as_mut().and_then(|l| l.conn.as_mut());
+            let mut first: Option<Bytes> = None;
+            let mut merged: Option<BytesMut> = None;
+            let polled = poll_fn(|cx| {
+                loop {
+                    let have = first.is_some();
+                    match poll_body(body, conn.as_deref_mut(), cx) {
+                        Poll::Ready(Some(Ok(f))) => {
+                            let Ok(data) = f.into_data() else { continue };
+                            if data.is_empty() {
+                                continue;
+                            }
+                            *read = read.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                            if *read > limits.max_response {
+                                *ended = Some(Ended::TooLarge);
+                                return Poll::Ready(Ok(()));
+                            }
+                            let total = match (&first, &mut merged) {
+                                (None, _) => {
+                                    let n = data.len();
+                                    first = Some(data);
+                                    n
+                                }
+                                (Some(a), None) => {
+                                    let mut m = BytesMut::with_capacity(a.len().saturating_add(data.len()));
+                                    m.extend_from_slice(a);
+                                    m.extend_from_slice(&data);
+                                    let n = m.len();
+                                    merged = Some(m);
+                                    n
+                                }
+                                (Some(_), Some(m)) => {
+                                    m.extend_from_slice(&data);
+                                    m.len()
+                                }
+                            };
+                            if total >= COALESCE_MAX {
+                                return Poll::Ready(Ok(()));
+                            }
+                        }
+                        Poll::Ready(Some(Err(_))) => {
+                            *ended = Some(Ended::Broken);
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(None) => {
+                            *ended = Some(Ended::Clean);
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Pending if have => return Poll::Ready(Ok(())),
+                        Poll::Pending => {
+                            if idle.as_mut().poll(cx).is_pending() {
+                                return Poll::Pending;
+                            }
+                            let due = last.checked_add(limits.idle).unwrap_or(*last).min(*deadline);
+                            if Instant::now() >= due {
+                                return Poll::Ready(Err(()));
+                            }
+                            idle.as_mut().reset(due);
+                        }
+                    }
                 }
-                if idle.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Err(()));
-                }
-                Poll::Pending
             })
-            .await
-            .map_err(|()| Failure::new(FailKind::Timeout, "provider stream stalled"))?;
-            match frame {
-                None => {
-                    if let Some(l) = &mut self.lease {
-                        l.reusable = true;
-                    }
-                    return Ok(None);
+            .await;
+            if polled.is_err() {
+                return Err(Failure::new(FailKind::Timeout, "provider stream stalled"));
+            }
+            if let Some(data) = merged.map(BytesMut::freeze).or(first) {
+                self.last = Instant::now();
+                self.handed = true;
+                return Ok(Some(data));
+            }
+        }
+        match self.ended {
+            Some(Ended::Broken) => Err(Failure::new(FailKind::Network, "provider stream broke")),
+            Some(Ended::TooLarge) => Err(Failure::new(FailKind::TooLarge, "provider response too large")),
+            _ => {
+                if let Some(l) = &mut self.lease {
+                    l.reusable = true;
                 }
-                Some(Err(_)) => return Err(Failure::new(FailKind::Network, "provider stream broke")),
-                Some(Ok(f)) => {
-                    let Ok(data) = f.into_data() else { continue };
-                    if data.is_empty() {
-                        continue;
-                    }
-                    self.read = self.read.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
-                    if self.read > self.limits.max_response {
-                        return Err(Failure::new(FailKind::TooLarge, "provider response too large"));
-                    }
-                    return Ok(Some(data));
-                }
+                Ok(None)
             }
         }
     }

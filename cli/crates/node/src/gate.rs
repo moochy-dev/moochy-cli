@@ -192,7 +192,15 @@ impl Gate {
                 emit_to = self.base;
             }
             match k {
-                K::Fail(why) => return Err(why),
+                K::Fail(why) => {
+                    // The events before the bad one are valid: queue them exactly as if they had
+                    // come in their own chunk (chunking never changes what the client sees);
+                    // the caller flushes them, then fails the attempt.
+                    if self.hold.is_none() {
+                        self.emit_until(emit_to);
+                    }
+                    return Err(why);
+                }
                 K::Pass => {
                     self.scan_event(start, end);
                     if self.hold.is_none() {
@@ -293,10 +301,8 @@ impl Gate {
     /// Non-streamed body: the tripwire over its text; a hit appends the visible warning.
     fn warn_body(&mut self, body: Bytes) -> Bytes {
         let Ok(mut v) = crate::json::parse(&body) else { return body };
-        let text = match self.dialect {
-            Dialect::Anthropic => v.get("content").and_then(Value::as_array).map(|c| c.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")),
-            Dialect::OpenAi => v.pointer("/choices/0/message/content").and_then(Value::as_str).map(str::to_owned),
-        };
+        // Every visible text field (A216), not only `content[].text` / `message.content`.
+        let text = moochy_worker::json::parse(&body, &mut self.tape).ok().and_then(|doc| visible_text(self.dialect, false, doc.root()));
         let Some(rule) = text.and_then(|t| self.scanner.push(&t)) else { return body };
         let note = format!("[moochy] warning: the response suggests a dangerous command ({rule}). Review it before running anything.");
         match self.dialect {
@@ -392,31 +398,34 @@ fn rel(abs: u64, base: u64) -> usize {
     usize::try_from(abs.saturating_sub(base)).unwrap_or(usize::MAX)
 }
 
-/// Text carried by one SSE event, and the content-block index it names (Anthropic).
+/// Text carried by one SSE event, and the content-block index it names (Anthropic). The text
+/// is every human-visible field the re-emitter writes (A216: `reemit::visible_texts` walks the
+/// re-emission allowlists, so inline `content_block.text`, thinking, refusals, … are all
+/// scanned), from the parsed event: no raw-byte prefilter an escape could slip past.
 fn event_text(d: Dialect, ev: &[u8], tape: &mut Vec<moochy_worker::json::Node>) -> (Option<String>, Option<u32>) {
-    // Hot path (CONTRACT §13): only events that can carry text or open a block are parsed.
-    let has = |n: &[u8]| ev.windows(n.len()).any(|w| w == n);
-    let relevant = match d {
-        Dialect::Anthropic => has(b"text_delta") || has(b"content_block_start"),
-        Dialect::OpenAi => has(b"\"content\":\""),
-    };
-    if !relevant {
-        return (None, None);
-    }
     let Some(data) = ev.split(|b| *b == b'\n').find_map(|l| l.strip_prefix(b"data:")) else { return (None, None) };
     let data = data.trim_ascii();
     tape.clear();
     let Ok(doc) = moochy_worker::json::parse(data, tape) else { return (None, None) };
     let v = doc.root();
-    let s = |x: Option<moochy_worker::json::Val<'_>>| x.and_then(moochy_worker::json::Val::as_str).map(std::borrow::Cow::into_owned);
-    match d {
-        Dialect::Anthropic => {
-            let index = v.get("index").and_then(|i| i.raw().parse().ok());
-            let text = v.get("delta").filter(|dl| dl.get("type").is_some_and(|t| t.is_str("text_delta"))).and_then(|dl| s(dl.get("text")));
-            (text, index)
+    let index = match d {
+        Dialect::Anthropic => v.get("index").and_then(|i| i.raw().parse().ok()),
+        Dialect::OpenAi => None,
+    };
+    (visible_text(d, true, v), index)
+}
+
+/// All visible text fields of one event or body, newline-separated; `None` when there is none.
+fn visible_text(d: Dialect, stream: bool, v: moochy_worker::json::Val<'_>) -> Option<String> {
+    let mut text: Option<String> = None;
+    moochy_worker::reemit::visible_texts(d.worker(), stream, v, &mut |t| {
+        let s = text.get_or_insert_with(String::new);
+        if !s.is_empty() {
+            s.push('\n');
         }
-        Dialect::OpenAi => (v.get("choices").and_then(|c| c.items().next()).and_then(|c| c.get("delta")).and_then(|dl| s(dl.get("content"))), None),
-    }
+        s.push_str(t);
+    });
+    text
 }
 
 /// Canonical re-emission (CONTRACT §15.4, A162): every byte for the client passes through here
@@ -429,10 +438,15 @@ impl Canon {
         Self(moochy_worker::reemit::Reemitter::new(dialect.worker(), stream))
     }
 
-    pub fn push(&mut self, b: &[u8]) -> Result<Bytes, &'static str> {
+    /// Canonical bytes of the events this chunk completes. On a refused event, `Err` carries
+    /// the canonical events completed before it (deliver them, then fail): the client sees the
+    /// same thing however the donor chunked its stream.
+    pub fn push(&mut self, b: &[u8]) -> Result<Bytes, (Bytes, &'static str)> {
         let mut out = Vec::with_capacity(b.len());
-        self.0.push(b, &mut out).map_err(|e| e.0)?;
-        Ok(Bytes::from(out))
+        match self.0.push(b, &mut out) {
+            Ok(()) => Ok(Bytes::from(out)),
+            Err(e) => Err((Bytes::from(out), e.0)),
+        }
     }
 
     pub fn finish(&mut self) -> Result<Bytes, &'static str> {
@@ -610,6 +624,50 @@ mod tests {
         let w = o.find("[moochy] warning").expect("warning shown");
         assert!(w < o.find("message_stop").unwrap(), "before message_stop");
         assert!(o.contains(r#""index":1"#), "a new block after the last one");
+    }
+
+    /// Chunking never changes what the client sees: valid events that share a donor chunk with a
+    /// malformed one are released exactly as if they had come alone, then the attempt fails.
+    #[test]
+    fn valid_events_before_a_bad_one_in_the_same_chunk_are_released() {
+        let start = sse("message_start", r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"x","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#);
+        let block = sse("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#);
+        let hello = sse("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#);
+        let bad = sse("content_block_start", r#"{"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#);
+        let run = |chunks: &[String]| {
+            let mut g = Gate::new(Dialect::Anthropic, true, REQ, false);
+            let mut out = Vec::new();
+            let mut failed = false;
+            for (i, c) in chunks.iter().enumerate() {
+                let r = g.push(u32::try_from(i).unwrap(), c.as_bytes());
+                while let Some(b) = g.pop(None, false) {
+                    out.extend_from_slice(&b);
+                }
+                if r.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            (String::from_utf8(out).unwrap(), failed)
+        };
+        let alone = run(&[start.clone(), block.clone(), hello.clone(), bad.clone()]);
+        let merged = run(&[start.clone(), format!("{block}{hello}{bad}")]);
+        assert!(alone.1 && merged.1, "both fail closed");
+        assert!(alone.0.contains(r#""text":"Hello""#), "{}", alone.0);
+        assert_eq!(merged, alone);
+    }
+
+    /// A refused event keeps the canonical events before it (delivered, then the attempt fails).
+    #[test]
+    fn canon_error_returns_the_valid_prefix() {
+        let start = sse("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#);
+        let hello = sse("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#);
+        let bad = sse("totally_new", r#"{"type":"totally_new"}"#);
+        let mut c = Canon::new(Dialect::Anthropic, true);
+        let (done, why) = c.push(format!("{start}{hello}{bad}").as_bytes()).unwrap_err();
+        let done = String::from_utf8(done.to_vec()).unwrap();
+        assert!(done.contains(r#""text":"Hello""#) && !done.contains("totally_new"), "{done}");
+        assert_eq!(why, "unknown event or block type");
     }
 
     /// `cargo test --release -p moochy -- --ignored --nocapture per_event_cost`: what the gate,

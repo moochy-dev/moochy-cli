@@ -224,9 +224,7 @@ impl Parser<'_, '_> {
         let mut esc = false;
         loop {
             // Fast skip of plain bytes (the bulk of prompts), then handle the special byte.
-            let rest = self.s.get(self.pos..).unwrap_or_default();
-            let plain = rest.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(rest.len());
-            self.pos = self.pos.saturating_add(plain);
+            self.pos = self.pos.saturating_add(special(self.s.get(self.pos..).unwrap_or_default()));
             match self.peek() {
                 None => return self.err("unterminated string"),
                 Some(b'"') => break,
@@ -672,9 +670,51 @@ impl OwnedDoc {
     }
 }
 
+/// Index of the first `"`, `\\` or control byte (< 0x20) in `s`, else `s.len()`. Eight bytes
+/// per step (SWAR): within a word, a borrow can only flag bytes above a byte that is
+/// really special, so the lowest flagged byte is exact.
+fn special(s: &[u8]) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const QUOTE: u64 = 0x2222_2222_2222_2222;
+    const BSLASH: u64 = 0x5C5C_5C5C_5C5C_5C5C;
+    const SPACE: u64 = 0x2020_2020_2020_2020;
+    let (words, r) = s.as_chunks::<8>();
+    let mut i = 0usize;
+    for w in words {
+        let x = u64::from_le_bytes(*w);
+        let (q, b) = (x ^ QUOTE, x ^ BSLASH);
+        let m = ((q.wrapping_sub(LO) & !q) | (b.wrapping_sub(LO) & !b) | (x.wrapping_sub(SPACE) & !x)) & HI;
+        if m != 0 {
+            return i.saturating_add((m.trailing_zeros() / 8) as usize);
+        }
+        i = i.saturating_add(8);
+    }
+    i.saturating_add(r.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(r.len()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::format_collect)]
 mod tests {
+
+    #[test]
+    fn special_matches_naive_scan() {
+        let naive = |s: &[u8]| s.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(s.len());
+        // Every special/plain byte value at every offset of words with every filler.
+        for fill in [b'a', 0x7f, 0x80, 0xa0, 0xff, b'!', b'#', b'[', b']', 0x21, 0x1f + 1] {
+            for len in 0..20 {
+                for at in 0..=len {
+                    for sp in (0u8..=255).filter(|&b| b != fill) {
+                        let mut v = vec![fill; len];
+                        if at < len {
+                            v[at] = sp;
+                        }
+                        assert_eq!(special(&v), naive(&v), "fill {fill:#x} len {len} at {at} byte {sp:#x}");
+                    }
+                }
+            }
+        }
+    }
     use super::*;
 
     fn ok(s: &str) -> String {
