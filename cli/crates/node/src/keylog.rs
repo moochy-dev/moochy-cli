@@ -1,47 +1,65 @@
-//! Key-log mirror (06 §10, spec/KEYLOG.md) on `moochy-keylog`.
+//! Key-log monitor (06 §10, spec/KEYLOG.md, `moochy-keylog/WIRING.md`).
 //!
-//! One mirror per relay origin, persisted under `<home>/state/keylog-<tag>/` (`records`:
-//! u16-BE length-prefixed records; `checkpoint`: the last verified signed note). Synced from the
-//! relay's checkpoints (`Hello.log_checkpoint`, `LogCheckpoint`) with tiles fetched through
-//! `NodeLink.GetLogTile`; checked hourly against the public Git anchor when configured. Once a
-//! verified checkpoint exists it answers the two trust questions: which worker keys a Gateway may
-//! seal to (`sealable`) and which Gateway keys a Worker accepts (`gateway_allowed`).
-//! Requires the log's note key (`config set log_key`): without it the node stays relay-asserted
-//! (D14) and says so.
+//! One [`moochy_keylog::Monitor`] per relay origin, persisted under `<home>/state/keylog-<tag>/`
+//! (records, checkpoint, fork evidence). It is fed by the relay's checkpoints
+//! (`Hello.log_checkpoint`, pushed `LogCheckpoint`, else a poll every minute), fetches tiles
+//! through `NodeLink.GetLogTile`, checks the public Git anchor hourly when configured, and
+//! raises the own-key / owner alerts. The shared [`View`] answers the two trust questions:
+//! which worker keys a Gateway may seal to ([`KeyLog::seal`], CONTRACT §15.4) and which Gateway
+//! keys a Worker accepts ([`KeyLog::gateway_key`], 03 §7.2).
+//!
+//! Requires the log's note key (`config set log_key`). Without it, or before the first verified
+//! checkpoint, nothing is sealed and no task is accepted, except under `MOOCHY_INSECURE_DEV=1`
+//! (D14, relay-asserted, tests and development only).
 
 use crate::config::{Config, Home};
-use crate::node::lock;
-use crate::pb::link::{LogTileRequest, node_link_client::NodeLinkClient};
+use crate::node::{Node, PoolWorker, lock};
+use crate::pb::link::LogTileRequest;
 use crate::util::{clean, log};
-use moochy_keylog::{AnchorStatus, Me, Mirror, NoteKey, tiles};
+use moochy_keylog::monitor::{self, Event, Gate, Monitor, View};
+use moochy_keylog::{Alert, Code, Me, NoteKey};
 use serde_json::json;
-use std::io::Write as _;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tonic::transport::Channel;
+use tokio::sync::watch;
+use tokio::time::Instant;
 
-pub struct LogMirror {
-    m: Mutex<Mirror>,
-    dir: PathBuf,
-    syncing: AtomicBool,
+const TILE_TIMEOUT: Duration = Duration::from_secs(10);
+const ANCHOR_EVERY: Duration = Duration::from_secs(3600);
+
+pub struct KeyLog {
+    view: Mutex<View>,
+    /// Taken by [`KeyLog::start`].
+    monitor: Mutex<Option<Monitor>>,
+    cfg: monitor::Config,
+    state: std::path::PathBuf,
+    /// Newest checkpoint note served by the relay (latest wins).
+    notes: watch::Sender<Option<Vec<u8>>>,
+    /// Reopen the monitor (new own keys) at the next point between two checkpoints.
+    reopen: Arc<tokio::sync::Notify>,
 }
 
-fn read_records(b: &[u8]) -> Option<Vec<&[u8]>> {
-    let mut out = Vec::new();
-    let mut rest = b;
-    while !rest.is_empty() {
-        let (len, tail) = rest.split_first_chunk::<2>()?;
-        let (rec, tail) = tail.split_at_checked(usize::from(u16::from_be_bytes(*len)))?;
-        out.push(rec);
-        rest = tail;
+/// Own keys created while the node runs (`<state>/owner_keys`, `<state>/device_keys`): one
+/// base64url key per line, deduplicated.
+fn read_keys(path: &std::path::Path) -> Vec<[u8; 32]> {
+    let mut v: Vec<[u8; 32]> = std::fs::read_to_string(path).map(|s| s.lines().filter_map(|l| crate::util::b64d32(l.trim())).take(64).collect()).unwrap_or_default();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+fn add_key(path: &std::path::Path, k: &[u8; 32]) {
+    if read_keys(path).contains(k) {
+        return;
     }
-    Some(out)
+    let mut all = std::fs::read_to_string(path).unwrap_or_default();
+    all.push_str(&crate::util::b64e(k));
+    all.push('\n');
+    let _ = crate::config::write_private(path, all.as_bytes());
 }
 
-impl LogMirror {
-    /// `None` when no log key is configured (relay-asserted mode).
+impl KeyLog {
+    /// `None` when no log key is configured (or it is unusable): nothing is trusted then.
     pub fn open(home: &Home, cfg: &Config, sign_pub: Option<[u8; 32]>) -> Option<Arc<Self>> {
         let key = match NoteKey::parse(cfg.log_key.as_deref()?) {
             Ok(k) => k,
@@ -52,130 +70,174 @@ impl LogMirror {
         };
         let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
         let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
-        let dir = home.state_dir().join(format!("keylog-{tag}"));
-        let restored = std::fs::read(dir.join("checkpoint")).ok().and_then(|note| {
-            let cp = moochy_keylog::note::open_checkpoint(&note, &origin, &key).ok()?;
-            let raw = std::fs::read(dir.join("records")).ok()?;
-            Mirror::restore(&origin, key.clone(), read_records(&raw)?, &cp).ok()
-        });
-        let mut m = restored.unwrap_or_else(|| Mirror::new(&origin, key));
-        if let (Some(ps), Some(pk)) = (cfg.pseudonym.clone(), sign_pub) {
-            m.set_me(Some(Me { pseudonym: ps, known_keys: vec![pk] }));
-        }
-        Some(Arc::new(Self { m: Mutex::new(m), dir, syncing: AtomicBool::new(false) }))
-    }
-
-    /// A verified checkpoint exists: the log, not the relay, decides trust.
-    pub fn active(&self) -> bool {
-        lock(&self.m).checkpoint().is_some()
-    }
-
-    /// Worker side: the signing key of a Gateway device allowed to use `repo_id` (03 §7.2 1–2).
-    pub fn gateway_key(&self, device: &str, repo_id: &str) -> Option<[u8; 32]> {
-        lock(&self.m).state().gateway_allowed(device, repo_id).ok().map(|d| d.sign_pub)
-    }
-
-    /// Gateway side: the logged encryption key of an owner-approved worker for `repo_id`.
-    pub fn sealable(&self, worker: &str, repo_id: &str) -> Option<[u8; 32]> {
-        lock(&self.m).state().sealable(worker, repo_id).ok().map(|s| s.enc_pub)
-    }
-
-    /// The logged device whose signing key this is (`moochy verify`).
-    pub fn device_by_key(&self, sign_pub: &[u8; 32]) -> Option<String> {
-        lock(&self.m).state().device_by_key(sign_pub).map(str::to_owned)
-    }
-
-    /// Bring the mirror up to a relay checkpoint. Tiles come over the authenticated link.
-    pub async fn sync(self: &Arc<Self>, mut client: NodeLinkClient<Channel>, note: Vec<u8>) {
-        if self.syncing.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Err(e) = self.sync_inner(&mut client, &note).await {
-            log("warn", "key log sync failed", &json!({"error": clean(&e)}));
-        }
-        self.syncing.store(false, Ordering::Release);
-    }
-
-    async fn sync_inner(&self, client: &mut NodeLinkClient<Channel>, note: &[u8]) -> Result<(), String> {
-        let (cp, from) = {
-            let m = lock(&self.m);
-            (m.open_checkpoint(note).map_err(|e| format!("checkpoint: {e}"))?, m.size())
-        };
-        if cp.size <= from {
-            return Ok(());
-        }
-        let mut recs: Vec<Vec<u8>> = Vec::new();
-        for b in tiles::bundles(from, cp.size) {
-            let r = tokio::time::timeout(Duration::from_secs(10), client.get_log_tile(LogTileRequest { path: b.path() }))
-                .await
-                .map_err(|_| "tile timeout".to_owned())?
-                .map_err(|s| format!("tile {}: {}", b.path(), s.message()))?
-                .into_inner();
-            let parsed = tiles::parse_bundle(&r.data, b.width).map_err(|e| format!("tile {}: {e}", b.path()))?;
-            recs.extend(parsed.into_iter().skip(usize::try_from(b.skip).unwrap_or(usize::MAX)).map(<[u8]>::to_vec));
-        }
-        let refs: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
-        let alerts = match lock(&self.m).update(&cp, &refs) {
-            Ok(a) => a,
-            Err(moochy_keylog::Error::Fork { size }) => {
-                log("error", "KEY LOG FORK: the relay served a history inconsistent with the mirror; not trusting new entries", &json!({"size": size}));
-                return Err("fork".into());
+        let state = home.state_dir();
+        let me = match (cfg.pseudonym.clone(), sign_pub) {
+            (Some(pseudonym), Some(pk)) => {
+                let mut known_keys = read_keys(&state.join("device_keys"));
+                known_keys.push(pk);
+                Some(Me { pseudonym, known_keys })
             }
-            Err(e) => return Err(format!("update: {e}")),
+            _ => None,
         };
-        self.persist(&recs, note).map_err(|e| format!("persist: {e}"))?;
-        for a in &alerts {
-            log("error", "public key log alert", &alert_fields(a));
+        let mc = monitor::Config {
+            origin,
+            key,
+            dir: Some(home.state_dir().join(format!("keylog-{tag}"))),
+            me,
+            known_owner_keys: read_keys(&state.join("owner_keys")),
+            witnesses: Vec::new(),
+            min_cosignatures: 0,
+        };
+        match Monitor::open(mc.clone()) {
+            Ok(m) => Some(Arc::new(Self {
+                view: Mutex::new(m.view()),
+                monitor: Mutex::new(Some(m)),
+                cfg: mc,
+                state,
+                notes: watch::channel(None).0,
+                reopen: Arc::new(tokio::sync::Notify::new()),
+            })),
+            Err(e) => {
+                log("error", "key log disabled: mirror cannot be opened", &json!({"error": e.to_string()}));
+                None
+            }
         }
-        Ok(())
     }
 
-    fn persist(&self, recs: &[Vec<u8>], note: &[u8]) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("records"))?;
-        for r in recs {
-            let len = u16::try_from(r.len()).map_err(|_| std::io::Error::other("record too large"))?;
-            f.write_all(&len.to_be_bytes())?;
-            f.write_all(r)?;
-        }
-        f.sync_all()?;
-        crate::config::write_private(&self.dir.join("checkpoint"), note).map_err(|e| std::io::Error::other(e.msg))
-    }
-
-    /// Hourly: compare with the public Git anchor (`log_anchor_url`).
-    pub async fn anchor_loop(self: Arc<Self>, url: String, mut stop: tokio::sync::watch::Receiver<bool>) {
-        loop {
-            let u = url.clone();
-            let note = tokio::task::spawn_blocking(move || {
-                moochy_keylog::fetch::Fetcher::new(&u, Duration::from_secs(10)).and_then(|f| f.get("checkpoint", moochy_keylog::note::MAX_NOTE))
-            })
-            .await;
-            match note {
-                Ok(Ok(note)) => {
-                    let st = {
-                        let m = lock(&self.m);
-                        m.open_checkpoint(&note).map(|cp| m.check(&cp))
-                    };
-                    match st {
-                        Ok(AnchorStatus::Fork) => log("error", "KEY LOG FORK vs the public anchor: stop trusting the relay's log", &json!({})),
-                        Ok(AnchorStatus::Behind) => log("warn", "key log mirror behind the public anchor (relay may be hiding entries)", &json!({})),
-                        Ok(AnchorStatus::Consistent) => {}
-                        Err(e) => log("warn", "anchor checkpoint invalid", &json!({"error": e.to_string()})),
+    /// Run the monitor for the node's lifetime (once).
+    pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
+        let Some(mut m) = lock(&self.monitor).take() else { return };
+        let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now(), reopen: self.reopen.clone() };
+        let me = self.clone();
+        let node = node.clone();
+        tokio::spawn(async move {
+            loop {
+                m.run(&mut link, |e| {
+                    let (level, msg, mut fields) = event_fields(e);
+                    if let Some(o) = fields.as_object_mut() {
+                        o.insert("keylog".into(), json!(e.message()));
+                    }
+                    log(level, &msg, &fields);
+                })
+                .await;
+                if *node.shutdown.borrow() {
+                    return;
+                }
+                // Reopen with the own keys acknowledged meanwhile (restored from disk, no network).
+                let mut cfg = me.cfg.clone();
+                cfg.known_owner_keys = read_keys(&me.state.join("owner_keys"));
+                if let Some(mine) = cfg.me.as_mut() {
+                    for k in read_keys(&me.state.join("device_keys")) {
+                        if !mine.known_keys.contains(&k) {
+                            mine.known_keys.push(k);
+                        }
                     }
                 }
-                _ => log("warn", "anchor fetch failed", &json!({})),
+                match Monitor::open(cfg) {
+                    Ok(n) => {
+                        *lock(&me.view) = n.view();
+                        m = n;
+                    }
+                    Err(e) => log("error", "key log monitor could not reopen", &json!({"error": e.to_string()})),
+                }
             }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(3600)) => {}
-                _ = stop.changed() => return,
-            }
+        });
+    }
+
+    /// A key this user just created (owner key, or a rotated device key), relayed by this node:
+    /// remember it so the monitor does not report it as someone else's (`unknown_*`).
+    pub fn acknowledge(&self, owner_key: Option<&[u8; 32]>, device_key: Option<&[u8; 32]>) {
+        if let Some(k) = owner_key {
+            add_key(&self.state.join("owner_keys"), k);
         }
+        if let Some(k) = device_key {
+            add_key(&self.state.join("device_keys"), k);
+        }
+        self.reopen.notify_one();
+    }
+
+    fn view(&self) -> View {
+        lock(&self.view).clone()
+    }
+
+    /// A checkpoint note from the relay (`Hello.log_checkpoint` or a push).
+    pub fn push(&self, note: Vec<u8>) {
+        if !note.is_empty() && note.len() <= moochy_keylog::note::MAX_NOTE {
+            self.notes.send_replace(Some(note));
+        }
+    }
+
+    /// A fresh verified checkpoint exists: the log, not the relay, decides trust.
+    pub fn verified(&self) -> bool {
+        matches!(self.view().gate(), Gate::Verified { .. })
+    }
+
+    /// Wording of the sealing gate (status, logs).
+    pub fn gate_name(&self) -> &'static str {
+        match self.view().gate() {
+            Gate::NoCheckpoint => "no_checkpoint",
+            Gate::Verified { .. } => "verified",
+            Gate::Stale { .. } => "stale_log",
+            Gate::Forked => "log_forked",
+        }
+    }
+
+    /// The logged device whose signing key this is (`moochy verify`, mo-node).
+    pub fn device_by_key(&self, sign_pub: &[u8; 32]) -> Option<String> {
+        self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()
+    }
+
+    /// Worker side (03 §7.2 1–2): the logged signing key of a Gateway device allowed to use
+    /// `repo_id`. Only from a fresh verified log.
+    pub fn gateway_key(&self, device: &str, repo_id: &str) -> Option<[u8; 32]> {
+        if !self.verified() {
+            return None;
+        }
+        self.view().gateway_allowed(device, repo_id).ok().map(|d| d.sign_pub)
+    }
+
+    /// Gateway sealing rule (CONTRACT §15.4, A174, A184): the gate is verified, the worker is
+    /// logged, unrevoked and owner-approved for `repo_id` at exactly the relay's indexes, and the
+    /// relay-advertised keys are the logged ones. Returns the LOGGED signing key (receipts and
+    /// progress checkpoints are verified with it, never with a relay-supplied one).
+    pub fn seal(&self, repo_id: &str, w: &PoolWorker) -> Result<[u8; 32], Code> {
+        let view = self.view();
+        let s = view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index)?;
+        let sign_pub = view.state(|st| st.device(&w.worker_device).map(|d| d.sign_pub))?.ok_or(Code::UnknownDevice)?;
+        let same_sign = w.sign_pub.is_none_or(|p| crate::util::ct_eq(&p, &sign_pub));
+        if !crate::util::ct_eq(&s.enc_pub, &w.enc_pub) || !same_sign {
+            return Err(Code::IndexMismatch);
+        }
+        Ok(sign_pub)
+    }
+}
+
+/// Log level + stable machine fields of a monitor event (the message carries the keywords
+/// `unknown_key`, `rogue`, `unsigned`, `fork`, `stale`, `rollback` that tooling greps).
+/// Messages: `key log` (routine), `key log alert` (monitor rules; `detail` names the rule and
+/// its ids, e.g. `UnknownKey { idx, device_id }`, all validated ASCII), `KEY LOG FORK: …`.
+fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
+    let routine = |v| ("info", "key log".to_owned(), v);
+    match e {
+        Event::Synced { size } => routine(json!({"event": "synced", "size": size})),
+        Event::AnchorConsistent { size } => routine(json!({"event": "anchor_consistent", "size": size})),
+        Event::Error(_) => ("warn", "key log".into(), json!({"event": "error"})),
+        Event::Alert(a) => {
+            let mut f = alert_fields(a);
+            if let Some(o) = f.as_object_mut() {
+                o.insert("detail".into(), json!(format!("{a:?}")));
+            }
+            ("error", "key log alert".into(), f)
+        }
+        Event::Fork { size, .. } => ("error", format!("KEY LOG FORK: {}", e.message()), json!({"event": "fork", "size": size})),
+        Event::Stale { served, mirrored } => ("error", "key log alert".into(), json!({"event": "stale", "served": served, "mirrored": mirrored})),
+        Event::Rollback { anchored, served } => ("error", "KEY LOG FORK: rollback vs the public anchor".into(), json!({"event": "rollback", "anchored": anchored, "served": served})),
+        Event::Unwitnessed { size, cosignatures } => ("error", "key log alert".into(), json!({"event": "unwitnessed", "size": size, "cosignatures": cosignatures})),
     }
 }
 
 /// Stable machine fields for a mirror alert (codes, wire kind names), never Rust `Debug` text.
-fn alert_fields(a: &moochy_keylog::mirror::Alert) -> serde_json::Value {
-    use moochy_keylog::mirror::Alert;
+fn alert_fields(a: &Alert) -> serde_json::Value {
     match a {
         Alert::Invalid { idx } => json!({"alert": "invalid_record", "idx": idx}),
         Alert::Rejected { idx, kind, code } => json!({"alert": "rejected", "idx": idx, "kind": kind.name(), "code": code.as_str()}),
@@ -188,13 +250,62 @@ fn alert_fields(a: &moochy_keylog::mirror::Alert) -> serde_json::Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn records_framing() {
-        let raw = [0u8, 2, b'a', b'b', 0, 0, 0, 1, b'c'];
-        let r = super::read_records(&raw).unwrap();
-        assert_eq!(r, vec![&b"ab"[..], &b""[..], &b"c"[..]]);
-        assert!(super::read_records(&[0, 5, b'a']).is_none(), "truncated");
+/// The monitor's view of the relay link: the node's current authenticated channel.
+struct Link {
+    node: Arc<Node>,
+    notes: watch::Receiver<Option<Vec<u8>>>,
+    anchor_due: Instant,
+    reopen: Arc<tokio::sync::Notify>,
+}
+
+impl moochy_keylog::LogLink for Link {
+    async fn get_tile(&mut self, path: &str) -> Result<Vec<u8>, moochy_keylog::Error> {
+        let mut c = self.node.link().ok_or_else(|| moochy_keylog::Error::Io("relay link down".into()))?.client;
+        let r = tokio::time::timeout(TILE_TIMEOUT, c.get_log_tile(LogTileRequest { path: path.into() }))
+            .await
+            .map_err(|_| moochy_keylog::Error::Io("tile timeout".into()))?
+            .map_err(|s| moochy_keylog::Error::Io(clean(s.message()).into_owned()))?;
+        Ok(r.into_inner().data.to_vec())
+    }
+
+    async fn next_checkpoint(&mut self) -> Option<Vec<u8>> {
+        let mut stop = self.node.shutdown.subscribe();
+        loop {
+            tokio::select! {
+                r = self.notes.changed() => {
+                    r.ok()?;
+                    if let Some(n) = self.notes.borrow_and_update().clone() {
+                        return Some(n);
+                    }
+                }
+                // Nothing pushed for a while: poll so the gate stays fresh (MAX_LOG_AGE).
+                () = tokio::time::sleep(monitor::POLL_EVERY) => {
+                    if let Ok(n) = self.get_tile("checkpoint").await {
+                        return Some(n);
+                    }
+                }
+                // Between two checkpoints: a clean point to end `run` and reopen.
+                () = self.reopen.notified() => return None,
+                r = stop.changed() => {
+                    if r.is_err() || *stop.borrow() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn anchor(&mut self) -> Option<Vec<u8>> {
+        let url = self.node.cfg.log_anchor_url.clone()?;
+        if Instant::now() < self.anchor_due {
+            return None;
+        }
+        self.anchor_due = Instant::now().checked_add(ANCHOR_EVERY)?;
+        let got = tokio::task::spawn_blocking(move || moochy_keylog::fetch::Fetcher::new(&url, TILE_TIMEOUT).and_then(|f| f.get("checkpoint", moochy_keylog::note::MAX_NOTE))).await;
+        if let Ok(Ok(note)) = got {
+            return Some(note);
+        }
+        log("warn", "key-log anchor fetch failed", &json!({}));
+        None
     }
 }

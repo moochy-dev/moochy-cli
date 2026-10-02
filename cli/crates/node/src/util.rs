@@ -123,7 +123,7 @@ pub fn fmt_dollars(uusd: u64) -> String {
 
 /// Environment variables that carry secrets: never inherited by a child we spawn (A190), except
 /// our own `moochy up`, which needs the passphrase to open the keystore.
-pub const SECRET_ENV: &[&str] = &["MOOCHY_PASSPHRASE", "MOOCHY_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+pub const SECRET_ENV: &[&str] = &["MOOCHY_PASSPHRASE", "MOOCHY_OWNER_PASSPHRASE", "MOOCHY_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
 /// `std::process::Command` without [`SECRET_ENV`].
 pub fn command(prog: impl AsRef<std::ffi::OsStr>) -> std::process::Command {

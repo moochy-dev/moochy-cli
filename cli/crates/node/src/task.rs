@@ -110,7 +110,7 @@ pub fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
         if p.receipt_sha256.0 != crypto::sha256(&e.receipt.receipt) {
             return Err("the public receipt does not commit to the signed receipt".into());
         }
-        let key_log = match node.keylog.as_ref().filter(|l| l.active()) {
+        let key_log = match node.keylog.as_ref().filter(|l| l.verified()) {
             Some(l) if l.device_by_key(&pk).as_deref() == Some(e.worker_device.as_str()) => "logged",
             Some(_) => return Err("the donor key is not in the public key log".into()),
             None => "not checked (no key log pinned)",

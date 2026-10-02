@@ -175,6 +175,9 @@ struct State {
     out_bytes: u64,
     /// OpenAI: highest tool-call index started (indices only move forward).
     oa_last: Option<u32>,
+    /// llama.cpp-style cumulative `timings` (prompt_n, cache_n, predicted_n): usage fallback
+    /// for local servers when no `usage` object was sent.
+    timings: Option<(u64, Option<u64>, u64)>,
 }
 
 fn invalid(st: &mut State, span: Span, sink: &mut dyn FnMut(Span, Event<'_>)) {
@@ -366,7 +369,7 @@ impl StreamParser {
             Dialect::OpenAiChat => {
                 // Some providers (xAI) send cumulative usage in every chunk: only a stream
                 // that really ended (`[DONE]`, or a whole JSON body) has final usage.
-                let mut u = st.oa.unwrap_or(Usage { estimated: true, ..Usage::default() });
+                let mut u = st.oa.or_else(|| st.timings.map(timings_usage)).unwrap_or(Usage { estimated: true, ..Usage::default() });
                 u.estimated |= !st.done;
                 u
             }
@@ -571,10 +574,34 @@ fn openai_chunk(st: &mut State, v: Val<'_>, data_len: u64, span: Span, sink: &mu
     if let Some(u) = v.get("usage").filter(|u| u.kind() == Kind::Obj) {
         oa_usage(st, u);
     }
+    timings(st, v);
     if !emitted {
         sink(span, Event::Other);
     }
     ends
+}
+
+/// Remember the latest `timings` (llama.cpp and Ollama send them; llama.cpp on every chunk,
+/// cumulative, even without `stream_options.include_usage`).
+fn timings(st: &mut State, v: Val<'_>) {
+    let Some(t) = v.get("timings").filter(|t| t.kind() == Kind::Obj) else { return };
+    let g = |k: &str| t.get(k).and_then(Val::as_u64);
+    if let (Some(p), Some(o)) = (g("prompt_n"), g("predicted_n")) {
+        st.timings = Some((p, g("cache_n"), o));
+    }
+}
+
+/// Usage from `timings` when the server sent no `usage`: llama.cpp's `prompt_n` excludes the
+/// cached `cache_n` (exact); without `cache_n` (Ollama) `prompt_n` includes cached tokens, so
+/// all of it counts as input (over-count) and the usage is flagged `estimated`.
+fn timings_usage((prompt, cache, predicted): (u64, Option<u64>, u64)) -> Usage {
+    Usage {
+        input: prompt,
+        output: predicted,
+        cache_read: cache.unwrap_or(0),
+        estimated: cache.is_none(),
+        ..Usage::default()
+    }
 }
 
 fn oa_usage(st: &mut State, u: Val<'_>) {
@@ -662,6 +689,10 @@ fn whole_body(st: &mut State, dialect: Dialect, v: Val<'_>) {
             set_once(&mut st.model, v.get("model"));
             if let Some(u) = v.get("usage").filter(|u| u.kind() == Kind::Obj) {
                 oa_usage(st, u);
+                st.done = true;
+            }
+            timings(st, v);
+            if st.timings.is_some() && v.get("choices").is_some() {
                 st.done = true;
             }
         }

@@ -1,0 +1,22 @@
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"Sure"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":","},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" here"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" are"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" the"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" words"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" for"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" counting"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"id":"chatcmpl-373","object":"chat.completion.chunk","created":1790893849,"model":"qwen2.5:0.5b","system_fingerprint":"fp_ollama","choices":[],"usage":{"prompt_tokens":38,"prompt_tokens_details":{"cached_tokens":24},"completion_tokens":8,"total_tokens":46},"timings":{"prompt_n":38,"prompt_ms":29,"prompt_per_token_ms":0.7631578947368421,"prompt_per_second":1310.344827586207,"predicted_n":8,"predicted_ms":50,"predicted_per_token_ms":6.25,"predicted_per_second":160}}
+
+data: [DONE]
+

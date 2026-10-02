@@ -453,6 +453,11 @@ pub(crate) fn provider_denies(p: Provider) -> &'static [(&'static str, &'static 
             ("verbosity", "not part of the xAI chat completions API"),
             ("logit_bias", "unsupported by xAI"),
         ],
+        Provider::Local => &[
+            ("store", "not part of a local inference server's API"),
+            ("modalities", "not part of a local inference server's API"),
+            ("verbosity", "not part of a local inference server's API"),
+        ],
         _ => &[],
     }
 }

@@ -56,14 +56,15 @@ fn mul(a: u64, b: u64) -> Result<u128, Error> {
 }
 
 /// Receipt cost (plan 05 §3): `ceil(Σ usage × price × fast / 1e6)`.
-/// OpenRouter: the provider-reported cost (already µ$, rounded up) is authoritative and required;
-/// every other provider MUST NOT carry one (a forged `provider_cost_uusd` is refused).
+/// OpenRouter: the provider-reported cost (already µ$, rounded up) is authoritative and required.
+/// xAI: a reported cost (`cost_in_usd_ticks`) is used when present, catalog prices otherwise (the
+/// relay caps it by the reservation). Every other provider MUST NOT carry one (refused).
 pub fn cost_uusd(c: &CatalogEntry, u: &Usage, fast: bool) -> Result<i64, Error> {
-    let openrouter = c.provider == "openrouter";
-    match (openrouter, u.provider_cost_uusd) {
-        (true, Some(pc)) if pc >= 0 => return Ok(pc),
-        (false, None) => {}
-        _ => return Err(Error::Malformed),
+    match (c.provider.as_str(), u.provider_cost_uusd) {
+        ("openrouter" | "xai", Some(pc)) if pc >= 0 => return Ok(pc),
+        ("xai", None) => {}
+        ("openrouter", _) | (_, Some(_)) => return Err(Error::Malformed),
+        (_, None) => {}
     }
     let sum = [
         mul(u.input, c.input)?,
