@@ -112,11 +112,13 @@ fn limit_cpu(pid: i32) {
     }
 }
 
-// ponytail: no prlimit on macOS; the node's deadline + `K` kill bound a stuck child there.
+// macOS: no prlimit on another process; moochy-sandbox gives each validator child RLIMIT_CPU 5 s
+// itself (limit_validator_child), and the node's deadline + `K` kill bound a stuck child.
 #[cfg(not(target_os = "linux"))]
 fn limit_cpu(_: i32) {}
 
 /// CPU seconds per validator child.
+#[cfg(target_os = "linux")]
 const CPU_SECS: u64 = 5;
 
 fn kill(pid: i32) {
