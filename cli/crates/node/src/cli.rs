@@ -624,11 +624,15 @@ fn status(home: &Home, as_json: bool) -> Result<()> {
 fn journal(home: &Home, follow: bool) -> Result<()> {
     rt_small()?.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        let mut st = c.journal(JournalRequest { follow }).await.map_err(|s| internal(s.message().to_owned()))?.into_inner();
-        while let Ok(Some(e)) = st.message().await {
-            emit(&json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms}));
+        let mut st = c.journal(JournalRequest { follow }).await.map_err(|s| internal(format!("journal unreadable: {}", clean(s.message()))))?.into_inner();
+        // A broken stream is an error, never an empty journal.
+        loop {
+            match st.message().await {
+                Ok(Some(e)) => emit(&json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms})),
+                Ok(None) => return Ok(()),
+                Err(s) => return Err(internal(format!("journal unreadable: {:?}: {}", s.code(), clean(s.message())))),
+            }
         }
-        Ok(())
     })
 }
 

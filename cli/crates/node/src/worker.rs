@@ -34,7 +34,11 @@ use tokio_stream::wrappers::ReceiverStream;
 const MAX_JOURNAL_TEXT: usize = 64 << 10;
 
 /// `(journal status, model, cost, opt-in (request, response) text)`.
-type Served = (String, String, i64, Option<(Vec<u8>, Vec<u8>)>);
+/// `(journal status, model, cost, opt-in texts, journaled)`; `journaled`: `finish` already wrote
+/// the journal entry (before `End`, so it exists once the relay counts the task settled, E62).
+type Served = (String, String, i64, Option<Texts>, bool);
+/// Opt-in journal texts (request, response).
+type Texts = (Vec<u8>, Vec<u8>);
 
 fn clip(b: &[u8]) -> Vec<u8> {
     b.get(..b.len().min(MAX_JOURNAL_TEXT)).unwrap_or_default().to_vec()
@@ -286,20 +290,23 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
         };
         acked_tx.send_replace(true);
         lock(&INFLIGHT).remove(&(task.clone(), attempt));
-        // Journal as soon as the attempt is over, not after the stream drain below (up to 10 s).
+        // Attempts that reached a receipt were journaled in `finish`; the others (refused before
+        // any receipt) here, before the stream drain below (up to 10 s).
         let ms = u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX);
-        node.journal(JournalEntry {
-            t_ms: i64::try_from(t0).unwrap_or(0),
-            role: "worker".into(),
-            task,
-            status: out.0,
-            model: out.1,
-            cost_uusd: out.2,
-            request: out.3.as_ref().map(|t| t.0.clone()).unwrap_or_default(),
-            response: out.3.map(|t| t.1).unwrap_or_default(),
-            ms,
-            ..JournalEntry::default()
-        });
+        if !out.4 {
+            node.journal(JournalEntry {
+                t_ms: i64::try_from(t0).unwrap_or(0),
+                role: "worker".into(),
+                task,
+                status: out.0,
+                model: out.1,
+                cost_uusd: out.2,
+                request: out.3.as_ref().map(|t| t.0.clone()).unwrap_or_default(),
+                response: out.3.map(|t| t.1).unwrap_or_default(),
+                ms,
+                ..JournalEntry::default()
+            });
+        }
         // Half-close and let the relay end the stream: dropping `down` first would reset it
         // before the last Nack / End is flushed.
         drop(tx);
@@ -628,7 +635,7 @@ async fn serve(
     let task16 = task_s.parse::<TaskId>().map_or([0; 16], |t| t.0.0);
     let device = node.device_id().unwrap_or_default().to_owned();
     let refuse = Refuse { tx, r, task: task_s, task16, worker: &device, attempt };
-    let refused = |code: &str| (format!("refused:{code}"), String::new(), 0, None);
+    let refused = |code: &str| (format!("refused:{code}"), String::new(), 0, None, false);
     let paused = node.paused.load(Ordering::Relaxed);
     let Some(keys) = node.keys.as_ref().filter(|_| can_serve(node) && !paused && node.worker_busy.load(Ordering::Relaxed) <= slots_max(node)) else {
         let code = if paused { "local_cap" } else { "busy" };
@@ -677,7 +684,7 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let tx = refuse.tx;
     let dialect = Dialect::from_wire(a.route.dialect.as_str()).unwrap_or(Dialect::Anthropic);
     let attempt8 = u8::try_from(attempt).unwrap_or(0);
-    let Ok(mut sealer) = ResponseSealer::new(&a.ck, &r, &a.task, &keys.device_id, attempt8) else { return ("failed:internal".into(), String::new(), 0, None) };
+    let Ok(mut sealer) = ResponseSealer::new(&a.ck, &r, &a.task, &keys.device_id, attempt8) else { return ("failed:internal".into(), String::new(), 0, None, false) };
     let call = tokio::select! {
         r = a.adapter.send(dialect.worker(), a.prepared.body.clone(), &a.prepared.headers) => Some(r),
         () = wait_cancel(down) => None,
@@ -697,13 +704,14 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
             refuse.nack(Some(&a.ck), &fl).await;
             // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
             let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
-            finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
-            return (format!("refused:{code}"), String::new(), 0, None);
+            let st = format!("refused:{code}");
+            finish(node, keys, &a, attempt8, &sealer, end, down, refuse, (&st, None)).await;
+            return (st, String::new(), 0, None, true);
         }
         None => {
             let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
-            finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
-            return ("cancelled".into(), String::new(), 0, None);
+            finish(node, keys, &a, attempt8, &sealer, end, down, refuse, ("cancelled", None)).await;
+            return ("cancelled".into(), String::new(), 0, None, true);
         }
     };
     let t_started = now_ms();
@@ -795,7 +803,6 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let model = clean(out.model.as_deref().unwrap_or("")).into_owned();
     let req_id = request_id.or(out.id).unwrap_or_default();
     let end = Ending { status, usage, cost, local, model: model.clone(), req_id, times: (t_start, t_started) };
-    finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
     let st = match status {
         ReceiptStatus::Ok => "ok",
         ReceiptStatus::Cancelled => "cancelled",
@@ -805,7 +812,8 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     };
     // Opt-in full text for the donor's own journal (bounded; never sent anywhere).
     let text = node.cfg.journal_full_text.then(|| (clip(&a.inner.body_b64.0), clip(&seen)));
-    (st.into(), model, cost, text)
+    finish(node, keys, &a, attempt8, &sealer, end, down, refuse, (st, text.clone())).await;
+    (st.into(), model, cost, text, true)
 }
 
 struct Ending {
@@ -819,10 +827,22 @@ struct Ending {
     times: (u64, u64),
 }
 
-/// Sign the receipt, persist it (fsync) before `End`, then wait for the ack; if none comes on
-/// the Serve stream, hand it to the session (`ReplayReceipt`) so it is never lost.
+/// Sign the receipt, persist it (fsync) before `End`, journal the attempt, send `End`, then wait
+/// for the ack; if none comes on the Serve stream, hand it to the session (`ReplayReceipt`) so
+/// it is never lost. The journal entry is written before `End`: the relay settles the task on
+/// `End`, and the ack wait plus its outbox fsync can take seconds on a slow disk (E62).
 #[allow(clippy::too_many_arguments)]
-async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer: &ResponseSealer, e: Ending, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) {
+async fn finish(
+    node: &Arc<Node>,
+    keys: &Keys,
+    a: &Admitted,
+    attempt: u8,
+    sealer: &ResponseSealer,
+    e: Ending,
+    down: &mut tonic::Streaming<ServeDown>,
+    refuse: &Refuse<'_>,
+    journal: (&str, Option<Texts>),
+) {
     let ucost = u64::try_from(e.local).unwrap_or(0);
     let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times) else {
         log("error", "receipt signing failed", &json!({"task": refuse.task}));
@@ -836,6 +856,20 @@ async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer
         let path = inflight_path(node, refuse.task, refuse.attempt);
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }
+    let (t0, now) = (e.times.0, now_ms());
+    let (request, response) = journal.1.unwrap_or_default();
+    node.journal(JournalEntry {
+        t_ms: i64::try_from(t0).unwrap_or(0),
+        role: "worker".into(),
+        task: refuse.task.to_owned(),
+        status: journal.0.to_owned(),
+        model: e.model.clone(),
+        cost_uusd: e.cost,
+        request,
+        response,
+        ms: u32::try_from(now.saturating_sub(t0)).unwrap_or(u32::MAX),
+        ..JournalEntry::default()
+    });
     let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
     let ack = if sent {
         timeout(Duration::from_secs(5), async {
