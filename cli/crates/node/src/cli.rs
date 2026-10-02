@@ -767,8 +767,12 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
 fn up_foreground(home: Home, offline: bool, unsafe_no_lockdown: bool) -> Result<()> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
     // CONTRACT §15.2: load, bind, lock down while single-threaded, then start the runtime.
-    let boot = crate::lockdown::Boot::load(&home, offline)?;
-    crate::lockdown::apply(&home, &boot, unsafe_no_lockdown)?;
+    // A222: the debug escape hatch exists only in insecure dev mode.
+    if unsafe_no_lockdown && !dev_mode() {
+        return Err(usage("--unsafe-no-lockdown is only accepted with MOOCHY_INSECURE_DEV=1 (debugging)"));
+    }
+    let mut boot = crate::lockdown::Boot::load(&home, offline)?;
+    crate::lockdown::apply(&home, &mut boot, unsafe_no_lockdown)?;
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().ctx("runtime")?;
     rt.block_on(up(home, offline, boot))
 }
@@ -803,6 +807,11 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
                 eprintln!("moochy: WARNING the local model server {} is not a loopback or private address (--allow-unvetted-host, development only)", clean(p.base_url.as_deref().unwrap_or("")));
             }
         }
+        // A222: an unvetted local host is a development setting; outside dev mode it is refused.
+        if p.allow_unvetted_host && !dev_mode() {
+            log("error", "local model server refused: --allow-unvetted-host is development only (MOOCHY_INSECURE_DEV=1)", &json!({}));
+            continue;
+        }
         let built = if local { Adapter::new_local(&cfg, p.allow_unvetted_host) } else { Adapter::new(&cfg) };
         match built {
             Ok(a) => adapters.push(Arc::new(a)),
@@ -810,12 +819,12 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         }
     }
     let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
-    Ok(WorkerParts { adapters, local_models, local_served, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
+    Ok(WorkerParts { adapters, local_models, local_served, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None, locked: false })
 }
 
 async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
     let port = boot.port();
-    let crate::lockdown::Boot { cfg, secrets, listener, validator } = boot;
+    let crate::lockdown::Boot { cfg, secrets, listener, validator, locked } = boot;
     let listener = tokio::net::TcpListener::from_std(listener).ctx("gateway listener")?;
     let sock_path = home.socket_path();
     let sock = crate::ctl::bind(&sock_path).await?;
@@ -825,6 +834,7 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
     };
     let mut parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
     parts.validator = validator;
+    parts.locked = locked;
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));

@@ -52,7 +52,7 @@ fn device_cap(node: &Node) -> Option<u64> {
 }
 
 fn can_serve(node: &Node) -> bool {
-    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && node.validator.as_ref().is_some_and(|v| v.alive()) && device_cap(node).is_some() && !node.adapters.is_empty()
+    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && node.locked && node.validator.as_ref().is_some_and(|v| v.alive()) && device_cap(node).is_some() && !node.adapters.is_empty()
 }
 
 fn slots_max(node: &Node) -> u32 {

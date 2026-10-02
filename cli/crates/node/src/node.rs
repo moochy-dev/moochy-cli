@@ -121,6 +121,8 @@ pub struct Node {
     pub local_served: std::collections::HashSet<String>,
     /// Worker: serializes `ListDonations` refreshes (T-03-088); value = last fetch (ms).
     pub pledge_refresh: tokio::sync::Mutex<u64>,
+    /// The process locked itself down (§15.2): required to donate (A222).
+    pub locked: bool,
     /// Worker: single-use jailed request validators (CONTRACT §15.2).
     pub validator: Option<Arc<crate::validator::Pool>>,
     /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
@@ -184,6 +186,7 @@ impl Node {
             adapters: w.adapters,
             store: w.store,
             validator: w.validator,
+            locked: w.locked,
             local_models: w.local_models,
             local_served: w.local_served,
             pledge_refresh: tokio::sync::Mutex::new(0),
@@ -502,6 +505,8 @@ pub struct WorkerParts {
     pub local_served: std::collections::HashSet<String>,
     pub store: Option<Arc<Mutex<Store>>>,
     pub validator: Option<Arc<crate::validator::Pool>>,
+    /// The process is locked down (CONTRACT §15.2); an unlocked node never donates (A222).
+    pub locked: bool,
 }
 
 /// RAII counter for in-flight work (`gateway_tasks`, `worker_busy`).
