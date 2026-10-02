@@ -496,11 +496,20 @@ fn slug_or_detect(o: &Opts) -> Result<String> {
     }
 }
 
-/// The project of the `origin` remote of the current git repository (github.com, gitlab.com).
+/// The project of the `origin` remote of the current git repository: github.com and gitlab.com
+/// (nested groups) exactly; any other remote (a mirror, a bundle) by its last two path segments,
+/// as before (two segments = GitHub; the relay decides whether the project exists).
 fn detect_repo() -> Option<String> {
     let out = crate::util::command("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
-    let p = crate::button::parse_remote(&String::from_utf8(out.stdout).ok()?).ok()?;
-    crate::config::canonical_slug(&if p.provider == "gitlab" { format!("gitlab/{}", p.path) } else { p.path })
+    let url = String::from_utf8(out.stdout).ok()?;
+    if let Ok(p) = crate::button::parse_remote(&url) {
+        return crate::config::canonical_slug(&if p.provider == "gitlab" { format!("gitlab/{}", p.path) } else { p.path });
+    }
+    let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = url.rsplit_once(':').map_or(url, |(_, p)| p);
+    let mut parts = path.rsplit('/');
+    let (name, owner) = (parts.next()?, parts.next()?);
+    crate::config::canonical_slug(&format!("{owner}/{name}"))
 }
 
 /// `moochy run -- <cmd…>` (CONTRACT §15.1). Fails closed until `moochy-sandbox` is in the build.
