@@ -184,7 +184,7 @@ impl Config {
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "monthly_limit" => {
-                self.device_monthly_cap_uusd = Some(crate::util::parse_dollars(value.trim_start_matches('$')).ok_or_else(|| usage("monthly_limit is a dollar amount, e.g. 20 or 12.50"))?);
+                self.device_monthly_cap_uusd = Some(crate::util::parse_amount(value).map_err(|e| usage(format!("monthly_limit is a dollar amount, e.g. 20 or 12.50: {e}")))?);
             }
             // Machine form of `monthly_limit` (millionths of a dollar), kept for scripts.
             "device_monthly_cap_uusd" => {

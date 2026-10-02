@@ -177,7 +177,10 @@ fn parse() -> Result<Opts> {
             Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
-            Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
+            Long("cap") => {
+                let v = crate::util::parse_amount(&s(p.value().map_err(err)?)?).map_err(|e| usage(format!("--cap (a monthly amount in dollars): {e}")))?;
+                o.cap = Some(i64::try_from(v).map_err(|_| usage("--cap is too large"))?);
+            }
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {

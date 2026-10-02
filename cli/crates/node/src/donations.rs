@@ -65,6 +65,9 @@ fn donation_json(d: &Donation) -> serde_json::Value {
         "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule)})
 }
 
+/// CONTRACT D19: default per-request limit of a donation.
+const DEFAULT_PER_REQUEST_UUSD: i64 = 5_000_000;
+
 fn dollars(uusd: i64) -> String {
     format!("${}.{:02}", uusd / 1_000_000, (uusd % 1_000_000) / 10_000)
 }
@@ -92,6 +95,7 @@ pub fn donate(home: &crate::config::Home, slug: &str, monthly_uusd: i64, yes: bo
     if monthly_uusd <= 0 {
         return Err(usage("set a monthly limit: --cap $20 (or --budget-uusd N)"));
     }
+    eprintln!("Donating tokens to {} up to {} a month (at most {} per request).", clean(slug), dollars(monthly_uusd), dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)));
     if !yes {
         use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() {
@@ -108,8 +112,8 @@ pub fn donate(home: &crate::config::Home, slug: &str, monthly_uusd: i64, yes: bo
         request_id: crate::util::ulid()?,
         repo_slug: slug.into(),
         budget_uusd: monthly_uusd,
-        // One request may use at most $1 (or the whole monthly limit when it is smaller).
-        per_task_cap_uusd: monthly_uusd.min(1_000_000),
+        // D19: one request may use at most $5 by default (or the whole monthly limit when smaller).
+        per_task_cap_uusd: monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD),
         models: Vec::new(),
         max_effort: String::new(),
         visibility: "pseudonymous".into(),
