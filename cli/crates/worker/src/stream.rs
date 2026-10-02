@@ -392,7 +392,10 @@ impl StreamParser {
         if st.tainted {
             usage.estimated = true;
         }
-        if usage.estimated {
+        // Responses with a usage object: the receipt usage is exactly what money.json `responses`
+        // derives from it (estimated if a count is missing); the byte floor is for cut streams.
+        let from_usage_object = self.dialect == Dialect::OpenAiResponses && st.oa.is_some() && !st.tainted;
+        if usage.estimated && !from_usage_object {
             // ponytail: ~4 bytes of SSE payload per output token; estimated receipts settle
             // pessimistically at the reservation anyway (05 §5.2).
             usage.output = usage.output.max(st.out_bytes.div_ceil(4));

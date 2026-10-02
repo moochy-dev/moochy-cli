@@ -549,12 +549,15 @@ pub(crate) const OPENAI_BODY: T = T::Obj(&[
 
 // --- OpenAI Responses (§18.6: OpenAI, xAI, OpenRouter) ---
 
+/// Every count may be missing or null: the event is still forwarded, and the receipt usage is
+/// marked estimated (settled at the reservation) exactly as `moochy_proto::money::responses_usage`
+/// and spec/vectors/money.json `responses` define.
 const R_USAGE: T = T::Obj(&[
-    M("input_tokens", T::U64, true),
-    M("input_tokens_details", T::Or(&[T::Null, T::Obj(&[M("cached_tokens", T::U64, false)])]), false),
-    M("output_tokens", T::U64, true),
-    M("output_tokens_details", T::Or(&[T::Null, T::Obj(&[M("reasoning_tokens", T::U64, false)])]), false),
-    M("total_tokens", T::U64, false),
+    M("input_tokens", OPT_U64, false),
+    M("input_tokens_details", T::Or(&[T::Null, T::Obj(&[M("cached_tokens", OPT_U64, false)])]), false),
+    M("output_tokens", OPT_U64, false),
+    M("output_tokens_details", T::Or(&[T::Null, T::Obj(&[M("reasoning_tokens", OPT_U64, false)])]), false),
+    M("total_tokens", OPT_U64, false),
     M("cost", T::Or(&[T::Null, T::Num]), false),
     M("is_byok", T::Bool, false),
     M("cost_in_usd_ticks", T::U64, false),

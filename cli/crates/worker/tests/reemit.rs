@@ -350,3 +350,68 @@ fn refused_event_keeps_the_canonical_prefix() {
     assert!(r.push(format!("{start}{good}{bad}").as_bytes(), &mut merged).is_err());
     assert_eq!(String::from_utf8(merged).unwrap(), String::from_utf8(alone).unwrap());
 }
+
+/// Events a client should receive from `input`: blocks with a `data:` line (comments carry no
+/// data; a Responses `[DONE]` is not an event of that dialect).
+fn data_events(d: Dialect, input: &str) -> usize {
+    input
+        .split("\n\n")
+        .filter(|b| b.lines().any(|l| l.starts_with("data:")))
+        .filter(|b| !(d == Dialect::OpenAiResponses && b.lines().any(|l| l.trim() == "data: [DONE]")))
+        .count()
+}
+
+/// Never a silent stop (every dialect): the re-emitter either refuses (an `Err` the Gateway
+/// turns into the dialect's native error event) or emits exactly one canonical event per input
+/// event. It never accepts while swallowing an event.
+#[test]
+fn refusals_are_explicit_never_silent() {
+    let r = Dialect::OpenAiResponses;
+    let mut streams: Vec<(String, Dialect, String)> = stream_fixtures().into_iter().map(|(n, d, s)| (n.to_owned(), d, String::from_utf8_lossy(s).into_owned())).collect();
+    for f in ["stream_text_tool.sse", "stream_custom_tool.sse"] {
+        streams.push((f.into(), r, std::fs::read_to_string(format!("{}/tests/fixtures/responses/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap()));
+    }
+    // Accepted streams lose nothing.
+    for (name, d, s) in &streams {
+        let out = reemit::reemit(*d, true, s.as_bytes()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(data_events(*d, &out), data_events(*d, s), "{name}: an event was dropped");
+    }
+    let a_ok = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let o_ok = "data: [DONE]\n\n";
+    let r_ok = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\"}}\n\n";
+    let big = format!("data: {{\"x\":\"{}\"}}\n\n", "a".repeat(reemit::MAX_EVENT + 1));
+    let cases: Vec<(Dialect, String)> = vec![
+        // Unknown event / block types.
+        (A, "event: totally_new\ndata: {\"type\":\"totally_new\"}\n\n".into()),
+        (r, "event: response.queued\ndata: {\"type\":\"response.queued\"}\n\n".into()),
+        (O, "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":1,\"delta\":{}}]}\n\n".into()),
+        // Missing required members.
+        (A, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0}\n\n".into()),
+        (O, "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\"}\n\n".into()),
+        (r, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"output_index\":0,\"content_index\":0}\n\n".into()),
+        // Not strict JSON, duplicate keys, CR-only endings, foreign SSE fields, two data lines.
+        (A, "event: ping\ndata: {\"type\":\"ping\"\n\n".into()),
+        (O, "data: {\"id\":\"c\",\"id\":\"d\"}\n\n".into()),
+        (r, format!("event: response.completed\rdata: x\n\n{r_ok}")),
+        (A, format!("id: 7\n{a_ok}")),
+        (O, "data: {}\ndata: {}\n\n".into()),
+        // Event name and data type disagree.
+        (A, "event: message_stop\ndata: {\"type\":\"ping\"}\n\n".into()),
+        (r, "event: response.completed\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\"}}\n\n".into()),
+        // Oversize event, truncated stream, bytes after the end.
+        (O, big),
+        (A, "event: ping\ndata: {\"type\":\"ping\"}".into()),
+        (r, r_ok[..r_ok.len() - 1].into()),
+        (O, format!("{o_ok}data: [DONE]\n")),
+    ];
+    for (d, s) in &cases {
+        let mut rm = Reemitter::new(*d, true);
+        let mut out = Vec::new();
+        let res = rm.push(s.as_bytes(), &mut out).and_then(|()| rm.finish(&mut out));
+        assert!(res.is_err(), "{d:?}: accepted {:?}", &s[..s.len().min(160)]);
+        // What was written before the refusal is whole events only (delivered, then the error).
+        let w = String::from_utf8(out).unwrap();
+        assert!(w.is_empty() || w.ends_with("\n\n"), "{d:?}: partial event written: {w:?}");
+    }
+}

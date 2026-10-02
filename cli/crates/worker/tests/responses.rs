@@ -281,3 +281,70 @@ fn tool_inspection() {
     // Non-streamed body: calls with their exact input.
     assert_eq!(response_tool_calls(R, BODY.as_bytes()).unwrap(), vec![("shell".to_owned(), br#"{"command":["cargo","test"],"workdir":"/repo"}"#.to_vec())]);
 }
+
+/// spec/vectors/money.json `responses` (CONTRACT §18.6): a `response.completed` whose usage has
+/// missing, null or inconsistent counts is forwarded (never dropped), and the receipt usage is
+/// exactly the vector's `receipt_usage` (estimated where the vector says so). Both wire forms of
+/// "absent": an explicit `null` and an omitted key.
+#[test]
+fn money_vectors_responses_usage() {
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../spec/vectors/money.json")).unwrap();
+    // The strict parser refuses integers outside i64 (contract): a provider usage of u64::MAX
+    // fails the attempt with an explicit error. The vector's arithmetic is checked at i64::MAX.
+    let raw = raw.replace("18446744073709551615", "9223372036854775807").into_bytes();
+    let huge = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"usage\":{\"input_tokens\":18446744073709551615}}}\n\n";
+    assert!(canon(huge).is_err(), "out-of-range usage is refused explicitly, not dropped");
+    let mut tape = Vec::new();
+    let doc = moochy_worker::json::parse(&raw, &mut tape).unwrap();
+    let vectors: Vec<_> = doc.root().get("responses").unwrap().items().collect();
+    assert!(vectors.len() >= 10);
+    for v in vectors {
+        let name = v.get("name").and_then(|n| n.as_str()).unwrap().into_owned();
+        let provider = v.get("provider").and_then(|p| p.as_str()).unwrap().into_owned();
+        let u = v.get("usage").unwrap();
+        let num = |x: Option<moochy_worker::json::Val<'_>>| x.and_then(|x| x.as_u64());
+        let cached = num(u.get("input_tokens_details").and_then(|d| d.get("cached_tokens")));
+        let cost = num(u.get("provider_cost_uusd"));
+        for keep_nulls in [true, false] {
+            let mut fields = Vec::new();
+            let mut put = |k: &str, x: Option<u64>| match x {
+                Some(n) => fields.push(format!("\"{k}\":{n}")),
+                None if keep_nulls => fields.push(format!("\"{k}\":null")),
+                None => {}
+            };
+            put("input_tokens", num(u.get("input_tokens")));
+            put("output_tokens", num(u.get("output_tokens")));
+            put("total_tokens", num(u.get("total_tokens")));
+            match (cached, keep_nulls) {
+                (Some(c), _) => fields.push(format!("\"input_tokens_details\":{{\"cached_tokens\":{c}}}")),
+                (None, true) => fields.push("\"input_tokens_details\":{\"cached_tokens\":null}".into()),
+                (None, false) => {}
+            }
+            // Provider cost on the wire: xAI ticks (10^4 per µ$), OpenRouter decimal dollars.
+            match (provider.as_str(), cost) {
+                ("xai", Some(c)) => fields.push(format!("\"cost_in_usd_ticks\":{}", c * 10_000)),
+                ("openrouter", Some(c)) => fields.push(format!("\"cost\":{}.{:06}", c / 1_000_000, c % 1_000_000)),
+                _ => {}
+            }
+            let usage = format!("{{{}}}", fields.join(","));
+            let stream = format!(
+                "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_v\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5\",\"output\":[]}}}}\n\n\
+                 event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_v\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5\",\"usage\":{usage}}}}}\n\n"
+            );
+            let out = canon(&stream).unwrap_or_else(|e| panic!("{name} (nulls {keep_nulls}): completed refused: {e}"));
+            assert!(out.contains("event: response.completed") && out.contains("\"usage\""), "{name}: {out}");
+            for s in [stream.as_str(), out.as_str()] {
+                let (_, o) = parse(s, 37);
+                assert!(o.complete && !o.malformed, "{name}");
+                let want = v.get("receipt_usage").unwrap();
+                let w = |k: &str| want.get(k).and_then(|x| x.as_u64()).unwrap();
+                let got = (o.usage.input, o.usage.output, o.usage.cache_read, o.usage.cache_write_5m, o.usage.cache_write_1h, o.usage.estimated);
+                let exp = (w("input"), w("output"), w("cache_read"), w("cache_write_5m"), w("cache_write_1h"), want.get("estimated").and_then(|x| x.as_bool()).unwrap());
+                assert_eq!(got, exp, "{name} (nulls {keep_nulls})");
+                if provider != "openai" {
+                    assert_eq!(o.usage.provider_cost_uusd, num(want.get("provider_cost_uusd")), "{name}: provider cost");
+                }
+            }
+        }
+    }
+}
