@@ -228,6 +228,7 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
         Event::Stale { served, mirrored } => ("error", "key log alert".into(), json!({"event": "stale", "served": served, "mirrored": mirrored})),
         Event::Rollback { anchored, served } => ("error", "KEY LOG FORK: rollback vs the public anchor".into(), json!({"event": "rollback", "anchored": anchored, "served": served})),
         Event::Unwitnessed { size, cosignatures } => ("error", "key log alert".into(), json!({"event": "unwitnessed", "size": size, "cosignatures": cosignatures})),
+        Event::FailOpen => ("warn", e.message(), json!({"event": "fail_open"})),
     }
 }
 
