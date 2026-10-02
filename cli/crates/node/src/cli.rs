@@ -759,7 +759,7 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
     use std::io::IsTerminal as _;
     let user_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| usage("HOME is not set"))?;
     let (default_path, plan) = crate::connect::write_plan(client, &user_home, slug, url, main, small)
-        .ok_or_else(|| usage(format!("--write is not supported for {client} (YAML/env based): paste the snippet from `moochy connect {client}`")))?;
+        .ok_or_else(|| usage(format!("--write is not supported for {client} (its settings are environment variables or typed into the app): paste the snippet from `moochy connect {client}`")))?;
     let path = o.config.clone().unwrap_or(default_path);
     let path = std::path::absolute(&path).ctx("config path")?;
     if git_tracked(&path) {
@@ -770,17 +770,28 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(internal(format!("read {}: {e}", path.display()))),
     };
-    let mut v = if old.trim().is_empty() {
-        json!({})
-    } else {
-        crate::json::parse(old.as_bytes()).map_err(|e| usage(format!("{} is not plain JSON ({e}); edit it by hand with the snippet", path.display())))?
+    // The file's format follows its extension (the agents' own files: TOML for Codex, YAML for
+    // Hermes, JSON otherwise); TOML and YAML are edited in place, JSON merged and re-printed.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let (pretty_old, new) = match ext.as_str() {
+        "toml" | "yaml" | "yml" => {
+            let edit = if ext == "toml" { crate::connect::toml_edit(&old, &plan) } else { crate::connect::yaml_edit(&old, &plan) };
+            (old.clone(), edit.map_err(|e| usage(format!("{}: {e}; paste the snippet from `moochy connect {client}` instead", path.display())))?)
+        }
+        _ => {
+            let mut v = if old.trim().is_empty() {
+                json!({})
+            } else {
+                crate::json::parse(old.as_bytes()).map_err(|e| usage(format!("{} is not plain JSON ({e}); edit it by hand with the snippet", path.display())))?
+            };
+            if !crate::connect::merge(&mut v, &plan) {
+                return Err(usage(format!("{} does not have the expected JSON shape", path.display())));
+            }
+            let pretty_old = if old.trim().is_empty() { String::new() } else { serde_json::to_string_pretty(&crate::json::parse(old.as_bytes()).unwrap_or_default()).unwrap_or_default() };
+            (pretty_old, format!("{}\n", serde_json::to_string_pretty(&v).ctx("encode config")?))
+        }
     };
-    if !crate::connect::merge(&mut v, &plan) {
-        return Err(usage(format!("{} does not have the expected JSON shape", path.display())));
-    }
-    let new = serde_json::to_string_pretty(&v).ctx("encode config")?;
-    let pretty_old = if old.trim().is_empty() { String::new() } else { serde_json::to_string_pretty(&crate::json::parse(old.as_bytes()).unwrap_or_default()).unwrap_or_default() };
-    if pretty_old == new {
+    if pretty_old.trim_end() == new.trim_end() {
         emit(&json!({"event": "connect", "client": client, "path": path.display().to_string(), "changed": false}));
         return Ok(());
     }
@@ -798,8 +809,13 @@ fn connect_write(o: &Opts, client: &str, url: &str, slug: &str, main: &str, smal
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ctx("create config dir")?;
     }
-    crate::config::write_private(&path, format!("{new}\n").as_bytes())?;
-    emit(&json!({"event": "connect", "client": client, "path": path.display().to_string(), "changed": true}));
+    // The previous file is kept next to it (0600) before anything changes.
+    let backup = (!old.is_empty()).then(|| PathBuf::from(format!("{}.moochy-backup", path.display())));
+    if let Some(b) = &backup {
+        crate::config::write_private(b, old.as_bytes())?;
+    }
+    crate::config::write_private(&path, new.as_bytes())?;
+    emit(&json!({"event": "connect", "client": client, "path": path.display().to_string(), "changed": true, "backup": backup.map(|b| b.display().to_string())}));
     Ok(())
 }
 
