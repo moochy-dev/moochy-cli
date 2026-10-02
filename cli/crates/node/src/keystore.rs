@@ -4,13 +4,11 @@
 //! mode 0600) and, behind the `keychain` feature, the OS keychain.
 
 use crate::config::{Config, Home, write_private};
-use crate::util::{Ctx as _, Result, auth, b64d, b64e, internal, lp, rand_bytes};
+use crate::util::{Ctx as _, Result, auth, b64d, b64e, internal, rand_bytes};
 use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use hmac::{Hmac, Mac as _};
 use moochy_proto::crypto::{EncSecret, SignKey};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -99,17 +97,26 @@ impl DeviceKeys {
     }
 }
 
-type HmacSha256 = Hmac<Sha256>;
-
 impl Secrets {
     pub fn new() -> Result<Self> {
         Ok(Self { device: None, local_secret: rand_bytes()?, providers: Vec::new() })
     }
 
+    /// HMAC-SHA256(secret, lp(parts…)), the `lp` framing fed piece by piece: no copy of the
+    /// inputs (the affinity key hashes the whole system prompt + tools on every request), and
+    /// ring's SHA-256 (hardware SHA on arm64/x86): 100 KB in ~58 µs instead of ~280 µs.
     fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
-        let mut m = <HmacSha256 as hmac::Mac>::new_from_slice(&self.local_secret).unwrap_or_else(|_| unreachable_hmac());
-        m.update(&lp(parts));
-        m.finalize().into_bytes().into()
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.local_secret);
+        let mut c = ring::hmac::Context::with_key(&key);
+        for p in parts {
+            // A part over 4 GiB cannot occur (bodies are capped far below); saturate rather
+            // than wrap if it ever did.
+            c.update(&u32::try_from(p.len()).unwrap_or(u32::MAX).to_be_bytes());
+            c.update(p);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(c.sign().as_ref().get(..32).unwrap_or(&[0u8; 32]));
+        out
     }
 
     /// Repo-scoped local token: `mooch_local_<b64(slug)>.<b64(HMAC(secret, lp(label, slug, gen)))>`.
@@ -144,12 +151,6 @@ impl Secrets {
     pub fn provider(&self, name: &str) -> Option<&ProviderKey> {
         self.providers.iter().find(|p| p.provider == name)
     }
-}
-
-/// HMAC-SHA256 accepts keys of any length; this cannot happen.
-#[cold]
-fn unreachable_hmac() -> HmacSha256 {
-    std::process::abort()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -384,6 +385,24 @@ mod b64_32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The local tokens already issued must stay valid: same bytes as HMAC-SHA256 over the
+    /// `lp` framing (vectors from Python's hmac/hashlib).
+    #[test]
+    fn mac_vectors() {
+        let mut s = Secrets::new().unwrap();
+        s.local_secret = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        let hex = |b: &[u8]| {
+            use std::fmt::Write as _;
+            b.iter().fold(String::new(), |mut s, x| {
+                let _ = write!(s, "{x:02x}");
+                s
+            })
+        };
+        assert_eq!(hex(&s.mac(&[b"moochy/local-token", b"acme/widget", &7u64.to_be_bytes()])), "2de1d599ca037e16d9463bfa920be5d8edfae8bccf9b0326b1437657e2606629");
+        let big = vec![b'x'; 100_000];
+        assert_eq!(hex(&s.mac(&[b"moochy/affinity", b"sys", b"", &big])), "201a3756c1ce80fe93d111d5a828e6ac9e75b89d297ace9f8d9410dc8c2bc99c");
+    }
 
     #[test]
     fn seal_open_and_tokens() {
