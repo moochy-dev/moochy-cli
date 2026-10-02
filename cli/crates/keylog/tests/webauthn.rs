@@ -194,6 +194,7 @@ fn passkey_monitor_alerts() {
             "NotSignedByMe:14",
             "OwnerKeyRevoked:15",
             "NotSignedByMe:17",
+            "NotSignedByMe:23",
         ]
     );
     // Both passkeys acknowledged (created on this user's devices): only the counter

@@ -60,6 +60,8 @@ fn alert_str(a: &Alert) -> String {
             idx, email_proof, ..
         } => format!("UnknownPasskey:{idx}:{email_proof}"),
         Alert::PasskeyCounter { idx, .. } => format!("PasskeyCounter:{idx}"),
+        Alert::BoxEnrolled { idx, .. } => format!("BoxEnrolled:{idx}"),
+        Alert::BoxOutsideRepo { idx, .. } => format!("BoxOutsideRepo:{idx}"),
     }
 }
 

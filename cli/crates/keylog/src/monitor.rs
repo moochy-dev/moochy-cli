@@ -195,6 +195,22 @@ fn alert_message(a: &Alert) -> String {
                 ""
             }
         ),
+        Alert::BoxEnrolled {
+            idx,
+            device_id,
+            repo_id,
+            box_id,
+            expires_at_ms,
+        } => format!(
+            "keylog: box_enrolled: box device {device_id} (token {box_id}) was enrolled on your account for repo {repo_id}, gateway only, until {expires_at_ms} ms (log #{idx}); if this wasn't you, run `moochy box revoke {device_id}`"
+        ),
+        Alert::BoxOutsideRepo {
+            idx,
+            device_id,
+            repo_id,
+        } => format!(
+            "keylog: SECURITY: box_outside_repo: box device {device_id} on your account is scoped to repo {repo_id}, which you neither own nor are a member of (log #{idx}); it was not enrolled by a token of yours"
+        ),
         Alert::PasskeyCounter { idx, owner_key } => format!(
             "keylog: SECURITY: passkey_counter: an assertion of your passkey {owner_key} reused or lowered its sign counter (log #{idx}): a cloned authenticator or a replayed signature; the entry is ignored"
         ),
