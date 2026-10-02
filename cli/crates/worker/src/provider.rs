@@ -17,7 +17,7 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::Full;
 use hyper::body::{Body, Incoming};
 use hyper::client::conn::{http1, http2};
-use hyper::header::{HeaderMap, HeaderValue};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::TcpStream;
@@ -255,11 +255,14 @@ struct Target {
     port: u16,
     /// `host[:port]` for the URI authority.
     authority: String,
+    /// Remote local server (§17.3): resolve here, refuse unless every address is public, and
+    /// dial that exact address (no second lookup an attacker could rebind).
+    public_only: bool,
 }
 
 fn real_target(p: Provider) -> Target {
     let host = AdapterDef::of(p).host;
-    Target { tls: true, host: host.to_owned(), port: 443, authority: host.to_owned() }
+    Target { tls: true, host: host.to_owned(), port: 443, authority: host.to_owned(), public_only: false }
 }
 
 /// `scheme://host[:port][/]`: an origin only (a path is refused rather than interpreted:
@@ -316,18 +319,59 @@ fn dev_target(url: &str) -> Result<Target, ConfigError> {
     if !ip.is_loopback() {
         return Err(ConfigError("base URL host must be loopback"));
     }
-    Ok(Target { tls: o.tls, host: ip.to_string(), port: o.port, authority: o.authority.to_owned() })
+    Ok(Target { tls: o.tls, host: ip.to_string(), port: o.port, authority: o.authority.to_owned(), public_only: false })
 }
 
 /// Where a local inference server may live. Vetted: loopback, private LAN (RFC 1918, IPv6
-/// ULA) and CGNAT/Tailscale (100.64.0.0/10) IP literals. Never: link-local (cloud metadata
-/// 169.254.169.254, fe80::/10), unspecified, multicast, broadcast. Public IPs and host names
-/// (DNS can rebind them) only with `allow_unvetted_host` (`--allow-unvetted-host`, dev).
+/// ULA) and CGNAT/Tailscale (100.64.0.0/10) IP literals, over http or https. A donor's own GPU
+/// box elsewhere (RunPod, Vast, Lambda: CONTRACT §17.3) only over https and only when its exact
+/// `host:port` is on the donor's vetted list ([`LocalOptions::vetted_hosts`]). Never:
+/// link-local (cloud metadata 169.254.169.254, fe80::/10), unspecified, multicast, broadcast,
+/// plain HTTP off the LAN. `allow_unvetted_host` (`--allow-unvetted-host`, dev) skips the list,
+/// not the https rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalHost {
     Loopback,
     Lan,
+    /// A remote TLS server on the donor's vetted list.
+    Remote,
     Unvetted,
+}
+
+/// How a remote (or LAN https) local server's certificate is checked.
+#[derive(Clone, Debug, Default)]
+pub enum RemoteTrust {
+    /// Mozilla roots (webpki-roots) and the host name.
+    #[default]
+    Roots,
+    /// Only this CA (DER), and the host name: a self-signed CA on the GPU box.
+    Ca(CertificateDer<'static>),
+    /// Exactly this end-entity certificate: SHA-256 of its DER (no CA, no name check).
+    Fingerprint([u8; 32]),
+}
+
+/// Options of a [`Provider::Local`] adapter (`moochy keys add local --url …`).
+#[derive(Default)]
+pub struct LocalOptions {
+    /// Dev only: hosts off the vetted list (still https-only off the LAN).
+    pub allow_unvetted_host: bool,
+    /// Remote servers the donor vetted, each exactly as [`remote_host_key`] returns it.
+    pub vetted_hosts: Vec<String>,
+    /// Auth header from the keystore: `(name, value)`, the value a secret (never logged). Takes
+    /// the place of the API key (`Authorization: Bearer …`).
+    pub auth_header: Option<(String, Zeroizing<String>)>,
+    pub trust: RemoteTrust,
+}
+
+impl std::fmt::Debug for LocalOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalOptions")
+            .field("allow_unvetted_host", &self.allow_unvetted_host)
+            .field("vetted_hosts", &self.vetted_hosts)
+            .field("auth_header", &self.auth_header.as_ref().map(|(n, _)| n))
+            .field("trust", &self.trust)
+            .finish()
+    }
 }
 
 fn vet_ip(ip: IpAddr) -> Result<LocalHost, ConfigError> {
@@ -368,29 +412,117 @@ fn vet_ip(ip: IpAddr) -> Result<LocalHost, ConfigError> {
     }
 }
 
-/// Vet a local inference server's base URL (`moochy keys add local --base-url …`): returns its
-/// class, or why it is refused. Origin only; the path is always `/v1/chat/completions`.
-pub fn check_local_base_url(url: &str, allow_unvetted_host: bool) -> Result<LocalHost, ConfigError> {
-    local_target(url, allow_unvetted_host).map(|(_, c)| c)
+/// A DNS host name, lowercased: ASCII labels `[a-z0-9-]`, no empty label (no trailing dot), no
+/// numeric last label (`2130706433`, `127.1`, `0x7f.1` are IPv4 in other parsers), ≤ 253 bytes.
+fn dns_name(host: &str) -> Result<String, ConfigError> {
+    let h = host.to_ascii_lowercase();
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let last = h.rsplit('.').next().unwrap_or("");
+    if h.len() > 253 || !h.split('.').all(label_ok) || last.bytes().all(|b| b.is_ascii_digit()) || last.starts_with("0x") {
+        return Err(ConfigError("local host must be an IP literal or a DNS name"));
+    }
+    Ok(h)
 }
 
-fn local_target(url: &str, allow_unvetted: bool) -> Result<(Target, LocalHost), ConfigError> {
+/// `host:port` (IPv6 in brackets, port always explicit) of a remote server URL: the exact entry
+/// to store in [`LocalOptions::vetted_hosts`] once the donor confirmed it. https only; loopback
+/// and LAN addresses need no vetting and are refused here.
+pub fn remote_host_key(url: &str) -> Result<String, ConfigError> {
     let o = parse_origin(url)?;
-    let class = match o.host.parse::<IpAddr>() {
-        Ok(ip) => vet_ip(ip)?,
-        Err(_) => {
-            let ok = o.host.len() <= 253 && o.host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') && !o.host.starts_with(['-', '.']);
-            if !ok {
-                return Err(ConfigError("local host must be an IP literal or a DNS name"));
-            }
-            LocalHost::Unvetted
-        }
-    };
-    if class == LocalHost::Unvetted && !allow_unvetted {
-        return Err(ConfigError("local host must be a loopback or LAN IP literal (public IPs and host names need --allow-unvetted-host)"));
+    if !o.tls {
+        return Err(ConfigError("a remote model server needs https:// (plain HTTP is refused off the LAN)"));
     }
-    let host = o.host.parse::<IpAddr>().map_or_else(|_| o.host.to_ascii_lowercase(), |ip| ip.to_string());
-    Ok((Target { tls: o.tls, host, port: o.port, authority: o.authority.to_owned() }, class))
+    let host = match o.host.parse::<IpAddr>() {
+        Ok(ip) if vet_ip(ip)? == LocalHost::Unvetted => ip.to_string(),
+        Ok(_) => return Err(ConfigError("loopback and LAN servers need no vetting")),
+        Err(_) => dns_name(o.host)?,
+    };
+    Ok(host_key(&host, o.port))
+}
+
+fn host_key(host: &str, port: u16) -> String {
+    if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
+}
+
+/// Vet a local inference server's base URL (`moochy keys add local --base-url …`) with no
+/// vetted remote hosts: returns its class, or why it is refused.
+pub fn check_local_base_url(url: &str, allow_unvetted_host: bool) -> Result<LocalHost, ConfigError> {
+    check_local_url(url, &LocalOptions { allow_unvetted_host, ..LocalOptions::default() })
+}
+
+/// Vet a local server URL against the donor's options (§17.3): its class, or why it is refused.
+/// Origin only; the path is always `/v1/chat/completions`.
+pub fn check_local_url(url: &str, opts: &LocalOptions) -> Result<LocalHost, ConfigError> {
+    local_target(url, opts).map(|(_, c)| c)
+}
+
+fn local_target(url: &str, opts: &LocalOptions) -> Result<(Target, LocalHost), ConfigError> {
+    let o = parse_origin(url)?;
+    let (host, class) = match o.host.parse::<IpAddr>() {
+        Ok(ip) => (ip.to_string(), vet_ip(ip)?),
+        Err(_) => (dns_name(o.host)?, LocalHost::Unvetted),
+    };
+    let class = if class == LocalHost::Unvetted {
+        if !o.tls {
+            return Err(ConfigError("a remote model server needs https:// (plain HTTP is refused off the LAN)"));
+        }
+        let key = host_key(&host, o.port);
+        if opts.vetted_hosts.contains(&key) {
+            LocalHost::Remote
+        } else if opts.allow_unvetted_host {
+            LocalHost::Unvetted
+        } else {
+            return Err(ConfigError("remote model server is not on your vetted host list (moochy keys add local --url https://…)"));
+        }
+    } else {
+        class
+    };
+    let public_only = matches!(class, LocalHost::Remote | LocalHost::Unvetted);
+    let authority = o.authority.to_ascii_lowercase();
+    Ok((Target { tls: o.tls, host, port: o.port, authority, public_only }, class))
+}
+
+/// Resolve a remote host and refuse unless every address is public (DNS rebinding to loopback,
+/// LAN, link-local or metadata addresses); the caller dials the returned address itself.
+async fn resolve_public(host: &str, port: u16) -> Result<std::net::SocketAddr, Failure> {
+    #[cfg(test)]
+    if let Some((ips, public)) = test_dns::lookup(host) {
+        let first = ips.first().copied().ok_or(Failure::new(FailKind::Network, "DNS lookup returned nothing"))?;
+        if public {
+            return Ok(std::net::SocketAddr::new(first, port));
+        }
+        return check_public(&ips.into_iter().map(|ip| std::net::SocketAddr::new(ip, port)).collect::<Vec<_>>());
+    }
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, port)).await.map_err(|_| Failure::new(FailKind::Network, "DNS lookup failed"))?.take(16).collect();
+    check_public(&addrs)
+}
+
+fn check_public(addrs: &[std::net::SocketAddr]) -> Result<std::net::SocketAddr, Failure> {
+    let first = addrs.first().copied().ok_or(Failure::new(FailKind::Network, "DNS lookup returned nothing"))?;
+    if addrs.iter().any(|a| vet_ip(a.ip()) != Ok(LocalHost::Unvetted)) {
+        return Err(Failure::new(FailKind::Network, "remote model server resolves to a loopback, private or link-local address (refused: DNS rebinding)"));
+    }
+    Ok(first)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) mod test_dns {
+    use std::net::IpAddr;
+    use std::sync::Mutex;
+
+    /// Test-only resolver entries: name → addresses, and whether to treat them as public (to
+    /// reach a loopback fake under a vetted remote name).
+    static ENTRIES: Mutex<Vec<(String, Vec<IpAddr>, bool)>> = Mutex::new(Vec::new());
+
+    pub fn set(name: &str, ips: Vec<IpAddr>, public: bool) {
+        ENTRIES.lock().unwrap().push((name.to_owned(), ips, public));
+    }
+
+    pub fn lookup(name: &str) -> Option<(Vec<IpAddr>, bool)> {
+        ENTRIES.lock().unwrap().iter().find(|e| e.0 == name).map(|e| (e.1.clone(), e.2))
+    }
 }
 
 fn tls_config(dev_root: Option<&CertificateDer<'static>>) -> Result<Arc<rustls::ClientConfig>, ConfigError> {
@@ -415,6 +547,86 @@ fn tls_config(dev_root: Option<&CertificateDer<'static>>) -> Result<Arc<rustls::
     .ok_or(ConfigError("TLS configuration failed"))
 }
 
+/// TLS to a local server (§17.3): HTTP/1.1 only, certificate per [`RemoteTrust`].
+fn local_tls_config(trust: &RemoteTrust) -> Result<Arc<rustls::ClientConfig>, ConfigError> {
+    let fail = |_| ConfigError("TLS configuration failed");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().map_err(fail)?;
+    let mut cfg = match trust {
+        RemoteTrust::Roots => builder.with_root_certificates(rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() }).with_no_client_auth(),
+        RemoteTrust::Ca(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.clone()).map_err(|_| ConfigError("pinned CA is not a valid certificate"))?;
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        RemoteTrust::Fingerprint(fp) => builder.dangerous().with_custom_certificate_verifier(Arc::new(PinnedCert { sha256: *fp, provider })).with_no_client_auth(),
+    };
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// [`RemoteTrust::Fingerprint`]: the server must present exactly this certificate (SHA-256 of
+/// its DER) and prove it holds the key (handshake signatures are verified as usual).
+#[derive(Debug)]
+struct PinnedCert {
+    sha256: [u8; 32],
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let got = ring::digest::digest(&ring::digest::SHA256, end_entity);
+        if got.as_ref() == self.sha256.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The header that carries a local server's credential (`authorization`, `x-api-key`, …):
+/// lowercase token, never one that frames or routes the request.
+fn auth_header_name(name: &str) -> Result<HeaderName, ConfigError> {
+    const FRAMING: &[&str] = &[
+        "host", "content-length", "content-type", "content-encoding", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade", "expect",
+        "user-agent", "accept-encoding", "cookie", "forwarded", "via",
+    ];
+    let ok = !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !name.starts_with("proxy-") && !name.starts_with("x-forwarded-") && !FRAMING.contains(&name);
+    if !ok {
+        return Err(ConfigError("auth header name must be a lowercase token such as authorization or x-api-key"));
+    }
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConfigError("bad auth header name"))
+}
+
 type H2 = http2::SendRequest<Full<Bytes>>;
 
 /// One provider key. Cheap to share (`Arc<Adapter>`); all requests multiplex on one warm
@@ -422,9 +634,11 @@ type H2 = http2::SendRequest<Full<Bytes>>;
 pub struct Adapter {
     provider: Provider,
     target: Target,
-    auth_name: &'static str,
+    auth_name: HeaderName,
     auth: Option<HeaderValue>,
     tls: Option<TlsConnector>,
+    /// Hosted providers: one warm HTTP/2 connection. Local servers (also over TLS): HTTP/1.1.
+    use_h2: bool,
     h2: Mutex<Option<H2>>,
     /// Idle HTTP/1.1 keep-alive connections (`http://` loopback dev targets only).
     h1_idle: Arc<StdMutex<Vec<H1Conn>>>,
@@ -439,20 +653,29 @@ impl std::fmt::Debug for Adapter {
 
 impl Adapter {
     pub fn new(cfg: &AdapterConfig) -> Result<Self, ConfigError> {
-        Self::build(cfg, false)
+        Self::build(cfg, &LocalOptions::default())
     }
 
     /// [`Adapter::new`] for [`Provider::Local`] with the dev-only `--allow-unvetted-host`
     /// switch (public IPs and host names; the node prints a warning at every start).
     pub fn new_local(cfg: &AdapterConfig, allow_unvetted_host: bool) -> Result<Self, ConfigError> {
-        Self::build(cfg, allow_unvetted_host)
+        Self::build(cfg, &LocalOptions { allow_unvetted_host, ..LocalOptions::default() })
     }
 
-    fn build(cfg: &AdapterConfig, allow_unvetted_host: bool) -> Result<Self, ConfigError> {
+    /// [`Provider::Local`] with the donor's options (§17.3): vetted remote hosts, an auth header
+    /// from the keystore, how to check the server's certificate.
+    pub fn new_local_with(cfg: &AdapterConfig, opts: &LocalOptions) -> Result<Self, ConfigError> {
+        Self::build(cfg, opts)
+    }
+
+    fn build(cfg: &AdapterConfig, opts: &LocalOptions) -> Result<Self, ConfigError> {
         let local = cfg.provider == Provider::Local;
+        if !local && (opts.auth_header.is_some() || !matches!(opts.trust, RemoteTrust::Roots) || !opts.vetted_hosts.is_empty()) {
+            return Err(ConfigError("local server options are for the local provider only"));
+        }
         let target = match &cfg.base_url {
             None if local => return Err(ConfigError("a local provider needs its server's base URL")),
-            Some(u) if local => local_target(u, allow_unvetted_host)?.0,
+            Some(u) if local => local_target(u, opts)?.0,
             None => real_target(cfg.provider),
             Some(_) if !cfg.insecure_dev => return Err(ConfigError("base URL override needs MOOCHY_INSECURE_DEV=1")),
             Some(u) => dev_target(u)?,
@@ -461,8 +684,20 @@ impl Adapter {
             return Err(ConfigError("a dev trust root is only accepted with a loopback dev base URL"));
         }
         let key = cfg.api_key.trim();
+        let mut auth_name = HeaderName::from_static(if cfg.provider == Provider::Anthropic { "x-api-key" } else { "authorization" });
         // Local servers usually take no key (Ollama/LM Studio ignore it): empty = no auth header.
-        let auth = if local && key.is_empty() {
+        let auth = if let Some((name, value)) = &opts.auth_header {
+            if !key.is_empty() {
+                return Err(ConfigError("give either an API key or an auth header, not both"));
+            }
+            auth_name = auth_header_name(name)?;
+            if value.is_empty() || value.len() > 4096 || !value.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+                return Err(ConfigError("auth header value must be 1..4096 visible ASCII characters"));
+            }
+            let mut v = HeaderValue::from_str(value).map_err(|_| ConfigError("auth header value is not a valid header value"))?;
+            v.set_sensitive(true);
+            Some(v)
+        } else if local && key.is_empty() {
             None
         } else {
             if key.is_empty() || key.len() > 512 || !key.bytes().all(|b| b.is_ascii_graphic()) {
@@ -477,9 +712,16 @@ impl Adapter {
             v.set_sensitive(true);
             Some(v)
         };
-        let auth_name = if cfg.provider == Provider::Anthropic { "x-api-key" } else { "authorization" };
-        let tls = if target.tls { Some(TlsConnector::from(tls_config(cfg.dev_root.as_ref())?)) } else { None };
-        Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, h2: Mutex::new(None), h1_idle: Arc::default(), limits: cfg.limits })
+        if local && cfg.dev_root.is_some() {
+            return Err(ConfigError("a local server's certificate is checked per LocalOptions::trust"));
+        }
+        let tls = match (target.tls, local) {
+            (false, _) => None,
+            (true, false) => Some(TlsConnector::from(tls_config(cfg.dev_root.as_ref())?)),
+            (true, true) => Some(TlsConnector::from(local_tls_config(&opts.trust)?)),
+        };
+        let use_h2 = target.tls && !local;
+        Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, use_h2, h2: Mutex::new(None), h1_idle: Arc::default(), limits: cfg.limits })
     }
 
     pub fn provider(&self) -> Provider {
@@ -490,7 +732,7 @@ impl Adapter {
     /// minute or so; keep-alive PINGs hold it open in between. No-op for `http://` dev targets.
     pub async fn warm(&self) -> Result<(), Failure> {
         let warm = async {
-            if self.tls.is_some() {
+            if self.use_h2 {
                 self.h2_sender().await.map(drop)
             } else if self.h1_idle_count() == 0 {
                 let c = self.dial_h1().await?;
@@ -513,8 +755,12 @@ impl Adapter {
 
     async fn dial_h1(&self) -> Result<H1Conn, Failure> {
         let tcp = self.tcp().await?;
+        let io: Box<dyn Io> = match &self.tls {
+            Some(tls) => Box::new(self.tls_handshake(tls, tcp).await?),
+            None => Box::new(tcp),
+        };
         let (sender, conn) =
-            http1::handshake(TokioIo::new(tcp)).await.map_err(|_| Failure::new(FailKind::Network, "HTTP/1 handshake failed"))?;
+            http1::handshake(TokioIo::new(io)).await.map_err(|_| Failure::new(FailKind::Network, "HTTP/1 handshake failed"))?;
         Ok(H1Conn { sender, conn: Some(conn) })
     }
 
@@ -549,10 +795,17 @@ impl Adapter {
 
     async fn tcp(&self) -> Result<TcpStream, Failure> {
         let t = &self.target;
-        let tcp = tokio::time::timeout(self.limits.connect, TcpStream::connect((t.host.as_str(), t.port)))
+        let connect = async {
+            if t.public_only {
+                TcpStream::connect(resolve_public(&t.host, t.port).await?).await
+            } else {
+                TcpStream::connect((t.host.as_str(), t.port)).await
+            }
+            .map_err(|_| Failure::new(FailKind::Network, "TCP connect failed"))
+        };
+        let tcp = tokio::time::timeout(self.limits.connect, connect)
             .await
-            .map_err(|_| Failure::new(FailKind::Timeout, "TCP connect timed out"))?
-            .map_err(|_| Failure::new(FailKind::Network, "TCP connect failed"))?;
+            .map_err(|_| Failure::new(FailKind::Timeout, "TCP connect timed out"))??;
         tcp.set_nodelay(true).map_err(|_| Failure::new(FailKind::Network, "TCP_NODELAY failed"))?;
         Ok(tcp)
     }
@@ -562,11 +815,7 @@ impl Adapter {
             return Err(Failure::new(FailKind::Unsupported, "no TLS for this target"));
         };
         let tcp = self.tcp().await?;
-        let name = ServerName::try_from(self.target.host.clone()).map_err(|_| Failure::new(FailKind::Network, "bad TLS server name"))?;
-        let stream = tokio::time::timeout(self.limits.connect, tls.connect(name, tcp))
-            .await
-            .map_err(|_| Failure::new(FailKind::Timeout, "TLS handshake timed out"))?
-            .map_err(|_| Failure::new(FailKind::Network, "TLS handshake failed"))?;
+        let stream = self.tls_handshake(tls, tcp).await?;
         if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
             return Err(Failure::new(FailKind::Network, "provider did not negotiate HTTP/2"));
         }
@@ -587,6 +836,14 @@ impl Adapter {
         Ok(sender)
     }
 
+    async fn tls_handshake(&self, tls: &TlsConnector, tcp: TcpStream) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Failure> {
+        let name = ServerName::try_from(self.target.host.clone()).map_err(|_| Failure::new(FailKind::Network, "bad TLS server name"))?;
+        tokio::time::timeout(self.limits.connect, tls.connect(name, tcp))
+            .await
+            .map_err(|_| Failure::new(FailKind::Timeout, "TLS handshake timed out"))?
+            .map_err(|_| Failure::new(FailKind::Network, "TLS handshake failed (certificate not trusted?)"))
+    }
+
     /// Send a prepared body ([`crate::firewall::prepare`]). Returns once response headers
     /// arrive (= `task.started`) with a 2xx; any other status is a [`Failure`] carrying the
     /// provider's bounded error body. Drop the [`Response`] to abort the provider request.
@@ -596,7 +853,7 @@ impl Adapter {
         };
         let t = &self.target;
         // h2 needs the absolute URI (:scheme/:authority); HTTP/1.1 wants origin-form + Host.
-        let uri = if t.tls {
+        let uri = if self.use_h2 {
             format!("https://{}{path}", t.authority)
         } else {
             path.to_owned()
@@ -605,9 +862,9 @@ impl Adapter {
             .header("content-type", "application/json")
             .header("user-agent", USER_AGENT);
         if let Some(a) = &self.auth {
-            b = b.header(self.auth_name, a.clone());
+            b = b.header(&self.auth_name, a.clone());
         }
-        if !t.tls {
+        if !self.use_h2 {
             b = b.header("host", t.authority.as_str());
         }
         for (k, v) in headers {
@@ -616,7 +873,7 @@ impl Adapter {
         let req = b.body(Full::new(body)).map_err(|_| Failure::new(FailKind::InvalidRequest, "bad request"))?;
 
         let fut = async {
-            if self.tls.is_some() {
+            if self.use_h2 {
                 let mut s = self.h2_sender().await?;
                 s.ready().await.map_err(|_| Failure::new(FailKind::Network, "HTTP/2 connection lost"))?;
                 let resp = s.send_request(req).await.map_err(|_| Failure::new(FailKind::Network, "request failed before headers"))?;
@@ -787,7 +1044,11 @@ fn header_u64(h: &HeaderMap, names: &[&str]) -> Option<u64> {
 /// Most idle keep-alive connections kept per adapter (`http://` targets).
 const H1_MAX_IDLE: usize = 16;
 
-type H1Driver = http1::Connection<TokioIo<TcpStream>, Full<Bytes>>;
+/// A plain or TLS byte stream (local servers speak HTTP/1.1 over either).
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Io for T {}
+
+type H1Driver = http1::Connection<TokioIo<Box<dyn Io>>, Full<Bytes>>;
 
 /// An HTTP/1.1 connection driven from the task that uses it (no connection task): a body
 /// chunk reaches the reader without a cross-thread wake, and every chunk already in the
@@ -1009,9 +1270,250 @@ impl Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines)]
 mod tests {
     use super::*;
+
+    // ---- §17.3 remote local servers over TLS ------------------------------------------------
+
+    const SSE_OK: &str = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+
+    struct TlsFake {
+        port: u16,
+        ca: CertificateDer<'static>,
+        leaf: CertificateDer<'static>,
+        heads: tokio::sync::mpsc::UnboundedReceiver<String>,
+    }
+
+    /// HTTP/1.1-over-TLS fake with a certificate for `names` from its own CA; answers every
+    /// request with `resp` (a whole raw response) and reports each request head.
+    async fn tls_fake(names: &[&str], resp: &'static str) -> TlsFake {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>()).unwrap().signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into());
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, heads) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(s).await else { return };
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match tls.read(&mut b).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&b[..n]),
+                        }
+                    }
+                    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                    let len: usize = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                    while buf.len() < end + 4 + len {
+                        match tls.read(&mut b).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&b[..n]),
+                        }
+                    }
+                    let _ = tx.send(head);
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        TlsFake { port, ca: ca.der().clone(), leaf: leaf.der().clone(), heads }
+    }
+
+    fn ok_response() -> &'static str {
+        static R: OnceLock<String> = OnceLock::new();
+        R.get_or_init(|| format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{SSE_OK}", SSE_OK.len()))
+    }
+
+    fn local_cfg(url: String) -> AdapterConfig {
+        AdapterConfig { provider: Provider::Local, api_key: Zeroizing::new(String::new()), base_url: Some(url), insecure_dev: false, dev_root: None, limits: Limits::local() }
+    }
+
+    const BODY: &[u8] = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+    async fn call(a: &Adapter) -> Result<Vec<u8>, Failure> {
+        let mut r = a.send(Dialect::OpenAiChat, Bytes::from_static(BODY), &[]).await?;
+        let mut out = Vec::new();
+        while let Some(c) = r.next().await? {
+            out.extend_from_slice(&c);
+        }
+        Ok(out)
+    }
+
+    fn remote_opts(port: u16, name: &str, trust: RemoteTrust) -> LocalOptions {
+        LocalOptions {
+            vetted_hosts: vec![format!("{name}:{port}")],
+            auth_header: Some(("x-api-key".into(), Zeroizing::new("s3cr3t-runpod-key".into()))),
+            trust,
+            ..LocalOptions::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_tls_vetted_host_pinned_ca_and_auth_header() {
+        let name = "gpu1.moochy.test";
+        test_dns::set(name, vec![IpAddr::from([127, 0, 0, 1])], true);
+        let mut f = tls_fake(&[name], ok_response()).await;
+        let opts = remote_opts(f.port, name, RemoteTrust::Ca(f.ca.clone()));
+        let url = format!("https://GPU1.moochy.test:{}", f.port);
+        assert_eq!(check_local_url(&url, &opts), Ok(LocalHost::Remote));
+        let a = Adapter::new_local_with(&local_cfg(url), &opts).unwrap();
+        assert_eq!(call(&a).await.unwrap(), SSE_OK.as_bytes());
+        let head = f.heads.recv().await.unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("post /v1/chat/completions http/1.1\r\n"), "{head}");
+        assert!(head.contains(&format!("host: gpu1.moochy.test:{}\r\n", f.port)), "{head}");
+        assert!(head.contains("x-api-key: s3cr3t-runpod-key\r\n") && !head.contains("authorization"), "{head}");
+        // The secret never shows up in what gets logged.
+        assert!(!format!("{a:?} {opts:?}").contains("s3cr3t"));
+        // Fingerprint pin: exactly this certificate, no CA needed.
+        let fp: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &f.leaf).as_ref().try_into().unwrap();
+        let a = Adapter::new_local_with(&local_cfg(format!("https://{name}:{}", f.port)), &remote_opts(f.port, name, RemoteTrust::Fingerprint(fp))).unwrap();
+        assert_eq!(call(&a).await.unwrap(), SSE_OK.as_bytes());
+        // Untrusted: wrong fingerprint, Mozilla roots for a self-signed CA, another CA.
+        let other = tls_fake(&[name], ok_response()).await;
+        for trust in [RemoteTrust::Fingerprint([7; 32]), RemoteTrust::Roots, RemoteTrust::Ca(other.ca.clone())] {
+            let a = Adapter::new_local_with(&local_cfg(format!("https://{name}:{}", f.port)), &remote_opts(f.port, name, trust.clone())).unwrap();
+            let e = call(&a).await.unwrap_err();
+            assert_eq!(e.kind, FailKind::Network, "{trust:?}: {e:?}");
+        }
+    }
+
+    /// SSRF: a redirect is an error status, never followed; nothing else is requested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_redirect_is_not_followed() {
+        let name = "gpu2.moochy.test";
+        test_dns::set(name, vec![IpAddr::from([127, 0, 0, 1])], true);
+        let mut f = tls_fake(&[name], "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://169.254.169.254/latest/meta-data/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+        let a = Adapter::new_local_with(&local_cfg(format!("https://{name}:{}", f.port)), &remote_opts(f.port, name, RemoteTrust::Ca(f.ca.clone()))).unwrap();
+        let e = call(&a).await.unwrap_err();
+        assert_eq!(e.status, Some(307));
+        assert!(f.heads.recv().await.is_some());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(f.heads.try_recv().is_err(), "exactly one request");
+    }
+
+    /// SSRF: a vetted name that resolves to loopback, LAN, link-local or metadata addresses (or a
+    /// mix) is refused at connect time, every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_dns_rebinding_is_refused() {
+        let f = tls_fake(&["rebind.moochy.test", "localhost"], ok_response()).await;
+        let cases: [(&str, Vec<IpAddr>); 5] = [
+            ("rebind1.moochy.test", vec![IpAddr::from([127, 0, 0, 1])]),
+            ("rebind2.moochy.test", vec![IpAddr::from([8, 8, 8, 8]), IpAddr::from([10, 0, 0, 1])]),
+            ("rebind3.moochy.test", vec![IpAddr::from([169, 254, 169, 254])]),
+            ("rebind4.moochy.test", vec!["::ffff:127.0.0.1".parse().unwrap()]),
+            ("rebind5.moochy.test", vec!["fd00::1".parse().unwrap()]),
+        ];
+        for (name, ips) in cases {
+            test_dns::set(name, ips, false);
+            let a = Adapter::new_local_with(&local_cfg(format!("https://{name}:{}", f.port)), &remote_opts(f.port, name, RemoteTrust::Ca(f.ca.clone()))).unwrap();
+            let e = call(&a).await.unwrap_err();
+            assert!(e.detail.contains("DNS rebinding"), "{name}: {e:?}");
+        }
+        // The real resolver: `localhost` resolves to loopback.
+        let a = Adapter::new_local_with(&local_cfg(format!("https://localhost:{}", f.port)), &remote_opts(f.port, "localhost", RemoteTrust::Ca(f.ca.clone()))).unwrap();
+        assert!(call(&a).await.unwrap_err().detail.contains("DNS rebinding"));
+    }
+
+    #[test]
+    fn remote_host_url_matrix() {
+        let vetted = |hosts: &[&str]| LocalOptions { vetted_hosts: hosts.iter().map(|h| (*h).to_owned()).collect(), ..LocalOptions::default() };
+        let dev = LocalOptions { allow_unvetted_host: true, ..LocalOptions::default() };
+        let o = vetted(&["gpu.example.com:8443", "gpu.example.com:443", "[2001:4860::8888]:8443", "203.0.113.7:443", "localhost:8443", "2130706433:443", "gpu.example.com.:443"]);
+        for (url, want) in [
+            ("https://gpu.example.com:8443", LocalHost::Remote),
+            ("https://GPU.Example.COM:8443/", LocalHost::Remote),
+            ("https://gpu.example.com", LocalHost::Remote),
+            ("https://[2001:4860::8888]:8443", LocalHost::Remote),
+            ("https://203.0.113.7", LocalHost::Remote),
+            // Syntactically fine; the connect-time check refuses its loopback addresses.
+            ("https://localhost:8443", LocalHost::Remote),
+            // Loopback and LAN: unchanged, http or https, no vetting.
+            ("http://127.0.0.1:11434", LocalHost::Loopback),
+            ("http://192.168.1.5:11434", LocalHost::Lan),
+            ("https://10.0.0.2:8443", LocalHost::Lan),
+        ] {
+            assert_eq!(check_local_url(url, &o), Ok(want), "{url}");
+        }
+        for url in [
+            // Plain HTTP off the LAN, even vetted or in dev mode.
+            "http://gpu.example.com:8443",
+            "http://203.0.113.7",
+            // Not exactly vetted: other port, other host, suffix games.
+            "https://gpu.example.com:9443",
+            "https://gpu.example.com.evil.com:8443",
+            "https://evilgpu.example.com:8443",
+            // IPv6 zone ids, link-local, metadata (also v4-mapped).
+            "https://[fe80::1%25eth0]:8443",
+            "https://[fe80::1%eth0]:8443",
+            "https://[::1%lo]:8443",
+            "https://[fe80::1]:8443",
+            "https://169.254.169.254",
+            "https://[::ffff:169.254.169.254]",
+            "https://0.0.0.0:8443",
+            // Numeric host forms other parsers read as IPv4.
+            "https://2130706433",
+            "https://0x7f000001",
+            "https://127.1",
+            "https://0177.0.0.1",
+            // Userinfo, fragments, backslashes, trailing dot, IDN, paths.
+            "https://gpu.example.com@169.254.169.254",
+            "https://169.254.169.254#@gpu.example.com",
+            "https://gpu.example.com\\@169.254.169.254",
+            "https://gpu.example.com.:443",
+            "https://gpü.example.com",
+            "https://gpu.example.com:8443/v1",
+        ] {
+            assert!(check_local_url(url, &o).is_err(), "accepted {url}");
+        }
+        assert!(check_local_url("http://gpu.example.com", &dev).is_err(), "dev mode keeps https-only off the LAN");
+        assert_eq!(check_local_url("https://gpu.example.com", &dev), Ok(LocalHost::Unvetted));
+        assert_eq!(remote_host_key("https://GPU.example.com").as_deref(), Ok("gpu.example.com:443"));
+        assert_eq!(remote_host_key("https://[2001:4860::8888]:8443/").as_deref(), Ok("[2001:4860::8888]:8443"));
+        for bad in ["http://gpu.example.com", "https://192.168.1.5", "https://127.0.0.1:8443", "https://169.254.169.254", "https://2130706433"] {
+            assert!(remote_host_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn remote_auth_header_rules() {
+        let url = "https://gpu.example.com".to_owned();
+        let with = |name: &str, key: &str| {
+            let mut cfg = local_cfg(url.clone());
+            cfg.api_key = Zeroizing::new(key.to_owned());
+            let o = LocalOptions { vetted_hosts: vec!["gpu.example.com:443".into()], auth_header: Some((name.to_owned(), Zeroizing::new("v".into()))), ..LocalOptions::default() };
+            Adapter::new_local_with(&cfg, &o).map(drop)
+        };
+        assert!(with("authorization", "").is_ok());
+        assert!(with("x-api-key", "").is_ok());
+        for bad in ["Authorization", "host", "content-length", "transfer-encoding", "proxy-authorization", "x-forwarded-for", "cookie", "", "a b"] {
+            assert!(with(bad, "").is_err(), "{bad}");
+        }
+        assert!(with("authorization", "sk-also").is_err(), "key and header both");
+        // Local options on a hosted provider are refused.
+        let hosted = AdapterConfig { provider: Provider::OpenAi, api_key: Zeroizing::new("sk".into()), base_url: None, insecure_dev: false, dev_root: None, limits: Limits::default() };
+        let o = LocalOptions { auth_header: Some(("x-api-key".into(), Zeroizing::new("v".into()))), ..LocalOptions::default() };
+        assert!(Adapter::new_local_with(&hosted, &o).is_err());
+        // Plain HTTP to a remote host never builds.
+        assert!(Adapter::new_local_with(&local_cfg("http://gpu.example.com".into()), &LocalOptions { allow_unvetted_host: true, ..LocalOptions::default() }).is_err());
+    }
 
     #[test]
     fn dev_urls() {

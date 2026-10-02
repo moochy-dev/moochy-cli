@@ -12,7 +12,7 @@ fn main() {
             if p.is_dir() { stack.push(p) } else { files.push(p) }
         }
     }
-    let urls = ["http://127.0.0.1:11434", "http://[::1]:8000/", "http://192.168.1.20:1234", "http://100.64.0.1:8080", "http://[fd00::1]:11434", "http://169.254.169.254", "http://[::ffff:10.0.0.1]:80", "https://gpu.local:443", "http://8.8.8.8"];
+    let urls = ["http://127.0.0.1:11434", "http://[::1]:8000/", "http://192.168.1.20:1234", "http://100.64.0.1:8080", "http://[fd00::1]:11434", "http://169.254.169.254", "http://[::ffff:10.0.0.1]:80", "https://gpu.local:443", "http://8.8.8.8", "https://abc123-8000.proxy.runpod.net", "https://[2001:4860::8888]:8443/", "https://203.0.113.7:8443", "https://[fe80::1%25eth0]:8443", "https://2130706433", "https://gpu.example.com.:443"];
     for (i, u) in urls.iter().enumerate() {
         let d = Path::new(&dir).join("local_url");
         std::fs::create_dir_all(&d).expect("mkdir");

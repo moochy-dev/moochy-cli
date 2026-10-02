@@ -282,6 +282,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ring",
  "rustls",
  "ruzstd",
  "tokio",

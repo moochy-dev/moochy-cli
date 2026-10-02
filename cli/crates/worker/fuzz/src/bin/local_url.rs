@@ -1,9 +1,11 @@
 //! Local inference server base-URL vetting (`provider::check_local_base_url`). Invariants: no
 //! panic; vetted (strict) acceptance implies unvetted acceptance with the same class; nothing
-//! accepted in either mode resolves to link-local / metadata / unspecified / multicast.
+//! accepted in either mode resolves to link-local / metadata / unspecified / multicast. §17.3:
+//! anything off the LAN (Remote/Unvetted) is https; a URL is Remote exactly when its
+//! `remote_host_key` is on the vetted list; that key is stable and never a loopback/LAN host.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use moochy_worker::provider::{LocalHost, check_local_base_url};
+use moochy_worker::provider::{LocalHost, LocalOptions, check_local_base_url, check_local_url, remote_host_key};
 use std::net::IpAddr;
 
 fn host(url: &str) -> Option<&str> {
@@ -22,6 +24,18 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(c) = strict {
         assert!(matches!(c, LocalHost::Loopback | LocalHost::Lan));
         assert_eq!(loose.clone().map_err(|e| e.0), Ok(c));
+    }
+    if matches!(loose, Ok(LocalHost::Unvetted)) {
+        assert!(url.starts_with("https://"), "plain HTTP off the LAN: {url}");
+    }
+    if let Ok(key) = remote_host_key(url) {
+        let vetted = LocalOptions { vetted_hosts: vec![key.clone()], ..LocalOptions::default() };
+        assert_eq!(check_local_url(url, &vetted).map_err(|e| e.0), Ok(LocalHost::Remote), "{url}");
+        assert!(url.starts_with("https://"));
+        assert_eq!(remote_host_key(&format!("https://{key}")).map_err(|e| e.0), Ok(key.clone()), "key round-trip: {url}");
+        assert!(strict.is_err(), "a vetted remote host is never also loopback/LAN: {url}");
+    } else if let Ok(c) = check_local_url(url, &LocalOptions { vetted_hosts: vec![url.to_owned()], ..LocalOptions::default() }) {
+        assert!(matches!(c, LocalHost::Loopback | LocalHost::Lan), "{url}");
     }
     if loose.is_ok() {
         if let Some(ip) = host(url).and_then(|h| h.parse::<IpAddr>().ok()) {
