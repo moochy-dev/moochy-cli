@@ -13,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod ctl;
 pub mod connect;
+pub mod donations;
 pub mod engine;
 pub mod files;
 pub mod gate;

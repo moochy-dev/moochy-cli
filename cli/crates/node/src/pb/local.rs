@@ -305,6 +305,21 @@ pub struct ReportResponse {
     #[prost(bytes = "vec", tag = "1")]
     pub bundle: ::prost::alloc::vec::Vec<u8>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DonationsRequest {
+    /// list | donate | action
+    #[prost(string, tag = "1")]
+    pub op: ::prost::alloc::string::String,
+    /// ListDonationsRequest | DonateRequest | DonationActionRequest
+    #[prost(bytes = "vec", tag = "2")]
+    pub request: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DonationsResponse {
+    /// ListDonationsResponse | Donation
+    #[prost(bytes = "vec", tag = "1")]
+    pub response: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod local_control_client {
     #![allow(
@@ -588,6 +603,33 @@ pub mod local_control_client {
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "SubmitEntry"));
             self.inner.unary(req, path, codec).await
         }
+        /// Donations (`moochy donate`, `moochy donations`): relayed as-is to NodeLink ListDonations /
+        /// Donate / DonationAction on the node's authenticated session (the relay knows the user from
+        /// the session, never from a field). `request`/`response` are the link.proto messages' bytes.
+        pub async fn donations(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DonationsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DonationsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/Donations",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "Donations"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Local audit journal (metadata only). `follow` keeps the stream open for new entries.
         pub async fn journal(
             &mut self,
@@ -770,6 +812,16 @@ pub mod local_control_server {
             &self,
             request: tonic::Request<super::SubmitEntryRequest>,
         ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status>;
+        /// Donations (`moochy donate`, `moochy donations`): relayed as-is to NodeLink ListDonations /
+        /// Donate / DonationAction on the node's authenticated session (the relay knows the user from
+        /// the session, never from a field). `request`/`response` are the link.proto messages' bytes.
+        async fn donations(
+            &self,
+            request: tonic::Request<super::DonationsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DonationsResponse>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the Journal method.
         type JournalStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::JournalEntry, tonic::Status>,
@@ -1273,6 +1325,51 @@ pub mod local_control_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SubmitEntrySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/Donations" => {
+                    #[allow(non_camel_case_types)]
+                    struct DonationsSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::DonationsRequest>
+                    for DonationsSvc<T> {
+                        type Response = super::DonationsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DonationsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::donations(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DonationsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

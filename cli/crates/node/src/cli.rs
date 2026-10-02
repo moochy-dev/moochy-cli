@@ -61,6 +61,11 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
+  donate --repo OWNER/NAME --cap $N [--yes]
+                                  Donate tokens to a project, up to $N a month (it starts once
+                                  the project owner accepts you)
+  donations [--json] | donations <pause|resume|stop> <id>
+                                  Your donations: what each project used this month
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
                                   with its own passphrase, that signs approvals, memberships and
                                   claims; only used by these commands, never by the app
@@ -155,6 +160,7 @@ fn parse() -> Result<Opts> {
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
@@ -250,6 +256,10 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["donate"] => crate::donations::donate(&home, &slug_or_detect(&o)?, o.cap.unwrap_or(0), o.has("yes")),
+        // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
+        ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
+        ["donations", act, id] => crate::donations::action(&home, act, id),
         ["owner", "init"] => crate::owner::init(&home, false),
         ["owner", "rotate"] => crate::owner::init(&home, true),
         // VOICE.md: "accept a donor".

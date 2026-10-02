@@ -7,7 +7,7 @@ use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
     ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
-    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest,
+    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse,
     StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
@@ -186,6 +186,10 @@ impl LocalControl for Ctl {
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+    }
+
+    async fn donations(&self, r: Request<DonationsRequest>) -> std::result::Result<Response<DonationsResponse>, Status> {
+        crate::donations::relay(&self.node, r.into_inner()).await.map(Response::new)
     }
 
     async fn submit_entry(&self, r: Request<SubmitEntryRequest>) -> std::result::Result<Response<SignResponse>, Status> {
