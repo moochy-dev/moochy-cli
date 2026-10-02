@@ -822,7 +822,18 @@ fn usage_mismatch(u: &moochy_proto::msg::Usage, model: &str, entry: &CatalogEntr
 }
 
 async fn emit(tx: &mpsc::Sender<TaskEv>, ev: TaskEv) -> Step {
-    if tx.send(ev).await.is_err() { Step::Gone } else { Step::Continue }
+    let bytes = matches!(ev, TaskEv::Bytes(_));
+    if tx.send(ev).await.is_err() {
+        return Step::Gone;
+    }
+    // The client writer was just woken into this worker thread's LIFO slot, where no other thread
+    // can steal it: without a yield it waits until this driver has drained every frame already
+    // buffered on the relay stream (a burst), so the first bytes of a burst reached the client
+    // last (CONTRACT §13, E22). Yield once per chunk handed off.
+    if bytes {
+        tokio::task::yield_now().await;
+    }
+    Step::Continue
 }
 
 #[cfg(test)]
