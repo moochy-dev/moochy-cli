@@ -152,9 +152,45 @@ struct FileV1 {
 }
 
 fn passphrase() -> Result<Zeroizing<String>> {
-    match std::env::var("MOOCHY_PASSPHRASE") {
-        Ok(p) if !p.is_empty() => Ok(Zeroizing::new(p)),
-        _ => Err(auth("keystore locked: set MOOCHY_PASSPHRASE")),
+    passphrase_source()?.ok_or_else(|| auth("keystore locked: set MOOCHY_PASSPHRASE (or MOOCHY_PASSPHRASE_FILE, or a systemd credential `moochy-passphrase`)"))
+}
+
+/// The file-keystore passphrase (mo-ops units): `MOOCHY_PASSPHRASE`, else the file named by
+/// `MOOCHY_PASSPHRASE_FILE` (owner-only permissions), else the systemd credential
+/// `$CREDENTIALS_DIRECTORY/moochy-passphrase` (LoadCredential/LoadCredentialEncrypted).
+/// One trailing newline is dropped; at most 4 KiB is read.
+pub fn passphrase_source() -> Result<Option<Zeroizing<String>>> {
+    use std::io::Read as _;
+    if let Ok(p) = std::env::var("MOOCHY_PASSPHRASE").map(Zeroizing::new)
+        && !p.is_empty()
+    {
+        return Ok(Some(p));
+    }
+    let read = |path: &std::path::Path, owner_only: bool| -> Result<Option<Zeroizing<String>>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(f) = std::fs::File::open(path) else { return Ok(None) };
+        let md = f.metadata().map_err(|e| auth(format!("{}: {e}", path.display())))?;
+        if !md.is_file() || (owner_only && md.permissions().mode() & 0o077 != 0) {
+            return Err(auth(format!("{}: the passphrase file must be a regular file readable only by you (chmod 600)", path.display())));
+        }
+        let mut raw = Zeroizing::new(Vec::new());
+        f.take(4097).read_to_end(&mut raw).map_err(|e| auth(format!("{}: {e}", path.display())))?;
+        if raw.len() > 4096 {
+            return Err(auth("the passphrase file is larger than 4 KiB"));
+        }
+        let s = std::str::from_utf8(&raw).map_err(|_| auth("the passphrase file is not UTF-8"))?;
+        let s = s.strip_suffix('\n').map_or(s, |t| t.strip_suffix('\r').unwrap_or(t));
+        Ok((!s.is_empty()).then(|| Zeroizing::new(s.to_owned())))
+    };
+    if let Some(p) = std::env::var_os("MOOCHY_PASSPHRASE_FILE") {
+        return match read(std::path::Path::new(&p), true)? {
+            Some(s) => Ok(Some(s)),
+            None => Err(auth("MOOCHY_PASSPHRASE_FILE names no readable, non-empty file")),
+        };
+    }
+    match std::env::var_os("CREDENTIALS_DIRECTORY") {
+        Some(d) => read(&std::path::Path::new(&d).join("moochy-passphrase"), false),
+        None => Ok(None),
     }
 }
 
@@ -239,7 +275,7 @@ pub fn load_or_init(home: &Home, cfg: &mut Config) -> Result<Secrets> {
         // T-02-010: the OS keychain by default; the encrypted file when MOOCHY_PASSPHRASE is set
         // (headless, CI) or when this machine has no keychain service.
         let mut chosen = "file";
-        if KEYCHAIN_BUILT && std::env::var_os("MOOCHY_PASSPHRASE").is_none() {
+        if KEYCHAIN_BUILT && passphrase_source().ok().flatten().is_none() {
             let mut probe = cfg.clone();
             probe.keystore = Some("keychain".into());
             match save(home, &probe, &s) {

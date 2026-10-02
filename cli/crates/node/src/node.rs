@@ -63,6 +63,8 @@ pub struct RepoPool {
     pub auto_cache: bool,
     /// Repo settings (§15.4): providers never sealed to, and the unsandboxed-tools opt-in.
     pub excluded_providers: Vec<String>,
+    /// Repo setting `PoolSync.pinned_donors`: donors the project prefers (tried first).
+    pub pinned_donors: Vec<String>,
     pub allow_unsandboxed_tools: bool,
 }
 
@@ -414,6 +416,7 @@ impl Node {
             }
             p.auto_cache = v.auto_cache;
             p.excluded_providers = v.excluded_providers.iter().take(16).filter(|x| plain_id(x)).cloned().collect();
+            p.pinned_donors = v.pinned_donors.iter().take(64).filter(|x| plain_id(x)).cloned().collect();
             if v.allow_unsandboxed_tools && !p.allow_unsandboxed_tools {
                 crate::util::log("warn", "this project lets tool calls from donated tokens reach agents outside `moochy run`", &serde_json::json!({"repo_id": v.repo_id}));
             }

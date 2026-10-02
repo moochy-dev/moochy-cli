@@ -203,9 +203,15 @@ fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>, pi
         .workers
         .iter()
         .filter(|w| w.models.iter().any(|m| m == model) && w.dialects.iter().any(|d| d == dialect.wire()) && provider_allowed(w, model, &pool.excluded_providers))
-        // Pinned donors (06 §8): only these donors receive the task.
+        // Pinned donors (06 §8), this device's config or session: only these donors receive it.
         .filter(|w| pinned.is_empty() || pinned.iter().any(|p| p.eq_ignore_ascii_case(&w.donor)))
         .collect();
+    // The project's preferred donors (PoolSync.pinned_donors) are tried first: when any of them
+    // can serve, the first wraps go only to them (the relay asks NeedWraps for others if needed).
+    let preferred = |w: &&PoolWorker| pool.pinned_donors.iter().any(|p| p.eq_ignore_ascii_case(&w.donor));
+    if c.iter().any(preferred) {
+        c.retain(preferred);
+    }
     c.sort_by_key(|w| (Some(w.worker_device.as_str()) != sticky, std::cmp::Reverse(w.hint)));
     c.into_iter().take(MAX_WRAPS).cloned().collect()
 }
@@ -613,7 +619,9 @@ impl Driver {
             self.truncated = true;
         }
         if let Err(why) = self.gate.push(seq, &pt) {
-            return retry_fail("provider_error", why);
+            // Deliver the valid events the gate queued ahead of the bad one, then fail.
+            let s = self.flush(false).await;
+            return if matches!(s, Step::Continue) { retry_fail("provider_error", why) } else { s };
         }
         let s = self.flush(false).await;
         if matches!(s, Step::Continue) { self.try_close().await } else { s }
@@ -758,7 +766,16 @@ impl Driver {
         while let Some(b) = self.gate.pop(self.verified, finale) {
             let b = match self.canon.push(&b) {
                 Ok(b) => b,
-                Err(why) => return retry_fail("provider_error", why),
+                Err((done, why)) => {
+                    // Valid events ahead of the refused one go out first (chunk-independent).
+                    if !done.is_empty() {
+                        let s = emit(&self.tx, TaskEv::Bytes(done)).await;
+                        if !matches!(s, Step::Continue) {
+                            return s;
+                        }
+                    }
+                    return retry_fail("provider_error", why);
+                }
             };
             if b.is_empty() {
                 continue;
@@ -836,6 +853,10 @@ mod exclusion {
         named.workers[1].donor = "Alice".into();
         let pinned = pick(&named, Dialect::Anthropic, "m", None, &["alice".into()]);
         assert_eq!(pinned.iter().map(|w| w.worker_device.as_str()).collect::<Vec<_>>(), vec!["o"], "pinned donors only");
+        let prefers = RepoPool { pinned_donors: vec!["alice".into()], ..named.clone() };
+        assert_eq!(pick(&prefers, Dialect::Anthropic, "m", None, &[]).len(), 1, "the project's preferred donor first");
+        let absent = RepoPool { pinned_donors: vec!["zed".into()], ..named };
+        assert_eq!(pick(&absent, Dialect::Anthropic, "m", None, &[]).len(), 3, "a preference never blocks when the preferred donor is away");
     }
 }
 
