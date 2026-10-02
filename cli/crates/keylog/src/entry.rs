@@ -21,6 +21,8 @@ pub const LABEL_RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
 /// Device-signed requests (spec/KEYLOG.md §2a): authenticate a request, never a log entry.
 pub const LABEL_KEY_REVOKE: &[u8] = b"moochy/v1/key-revoke";
 pub const LABEL_KEY_ROTATE: &[u8] = b"moochy/v1/key-rotate";
+/// Owner-key request for `POST /api/lookup` (spec/KEYLOG.md §3), never a log signature.
+pub const LABEL_LOOKUP: &[u8] = b"moochy/v1/lookup";
 /// Label of donor-signed projections (CONTRACT §2).
 pub const LABEL_PROJECTION: &[u8] = b"moochy/v1/projection";
 
@@ -130,6 +132,11 @@ pub enum Body<'a> {
         suite: &'a str,
         roles: Roles,
         repo_scope: Option<&'a str>,
+        /// Box device (§17.1, spec/KEYLOG.md §2b): enrollment token id (`bt_…`); then
+        /// `roles` is Gateway, `repo_scope` is set and `expires_at_ms` > 0.
+        box_id: Option<&'a str>,
+        /// Box devices: inactive from this time on; 0 for every other device.
+        expires_at_ms: u64,
     },
     Revoke {
         device_id: &'a str,
@@ -168,6 +175,9 @@ pub enum Body<'a> {
         owner_pub: &'a [u8; 32],
         prev: Option<&'a [u8; 32]>,
         issued_at_ms: u64,
+        /// 5-field form (spec/KEYLOG.md §4b): an active owner key (a passkey) of the same
+        /// user co-signs the account's first CLI key; `sig = lp(new_sig, authorizer_sig)`.
+        authorizer: Option<&'a str>,
     },
     OwnerRevoke {
         pseudonym: &'a str,
@@ -300,6 +310,24 @@ pub fn key_body(
     ])
 }
 
+/// What the owner CLI signs with its Ed25519 owner key for `POST /api/lookup` (A218):
+/// `lp("moochy/v1/lookup", handle, repo_slug, owner_pseudonym, decimal(issued_at_ms))`.
+#[must_use]
+pub fn lookup_request_message(
+    handle: &str,
+    repo_slug: &str,
+    owner_pseudonym: &str,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    lp(&[
+        LABEL_LOOKUP,
+        handle.as_bytes(),
+        repo_slug.as_bytes(),
+        owner_pseudonym.as_bytes(),
+        issued_at_ms.to_string().as_bytes(),
+    ])
+}
+
 /// What the current device signs over its successor's KEY_ADDED body (`moochy keys
 /// rotate`): `lp("moochy/v1/key-rotate", key_body)`; sent with the successor's PoP first.
 #[must_use]
@@ -374,7 +402,11 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
     let logged_at_ms = u64_of(at)?;
     let want_sig = kind == Kind::KeyAdded || kind.owner_signed();
     let passkey_add = kind == Kind::OwnerKeyAdded && unlp::<9>(body).is_ok();
+    let authorized_add = kind == Kind::OwnerKeyAdded && unlp::<5>(body).is_ok();
     let sig_ok = match kind {
+        Kind::OwnerKeyAdded if authorized_add => {
+            unlp::<2>(sig).is_ok_and(|[new, auth]| new.len() == 64 && owner_sig_form(auth))
+        }
         Kind::OwnerKeyAdded if passkey_add => unlp::<2>(sig).is_ok_and(|[pop, auth]| {
             Assertion::parse(pop).is_ok() && (auth.is_empty() || owner_sig_form(auth))
         }),
@@ -385,11 +417,17 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
     if !sig_ok {
         return Err(Error::Format("sig length"));
     }
-    if rec.len() > MAX_PLAIN_RECORD && !(passkey_add || kind.owner_signed() && sig.len() != 64) {
+    if rec.len() > MAX_PLAIN_RECORD
+        && !(passkey_add || authorized_add || kind.owner_signed() && sig.len() != 64)
+    {
         return Err(Error::TooLarge);
     }
     let body_p = parse_body(kind, body)?;
-    if let Body::OwnerKey { prev, .. } = body_p
+    if let Body::OwnerKey {
+        prev,
+        authorizer: None,
+        ..
+    } = body_p
         && prev.is_some() != (sig.len() == 128)
     {
         return Err(Error::Format("OWNER_KEY_ADDED sig count"));
@@ -415,7 +453,13 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
     let bad = Error::Format(kind.name());
     Ok(match kind {
         Kind::KeyAdded => {
-            let [d, p, sp, ep, su, ro, sc] = unlp::<7>(b)?;
+            let (fields, bx, exp) = match unlp::<9>(b) {
+                Ok([d, p, sp, ep, su, ro, sc, bx, exp]) => {
+                    ([d, p, sp, ep, su, ro, sc], Some(s(bx)?), u64_of(exp)?)
+                }
+                Err(_) => (unlp::<7>(b)?, None, 0),
+            };
+            let [d, p, sp, ep, su, ro, sc] = fields;
             let (d, p, su, ro, sc) = (s(d)?, s(p)?, s(su)?, s(ro)?, s(sc)?);
             let roles = match ro {
                 "gateway" => Roles::Gateway,
@@ -432,6 +476,10 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 || !is_pseudonym(p)
                 || !is_token(su, 64)
                 || !(sc.is_empty() || is_id(sc, "r_"))
+                // Box: gateway only, one repo, expiring (§17.1).
+                || bx.is_some_and(|x| {
+                    !is_id(x, "bt_") || roles != Roles::Gateway || sc.is_empty() || exp == 0
+                })
             {
                 return Err(bad);
             }
@@ -443,6 +491,8 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 suite: su,
                 roles,
                 repo_scope: (!sc.is_empty()).then_some(sc),
+                box_id: bx,
+                expires_at_ms: exp,
             }
         }
         Kind::KeyRevoked => {
@@ -552,7 +602,13 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
             }
         }
         Kind::OwnerKeyAdded => {
-            let [p, k, prev, t] = unlp::<4>(b)?;
+            let ([p, k, prev, t], authorizer) = match unlp::<5>(b) {
+                Ok([p, k, prev, t, auth]) => ([p, k, prev, t], Some(s(auth)?)),
+                Err(_) => (unlp::<4>(b)?, None),
+            };
+            if authorizer.is_some_and(|a| !is_owner_key_id(a) || !prev.is_empty()) {
+                return Err(bad);
+            }
             let (p, t) = (s(p)?, u64_of(t)?);
             let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else {
                 return Err(bad);
@@ -569,6 +625,7 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 owner_pub,
                 prev,
                 issued_at_ms: t,
+                authorizer,
             }
         }
         Kind::OwnerKeyRevoked => {
@@ -626,6 +683,26 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 fn is_owner_key_id(s: &str) -> bool {
     s.strip_prefix("ok_")
         .is_some_and(|u| u.len() == 32 && u.bytes().all(|c| HEX.contains(&c)))
+}
+
+/// 5-field OWNER_KEY_ADDED body (spec/KEYLOG.md §4b): the account's first CLI owner key,
+/// co-signed by the active owner key (passkey) `authorizer`. The CLI signs
+/// `sig_message(OwnerKeyAdded, body)` with the new key; the web adds the passkey assertion
+/// over the same message; `sig = lp(new_sig, assertion)`.
+#[must_use]
+pub fn authorized_owner_key_body(
+    pseudonym: &str,
+    owner_pub: &[u8; 32],
+    issued_at_ms: u64,
+    authorizer: &str,
+) -> Vec<u8> {
+    lp(&[
+        pseudonym.as_bytes(),
+        owner_pub,
+        &[],
+        &issued_at_ms.to_be_bytes(),
+        authorizer.as_bytes(),
+    ])
 }
 
 /// OWNER_KEY_ADDED body (the user's foreground CLI builds and signs it; on rotation

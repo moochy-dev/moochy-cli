@@ -74,6 +74,22 @@ pub enum Alert {
     /// An assertion of one of my passkeys came with a sign counter not above the last
     /// one: a cloned authenticator or a replayed signature (the entry was rejected).
     PasskeyCounter { idx: u64, owner_key: String },
+    /// A box device (§17.1) was enrolled on my account: listed apart from my devices
+    /// (its keys are made in the box, so it is never "known"); revoke it if it is not mine.
+    BoxEnrolled {
+        idx: u64,
+        device_id: String,
+        repo_id: String,
+        box_id: String,
+        expires_at_ms: u64,
+    },
+    /// A box on my account is scoped to a repo I neither own nor am an active member of
+    /// at that point of the log: the relay enrolled it outside the token rules.
+    BoxOutsideRepo {
+        idx: u64,
+        device_id: String,
+        repo_id: String,
+    },
 }
 
 /// Result of comparing a checkpoint (e.g. the Git anchor) with the mirror.
@@ -271,7 +287,9 @@ impl Mirror {
             });
             let signer = match e.body {
                 Body::Claim { signer, .. } | Body::Grant { signer, .. } => Some(signer),
-                Body::OwnerPasskey { authorizer, .. } => authorizer,
+                Body::OwnerPasskey { authorizer, .. } | Body::OwnerKey { authorizer, .. } => {
+                    authorizer
+                }
                 _ => None,
             };
             if let (Code::Counter, Some(me), Some(k)) =
@@ -354,6 +372,29 @@ impl Mirror {
                     idx,
                     owner_key: crate::entry::owner_key_id(cose),
                 });
+            }
+            Body::Key {
+                device_id,
+                pseudonym,
+                repo_scope: Some(repo_id),
+                box_id: Some(box_id),
+                expires_at_ms,
+                ..
+            } if pseudonym == me.pseudonym => {
+                alerts.push(Alert::BoxEnrolled {
+                    idx,
+                    device_id: device_id.to_owned(),
+                    repo_id: repo_id.to_owned(),
+                    box_id: box_id.to_owned(),
+                    expires_at_ms,
+                });
+                if !self.state.owner_or_member(repo_id, pseudonym) {
+                    alerts.push(Alert::BoxOutsideRepo {
+                        idx,
+                        device_id: device_id.to_owned(),
+                        repo_id: repo_id.to_owned(),
+                    });
+                }
             }
             Body::Key {
                 device_id,

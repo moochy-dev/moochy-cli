@@ -228,3 +228,68 @@ spec's (`webauthn_*`, `counter`, `high_s`, `owner_key_exists`, `dup_key`, `skew`
   s.owner_key(id).map(|k| k.owner_pub))` and persist it with the other known owner keys. Show
   `email_proof: true` prominently: the key was bound on the relay's word that the user's mailbox
   was proven (takeover path if the mailbox or relay is compromised).
+
+## 9. Box devices (CONTRACT §17.1, spec/KEYLOG.md §2b) and the passkey-authorized CLI key (§4b)
+
+### 9a. mo-relay: append path
+
+- **Box KEY_ADDED.** In `edge/keylog.go` `keyBody`, add `Box: k.Box, ExpiresAtMs: uint64(k.ExpiresAtMs)`
+  to the `tlog.Key`. In `sched` `enroll`, set `KeyInfo.Box = b.ID` (the `bt_…` token id, not a
+  bool) and `KeyInfo.ExpiresAtMs = b.Expires`. Leave both zero for every other device.
+  `Key.Body()` then emits the 9-field form. The grammar refuses a box that is not exactly
+  `roles = "gateway"` with a repo scope. The state refuses an expiry outside
+  `(logged_at, logged_at + 30 d]` (`box_expiry`), so a token that expired between `enroll` and
+  `Append` fails. The existing "refused → revoke the device" path covers it. The PoP is
+  unchanged.
+- **Expiry.** `Log.GatewayAllowed` / `Log.Sealable` read `cfg.Now()` and return `expired` for a
+  box at or after its expiry. `sched/core.go`'s `RequireLog` check therefore refuses expired boxes
+  even before the relay logs the `KEY_REVOKED`. Keep logging `KEY_REVOKED` (`reason: "expired"`
+  or `"box"`) at expiry or revocation: Nodes see revocations immediately and expiry by their own
+  clock.
+- **No owner powers.** A box session must not use the §2a device requests to revoke other
+  devices or to rotate (`KEY_ADDED` with two sigs); only its own `KEY_REVOKED` is allowed. It
+  must never submit `SignedLogEntry` kinds 3–7 or `OWNER_KEY_*`. The `sched/keylog.go:643` gate
+  already covers owner powers; please also cover `rotateKey` / `selfRevoke` in `edge/keylog.go`.
+- **CLI key authorized by a passkey (§4b).** `moochy owner init` on an account that only has
+  passkeys:
+  1. The CLI builds `entry::authorized_owner_key_body(ps, &pub, now, authorizer_ok_id)` and signs
+     `sig_message(OwnerKeyAdded, body)` with the new key. It submits
+     `SignedLogEntry{kind: "OWNER_KEY_ADDED", body, sigs: [new_sig]}`; `AppendSigned` cannot
+     append it alone.
+  2. The relay holds it as pending, bound to the session's pseudonym (Parse the body, check
+     `Pseudonym` = the session user). It shows it on the web as "bind CLI owner key `ok_…` from
+     device X?".
+  3. The web runs one passkey `get()` (`allowCredentials` = the authorizer's credential) with
+     `challenge = tlog.Challenge(tlog.SigMessage(tlog.OwnerKeyAdded, body))`.
+  4. The relay calls `KeyLog.Append(ctx, tlog.OwnerKeyAdded, body,
+     tlog.AuthorizedOwnerKeySig(newSig, assertion.Encode()))`.
+
+  Append verifies both signatures, normalizes low-S and applies skew to `issued_at`. Answer the
+  CLI's request with the index, or with the code (`owner_key_exists` if a CLI key already exists:
+  rotate instead).
+
+### 9b. mo-donor: mirror
+
+- **Required patch.** `crates/node/src/keylog.rs`, `alert_fields`: checked, `cargo build -p moochy` and its tests build with these two arms.
+
+  ```rust
+  Alert::BoxEnrolled { idx, device_id, repo_id, box_id, expires_at_ms } => json!({"alert": "box_enrolled", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id), "repo_id": clean(repo_id), "box_id": clean(box_id), "expires_at_ms": expires_at_ms}),
+  Alert::BoxOutsideRepo { idx, device_id, repo_id } => json!({"alert": "box_outside_repo", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id), "repo_id": clean(repo_id)}),
+  ```
+
+  `BoxEnrolled` is informational: show it in `moochy box list`, not as a security event.
+  `BoxOutsideRepo` is a security event.
+- **Expiry needs nothing from you.** `view.gateway_allowed` / `view.sealable` now refuse an
+  expired box (`Code::Expired`) using the wall clock. `State::gateway_allowed_at(…, now_ms)` /
+  `sealable_at` exist for tests. `Body::Key` has two new fields, `box_id` and `expires_at_ms`.
+  Your patterns use `..`, so they are unaffected.
+- **Listing.** `view.state(|s| s.boxes(&my_pseudonym))` returns `(device_id, &Device)` in log
+  order. `Device.box_id` is `Some(bt_…)`, `expires_at_ms` is set, and `revoked` is set too: this
+  is the `moochy box list` view from the log. Show "expired" when `now ≥ expires_at_ms`.
+- **Box node itself.** A box runs `moochy up --headless` with `MOOCHY_ENROLL`. Its own mirror
+  sees its own `KEY_ADDED` under the owner's pseudonym. Configure its `Me` with the box's own
+  `sign_pub` in `known_keys` and do not treat the owner's other `BoxEnrolled` alerts as its
+  business: a box should run the monitor for the gate only, without `Me`.
+- **`moochy owner init` with passkeys** (§4b, 9a): when `Code::OwnerKeyExists` comes back from a
+  first-key submission and the account has passkeys (`view.state(|s| s.owner_key(..))`), switch
+  to the authorized form. Then `acknowledge_owner_key(pub)` as today, before submitting.

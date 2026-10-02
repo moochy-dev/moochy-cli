@@ -50,6 +50,10 @@ pub enum Code {
     Counter,
     /// ECDSA signature with s > n/2 (relays normalize before appending).
     HighS,
+    /// A box device past its expiry (§17.1).
+    Expired,
+    /// A box KEY_ADDED whose expiry is not within (logged_at, logged_at + 30 days].
+    BoxExpiry,
 }
 
 impl Code {
@@ -86,6 +90,8 @@ impl Code {
             Self::WebAuthnFormat => "webauthn_format",
             Self::Counter => "counter",
             Self::HighS => "high_s",
+            Self::Expired => "expired",
+            Self::BoxExpiry => "box_expiry",
         }
     }
 }
@@ -102,6 +108,20 @@ pub struct Device {
     /// Index of the KEY_ADDED entry.
     pub idx: u64,
     pub revoked: bool,
+    /// Box device (§17.1): its enrollment token id. Gateway only, one repo, no owner or
+    /// donor powers.
+    pub box_id: Option<String>,
+    /// Box devices: inactive from this time on (ms); 0 = never expires.
+    pub expires_at_ms: u64,
+}
+
+/// Longest box lifetime from its KEY_ADDED: 30 days.
+pub const MAX_BOX_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,12 +228,20 @@ impl State {
                 suite,
                 roles,
                 repo_scope,
+                box_id,
+                expires_at_ms,
             } => {
                 if self.devices.contains_key(device_id) {
                     return Err(Code::DupDevice);
                 }
                 if self.pubs.contains_key(sign_pub) {
                     return Err(Code::DupKey);
+                }
+                if box_id.is_some()
+                    && (expires_at_ms <= e.logged_at_ms
+                        || expires_at_ms.saturating_sub(e.logged_at_ms) > MAX_BOX_TTL_MS)
+                {
+                    return Err(Code::BoxExpiry);
                 }
                 if check_sigs && !verify(sign_pub, &pop_message(sign_pub, enc_pub, suite), e.sig) {
                     return Err(Code::BadPop);
@@ -230,6 +258,8 @@ impl State {
                         repo_scope: repo_scope.map(str::to_owned),
                         idx,
                         revoked: false,
+                        box_id: box_id.map(str::to_owned),
+                        expires_at_ms,
                     },
                 );
             }
@@ -338,6 +368,7 @@ impl State {
                 pseudonym,
                 owner_pub,
                 prev,
+                authorizer,
                 ..
             } => {
                 if self.pubs.contains_key(owner_pub) {
@@ -350,14 +381,25 @@ impl State {
                 match (cur, prev) {
                     (None, Some(_)) => return Err(Code::UnknownOwnerKey),
                     // A passkey exists: an unauthorized first CLI key would be trust-on-first-use.
-                    (None, None) if self.passkeys_of.get(pseudonym).is_some_and(|n| *n > 0) => {
+                    (None, None)
+                        if authorizer.is_none()
+                            && self.passkeys_of.get(pseudonym).is_some_and(|n| *n > 0) =>
+                    {
                         return Err(Code::OwnerKeyExists);
                     }
+                    // A CLI key exists: rotate it (prev) instead.
+                    (Some(_), _) if authorizer.is_some() => return Err(Code::OwnerKeyExists),
                     (Some(c), p) if p != Some(&c.owner_pub) => return Err(Code::OwnerKeyExists),
                     _ => {}
                 }
                 let msg = sig_message(Kind::OwnerKeyAdded, e.raw_body);
-                if check_sigs && !verify(owner_pub, &msg, e.sig.get(..64).unwrap_or_default()) {
+                let (new_sig, auth_sig) = match authorizer {
+                    Some(_) => unlp::<2>(e.sig)
+                        .map(|[n, a]| (n, a))
+                        .map_err(|_| Code::BadSig)?,
+                    None => (e.sig, &[][..]),
+                };
+                if check_sigs && !verify(owner_pub, &msg, new_sig.get(..64).unwrap_or_default()) {
                     return Err(Code::BadPop);
                 }
                 if let (true, Some(p)) = (check_sigs, prev)
@@ -365,7 +407,22 @@ impl State {
                 {
                     return Err(Code::BadSig);
                 }
+                let mut auth_ctr = None;
+                if let Some(a) = authorizer {
+                    let k = self.owners.get(a).ok_or(Code::UnknownOwnerKey)?;
+                    if k.revoked {
+                        return Err(Code::Revoked);
+                    }
+                    if k.pseudonym != pseudonym {
+                        return Err(Code::NotOwner);
+                    }
+                    auth_ctr =
+                        Self::owner_sig(k, Kind::OwnerKeyAdded, e.raw_body, auth_sig, check_sigs)?;
+                }
                 let cur_id = cur.map(|c| c.id.clone());
+                if let Some(a) = authorizer {
+                    self.bump(a, auth_ctr);
+                }
                 let id = owner_key_id(owner_pub);
                 self.pubs.insert(*owner_pub, id.clone());
                 if let Some(c) = cur_id.and_then(|c| self.owners.get_mut(&c)) {
@@ -593,10 +650,41 @@ impl State {
         self.catalogs.get(&version)
     }
 
-    fn usable(&self, id: &str, worker: bool, repo_id: &str) -> Result<(&Device, &Repo), Code> {
+    /// The user's box devices (§17.1), in log order, expired and revoked ones included:
+    /// `(device_id, device)`.
+    #[must_use]
+    pub fn boxes(&self, pseudonym: &str) -> Vec<(&str, &Device)> {
+        let mut v: Vec<(&str, &Device)> = self
+            .devices
+            .iter()
+            .filter(|(_, d)| d.box_id.is_some() && d.pseudonym == pseudonym)
+            .map(|(id, d)| (id.as_str(), d))
+            .collect();
+        v.sort_by_key(|(_, d)| d.idx);
+        v
+    }
+
+    /// Does `pseudonym` own `repo_id` or hold an active MEMBER_ADDED for it?
+    #[must_use]
+    pub fn owner_or_member(&self, repo_id: &str, pseudonym: &str) -> bool {
+        self.repos.get(repo_id).is_some_and(|r| {
+            r.owner == pseudonym || r.members.get(pseudonym).is_some_and(|g| g.active)
+        })
+    }
+
+    fn usable(
+        &self,
+        id: &str,
+        worker: bool,
+        repo_id: &str,
+        now_ms: u64,
+    ) -> Result<(&Device, &Repo), Code> {
         let d = self.devices.get(id).ok_or(Code::UnknownDevice)?;
         if d.revoked {
             return Err(Code::Revoked);
+        }
+        if d.expires_at_ms != 0 && now_ms >= d.expires_at_ms {
+            return Err(Code::Expired);
         }
         if !(if worker {
             d.roles.has_worker()
@@ -615,7 +703,12 @@ impl State {
     /// unrevoked, have the worker role and scope, and its user must hold an active
     /// owner-signed DONOR_APPROVED for the repo.
     pub fn sealable(&self, worker: &str, repo_id: &str) -> Result<Sealable, Code> {
-        let (d, r) = self.usable(worker, true, repo_id)?;
+        self.sealable_at(worker, repo_id, now_ms())
+    }
+
+    /// [`Self::sealable`] at wall-clock time `now_ms` (box expiry).
+    pub fn sealable_at(&self, worker: &str, repo_id: &str, now_ms: u64) -> Result<Sealable, Code> {
+        let (d, r) = self.usable(worker, true, repo_id, now_ms)?;
         match r.donors.get(d.pseudonym.as_str()) {
             Some(g) if g.active => Ok(Sealable {
                 enc_pub: d.enc_pub,
@@ -631,7 +724,17 @@ impl State {
     /// owner-signed MEMBER_ADDED. The Worker also checks the task signature against
     /// [`Device::sign_pub`].
     pub fn gateway_allowed(&self, gateway: &str, repo_id: &str) -> Result<&Device, Code> {
-        let (d, r) = self.usable(gateway, false, repo_id)?;
+        self.gateway_allowed_at(gateway, repo_id, now_ms())
+    }
+
+    /// [`Self::gateway_allowed`] at wall-clock time `now_ms`: an expired box is refused.
+    pub fn gateway_allowed_at(
+        &self,
+        gateway: &str,
+        repo_id: &str,
+        now_ms: u64,
+    ) -> Result<&Device, Code> {
+        let (d, r) = self.usable(gateway, false, repo_id, now_ms)?;
         if d.pseudonym == r.owner
             || r.members
                 .get(d.pseudonym.as_str())

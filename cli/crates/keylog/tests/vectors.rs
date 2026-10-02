@@ -60,6 +60,8 @@ fn alert_str(a: &Alert) -> String {
             idx, email_proof, ..
         } => format!("UnknownPasskey:{idx}:{email_proof}"),
         Alert::PasskeyCounter { idx, .. } => format!("PasskeyCounter:{idx}"),
+        Alert::BoxEnrolled { idx, .. } => format!("BoxEnrolled:{idx}"),
+        Alert::BoxOutsideRepo { idx, .. } => format!("BoxOutsideRepo:{idx}"),
     }
 }
 
@@ -433,6 +435,23 @@ fn request_vectors() {
     let sig = |k: &str, v: &Value| {
         Signature::from(<[u8; 64]>::try_from(unhex(v[k].as_str().unwrap())).unwrap())
     };
+    let lk = &r["lookup"];
+    let lm = entry::lookup_request_message(
+        lk["handle"].as_str().unwrap(),
+        lk["repo_slug"].as_str().unwrap(),
+        lk["owner_pseudonym"].as_str().unwrap(),
+        lk["issued_at_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(lm, unhex(lk["message_hex"].as_str().unwrap()));
+    let ok_pub: [u8; 32] = unhex(lk["owner_pub_hex"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    assert!(
+        VerificationKey::try_from(ok_pub)
+            .unwrap()
+            .verify(&sig("sig_hex", lk), &lm)
+            .is_ok()
+    );
     let rv = &r["revoke"];
     let body = unhex(rv["body_hex"].as_str().unwrap());
     let rec = entry::record(moochy_keylog::Kind::KeyRevoked, 0, &body, &[]);
