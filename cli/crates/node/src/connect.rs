@@ -86,7 +86,7 @@ pub fn snippet(client: &str, url: &str, repo: &str, main: &str, small: &str) -> 
         "generic-openai" => format!("{token}base_url: {url}/v1\napi_key: $MOOCHY_TOKEN\nmodel: {main}\n"),
         "generic-anthropic" => format!("{token}base_url: {url}\napi_key: $MOOCHY_TOKEN   (x-api-key or Authorization: Bearer)\nmodel: {main}\n"),
         c if GUIDE_CLIENTS.contains(&c) => format!(
-            "{}\n# The token: `moochy env --repo {repo} --json` prints it; export it as MOOCHY_TOKEN (sent as `Authorization: Bearer` or `x-api-key`), never write it into a file tracked by git.\n",
+            "{}\n# The token: moochy env --repo {repo} --json prints it; export it as MOOCHY_TOKEN (sent as Authorization: Bearer or x-api-key), never write it into a file tracked by git.\n",
             guide_snippet(c, url, repo, main)?
         ),
         _ => return None,
@@ -138,7 +138,7 @@ fn guide_snippet(id: &str, url: &str, repo: &str, main: &str) -> Option<String> 
             if tool.contains("MCP only") || tool.contains("not yet") {
                 out.push_str("# API: ");
                 out.push_str(&tool);
-                out.push_str(". This agent uses donated tokens through MCP (`moochy_delegate`).\n");
+                out.push_str(". This agent uses donated tokens through MCP (moochy_delegate).\n");
             }
         } else if l.starts_with('|') {
         } else if l.trim().is_empty() {
@@ -147,7 +147,8 @@ fn guide_snippet(id: &str, url: &str, repo: &str, main: &str) -> Option<String> 
             }
         } else {
             out.push_str("# ");
-            out.push_str(&fill(l.trim_start_matches("### ")).replace("**", ""));
+            // Comments are plain text: no markdown emphasis; code spans in single quotes.
+            out.push_str(&fill(l.trim_start_matches("### ")).replace("**", "").replace('`', "'"));
             out.push('\n');
         }
     }
