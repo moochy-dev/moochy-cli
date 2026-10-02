@@ -79,6 +79,46 @@ pub fn cost_uusd(c: &CatalogEntry, u: &Usage, fast: bool) -> Result<i64, Error> 
     ceil_div(sum.checked_mul(u128::from(m)).ok_or(Error::Overflow)?, PER_MILLION)
 }
 
+/// Raw `usage` of an OpenAI Responses reply (`response.completed`), CONTRACT §18.6 /
+/// cli/crates/worker/RESPONSES.md. `None` = field absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResponsesUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    /// `input_tokens_details.cached_tokens` (part of `input_tokens`).
+    pub cached_tokens: Option<u64>,
+    /// Provider-charged cost already in µ$ (OpenRouter `usage.cost`, xAI `cost_in_usd_ticks`).
+    pub provider_cost_uusd: Option<i64>,
+}
+
+/// Receipt usage of a Responses reply, exactly as the worker's stream parser maps it:
+/// `input = input_tokens − cached_tokens`, `cache_read = cached_tokens`,
+/// `output = max(output_tokens, total_tokens − input_tokens)` (reasoning included; the second
+/// term only ever raises it), no cache writes. Missing `input_tokens`/`output_tokens`, or
+/// `cached_tokens > input_tokens` (input then counted whole), mark the usage `estimated`, which
+/// settles pessimistically at the reservation (05 §5.2). Never wraps.
+#[must_use]
+pub fn responses_usage(r: &ResponsesUsage) -> Usage {
+    let mut estimated = r.input_tokens.is_none() || r.output_tokens.is_none();
+    let input = r.input_tokens.unwrap_or(0);
+    let cached = r.cached_tokens.unwrap_or(0);
+    let uncached = input.checked_sub(cached).unwrap_or_else(|| {
+        estimated = true;
+        input
+    });
+    let from_total = r.total_tokens.and_then(|t| t.checked_sub(input)).unwrap_or(0);
+    Usage {
+        input: uncached,
+        output: r.output_tokens.unwrap_or(0).max(from_total),
+        cache_write_5m: 0,
+        cache_write_1h: 0,
+        cache_read: cached,
+        estimated,
+        provider_cost_uusd: r.provider_cost_uusd,
+    }
+}
+
 /// Reservation (plan 05 §5.1):
 /// `ceil((est_input × in × m_cache + max_tokens × out) × fast / 1e6)`,
 /// `m_cache` = 5/4 for `5m`, 2 for `1h`, 1 otherwise — computed exactly over a common denominator.
@@ -170,7 +210,10 @@ pub struct BodyFacts {
     pub model: String,
     /// Explicit effort (`output_config.effort` / `reasoning_effort`), if any.
     pub effort: Option<String>,
-    pub max_tokens: u32,
+    /// Explicit output cap. Always present for `anthropic.messages` and `openai.chat`; may be
+    /// absent for `openai.responses` (Codex sends none): then the catalog `max_output` applies,
+    /// see [`BodyFacts::max_tokens_for`].
+    pub max_tokens: Option<u32>,
     pub stream: bool,
     /// Longest `cache_control` TTL anywhere in the body.
     pub cache_ttl: CacheTtl,
@@ -190,6 +233,12 @@ impl BodyFacts {
         let i = self.images.checked_mul(c.max_image_tokens).ok_or(Error::Overflow)?;
         let p = self.pages.checked_mul(c.max_page_tokens).ok_or(Error::Overflow)?;
         t.checked_add(i).and_then(|x| x.checked_add(p)).ok_or(Error::Overflow)
+    }
+
+    /// Effective output cap: the body's, else the catalog `max_output` (Responses only).
+    #[must_use]
+    pub fn max_tokens_for(&self, c: &CatalogEntry) -> u32 {
+        self.max_tokens.unwrap_or(c.max_output)
     }
 
     /// Flags the body requires (each needs donor opt-in), sorted.
@@ -215,7 +264,7 @@ impl BodyFacts {
             dialect,
             model: c.model.clone(),
             effort: self.effort.clone().unwrap_or_else(|| c.default_effort.clone()),
-            max_tokens: self.max_tokens,
+            max_tokens: self.max_tokens_for(c),
             est_input_tokens: self.est_input_tokens(c)?,
             cache_ttl: self.cache_ttl,
             stream: self.stream,
@@ -236,7 +285,7 @@ pub fn check_route(route: &RouteHeader, f: &BodyFacts, c: &CatalogEntry) -> Resu
         (model_ok, "model"),
         (c.dialects.contains(&route.dialect), "dialect"),
         (route.effort == effort, "effort"),
-        (route.max_tokens == f.max_tokens && f.max_tokens <= c.max_output, "max_tokens"),
+        (route.max_tokens == f.max_tokens_for(c) && f.max_tokens_for(c) <= c.max_output, "max_tokens"),
         (f.est_input_tokens(c).ok() == Some(route.est_input_tokens), "est_input_tokens"),
         (route.cache_ttl == f.cache_ttl, "cache_ttl"),
         (route.stream == f.stream, "stream"),
@@ -249,8 +298,10 @@ pub fn check_route(route: &RouteHeader, f: &BodyFacts, c: &CatalogEntry) -> Resu
 }
 
 /// Extract [`BodyFacts`] from a provider request body. Strict JSON (CONTRACT §1).
-/// `max_tokens` is required (Anthropic: `max_tokens`; OpenAI: `max_completion_tokens` or
-/// `max_tokens`, and if both are present they must be equal).
+/// `max_tokens` is required for Anthropic (`max_tokens`) and OpenAI chat
+/// (`max_completion_tokens` or `max_tokens`, equal if both are present); for OpenAI Responses it
+/// is `max_output_tokens` when present (else the catalog `max_output`, CONTRACT §18.6), effort is
+/// `reasoning.effort`.
 pub fn body_facts(dialect: Dialect, body: &[u8]) -> Result<BodyFacts, Error> {
     let v = json::parse_value(body)?;
     let o = v.as_object().ok_or(Error::Malformed)?;
@@ -286,7 +337,18 @@ pub fn body_facts(dialect: Dialect, body: &[u8]) -> Result<BodyFacts, Error> {
             };
             (mt, str_field("reasoning_effort")?, false)
         }
+        Dialect::OpenAiResponses => {
+            let effort = match o.get("reasoning").and_then(|r| r.get("effort")) {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(Error::Malformed),
+            };
+            (u32_field("max_output_tokens")?, effort, false)
+        }
     };
+    if max_tokens.is_none() && dialect != Dialect::OpenAiResponses {
+        return Err(Error::Malformed);
+    }
     let mut w = Walk { cache_ttl: CacheTtl::None, images: 0, pages: 0, image_bytes: 0 };
     w.walk(&v)?;
     let text_bytes = u64::try_from(body.len())
@@ -296,7 +358,7 @@ pub fn body_facts(dialect: Dialect, body: &[u8]) -> Result<BodyFacts, Error> {
     Ok(BodyFacts {
         model,
         effort,
-        max_tokens: max_tokens.ok_or(Error::Malformed)?,
+        max_tokens,
         stream,
         cache_ttl: w.cache_ttl,
         fast,
@@ -346,6 +408,15 @@ impl Walk {
                     Some("image_url") => {
                         self.images = self.images.checked_add(1).ok_or(Error::Overflow)?;
                         if let Some(u) = o.get("image_url").and_then(|i| i.get("url")).and_then(Value::as_str)
+                            && u.starts_with("data:")
+                        {
+                            self.exclude(u)?;
+                        }
+                    }
+                    // OpenAI Responses image part: `image_url` is the URL string itself.
+                    Some("input_image") => {
+                        self.images = self.images.checked_add(1).ok_or(Error::Overflow)?;
+                        if let Some(u) = o.get("image_url").and_then(Value::as_str)
                             && u.starts_with("data:")
                         {
                             self.exclude(u)?;
