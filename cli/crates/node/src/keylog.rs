@@ -90,6 +90,18 @@ fn passkey_id(digest: &[u8; 32]) -> String {
     std::iter::once("ok_".to_owned()).chain(digest.iter().take(16).map(|b| format!("{b:02x}"))).collect()
 }
 
+/// One owner key of this account, from the key log (`KeyLog::owner_key_row`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerKeyRow {
+    /// Its OWNER_KEY_ADDED entry.
+    pub idx: u64,
+    pub revoked: bool,
+    /// Passkeys: registered with only the emailed proof (first owner key of the account).
+    pub email_proof: Option<bool>,
+    /// How it was bound (KEYLOG §4c).
+    pub proof: moochy_keylog::state::OwnerKeyProof,
+}
+
 /// One box device of this account, from the key log (`KeyLog::boxes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxRow {
@@ -182,12 +194,16 @@ impl KeyLog {
         Some(Self::mirror(home, cfg)?.state(|s| s.active_owner_key(pseudonym).map(|k| k.id.clone())).ok().flatten())
     }
 
-    /// `moochy owner trust` (A224): an owner key of `pseudonym` as the mirror shows it:
-    /// `(log index, revoked, Some(email_proof) for a passkey)`. Outer `None`: no key log.
-    pub fn owner_key_row(home: &Home, cfg: &Config, pseudonym: &str, id: &str) -> Option<Option<(u64, bool, Option<bool>)>> {
+    /// `moochy owner trust|status|init` (A224): an owner key of `pseudonym` as the mirror shows it.
+    /// Outer `None`: no key log; inner `None`: not (yet) in this machine's copy.
+    pub fn owner_key_row(home: &Home, cfg: &Config, pseudonym: &str, id: &str) -> Option<Option<OwnerKeyRow>> {
         Some(
             Self::mirror(home, cfg)?
-                .state(|s| s.owner_key(id).filter(|k| k.pseudonym == pseudonym).map(|k| (k.idx, k.revoked, k.passkey.as_ref().map(|p| p.email_proof))))
+                .state(|s| {
+                    s.owner_key(id)
+                        .filter(|k| k.pseudonym == pseudonym)
+                        .map(|k| OwnerKeyRow { idx: k.idx, revoked: k.revoked, email_proof: k.passkey.as_ref().map(|p| p.email_proof), proof: k.proof })
+                })
                 .ok()
                 .flatten(),
         )
@@ -370,6 +386,15 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
             // A224: a first CLI owner key without proof is a reminder when it is this device's own.
             if matches!(a, Alert::UnprovenOwnerKey { known: true, .. }) {
                 return ("info", "key log: your first owner key was registered without an email proof".into(), f);
+            }
+            if let (Alert::UnprovenOwnerKey { owner_key, known: false, .. }, Some(o)) = (a, f.as_object_mut()) {
+                o.insert(
+                    "warning".into(),
+                    json!(format!(
+                        "an owner key {} you did not create was bound on your account with no email proof and no authorization: approvals it signs are not yours. Revoke it on moochy.dev and check your account's sessions",
+                        clean(owner_key)
+                    )),
+                );
             }
             ("error", "key log alert".into(), f)
         }

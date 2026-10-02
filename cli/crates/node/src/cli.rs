@@ -104,6 +104,8 @@ COMMANDS:
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
                                   with its own passphrase, that signs approvals, memberships and
                                   claims; only used by these commands, never by the app
+  owner status                    Your owner key in the public key log and how it was bound
+                                  (confirmed email, passkey, rotation, or before the email rule)
   pending                         Requests waiting for your signature (maintainers)
   decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] [--yes]
             | decisions accept <id>
@@ -332,6 +334,7 @@ fn run() -> Result<()> {
         ["donations", act, id] => crate::donations::action(&home, act, id),
         ["decisions", rest @ ..] => decisions_cmd(&home, &o, rest),
         ["owner", "init"] => crate::owner::init(&home, false),
+        ["owner", "status"] => crate::owner::show_status(&home),
         ["owner", "trust", id] => crate::owner::trust(&home, id, o.has("yes")),
         ["owner", "rotate"] => crate::owner::init(&home, true),
         // VOICE.md: "accept a donor".
