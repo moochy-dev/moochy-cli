@@ -155,7 +155,7 @@ pub struct PoolWorker {
     pub approval_log_index: u64,
     #[prost(string, tag = "5")]
     pub donor_pseudonym: ::prost::alloc::string::String,
-    /// "anthropic.messages" | "openai.chat"
+    /// "anthropic.messages" | "openai.chat" | "openai.responses" (CONTRACT §18.2: openai, xai, openrouter only)
     #[prost(string, repeated, tag = "6")]
     pub dialects: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// public model ids (slugs)
