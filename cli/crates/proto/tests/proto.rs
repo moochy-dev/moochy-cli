@@ -442,6 +442,7 @@ fn protobuf_and_artifacts() {
             wraps: vec![pb::Wrap { worker_device: "d_01K6A0000000000000000000W1".into(), wrap: Bytes::from(vec![7; 80]) }],
             body_len: 100,
             body_chunks: 1,
+            platform_sandboxed: false,
         })),
     };
     assert_eq!(pb::SubmitUp::decode(up.encode_to_vec().as_slice()).unwrap(), up);
