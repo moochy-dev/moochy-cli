@@ -152,6 +152,9 @@ struct Ask<'a> {
     repo_slug: &'a str,
     /// The user argument: a handle, a pseudonym, or a device id (`members --device`).
     subject: Option<&'a str>,
+    /// `members --device`: the argument is a device id, shown as the label; the body names the
+    /// device owner's pseudonym (E32).
+    device: bool,
 }
 
 /// The exact fields one signature will cover, after binding.
@@ -189,7 +192,9 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
                 return Err(refuse("a body that differs from what it shows"));
             }
             // Device ids and pseudonyms are matched exactly; a handle against the label.
-            let ok = arg == subject || (!arg.starts_with("d_") && !arg.starts_with("ps_") && arg.eq_ignore_ascii_case(&p.subject_username));
+            let ok = arg == subject
+                || (!arg.starts_with("d_") && !arg.starts_with("ps_") && arg.eq_ignore_ascii_case(&p.subject_username))
+                || (ask.device && arg.starts_with("d_") && arg == p.subject_username && subject.starts_with("ps_"));
             if !ok {
                 return Err(refuse(&format!("subject {} ({})", clean(&p.subject_username), clean(subject))));
             }
@@ -257,9 +262,9 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
         r.map(tonic::Response::into_inner).map_err(|s| status(&s))
     })?;
     let want = match words {
-        ["approve", donor] => Ask { kind: if revoke { Kind::DonorRevoked } else { Kind::DonorApproved }, repo_slug: slug, subject: Some(donor) },
-        ["members", op, user] => Ask { kind: if *op == "add" { Kind::MemberAdded } else { Kind::MemberRemoved }, repo_slug: slug, subject: Some(user) },
-        _ => Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None },
+        ["approve", donor] => Ask { kind: if revoke { Kind::DonorRevoked } else { Kind::DonorApproved }, repo_slug: slug, subject: Some(donor), device: false },
+        ["members", op, user] => Ask { kind: if *op == "add" { Kind::MemberAdded } else { Kind::MemberRemoved }, repo_slug: slug, subject: Some(user), device },
+        _ => Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false },
     };
     let me = cfg.pseudonym.as_deref();
     let main = bind(&want, me, &preview)?;
@@ -271,7 +276,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
             c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await.ok().map(tonic::Response::into_inner)
         }))
         .flatten()
-        .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));
+        .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));
     let has_key = key_path(home, cfg.relay.as_deref()).exists();
     if !has_key {
         eprintln!("No owner key yet: one will be created (a separate key with its own passphrase) and registered in the public key log.");
@@ -372,7 +377,7 @@ mod tests {
     }
 
     fn approve(who: &str) -> Ask<'_> {
-        Ask { kind: Kind::DonorApproved, repo_slug: "acme/widget", subject: Some(who) }
+        Ask { kind: Kind::DonorApproved, repo_slug: "acme/widget", subject: Some(who), device: false }
     }
 
     /// A217/A218 reproducers: a compromised background process (fake node.sock) proposes
@@ -394,8 +399,14 @@ mod tests {
         assert!(bind(&approve("alice"), Some(ME), &p).is_err());
         // A pseudonym argument never matches a label.
         assert!(bind(&approve(MALLORY), Some(ME), &grant("DONOR_APPROVED", ALICE, MALLORY, ALICE)).is_err());
+        // `members add d_… --device` (E32): the label is the device id, the body its owner's pseudonym.
+        let dev = "d_01J0000000000000000000000D";
+        let member = |device| Ask { kind: Kind::MemberAdded, repo_slug: "acme/widget", subject: Some(dev), device };
+        assert!(bind(&member(true), Some(ME), &grant("MEMBER_ADDED", ALICE, dev, ALICE)).is_ok());
+        assert!(bind(&member(false), Some(ME), &grant("MEMBER_ADDED", ALICE, dev, ALICE)).is_err(), "only with --device");
+        assert!(bind(&member(true), Some(ME), &grant("MEMBER_ADDED", ALICE, "d_01J0000000000000000000000E", ALICE)).is_err(), "another device");
         // A hidden DONOR_APPROVED offered as the "claim" of an approve (A217) never binds as a claim.
-        let claim_ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None };
+        let claim_ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None, device: false };
         assert!(bind(&claim_ask, Some(ME), &grant("DONOR_APPROVED", MALLORY, "mallory", MALLORY)).is_err());
     }
 
@@ -409,7 +420,7 @@ mod tests {
             body_to_sign: claim_body(R, "github", "123", owner, OK, 1),
             ..SignResponse::default()
         };
-        let ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None };
+        let ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None, device: false };
         let b = bind(&ask, Some(ME), &claim(ME)).unwrap();
         assert_eq!(b.claim, Some(("github".into(), "123".into())));
         assert!(bind(&ask, Some(ME), &claim(MALLORY)).is_err(), "claim for another account");

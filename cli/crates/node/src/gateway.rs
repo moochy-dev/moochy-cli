@@ -203,8 +203,8 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
     // peer running as this user; over TCP it is just an unknown token.
     let on_socket = crate::run::same_user(peer, &node.home.state_dir());
     let caller = token(req.headers())
-        .and_then(|t| crate::run::check(t).filter(|_| on_socket).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
-    let Some((slug, sandboxed)) = caller else {
+        .and_then(|t| crate::run::check(t).filter(|_| on_socket).map(|r| (r.slug, true, r.platform)).or_else(|| node.check_token(t).map(|s| (s, false, false))));
+    let Some((slug, sandboxed, platform)) = caller else {
         if path == "/mcp" {
             let mut r = json_resp(401, &json!({"error": "unauthorized"}));
             r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -214,21 +214,26 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
     };
     // Tool calls are released only to sandboxed sessions or projects that opted in (§15.4).
     // The project's own setting (PoolSync), or the local override in development only.
-    let repo_allows = crate::node::lock(&node.pools).values().any(|p| p.allow_unsandboxed_tools && p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&slug)));
-    let release = sandboxed || repo_allows || (node.insecure_dev && node.cfg.unsandboxed_tools_allowed(&slug));
+    // A platform-sandboxed run (§17.2, `--box-is-sandbox`) only if the project allows platform sandboxes.
+    let (repo_allows, platform_ok) = crate::node::lock(&node.pools)
+        .values()
+        .filter(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&slug)))
+        .fold((false, false), |(a, b), p| (a || p.allow_unsandboxed_tools, b || p.allow_platform_sandboxes));
+    let release = (sandboxed && (!platform || platform_ok)) || repo_allows || (node.insecure_dev && node.cfg.unsandboxed_tools_allowed(&slug));
     match (req.method(), path.as_str()) {
         (&Method::POST, "/moochy/run") if !sandboxed => {
             let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
-            crate::run::open(slug, key, peer, &node.home.state_dir())
+            let platform = req.headers().get(crate::run::PLATFORM_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+            crate::run::open(slug, platform, key, peer, &node.home.state_dir())
         }
         (_, "/mcp") => crate::mcp::http(node, slug, req).await,
         (&Method::GET, "/v1/models") => {
             node.settle_pool(&slug, |p| !p.models().is_empty()).await;
             models(&node, &slug)
         }
-        (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false, release).await,
-        (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true, release).await,
-        (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false, release).await,
+        (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false, (release, platform)).await,
+        (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true, (release, platform)).await,
+        (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false, (release, platform)).await,
         _ => native_error(dialect, &Failure::new("not_found", false, format!("moochy: no route for {path}"))),
     }
 }
@@ -341,7 +346,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
     let pinned = node.cfg.pinned_donors.get(&slug.to_ascii_lowercase()).cloned().unwrap_or_default();
-    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, stripped, pinned })
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, platform_sandboxed: false, stripped, pinned })
 }
 
 fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
@@ -366,7 +371,8 @@ fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::Catalo
 }
 
 #[allow(clippy::too_many_lines, reason = "one request: read, prepare, submit, stream or buffer, headers")]
-async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: bool) -> Resp {
+/// `release`: (tool calls may reach this client, the session is platform-sandboxed).
+async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: (bool, bool)) -> Resp {
     let t_rx = crate::task::now_us();
     // Session-level pinned donors (06 §8): `x-moochy-donors: alice,bob`.
     let session_pins = req.headers().get("x-moochy-donors").and_then(|v| v.to_str().ok()).map(str::to_owned);
@@ -394,7 +400,7 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         };
     }
     let treq = match prepare(&node, slug, dialect, raw, &headers, t_rx) {
-        Ok(t) => TaskReq { release_tools: release, pinned: narrow_pins(t.pinned.clone(), session_pins.as_deref()), ..t },
+        Ok(t) => TaskReq { release_tools: release.0, platform_sandboxed: release.1, pinned: narrow_pins(t.pinned.clone(), session_pins.as_deref()), ..t },
         Err(f) => return native_error(dialect, &f),
     };
     let stream = treq.facts.stream;

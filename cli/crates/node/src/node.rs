@@ -66,6 +66,8 @@ pub struct RepoPool {
     /// Repo setting `PoolSync.pinned_donors`: donors the project prefers (tried first).
     pub pinned_donors: Vec<String>,
     pub allow_unsandboxed_tools: bool,
+    /// Repo setting (§17.2), resolved for this device: `moochy run --box-is-sandbox` sessions get tool calls.
+    pub allow_platform_sandboxes: bool,
 }
 
 impl RepoPool {
@@ -421,6 +423,7 @@ impl Node {
                 crate::util::log("warn", "this project lets tool calls from donated tokens reach agents outside `moochy run`", &serde_json::json!({"repo_id": v.repo_id}));
             }
             p.allow_unsandboxed_tools = v.allow_unsandboxed_tools;
+            p.allow_platform_sandboxes = v.allow_platform_sandboxes;
             let before = p.models();
             if v.full {
                 p.workers.clear();

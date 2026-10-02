@@ -14,7 +14,7 @@ The export copies these files into place; everything else stays where it is.
 | `dist-workspace.toml` | `/dist-workspace.toml` |
 | `github/build-setup.yml` | `/.github/build-setup.yml` |
 | `github/workflows/*.yml` | `/.github/workflows/` |
-| `deny.toml`, `supply-chain/`, `scripts/`, `container/`, `service/`, `apparmor/` | `/deploy/client/` (unchanged) |
+| `deny.toml`, `supply-chain/`, `scripts/`, `container/`, `service/`, `apparmor/`, `boxes/`, `devcontainer/` | `/deploy/client/` (unchanged) |
 
 Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release"` in `cli/Cargo.toml`; `[package.metadata.dist] dist = true`, `repository`, `homepage` in `cli/crates/node/Cargo.toml`.
 

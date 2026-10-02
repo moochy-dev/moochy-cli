@@ -133,6 +133,9 @@ pub struct PoolSync {
     /// repo setting: donor pseudonyms the project prefers; the Gateway tries them first (empty = no preference)
     #[prost(string, repeated, tag = "10")]
     pub pinned_donors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// repo setting (§17.2) resolved for THIS device: release pooled tool calls to `moochy run --box-is-sandbox` sessions (default true for box devices, false otherwise)
+    #[prost(bool, tag = "11")]
+    pub allow_platform_sandboxes: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolWorker {
@@ -477,6 +480,9 @@ pub struct SubmitOpen {
     pub body_len: u64,
     #[prost(uint32, tag = "5")]
     pub body_chunks: u32,
+    /// §17.2: the request comes from a `moochy run --box-is-sandbox` session (the box, not moochy, is the sandbox)
+    #[prost(bool, tag = "6")]
+    pub platform_sandboxed: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Wraps {
@@ -655,6 +661,12 @@ pub struct DeviceStartRequest {
     /// key-log proof of possession (label moochy/v1/key-pop, spec/KEYLOG.md); goes into KEY_ADDED
     #[prost(bytes = "bytes", tag = "7")]
     pub pop_sig: ::prost::bytes::Bytes,
+    /// §17.1 box enrollment: a token from CreateBoxToken. The relay checks it (hash, not expired or
+    /// revoked, fewer than max_boxes uses), requires roles == \[GATEWAY\], logs KEY_ADDED with the box
+    /// flag, the expiry and repo_scope, and approves without a browser: user_code is empty and the
+    /// first DevicePoll answers APPROVED. A bad token: PERMISSION_DENIED (no detail on which check).
+    #[prost(string, tag = "8")]
+    pub enroll_token: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeviceStartResponse {
@@ -684,6 +696,15 @@ pub struct DevicePollResponse {
     pub user_pseudonym: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub username: ::prost::alloc::string::String,
+    /// Enrolled boxes only (§17.1): the ephemeral device's scope, expiry and own cap.
+    #[prost(bool, tag = "5")]
+    pub r#box: bool,
+    #[prost(string, tag = "6")]
+    pub repo_slug: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub expires_at_ms: i64,
+    #[prost(int64, tag = "8")]
+    pub cap_uusd_month: i64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListDonationsRequest {}
@@ -779,6 +800,104 @@ pub struct SetDeviceCapResponse {
     pub device_id: ::prost::alloc::string::String,
     #[prost(int64, tag = "2")]
     pub cap_uusd_month: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateBoxTokenRequest {
+    /// idempotency key (ULID)
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// "owner/name"
+    #[prost(string, tag = "2")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// 10 min .. 30 days; the token AND every box it enrolls expire at created + ttl
+    #[prost(int64, tag = "3")]
+    pub ttl_ms: i64,
+    /// each box's own monthly cap (> 0; a member's boxes also count against the member's cap)
+    #[prost(int64, tag = "4")]
+    pub cap_uusd_month: i64,
+    /// enrollments this token allows, 1..100
+    #[prost(uint32, tag = "5")]
+    pub max_boxes: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BoxToken {
+    /// "bt\_" + ULID
+    #[prost(string, tag = "1")]
+    pub token_id: ::prost::alloc::string::String,
+    /// the secret ("mbx\_" + 43 base64url chars): CreateBoxToken only, never stored in clear
+    #[prost(string, tag = "2")]
+    pub token: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub repo_slug: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub created_at_ms: i64,
+    #[prost(int64, tag = "5")]
+    pub expires_at_ms: i64,
+    #[prost(int64, tag = "6")]
+    pub cap_uusd_month: i64,
+    #[prost(uint32, tag = "7")]
+    pub max_boxes: u32,
+    /// enrollments so far
+    #[prost(uint32, tag = "8")]
+    pub used: u32,
+    #[prost(bool, tag = "9")]
+    pub revoked: bool,
+    /// username of the owner or member who created it
+    #[prost(string, tag = "10")]
+    pub created_by: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BoxDevice {
+    #[prost(string, tag = "1")]
+    pub device_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub token_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub repo_slug: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub enrolled_at_ms: i64,
+    #[prost(int64, tag = "6")]
+    pub expires_at_ms: i64,
+    #[prost(int64, tag = "7")]
+    pub cap_uusd_month: i64,
+    #[prost(int64, tag = "8")]
+    pub spent_uusd_month: i64,
+    #[prost(bool, tag = "9")]
+    pub online: bool,
+    #[prost(bool, tag = "10")]
+    pub revoked: bool,
+    /// second concurrent sessions refused for this device key (§17.1)
+    #[prost(uint32, tag = "11")]
+    pub clone_refusals: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListBoxesRequest {
+    /// "" = every repo this user may manage
+    #[prost(string, tag = "1")]
+    pub repo_slug: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBoxesResponse {
+    /// token field always empty
+    #[prost(message, repeated, tag = "1")]
+    pub tokens: ::prost::alloc::vec::Vec<BoxToken>,
+    #[prost(message, repeated, tag = "2")]
+    pub boxes: ::prost::alloc::vec::Vec<BoxDevice>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevokeBoxRequest {
+    /// "bt\_…" or "d\_…"
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevokeBoxResponse {
+    #[prost(string, repeated, tag = "1")]
+    pub revoked_devices: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "2")]
+    pub token_revoked: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1167,6 +1286,80 @@ pub mod node_link_client {
                 .insert(GrpcMethod::new("moochy.v1.NodeLink", "SetDeviceCap"));
             self.inner.unary(req, path, codec).await
         }
+        /// Cloud boxes (CONTRACT §17.1), authenticated like SetDeviceCap. The repo owner, or a member
+        /// within their own cap, creates an enrollment token; a box enrolls with it (DeviceStartRequest
+        /// .enroll_token) as an ephemeral gateway device. Box devices themselves get PERMISSION_DENIED.
+        pub async fn create_box_token(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateBoxTokenRequest>,
+        ) -> std::result::Result<tonic::Response<super::BoxToken>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/CreateBoxToken",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "CreateBoxToken"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Tokens and box devices of the repos this user may manage (owner: every box; member: their own).
+        pub async fn list_boxes(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListBoxesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListBoxesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/ListBoxes",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "ListBoxes"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `bt_…`: the token can enroll no more boxes and every box it enrolled is revoked; `d_…`: one box.
+        pub async fn revoke_box(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RevokeBoxRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RevokeBoxResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/RevokeBox",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "RevokeBox"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1264,6 +1457,29 @@ pub mod node_link_server {
             request: tonic::Request<super::SetDeviceCapRequest>,
         ) -> std::result::Result<
             tonic::Response<super::SetDeviceCapResponse>,
+            tonic::Status,
+        >;
+        /// Cloud boxes (CONTRACT §17.1), authenticated like SetDeviceCap. The repo owner, or a member
+        /// within their own cap, creates an enrollment token; a box enrolls with it (DeviceStartRequest
+        /// .enroll_token) as an ephemeral gateway device. Box devices themselves get PERMISSION_DENIED.
+        async fn create_box_token(
+            &self,
+            request: tonic::Request<super::CreateBoxTokenRequest>,
+        ) -> std::result::Result<tonic::Response<super::BoxToken>, tonic::Status>;
+        /// Tokens and box devices of the repos this user may manage (owner: every box; member: their own).
+        async fn list_boxes(
+            &self,
+            request: tonic::Request<super::ListBoxesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListBoxesResponse>,
+            tonic::Status,
+        >;
+        /// `bt_…`: the token can enroll no more boxes and every box it enrolled is revoked; `d_…`: one box.
+        async fn revoke_box(
+            &self,
+            request: tonic::Request<super::RevokeBoxRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RevokeBoxResponse>,
             tonic::Status,
         >;
     }
@@ -1771,6 +1987,141 @@ pub mod node_link_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SetDeviceCapSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/CreateBoxToken" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateBoxTokenSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::CreateBoxTokenRequest>
+                    for CreateBoxTokenSvc<T> {
+                        type Response = super::BoxToken;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateBoxTokenRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::create_box_token(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateBoxTokenSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/ListBoxes" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListBoxesSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::ListBoxesRequest>
+                    for ListBoxesSvc<T> {
+                        type Response = super::ListBoxesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListBoxesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::list_boxes(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListBoxesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/RevokeBox" => {
+                    #[allow(non_camel_case_types)]
+                    struct RevokeBoxSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::RevokeBoxRequest>
+                    for RevokeBoxSvc<T> {
+                        type Response = super::RevokeBoxResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RevokeBoxRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::revoke_box(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RevokeBoxSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

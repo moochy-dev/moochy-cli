@@ -31,8 +31,15 @@ pub fn default_name() -> String {
     if n.is_empty() { "moochy-node".into() } else { n }
 }
 
-pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Vec<String>, name: String) -> Result<()> {
+/// `enroll`: a cloud-box enrollment token (CONTRACT §17.1, `MOOCHY_ENROLL`): the relay approves
+/// without a browser and the device is saved as a box bound to this machine.
+pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Vec<String>, name: String, enroll: Option<&str>) -> Result<()> {
     let origin = Origin::parse(relay)?;
+    // Box: gateway only, and the machine binding read before a token use is spent.
+    let box_fp = enroll.map(|_| crate::boxes::fingerprint()).transpose()?;
+    if enroll.is_some() && roles != ["gateway"] {
+        return Err(usage("a box enrolls as a gateway device only"));
+    }
     if roles.is_empty() || roles.iter().any(|r| r != "gateway" && r != "worker") {
         return Err(usage("--roles must be gateway, worker or gateway,worker"));
     }
@@ -58,18 +65,21 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
         sig: bytes::Bytes::copy_from_slice(&sig),
         // Key-log proof of possession that goes into KEY_ADDED (CONTRACT R8, spec/KEYLOG.md).
         pop_sig: bytes::Bytes::copy_from_slice(&keys.sign(&moochy_keylog::entry::pop_message(&sign_pub, &enc_pub, SUITE))),
+        enroll_token: enroll.unwrap_or_default().to_owned(),
     };
     let r = tokio::time::timeout(crate::tls::IO_TIMEOUT, client.device_start(start))
         .await
         .map_err(|_| net("relay timeout"))?
         .map_err(|s| status_err(&s))?
         .into_inner();
-    let code_ok = !r.user_code.is_empty() && r.user_code.len() <= 16 && r.user_code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
+    let code_ok = (enroll.is_some() || !r.user_code.is_empty()) && r.user_code.len() <= 16 && r.user_code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
     if !code_ok || r.device_code.is_empty() || r.device_code.len() > 256 {
         return Err(net("relay sent a malformed device code"));
     }
-    emit(&json!({"event": "device_code", "user_code": r.user_code}));
-    eprintln!("To add this device, sign in to Moochy in your browser and enter the code {} ({}).", r.user_code, origin.url());
+    if enroll.is_none() {
+        emit(&json!({"event": "device_code", "user_code": r.user_code}));
+        eprintln!("To add this device, sign in to Moochy in your browser and enter the code {} ({}).", r.user_code, origin.url());
+    }
 
     let interval = Duration::from_millis(u64::from(r.poll_interval_ms).clamp(200, 5000));
     let deadline = u64::try_from(r.expires_at_ms).ok().filter(|t| *t > now_ms()).unwrap_or_else(|| now_ms().saturating_add(MAX_WAIT_MS)).min(now_ms().saturating_add(MAX_WAIT_MS));
@@ -101,6 +111,7 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
                 if moochy_keylog::entry::is_pseudonym(&p.user_pseudonym) {
                     cfg.pseudonym = Some(p.user_pseudonym.clone());
                 }
+                cfg.box_device = box_fp.map(|fp| crate::boxes::bind(&p, fp)).transpose()?;
                 break p.device_id;
             }
             Ok(DeviceState::Denied) => return Err(auth("device approval denied")),
@@ -119,6 +130,9 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
     cfg.roles = roles;
     cfg.device_id = Some(device_id.clone());
     home.save(&cfg)?;
-    emit(&json!({"event": "logged_in", "device_id": device_id}));
+    match &cfg.box_device {
+        Some(b) => emit(&json!({"event": "box_enrolled", "device_id": device_id, "repo": b.repo, "expires_at_ms": b.expires_at_ms, "monthly_limit": crate::util::fmt_dollars(u64::try_from(b.cap_uusd_month).unwrap_or(0))})),
+        None => emit(&json!({"event": "logged_in", "device_id": device_id})),
+    }
     Ok(())
 }

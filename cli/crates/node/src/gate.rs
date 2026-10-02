@@ -52,6 +52,8 @@ pub struct Gate {
     items: Vec<(u64, u64, K)>,
     /// §15.4: the session may receive tool calls (sandboxed, or the project opted in).
     release: bool,
+    /// Why a call is withheld when `release` is false.
+    withheld_because: &'static str,
     /// The stream reached `message_stop` / `[DONE]`, or carried a provider error event.
     ended: bool,
     /// Tripwire over response text (prompt injection, §15.4): a flag, never a block.
@@ -67,6 +69,8 @@ const MAX_TOOL_INPUT: usize = 4 << 20;
 
 /// Why a valid tool call is withheld from a client outside `moochy run` (§15.4).
 pub const NOT_SANDBOXED: &str = "this session is not sandboxed; run your agent with `moochy run`, or allow it for the project with `moochy config set allow_unsandboxed_tools owner/name`";
+/// … to a `moochy run --box-is-sandbox` session of a project that does not allow platform sandboxes (§17.2).
+pub const PLATFORM_NOT_ALLOWED: &str = "this project does not allow platform sandboxes (`moochy run --box-is-sandbox`); use `moochy run` where the box supports it, or ask the maintainer to allow platform sandboxes";
 
 /// One visible notice per withheld call. The name is donor-chosen: escaped and shortened.
 fn notice(name: &str, reason: &str) -> String {
@@ -75,6 +79,15 @@ fn notice(name: &str, reason: &str) -> String {
 }
 
 impl Gate {
+    /// A platform-sandboxed session (§17.2): say why its calls are withheld.
+    #[must_use]
+    pub fn platform(mut self, platform: bool) -> Self {
+        if platform {
+            self.withheld_because = PLATFORM_NOT_ALLOWED;
+        }
+        self
+    }
+
     pub fn new(dialect: Dialect, stream: bool, request: &[u8], release: bool) -> Self {
         Self {
             dialect,
@@ -88,6 +101,7 @@ impl Gate {
             last_seq: 0,
             items: Vec::new(),
             release,
+            withheld_because: NOT_SANDBOXED,
             ended: false,
             scanner: TextScanner::new(),
             warning: None,
@@ -140,7 +154,7 @@ impl Gate {
 
     fn verdict(&self, name: &str, input: &[u8]) -> Option<String> {
         if !self.release {
-            return Some(NOT_SANDBOXED.into());
+            return Some(self.withheld_because.into());
         }
         match self.tools.as_ref().map(|t| t.check_call(name, input)) {
             Some(Verdict::Allow) => None,

@@ -331,6 +331,18 @@ pub struct VerifyResponse {
     #[prost(string, tag = "1")]
     pub result_json: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LinkCallRequest {
+    #[prost(string, tag = "1")]
+    pub op: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub request: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LinkCallResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub response: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod local_control_client {
     #![allow(
@@ -784,6 +796,33 @@ pub mod local_control_client {
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "Report"));
             self.inner.unary(req, path, codec).await
         }
+        /// Owner and member calls relayed as-is on the node's session (like Donations): `op` names the
+        /// NodeLink RPC; `request`/`response` are its link.proto messages' bytes. Ops: set_device_cap,
+        /// create_box_token, list_boxes, revoke_box.
+        pub async fn link_call(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LinkCallRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::LinkCallResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/LinkCall",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "LinkCall"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -903,6 +942,16 @@ pub mod local_control_server {
             &self,
             request: tonic::Request<super::ReportRequest>,
         ) -> std::result::Result<tonic::Response<super::ReportResponse>, tonic::Status>;
+        /// Owner and member calls relayed as-is on the node's session (like Donations): `op` names the
+        /// NodeLink RPC; `request`/`response` are its link.proto messages' bytes. Ops: set_device_cap,
+        /// create_box_token, list_boxes, revoke_box.
+        async fn link_call(
+            &self,
+            request: tonic::Request<super::LinkCallRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::LinkCallResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct LocalControlServer<T> {
@@ -1680,6 +1729,51 @@ pub mod local_control_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReportSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/LinkCall" => {
+                    #[allow(non_camel_case_types)]
+                    struct LinkCallSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::LinkCallRequest>
+                    for LinkCallSvc<T> {
+                        type Response = super::LinkCallResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LinkCallRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::link_call(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LinkCallSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
