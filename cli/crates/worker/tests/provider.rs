@@ -208,6 +208,8 @@ async fn anthropic_stream_end_to_end() {
     while let Some(c) = resp.next().await.unwrap() {
         got.extend_from_slice(&c);
         chunks += 1;
+        // A merge never holds more than 4 frames (one SSE event per frame here).
+        assert!(c.windows(2).filter(|w| w == b"\n\n").count() <= 4, "merged more than 4 frames");
         ends += p.feed(&c, &mut |_, _| {}).unwrap().tool_ends;
     }
     assert_eq!(got, ANTH.as_bytes(), "bytes forwarded unaltered");
