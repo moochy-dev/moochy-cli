@@ -35,6 +35,11 @@ impl Boot {
             }
             s
         };
+        // CONTRACT §6: trust comes from the key log, never from the relay's word. Without a key
+        // (compiled in for the default relay, or `--log-key`) only insecure dev mode may start.
+        if !offline && crate::keylog::effective_log_key(&cfg).is_none() && std::env::var("MOOCHY_INSECURE_DEV").as_deref() != Ok("1") {
+            return Err(usage("no key-log key for this server: `moochy login --log-key <vkey>` or `moochy config set log_key <vkey>`"));
+        }
         let addr = cfg.gateway_addr()?;
         let listener = std::net::TcpListener::bind(addr).map_err(|e| usage(format!("bind {addr}: {e}")))?;
         listener.set_nonblocking(true).ctx("gateway listener")?;
@@ -96,8 +101,8 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
     p.ro_paths.extend(ro_paths(home, &boot.cfg));
     p.gateway_port = Some(boot.port());
     p.unsafe_no_lockdown = unsafe_no_lockdown;
-    // Development provider overrides (`keys add --base-url`, MOOCHY_INSECURE_DEV only) on other
-    // ports than 443.
+    // Provider origins on other ports than 443: a local model server (`keys add local`) and
+    // development overrides (`keys add --base-url`, MOOCHY_INSECURE_DEV only).
     p.connect_ports = dev_ports(&boot.secrets);
     let r = lockdown_self(&p).map_err(|e| internal(format!("cannot lock the background process down ({e}); run `moochy doctor`, or `moochy up --unsafe-no-lockdown` for debugging only")))?;
     let rep = json!({

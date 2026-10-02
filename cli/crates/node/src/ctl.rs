@@ -7,7 +7,7 @@ use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
     ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
-    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse,
+    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse, VerifyRequest, VerifyResponse,
     StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
@@ -186,6 +186,18 @@ impl LocalControl for Ctl {
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+    }
+
+    async fn verify(&self, r: Request<VerifyRequest>) -> std::result::Result<Response<VerifyResponse>, Status> {
+        let r = r.into_inner().receipt_ref;
+        // A receipt of this device's own request: checked from local evidence (also its
+        // commitment to the signed receipt); any other public receipt: fetched from the relay
+        // and checked against the key log.
+        let v = match crate::task::verify(&self.node, &r) {
+            Ok(v) => v,
+            Err(_) => crate::keylog::verify_ref(&self.node, &r).await.map_err(Status::failed_precondition)?,
+        };
+        Ok(Response::new(VerifyResponse { result_json: v.to_string() }))
     }
 
     async fn donations(&self, r: Request<DonationsRequest>) -> std::result::Result<Response<DonationsResponse>, Status> {

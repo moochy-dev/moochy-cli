@@ -248,9 +248,9 @@ pub fn rotate_device(home: &Home) -> Result<()> {
     // ponytail: repo-scoped (CI) devices keep their scope only once it is read back from the log;
     // the relay refuses a scope change (subject_mismatch) rather than widening it.
     let suite = crate::login::SUITE;
-    let body = moochy_keylog::entry::lp(&[id.as_bytes(), pseudonym.as_bytes(), &sign_pub, &enc_pub, suite.as_bytes(), roles.as_bytes(), b""]);
+    let body = moochy_keylog::entry::key_body(&id, &pseudonym, &sign_pub, &enc_pub, suite, roles, "");
     let pop = new.sign_key().sign(&moochy_keylog::entry::pop_message(&sign_pub, &enc_pub, suite));
-    let endorse = old.sign(&moochy_keylog::entry::lp(&[b"moochy/v1/key-rotate", &body]));
+    let endorse = old.sign(&moochy_keylog::entry::rotate_request_message(&body));
     let r = rt()?.block_on(submit(home, SubmitEntryRequest { request_id: format!("rotate-{id}"), kind: "KEY_ADDED".into(), body, sigs: vec![pop.to_vec(), endorse.to_vec()] }))?;
     sec.device = Some(new);
     keystore::save(home, &cfg, &sec)?;

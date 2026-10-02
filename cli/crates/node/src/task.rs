@@ -96,56 +96,9 @@ pub struct Evidence {
 /// `moochy verify <receipt_ref>`: check a public receipt (projection) of a task this Gateway
 /// consumed: the donor's signature over it, that it commits to the signed receipt, and, with a
 /// pinned key log, that the signing key is a logged key of that donor device.
-pub async fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
-    if let Some(v) = verify_local(node, receipt_ref)? {
-        return Ok(v);
-    }
-    verify_remote(node, receipt_ref).await
-}
-
-/// The relay's answer for `projection/<ref>` (moochy-keylog `fetch_projection` shape).
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ServedProjection {
-    projection_b64: String,
-    sig_b64: String,
-    worker_device: String,
-    key_log_index: Option<u64>,
-}
-
-/// A receipt this device did not consume: the relay serves the exact signed projection; the
-/// signature is checked against the worker's KEY_ADDED in our own key-log mirror, so nothing
-/// the relay says is trusted.
-async fn verify_remote(node: &Node, receipt_ref: &str) -> Result<Value, String> {
-    let raw_ref = receipt_ref.strip_prefix("r_").unwrap_or(receipt_ref);
-    if !moochy_keylog::projection::valid_ref(raw_ref) {
-        return Err("not a receipt reference".into());
-    }
-    let log = node.keylog.as_ref().filter(|l| l.verified()).ok_or("this receipt is not from this device, and no verified public key log is pinned to check it (log_key)")?;
-    let mut c = node.link().ok_or("not connected; start the Moochy app and retry")?.client;
-    let r = tokio::time::timeout(std::time::Duration::from_secs(10), c.get_log_tile(pb::LogTileRequest { path: format!("projection/{raw_ref}") }))
-        .await
-        .map_err(|_| "the server did not answer in time")?
-        .map_err(|s| if s.code() == tonic::Code::NotFound { "no receipt with this reference".to_owned() } else { format!("server: {}", clean(s.message())) })?
-        .into_inner();
-    if r.data.len() > moochy_keylog::projection::MAX_REPLY {
-        return Err("the server's answer is too large".into());
-    }
-    let v = crate::json::parse(&r.data).map_err(|_| "malformed answer from the server")?;
-    let sp: ServedProjection = serde_json::from_value(v).map_err(|_| "malformed answer from the server")?;
-    let projection = crate::util::b64d(&sp.projection_b64).ok_or("malformed answer from the server")?;
-    let sig = crate::util::b64d(&sp.sig_b64).ok_or("malformed answer from the server")?;
-    let idx = sp.key_log_index.ok_or("the signing device is not in the public key log")?;
-    let ok = log.verify_projection(&projection, &sig, &sp.worker_device, idx).map_err(|c| format!("the public receipt does not verify ({})", c.as_str()))?;
-    let pv = crate::json::parse(&projection).map_err(|_| "malformed public receipt")?;
-    let p: moochy_proto::msg::Projection = serde_json::from_value(pv).map_err(|_| "malformed public receipt")?;
-    let want = crate::util::b64d(raw_ref).ok_or("not a receipt reference")?;
-    if p.receipt_ref.0[..] != want[..] {
-        return Err("the server answered with a receipt for another reference".into());
-    }
-    Ok(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": p.donor, "model": p.model,
-        "cost_uusd": p.cost_uusd, "day": p.day, "worker_device": sp.worker_device, "donor_pseudonym": ok.donor_pseudonym,
-        "device_revoked": ok.revoked, "key_log": "logged", "source": "relay"}))
+/// Any other public receipt is checked by `keylog::verify_ref` (relay-served projection).
+pub fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
+    verify_local(node, receipt_ref)?.ok_or_else(|| "no receipt with this reference among this device's recent requests".to_owned())
 }
 
 /// A request this device made: checked against the receipt kept in the evidence store.
@@ -532,9 +485,9 @@ impl Driver {
         match m {
             submit_down::Msg::NeedWraps(n) => {
                 // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool,
-                // read through the key-log-filtered accessor (never the raw `node.pools`: the seal
-                // check runs at read time, A174/E43), not the snapshot taken at submit (E27).
-                if let Some(p) = self.pool.slug.clone().and_then(|s| self.node.pool_for(&s)).filter(|p| p.repo_id == self.repo_id) {
+                // not the snapshot taken at submit (E27), filtered by the key-log seal rule (A174):
+                // never the raw `node.pools` on the submit path.
+                if let Some(p) = self.node.sealable_pool(&self.repo_id) {
                     self.pool = p;
                 }
                 let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
