@@ -286,10 +286,8 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
         };
         acked_tx.send_replace(true);
         lock(&INFLIGHT).remove(&(task.clone(), attempt));
-        // Half-close and let the relay end the stream: dropping `down` first would reset it
-        // before the last Nack / End is flushed.
-        drop(tx);
-        let _ = timeout(Duration::from_secs(10), async { while next(&mut down).await.is_some() {} }).await;
+        // Journal as soon as the attempt is over, not after the stream drain below (up to 10 s).
+        let ms = u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX);
         node.journal(JournalEntry {
             t_ms: i64::try_from(t0).unwrap_or(0),
             role: "worker".into(),
@@ -299,9 +297,13 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
             cost_uusd: out.2,
             request: out.3.as_ref().map(|t| t.0.clone()).unwrap_or_default(),
             response: out.3.map(|t| t.1).unwrap_or_default(),
-            ms: u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX),
+            ms,
             ..JournalEntry::default()
         });
+        // Half-close and let the relay end the stream: dropping `down` first would reset it
+        // before the last Nack / End is flushed.
+        drop(tx);
+        let _ = timeout(Duration::from_secs(10), async { while next(&mut down).await.is_some() {} }).await;
         reoffer(&node);
     });
 }
