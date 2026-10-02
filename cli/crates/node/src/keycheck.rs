@@ -149,6 +149,8 @@ pub fn add_local(home: &crate::config::Home, base_url: Option<&str>, key_stdin: 
         LocalHost::Loopback => {}
         LocalHost::Lan => eprintln!("Note: requests to this server cross your local network{}.", if url.starts_with("http://") { " in clear text" } else { "" }),
         LocalHost::Unvetted => eprintln!("WARNING: {url} is not a loopback or private address: its name can be re-pointed elsewhere (development only)."),
+        // Vetted remote GPU server over TLS (CONTRACT §17.3; mo-donor wires the vetted list).
+        LocalHost::Remote => eprintln!("Note: {url} is a vetted remote server; requests travel to it over TLS."),
     }
     let key = if key_stdin {
         let mut raw = zeroize::Zeroizing::new(Vec::new());

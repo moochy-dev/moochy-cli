@@ -134,8 +134,10 @@ fn host_vetting() {
     ] {
         assert!(provider::check_local_base_url(url, false).is_err(), "{url}");
     }
-    // --allow-unvetted-host (dev): public IPs and names, but never metadata/link-local.
-    assert_eq!(provider::check_local_base_url("http://gpu-box.local:11434", true).map_err(|e| e.0), Ok(Unvetted));
+    // --allow-unvetted-host (dev): public IPs and names over https (§17.3: plain HTTP off the
+    // LAN is refused even in dev), never metadata/link-local.
+    assert!(provider::check_local_base_url("http://gpu-box.local:11434", true).is_err());
+    assert_eq!(provider::check_local_base_url("https://gpu-box.local:11434", true).map_err(|e| e.0), Ok(Unvetted));
     assert_eq!(provider::check_local_base_url("https://203.0.113.9:8000", true).map_err(|e| e.0), Ok(Unvetted));
     assert!(provider::check_local_base_url("http://169.254.169.254", true).is_err());
     assert!(provider::check_local_base_url("http://evil_host:1", true).is_err());
@@ -155,7 +157,8 @@ fn adapter_rules() {
     assert!(Adapter::new(&cfg(Some("http://192.168.1.20:1234"), "lm-studio")).is_ok());
     assert!(Adapter::new(&cfg(None, "")).is_err(), "base URL required");
     assert!(Adapter::new(&cfg(Some("http://gpu-box.local:11434"), "")).is_err());
-    assert!(Adapter::new_local(&cfg(Some("http://gpu-box.local:11434"), ""), true).is_ok());
+    assert!(Adapter::new_local(&cfg(Some("http://gpu-box.local:11434"), ""), true).is_err(), "plain HTTP off the LAN");
+    assert!(Adapter::new_local(&cfg(Some("https://gpu-box.local:11434"), ""), true).is_ok());
     assert!(Provider::Local.serves(O) && !Provider::Local.serves(Dialect::AnthropicMessages));
     assert!(Limits::local().headers > Limits::default().headers);
 }

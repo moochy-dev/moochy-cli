@@ -1146,6 +1146,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "ring",
  "rustls",
  "ruzstd",
  "tokio",
