@@ -31,6 +31,8 @@ const XAI: &str = include_str!("fixtures/xai.sse");
 #[derive(Clone)]
 enum Mode {
     Sse(&'static str),
+    /// SSE with a pause (ms) before each event after the first.
+    Paced(&'static str, u64),
     Status(u16, &'static str, &'static str),
     SlowHeaders(u64),
     Hang,
@@ -103,17 +105,21 @@ async fn fake(mode: Mode) -> Fake {
                         let resp = format!("HTTP/1.1 {code} X\r\ncontent-type: application/json\r\nconnection: close\r\n{extra}content-length: {}\r\n\r\n{body}", body.len());
                         let _ = s.write_all(resp.as_bytes()).await;
                     }
-                    Mode::Sse(_) | Mode::SlowHeaders(_) => {
-                        let body = match mode {
-                            Mode::Sse(b) => b,
+                    Mode::Sse(_) | Mode::SlowHeaders(_) | Mode::Paced(..) => {
+                        let (body, pace) = match mode {
+                            Mode::Sse(b) => (b, 0),
+                            Mode::Paced(b, ms) => (b, ms),
                             Mode::SlowHeaders(ms) => {
                                 tokio::time::sleep(Duration::from_millis(ms)).await;
-                                ANTH
+                                (ANTH, 0)
                             }
                             _ => unreachable!(),
                         };
                         let _ = s.write_all(SSE_HEAD).await;
-                        for ev in body.split_inclusive("\n\n") {
+                        for (i, ev) in body.split_inclusive("\n\n").enumerate() {
+                            if i > 0 && pace > 0 {
+                                tokio::time::sleep(Duration::from_millis(pace)).await;
+                            }
                             if chunk(&mut s, ev.as_bytes()).await.is_err() {
                                 return;
                             }
@@ -172,6 +178,24 @@ fn prepare(p: Provider, d: Dialect, body: &str) -> firewall::Prepared {
 const ABODY: &str = r#"{"model":"anthropic/claude-sonnet-5.5","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 const OBODY: &str = r#"{"model":"openai/gpt-5","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 
+/// Events that arrive apart are handed out apart: `next` never waits to fill a batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paced_events_are_not_batched() {
+    let f = fake(Mode::Paced(ANTH, 5)).await;
+    let a = adapter(Provider::Anthropic, format!("http://{}", f.addr), Limits::default());
+    let prep = prepare(Provider::Anthropic, Dialect::AnthropicMessages, ABODY);
+    let mut resp = a.send(Dialect::AnthropicMessages, prep.body.clone(), &prep.headers).await.unwrap();
+    let mut chunks = Vec::new();
+    while let Some(c) = resp.next().await.unwrap() {
+        chunks.push(c);
+    }
+    let events: Vec<&str> = ANTH.split_inclusive("\n\n").collect();
+    assert_eq!(chunks.len(), events.len(), "one chunk per event");
+    for (c, e) in chunks.iter().zip(&events) {
+        assert_eq!(&c[..], e.as_bytes());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anthropic_stream_end_to_end() {
     let mut f = fake(Mode::Sse(ANTH)).await;
@@ -187,7 +211,9 @@ async fn anthropic_stream_end_to_end() {
         ends += p.feed(&c, &mut |_, _| {}).unwrap().tool_ends;
     }
     assert_eq!(got, ANTH.as_bytes(), "bytes forwarded unaltered");
-    assert!(chunks >= 12, "flushed per event, not batched ({chunks})");
+    // A burst already in the socket buffer may arrive merged (never waited for: see
+    // `paced_events_are_not_batched`).
+    assert!(chunks >= 1);
     assert_eq!(ends, 1);
     let o = p.finish();
     assert_eq!((o.usage.output, o.usage.cache_read, o.usage.estimated), (89, 2000, false));
