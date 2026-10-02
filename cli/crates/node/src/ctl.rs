@@ -28,17 +28,19 @@ use tonic::{Request, Response, Status};
 
 const MAX_MSG: usize = 8 << 20;
 
-/// Bind the control socket (refuses if a live Node already owns it).
-pub async fn bind(path: &Path) -> Result<UnixListener> {
+/// Bind the control socket (refuses if a live Node already owns it). Synchronous: `up` binds
+/// every listener before the lockdown (macOS Seatbelt refuses a Unix-socket bind afterwards).
+pub fn bind(path: &Path) -> Result<std::os::unix::net::UnixListener> {
     if path.as_os_str().len() > 100 {
         return Err(crate::util::usage(format!("socket path too long for a Unix socket: {}", path.display())));
     }
-    if UnixStream::connect(path).await.is_ok() {
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
         return Err(crate::util::usage("a moochy node is already running for this --home"));
     }
     let _ = std::fs::remove_file(path);
-    let l = UnixListener::bind(path).map_err(|e| internal(format!("bind {}: {e}", path.display())))?;
+    let l = std::os::unix::net::UnixListener::bind(path).map_err(|e| internal(format!("bind {}: {e}", path.display())))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| internal(format!("chmod socket: {e}")))?;
+    l.set_nonblocking(true).map_err(|e| internal(format!("control socket: {e}")))?;
     Ok(l)
 }
 
