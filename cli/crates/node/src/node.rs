@@ -423,6 +423,9 @@ impl Node {
                 crate::util::log("warn", "this project lets tool calls from donated tokens reach agents outside `moochy run`", &serde_json::json!({"repo_id": v.repo_id}));
             }
             p.allow_unsandboxed_tools = v.allow_unsandboxed_tools;
+            if v.allow_platform_sandboxes && !p.allow_platform_sandboxes {
+                crate::util::log("warn", "this project lets tool calls from donated tokens reach agents in a box platform's sandbox (not `moochy run`)", &serde_json::json!({"repo_id": v.repo_id}));
+            }
             p.allow_platform_sandboxes = v.allow_platform_sandboxes;
             let before = p.models();
             if v.full {

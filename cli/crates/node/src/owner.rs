@@ -155,6 +155,9 @@ struct Ask<'a> {
     /// `members --device`: the argument is a device id, shown as the label; the body names the
     /// device owner's pseudonym (E32).
     device: bool,
+    /// `--device`: the device's owner according to the verified key log (read by the CLI from
+    /// disk, never from `node.sock`); the signed pseudonym must be it.
+    device_owner: Option<&'a str>,
 }
 
 /// The exact fields one signature will cover, after binding.
@@ -194,7 +197,7 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
             // Device ids and pseudonyms are matched exactly; a handle against the label.
             let ok = arg == subject
                 || (!arg.starts_with("d_") && !arg.starts_with("ps_") && arg.eq_ignore_ascii_case(&p.subject_username))
-                || (ask.device && arg.starts_with("d_") && arg == p.subject_username && subject.starts_with("ps_"));
+                || (ask.device && arg.starts_with("d_") && arg == p.subject_username && ask.device_owner.is_none_or(|o| o == subject) && subject.starts_with("ps_"));
             if !ok {
                 return Err(refuse(&format!("subject {} ({})", clean(&p.subject_username), clean(subject))));
             }
@@ -214,7 +217,12 @@ fn confirm(b: &Bound, p: &SignResponse, signer: &str, extra: &str, yes: bool) ->
         _ => "is the owner of",
     };
     eprintln!("Owner signature {}:", b.kind.name());
-    eprintln!("  {} ({}) {meaning} {} ({})", clean(&p.subject_username), clean(&b.subject), clean(&p.repo_slug), clean(&b.repo_id));
+    if p.subject_username.starts_with("d_") && b.claim.is_none() {
+        // A device as a member: the signature covers the device's whole account.
+        eprintln!("  the account {} (all its devices, including {}) {meaning} {} ({})", clean(&b.subject), clean(&p.subject_username), clean(&p.repo_slug), clean(&b.repo_id));
+    } else {
+        eprintln!("  {} ({}) {meaning} {} ({})", clean(&p.subject_username), clean(&b.subject), clean(&p.repo_slug), clean(&b.repo_id));
+    }
     if let Some((prov, id)) = &b.claim {
         eprintln!("  project at {} (id {})", clean(prov), clean(id));
     }
@@ -249,6 +257,22 @@ fn emit_signed(done: &SignResponse) {
 pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, device: bool, cap: i64) -> Result<()> {
     let cfg = home.load()?;
     let rt = rt()?;
+    // `--device` (a CI device as a member): only to add, and the device's account comes from the
+    // verified key log on disk, never from the app's labels (a compromised app could put any
+    // pseudonym behind the device id the owner typed). The signature covers the whole account.
+    let device_owner = match (device, words) {
+        (true, ["members", "add", d]) => match crate::keylog::KeyLog::device_owner(home, &cfg, d) {
+            Some(Some(ps)) => Some(ps),
+            Some(None) => return Err(usage(format!("{} is not a device in the public key log", clean(d)))),
+            None if std::env::var("MOOCHY_INSECURE_DEV").as_deref() == Ok("1") => {
+                eprintln!("WARNING: no key log on this machine: the device's account is not checked (MOOCHY_INSECURE_DEV)");
+                None
+            }
+            None => return Err(usage("--device needs the public key log (log_key) to check the device's account")),
+        },
+        (true, _) => return Err(usage("--device is only for `members add` (to remove, use the member's account)")),
+        _ => None,
+    };
     let preview = rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let r = match words {
@@ -262,9 +286,9 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
         r.map(tonic::Response::into_inner).map_err(|s| status(&s))
     })?;
     let want = match words {
-        ["approve", donor] => Ask { kind: if revoke { Kind::DonorRevoked } else { Kind::DonorApproved }, repo_slug: slug, subject: Some(donor), device: false },
-        ["members", op, user] => Ask { kind: if *op == "add" { Kind::MemberAdded } else { Kind::MemberRemoved }, repo_slug: slug, subject: Some(user), device },
-        _ => Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false },
+        ["approve", donor] => Ask { kind: if revoke { Kind::DonorRevoked } else { Kind::DonorApproved }, repo_slug: slug, subject: Some(donor), device: false, device_owner: None },
+        ["members", op, user] => Ask { kind: if *op == "add" { Kind::MemberAdded } else { Kind::MemberRemoved }, repo_slug: slug, subject: Some(user), device, device_owner: device_owner.as_deref() },
+        _ => Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false, device_owner: None },
     };
     let me = cfg.pseudonym.as_deref();
     let main = bind(&want, me, &preview)?;
@@ -276,7 +300,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
             c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await.ok().map(tonic::Response::into_inner)
         }))
         .flatten()
-        .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));
+        .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false, device_owner: None }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));
     let has_key = key_path(home, cfg.relay.as_deref()).exists();
     if !has_key {
         eprintln!("No owner key yet: one will be created (a separate key with its own passphrase) and registered in the public key log.");
@@ -402,7 +426,7 @@ mod tests {
     }
 
     fn approve(who: &str) -> Ask<'_> {
-        Ask { kind: Kind::DonorApproved, repo_slug: "acme/widget", subject: Some(who), device: false }
+        Ask { kind: Kind::DonorApproved, repo_slug: "acme/widget", subject: Some(who), device: false, device_owner: None }
     }
 
     /// A217/A218 reproducers: a compromised background process (fake node.sock) proposes
@@ -426,12 +450,15 @@ mod tests {
         assert!(bind(&approve(MALLORY), Some(ME), &grant("DONOR_APPROVED", ALICE, MALLORY, ALICE)).is_err());
         // `members add d_… --device` (E32): the label is the device id, the body its owner's pseudonym.
         let dev = "d_01J0000000000000000000000D";
-        let member = |device| Ask { kind: Kind::MemberAdded, repo_slug: "acme/widget", subject: Some(dev), device };
+        let member = |device| Ask { kind: Kind::MemberAdded, repo_slug: "acme/widget", subject: Some(dev), device, device_owner: Some(ALICE) };
         assert!(bind(&member(true), Some(ME), &grant("MEMBER_ADDED", ALICE, dev, ALICE)).is_ok());
         assert!(bind(&member(false), Some(ME), &grant("MEMBER_ADDED", ALICE, dev, ALICE)).is_err(), "only with --device");
         assert!(bind(&member(true), Some(ME), &grant("MEMBER_ADDED", ALICE, "d_01J0000000000000000000000E", ALICE)).is_err(), "another device");
+        // The device id the owner typed, but another account in the signed body: the key log
+        // says the device is alice's (review of 311f70964).
+        assert!(bind(&member(true), Some(ME), &grant("MEMBER_ADDED", MALLORY, dev, MALLORY)).is_err(), "device behind another account");
         // A hidden DONOR_APPROVED offered as the "claim" of an approve (A217) never binds as a claim.
-        let claim_ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None, device: false };
+        let claim_ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None, device: false, device_owner: None };
         assert!(bind(&claim_ask, Some(ME), &grant("DONOR_APPROVED", MALLORY, "mallory", MALLORY)).is_err());
     }
 
@@ -445,7 +472,7 @@ mod tests {
             body_to_sign: claim_body(R, "github", "123", owner, OK, 1),
             ..SignResponse::default()
         };
-        let ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None, device: false };
+        let ask = Ask { kind: Kind::RepoClaimed, repo_slug: "acme/widget", subject: None, device: false, device_owner: None };
         let b = bind(&ask, Some(ME), &claim(ME)).unwrap();
         assert_eq!(b.claim, Some(("github".into(), "123".into())));
         assert!(bind(&ask, Some(ME), &claim(MALLORY)).is_err(), "claim for another account");

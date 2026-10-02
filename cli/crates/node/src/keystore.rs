@@ -182,11 +182,15 @@ pub fn passphrase_source() -> Result<Option<Zeroizing<String>>> {
         return Ok(Some(p));
     }
     let read = |path: &std::path::Path, owner_only: bool| -> Result<Option<Zeroizing<String>>> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let Ok(f) = std::fs::File::open(path) else { return Ok(None) };
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        // Non-blocking open: a FIFO in its place cannot hang the start (the type is checked on
+        // the opened descriptor right after).
+        let nonblock = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap_or(0);
+        let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(nonblock).open(path) else { return Ok(None) };
         let md = f.metadata().map_err(|e| auth(format!("{}: {e}", path.display())))?;
-        if !md.is_file() || (owner_only && md.permissions().mode() & 0o077 != 0) {
-            return Err(auth(format!("{}: the passphrase file must be a regular file readable only by you (chmod 600)", path.display())));
+        let mine = md.uid() == rustix::process::geteuid().as_raw();
+        if !md.is_file() || (owner_only && (md.permissions().mode() & 0o077 != 0 || !mine)) {
+            return Err(auth(format!("{}: the passphrase file must be a regular file of yours, readable only by you (chmod 600)", path.display())));
         }
         let mut raw = Zeroizing::new(Vec::new());
         f.take(4097).read_to_end(&mut raw).map_err(|e| auth(format!("{}: {e}", path.display())))?;
@@ -290,7 +294,8 @@ pub fn load_or_init(home: &Home, cfg: &mut Config) -> Result<Secrets> {
         // T-02-010: the OS keychain by default; the encrypted file when MOOCHY_PASSPHRASE is set
         // (headless, CI) or when this machine has no keychain service.
         let mut chosen = "file";
-        if KEYCHAIN_BUILT && passphrase_source().ok().flatten().is_none() {
+        // A passphrase file that is set but unusable is an error, never a silent keychain.
+        if KEYCHAIN_BUILT && passphrase_source()?.is_none() {
             let mut probe = cfg.clone();
             probe.keystore = Some("keychain".into());
             match save(home, &probe, &s) {

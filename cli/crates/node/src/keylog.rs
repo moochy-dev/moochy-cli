@@ -129,6 +129,27 @@ impl KeyLog {
         }
     }
 
+    /// Foreground CLI (owner commands): the pseudonym that owns `device` in this node's persisted
+    /// mirror, read from disk — independent of `node.sock`, and trustworthy: the records must
+    /// reproduce a checkpoint signed by the pinned log key (`Monitor::open`). Outer `None`: no
+    /// key log on this node; inner `None`: the device is not in the log.
+    pub fn device_owner(home: &Home, cfg: &Config, device: &str) -> Option<Option<String>> {
+        let key = NoteKey::parse(&effective_log_key(cfg)?).ok()?;
+        let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
+        let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
+        let mc = monitor::Config {
+            origin,
+            key,
+            dir: Some(home.state_dir().join(format!("keylog-{tag}"))),
+            me: None,
+            known_owner_keys: Vec::new(),
+            witnesses: Vec::new(),
+            min_cosignatures: 0,
+        };
+        let m = Monitor::open(mc).ok()?;
+        Some(m.view().state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
+    }
+
     /// Run the monitor for the node's lifetime (once).
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
