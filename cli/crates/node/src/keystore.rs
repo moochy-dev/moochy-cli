@@ -418,8 +418,10 @@ mod tests {
         assert_eq!(&*open(&file, "pw", AAD).unwrap(), &plain);
         assert!(open(&file, "pW", AAD).is_err());
         let mut f: serde_json::Value = serde_json::from_slice(&file).unwrap();
-        let ct = f["ct"].as_str().unwrap().replace('A', "B");
-        f["ct"] = ct.into();
+        // Tamper deterministically: flip one ciphertext byte.
+        let mut ct = b64d(f["ct"].as_str().unwrap()).unwrap();
+        ct[0] ^= 1;
+        f["ct"] = b64e(&ct).into();
         assert!(open(&serde_json::to_vec(&f).unwrap(), "pw", AAD).is_err());
 
         let t = s.local_token("acme/widget", 0);
