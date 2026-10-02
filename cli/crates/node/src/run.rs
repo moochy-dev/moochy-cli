@@ -305,7 +305,10 @@ async fn mint(sock: &Path, port: u16, repo_token: &str, key: &str) -> Result<(St
 /// A197: the worktree becomes read-write inside the sandbox, so it must not be `/`, contain the
 /// home directory, or overlap the Moochy home (keystore, run key, state).
 fn guard_worktree(wt: &Path, moochy_home: &Path) -> Result<()> {
+    // Every side canonical (macOS: /var → /private/var, /tmp → /private/tmp), or a symlinked
+    // spelling of the worktree would slip past the overlap checks.
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let wt = &canon(wt);
     let mh = canon(moochy_home);
     let home = std::env::var_os("HOME").map(|h| canon(Path::new(&h)));
     let why = if wt.parent().is_none() {
@@ -387,9 +390,15 @@ mod tests {
         assert!(guard_worktree(Path::new("/"), &mh).is_err());
         assert!(guard_worktree(&base, &mh).is_err(), "contains the Moochy home");
         assert!(guard_worktree(&mh.join("state"), &mh).is_err(), "inside the Moochy home");
-        if let Some(h) = std::env::var_os("HOME") {
-            assert!(guard_worktree(&std::fs::canonicalize(h).unwrap(), &mh).is_err(), "the home directory");
+        if let Some(h) = std::env::var_os("HOME").filter(|h| Path::new(h).is_dir()) {
+            assert!(guard_worktree(Path::new(&h), &mh).is_err(), "the home directory, as spelled in $HOME");
         }
+        // A symlinked spelling of the Moochy home's parent is caught too (macOS /var, /tmp).
+        let link = std::env::temp_dir().join(format!("moochy-guard-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(guard_worktree(&link, &mh).is_err(), "symlinked spelling of a dir containing the home");
+        let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&base);
     }
 
