@@ -146,8 +146,11 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
             _ => {}
         }
     }
+    // A224 (KEYLOG §4c/§4b): a first owner key is held by the relay until the human confirms the
+    // emailed link or approves it with a passkey on the web (10 min); everything else is quick.
+    let wait = if matches!(body, Body::OwnerKey { prev: None, .. }) { OWNER_KEY_WAIT } else { Duration::from_secs(15) };
     let id = if r.request_id.is_empty() { format!("{}-{}", r.kind, now_ms()) } else { r.request_id.clone() };
-    let ack = submit_entry(node, &id, &r.kind, Bytes::from(r.body), r.sigs.into_iter().map(Bytes::from).collect(), Duration::from_secs(15)).await?;
+    let ack = submit_entry(node, &id, &r.kind, Bytes::from(r.body), r.sigs.into_iter().map(Bytes::from).collect(), wait).await?;
     if !ack.error.is_empty() {
         return Err(Status::failed_precondition(format!("relay refused the entry: {}", clean(&ack.error))));
     }
@@ -157,6 +160,9 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
     log("info", "owner-signed key-log entry relayed", &json!({"kind": r.kind, "log_index": ack.index}));
     Ok(out)
 }
+
+/// How long a first owner key may wait for its proof: the relay's 10 min hold, plus margin.
+pub const OWNER_KEY_WAIT: Duration = Duration::from_secs(11 * 60);
 
 /// Send one signed key-log entry over the session and wait for its `LogEntryAck`.
 pub async fn submit_entry(node: &Node, request_id: &str, kind: &str, body: Bytes, sigs: Vec<Bytes>, wait: Duration) -> Result<LogEntryAck, Status> {

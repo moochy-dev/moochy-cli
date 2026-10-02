@@ -13,6 +13,7 @@ use crate::pb::link::{LookupRequest, LookupResponse};
 use crate::pb::local::{ApproveRequest, ClaimRequest, MembersRequest, SignResponse, SubmitEntryRequest, members_request::Op};
 use crate::util::{Ctx as _, Result, auth, b64e, clean, internal, now_ms, usage};
 use moochy_keylog::Kind;
+use moochy_keylog::state::OwnerKeyProof;
 use moochy_keylog::entry::{Body, authorized_owner_key_body, claim_body, grant_body, owner_key_body, owner_key_id, parse_body, sig_message};
 use moochy_proto::crypto::SignKey;
 use serde_json::json;
@@ -124,7 +125,12 @@ fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -
     let msg = sig_message(Kind::OwnerKeyAdded, &body);
     let mut sigs = vec![new.sign(&msg).to_vec()];
     sigs.extend(prev.map(|p| p.sign(&msg).to_vec()));
-    let r = match rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs })) {
+    let id = owner_key_id(&new.public());
+    if prev.is_none() {
+        // A224 (KEYLOG §4c): the relay holds a first key until the human proves it on the web.
+        eprintln!("Registering owner key {id}. If the server asks for proof, it emails your confirmed address a link naming {id}: open it signed in and confirm (it expires in 10 min). Waiting…");
+    }
+    let r = match rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs })).map_err(proof_refusal) {
         // The account has a passkey (KEYLOG §4b): a first CLI key needs it to co-sign on the web.
         Err(e) if prev.is_none() && e.msg.contains("owner_key_exists") => {
             let authorizer = match crate::keylog::KeyLog::passkey_authorizer(home, &cfg, &pseudonym) {
@@ -140,20 +146,92 @@ fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -
             };
             let body = authorized_owner_key_body(&pseudonym, &new.public(), now_ms(), &authorizer);
             let sig = new.sign(&sig_message(Kind::OwnerKeyAdded, &body));
-            eprintln!("Your account has a passkey ({authorizer}): approve this new owner key {} with it on the web.", owner_key_id(&new.public()));
-            rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs: vec![sig.to_vec()] }))?
+            eprintln!("Your account has a passkey ({authorizer}): approve owner key {id} with it on moochy.dev (within 10 min). Waiting…");
+            rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs: vec![sig.to_vec()] })).map_err(proof_refusal)?
         }
         r => r?,
     };
+    // Only now (the log answered with its index) is the key kept and reported.
     store(home, cfg.relay.as_deref(), &new, &pass)?;
-    let id = owner_key_id(&new.public());
-    if prev.is_none() {
-        // A224: the residual, said plainly. The log took this key on the session's word.
-        eprintln!("Owner key {id} registered at #{} as an owner key of your account, on this device's word only (trust on first use).", r.log_index);
+    // How the log bound it, from this machine's verified copy (it may lag the answer a little).
+    let mut row = None;
+    for _ in 0..20 {
+        row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &pseudonym, &id);
+        if !matches!(row, Some(None)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let proof = match row {
+        Some(Some(k)) => Some(proof_name(k.proof)),
+        _ => None,
+    };
+    match row {
+        Some(Some(k)) => eprintln!("Owner key {id} is in the public key log at #{}: {}.", k.idx, proof_text(k.proof)),
+        _ => eprintln!("Owner key {id} is in the public key log at #{} (`moochy owner status` shows how it was bound once this machine's copy of the log has it).", r.log_index),
+    }
+    if prev.is_none() && row.is_some_and(|k| k.is_some_and(|k| k.proof == OwnerKeyProof::None)) {
         eprintln!("Check on moochy.dev that your account lists exactly this owner key; your other devices alert on any owner key they did not see created.");
     }
-    crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": id, "log_index": r.log_index, "first": prev.is_none()}));
+    crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": id, "log_index": r.log_index, "first": prev.is_none(), "proof": proof}));
     Ok(new)
+}
+
+/// KEYLOG §4c: how an owner key was bound, in words.
+fn proof_text(p: OwnerKeyProof) -> &'static str {
+    match p {
+        OwnerKeyProof::Email => "bound with your confirmed email",
+        OwnerKeyProof::Authorizer => "authorized by another owner key of yours (your passkey)",
+        OwnerKeyProof::Rotation => "a rotation signed by your previous owner key",
+        OwnerKeyProof::None => "bound before the email-proof rule, on the server's word alone (trust on first use); rotating keeps it trusted only if it was yours",
+    }
+}
+
+fn proof_name(p: OwnerKeyProof) -> &'static str {
+    match p {
+        OwnerKeyProof::None => "none",
+        OwnerKeyProof::Email => "email",
+        OwnerKeyProof::Authorizer => "authorizer",
+        OwnerKeyProof::Rotation => "rotation",
+    }
+}
+
+/// KEYLOG §4c/§10: the relay's refusals of an owner key, as plain sentences.
+fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
+    let say = |m: &str| usage(format!("{m}; nothing was registered"));
+    if e.msg.contains("owner_key_proof") {
+        say("the server refused an owner key without proof: this server does not offer the email confirmation (update moochy, or add a passkey on moochy.dev first and run `moochy owner init` again so the passkey approves it)")
+    } else if e.msg.contains("email_changed_recently") {
+        say("your email address changed less than 72 hours ago: for your safety the server binds a first owner key by email only after that (or approve it with a passkey you already have)")
+    } else if e.msg.contains("skew") {
+        say("the confirmation came too late (more than 10 minutes): run `moochy owner init` again and confirm the new email")
+    } else if e.msg.contains("did not acknowledge") {
+        say("nobody confirmed within 10 minutes")
+    } else {
+        e
+    }
+}
+
+/// `moochy owner status` (KEYLOG §4c): this account's CLI owner key as the public key log shows it.
+pub fn show_status(home: &Home) -> Result<()> {
+    let cfg = home.load()?;
+    let me = cfg.pseudonym.clone().ok_or_else(|| auth("not logged in: run `moochy login` first"))?;
+    let here = key_path(home, cfg.relay.as_deref()).exists();
+    let Some(active) = crate::keylog::KeyLog::active_owner_key(home, &cfg, &me) else {
+        return Err(usage("no public key log on this machine (log_key): owner keys cannot be checked"));
+    };
+    let Some(id) = active else {
+        eprintln!("No CLI owner key in the public key log for your account{}.", if here { " (this device has a key file the log does not list: run `moochy owner init` after removing it, or check the log)" } else { "" });
+        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here}));
+        return Ok(());
+    };
+    let row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &me, &id).flatten();
+    match row {
+        Some(k) => eprintln!("Owner key {id} (log #{}): {}.{}", k.idx, proof_text(k.proof), if here { "" } else { " Its secret is not on this device." }),
+        None => eprintln!("Owner key {id}."),
+    }
+    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here}));
+    Ok(())
 }
 
 /// `moochy owner init` (first key) / `moochy owner rotate` (new key, the current one signs too).
@@ -526,10 +604,10 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
     // A224: how the key got in, from this machine's verified copy of the log (not the app's word).
     let cfg = home.load()?;
     let how = match cfg.pseudonym.as_deref().and_then(|me| crate::keylog::KeyLog::owner_key_row(home, &cfg, me, id)) {
-        Some(Some((idx, _, _))) if idx != d.log_index => return Err(auth(format!("refusing: the app says {id} is at #{}, the key log at #{idx}", d.log_index))),
-        Some(Some((_, _, Some(true)))) => "a passkey registered with only an emailed link (trust on first use: whoever read that email could have made it)",
-        Some(Some((_, _, Some(false)))) => "a passkey approved by another owner key of yours",
-        Some(Some((_, _, None))) => "a CLI owner key (Ed25519)",
+        Some(Some(k)) if k.idx != d.log_index => return Err(auth(format!("refusing: the app says {id} is at #{}, the key log at #{}", d.log_index, k.idx))),
+        Some(Some(k)) if k.email_proof == Some(true) => "a passkey registered with only an emailed link (trust on first use: whoever read that email could have made it)",
+        Some(Some(k)) if k.email_proof.is_some() => "a passkey approved by another owner key of yours",
+        Some(Some(k)) => proof_text(k.proof),
         Some(None) => return Err(usage(format!("{id} is not an owner key of your account in the public key log"))),
         None => "not checked: no public key log on this machine",
     };
@@ -637,6 +715,18 @@ mod tests {
         assert!(check_lookup(&b, Some("bob"), &l(R, MALLORY)).is_err(), "answer for another handle");
         assert!(check_lookup(&b, None, &l("r_01ARZ3NDEKTSV4RRFFQ69G5FAW", "")).is_err(), "another project");
         assert!(check_lookup(&b, None, &l(R, "")).is_ok(), "pseudonym argument: repo only");
+    }
+
+    /// KEYLOG §4c: the relay's owner-key codes reach the user as sentences, never as success.
+    #[test]
+    fn owner_key_refusals_are_sentences() {
+        let r = |code: &str| proof_refusal(usage(format!("relay refused the entry: {code}"))).msg;
+        assert!(r("owner_key_proof").contains("without proof") && r("owner_key_proof").contains("nothing was registered"));
+        assert!(r("email_changed_recently").contains("72 hours"));
+        assert!(r("skew").contains("too late"));
+        assert!(proof_refusal(crate::util::net("relay did not acknowledge the entry")).msg.contains("within 10 minutes"));
+        assert_eq!(r("bad_sig"), "relay refused the entry: bad_sig");
+        assert_eq!(proof_name(OwnerKeyProof::Email), "email");
     }
 
     #[test]
