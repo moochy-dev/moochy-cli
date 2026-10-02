@@ -4,10 +4,11 @@
 //! - Inside the box, `MOOCHY_ENROLL=<token> moochy up --headless` generates the box's own keys and
 //!   enrolls an ephemeral gateway device: repo-scoped, expiring, its own cap, no owner powers, no
 //!   donor role. The maintainer's device key never leaves the maintainer's machine.
-//! - Clone detection: the box identity is bound to this machine (machine-id) and this boot
-//!   (boot id); `moochy up` refuses when either changed (a forked or copied disk, or a reboot) and
-//!   the box must enroll again, using one more of the token's enrollments. The relay's one live
-//!   session per device is the second layer.
+//! - Clone detection (integrator decision, CONTRACT §17.1): every process start sends a fresh
+//!   random instance value with its Auth (`link::instance`); the relay refuses a second live
+//!   session of one device key with another instance and alerts the owner. The machine-id is
+//!   copied by forks, templates and memory snapshots, so here it is only a hint: a box that starts
+//!   on another machine-id says so, and still starts.
 //!
 //! Owner/member calls go through the running app (LocalControl `LinkCall`), which relays the
 //! link.proto message on its authenticated session, like donations.
@@ -39,69 +40,53 @@ pub struct BoxState {
     pub repo: String,
     pub expires_at_ms: i64,
     pub cap_uusd_month: i64,
-    /// Labelled SHA-256 of the machine-id and of the boot id (never the raw ids).
+    /// Labelled SHA-256 of the machine-id at enrollment (never the raw id); "" = unknown. A hint.
     pub machine: String,
-    pub boot: String,
 }
 
-/// (machine, boot) fingerprints of the running system. Fails closed when either is unknown.
-pub fn fingerprint() -> Result<(String, String)> {
-    let (m, b) = raw_ids()?;
-    let h = |label: &str, v: &str| b64e(&Sha256::digest(crate::util::lp(&[label.as_bytes(), v.trim().as_bytes()])));
-    Ok((h("moochy/v1/box-machine", &m), h("moochy/v1/box-boot", &b)))
+/// The machine fingerprint of the running system, when it has one.
+pub fn fingerprint() -> Option<String> {
+    let m = machine_id()?;
+    Some(b64e(&Sha256::digest(crate::util::lp(&[b"moochy/v1/box-machine", m.trim().as_bytes()]))))
 }
 
 #[cfg(target_os = "linux")]
-fn raw_ids() -> Result<(String, String)> {
+fn machine_id() -> Option<String> {
     let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty() && s.len() <= 128);
-    let machine = read("/etc/machine-id")
-        .or_else(|| read("/var/lib/dbus/machine-id"))
-        .ok_or_else(|| usage("this box has no /etc/machine-id, so moochy cannot tell a copy from the original: create one (`systemd-machine-id-setup`, or the deploy/client/boxes setup script) and enroll again"))?;
-    let boot = read("/proc/sys/kernel/random/boot_id").ok_or_else(|| usage("cannot read the boot id (/proc/sys/kernel/random/boot_id)"))?;
-    Ok((machine, boot))
+    read("/etc/machine-id").or_else(|| read("/var/lib/dbus/machine-id"))
 }
 
 #[cfg(target_os = "macos")]
-fn raw_ids() -> Result<(String, String)> {
-    let out = |prog: &str, args: &[&str]| -> Option<String> {
-        let o = crate::util::command(prog).args(args).stderr(std::process::Stdio::null()).output().ok()?;
-        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
-    };
-    let machine = out("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
-        .and_then(|t| t.lines().find(|l| l.contains("\"IOPlatformUUID\"")).and_then(|l| l.rsplit('"').nth(1).map(str::to_owned)))
-        .ok_or_else(|| usage("cannot read this Mac's hardware UUID (ioreg)"))?;
-    let boot = out("/usr/sbin/sysctl", &["-n", "kern.boottime"]).filter(|s| !s.trim().is_empty()).ok_or_else(|| usage("cannot read the boot time (sysctl kern.boottime)"))?;
-    Ok((machine, boot))
+fn machine_id() -> Option<String> {
+    let o = crate::util::command("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]).stderr(std::process::Stdio::null()).output().ok()?;
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    t.lines().find(|l| l.contains("\"IOPlatformUUID\"")).and_then(|l| l.rsplit('"').nth(1).map(str::to_owned))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn raw_ids() -> Result<(String, String)> {
-    Err(usage("cloud boxes are supported on Linux and macOS only"))
-}
-
-/// Why this box may not start, if it may not: expired, or not the machine/boot it enrolled on.
-pub fn refusal(b: &BoxState, now: u64, fp: &(String, String)) -> Option<String> {
-    if i64::try_from(now).unwrap_or(i64::MAX) >= b.expires_at_ms {
-        return Some("this box device has expired".into());
-    }
-    if fp.0 != b.machine {
-        return Some("this is not the machine this box enrolled on (a copied or forked disk)".into());
-    }
-    if fp.1 != b.boot {
-        return Some("this box restarted or was forked since it enrolled".into());
-    }
+fn machine_id() -> Option<String> {
     None
 }
 
-/// The box scope from an approved enrollment (`login` with a token), bound to `fp` (taken
-/// before enrolling, so a machine without ids never spends a token use).
-pub fn bind(p: &DevicePollResponse, fp: (String, String)) -> Result<BoxState> {
+/// The box's expiry refusal, if it is past it.
+pub fn refusal(b: &BoxState, now: u64) -> Option<String> {
+    (i64::try_from(now).unwrap_or(i64::MAX) >= b.expires_at_ms).then(|| "this box device has expired".to_owned())
+}
+
+/// The hint when this box runs on another machine-id than the one it enrolled on.
+pub fn machine_hint(b: &BoxState, fp: Option<&str>) -> Option<&'static str> {
+    (!b.machine.is_empty() && fp.is_some_and(|f| f != b.machine)).then_some(
+        "this box runs on another machine-id than the one it enrolled on (a fork, template or snapshot?). If the original is still running, the server refuses one of them and tells the owner; a fork should enroll with its own token use",
+    )
+}
+
+/// The box scope from an approved enrollment (`login` with a token), with the machine hint.
+pub fn bind(p: &DevicePollResponse, machine: Option<String>) -> Result<BoxState> {
     let exp = p.expires_at_ms;
     if !p.r#box || !crate::config::valid_slug(&p.repo_slug) || exp <= i64::try_from(now_ms()).unwrap_or(i64::MAX) || p.cap_uusd_month <= 0 {
         return Err(net("the server approved the enrollment without a valid box scope (project, expiry, cap): not saved"));
     }
-    let (machine, boot) = fp;
-    Ok(BoxState { repo: p.repo_slug.to_ascii_lowercase(), expires_at_ms: exp, cap_uusd_month: p.cap_uusd_month, machine, boot })
+    Ok(BoxState { repo: p.repo_slug.to_ascii_lowercase(), expires_at_ms: exp, cap_uusd_month: p.cap_uusd_month, machine: machine.unwrap_or_default() })
 }
 
 /// The enrollment token from the environment, checked for shape (never printed).
@@ -125,16 +110,13 @@ pub enum Start {
 }
 
 /// Decide before `moochy up` starts the node. `token`: `MOOCHY_ENROLL` is set.
-pub fn plan(cfg: &Config, token: bool, now: u64, fp: Option<&(String, String)>) -> Result<Start> {
+pub fn plan(cfg: &Config, token: bool, now: u64) -> Result<Start> {
     match (&cfg.box_device, cfg.device_id.is_some()) {
-        (Some(b), true) => {
-            let fp = fp.ok_or_else(|| internal("no machine fingerprint"))?;
-            match refusal(b, now, fp) {
-                None => Ok(Start::Run),
-                Some(_) if token => Ok(Start::Enroll),
-                Some(why) => Err(auth(format!("{why}: refusing to start. A box enrolls again with its own token use: MOOCHY_ENROLL=<token> moochy up --headless"))),
-            }
-        }
+        (Some(b), true) => match refusal(b, now) {
+            None => Ok(Start::Run),
+            Some(_) if token => Ok(Start::Enroll),
+            Some(why) => Err(auth(format!("{why}: refusing to start. A box enrolls again with a new token: MOOCHY_ENROLL=<token> moochy up --headless"))),
+        },
         (_, false) if token => Ok(Start::Enroll),
         // A regular device never turns into a box (and keeps its own keys).
         (None, true) if token => Err(usage("this machine is already a device of your account: MOOCHY_ENROLL is only for a fresh box (unset it, or use a separate --home)")),
@@ -291,17 +273,14 @@ pub fn revoke(home: &Home, id: &str, prefix: &str) -> Result<()> {
 pub fn doctor_lines(cfg: &Config, sandbox_ok: bool) -> Vec<(&'static str, &'static str, String)> {
     let mut v = Vec::new();
     if let Some(b) = &cfg.box_device {
-        let fp = fingerprint();
-        let state = match fp.as_ref().map(|fp| refusal(b, now_ms(), fp)) {
-            Ok(None) => Ok(()),
-            Ok(Some(why)) => Err(why),
-            Err(e) => Err(e.msg.clone()),
-        };
         let left_h = (b.expires_at_ms.saturating_sub(i64::try_from(now_ms()).unwrap_or(i64::MAX))) / 3_600_000;
-        v.push(match state {
-            Ok(()) => ("ok  ", "box", format!("cloud box for {}: expires in {left_h} h, up to {} a month, bound to this machine and boot", clean(&b.repo), fmt_dollars(u64::try_from(b.cap_uusd_month).unwrap_or(0)))),
-            Err(why) => ("FAIL", "box", format!("{why}: enroll again (MOOCHY_ENROLL=<token> moochy up --headless)")),
+        v.push(match refusal(b, now_ms()) {
+            None => ("ok  ", "box", format!("cloud box for {}: expires in {left_h} h, up to {} a month", clean(&b.repo), fmt_dollars(u64::try_from(b.cap_uusd_month).unwrap_or(0)))),
+            Some(why) => ("FAIL", "box", format!("{why}: enroll again (MOOCHY_ENROLL=<token> moochy up --headless)")),
         });
+        if let Some(h) = machine_hint(b, fingerprint().as_deref()) {
+            v.push(("note", "box", h.to_owned()));
+        }
     }
     if !sandbox_ok {
         v.push((
@@ -327,30 +306,26 @@ mod tests {
     fn boxed(exp: i64) -> Config {
         Config {
             device_id: Some("d_01J0000000000000000000000A".into()),
-            box_device: Some(BoxState { repo: "acme/widget".into(), expires_at_ms: exp, cap_uusd_month: 1, machine: "m".into(), boot: "b".into() }),
+            box_device: Some(BoxState { repo: "acme/widget".into(), expires_at_ms: exp, cap_uusd_month: 1, machine: "m".into() }),
             ..Config::default()
         }
     }
 
     #[test]
-    fn start_plan_refuses_clones_and_expired_boxes() {
-        let here = ("m".to_owned(), "b".to_owned());
+    fn start_plan_refuses_expired_boxes_and_hints_at_forks() {
         let cfg = boxed(2_000);
-        assert_eq!(plan(&cfg, false, 1_000, Some(&here)).unwrap(), Start::Run);
-        // A forked disk: same keys, other machine-id (E106) — refused, enrolls again with a token.
-        let fork = ("m2".to_owned(), "b".to_owned());
-        let e = plan(&cfg, false, 1_000, Some(&fork)).unwrap_err();
-        assert!(e.msg.contains("not the machine") && e.msg.contains("MOOCHY_ENROLL"), "{}", e.msg);
-        assert_eq!(plan(&cfg, true, 1_000, Some(&fork)).unwrap(), Start::Enroll);
-        // A new boot (fork of a running VM, or a restart).
-        assert!(plan(&cfg, false, 1_000, Some(&("m".to_owned(), "b2".to_owned()))).unwrap_err().msg.contains("restarted or was forked"));
-        // Expiry (E105).
-        assert!(plan(&cfg, false, 2_000, Some(&here)).unwrap_err().msg.contains("expired"));
+        assert_eq!(plan(&cfg, false, 1_000).unwrap(), Start::Run);
+        // Expiry (E105): refused, or enroll again with a token.
+        assert!(plan(&cfg, false, 2_000).unwrap_err().msg.contains("expired"));
+        assert_eq!(plan(&cfg, true, 2_000).unwrap(), Start::Enroll);
+        // Another machine-id is only a hint (the relay's instance check refuses clones, E106).
+        let b = cfg.box_device.as_ref().unwrap();
+        assert!(machine_hint(b, Some("m2")).is_some() && machine_hint(b, Some("m")).is_none() && machine_hint(b, None).is_none());
         // Fresh machine with a token: enroll; a regular device never turns into a box.
-        assert_eq!(plan(&Config::default(), true, 0, None).unwrap(), Start::Enroll);
+        assert_eq!(plan(&Config::default(), true, 0).unwrap(), Start::Enroll);
         let regular = Config { device_id: Some("d_x".into()), ..Config::default() };
-        assert!(plan(&regular, true, 0, None).is_err());
-        assert_eq!(plan(&regular, false, 0, None).unwrap(), Start::Run);
+        assert!(plan(&regular, true, 0).is_err());
+        assert_eq!(plan(&regular, false, 0).unwrap(), Start::Run);
         assert!(refuse_on_box(&cfg, "members").is_err() && refuse_on_box(&regular, "members").is_ok());
     }
 
@@ -363,10 +338,10 @@ mod tests {
             assert!(parse_ttl(bad).is_err(), "{bad}");
         }
         if cfg!(target_os = "linux") && std::path::Path::new("/etc/machine-id").exists() {
-            let (m, b) = fingerprint().unwrap();
-            assert_eq!(fingerprint().unwrap(), (m.clone(), b.clone()), "stable within a boot");
+            let m = fingerprint().unwrap();
+            assert_eq!(fingerprint().unwrap(), m, "stable");
             let raw = std::fs::read_to_string("/etc/machine-id").unwrap();
-            assert!(!m.contains(raw.trim()) && m != b, "labelled hashes, never the raw id");
+            assert!(!m.contains(raw.trim()), "a labelled hash, never the raw id");
         }
     }
 
@@ -382,8 +357,8 @@ mod tests {
     fn bind_needs_a_full_scope() {
         let future = i64::try_from(now_ms()).unwrap() + 3_600_000;
         let p = DevicePollResponse { r#box: true, repo_slug: "Acme/Widget".into(), expires_at_ms: future, cap_uusd_month: 5, ..DevicePollResponse::default() };
-        let fp = || ("m".to_owned(), "b".to_owned());
-        assert_eq!(bind(&p, fp()).unwrap(), BoxState { repo: "acme/widget".into(), expires_at_ms: future, cap_uusd_month: 5, machine: "m".into(), boot: "b".into() });
+        let fp = || Some("m".to_owned());
+        assert_eq!(bind(&p, fp()).unwrap(), BoxState { repo: "acme/widget".into(), expires_at_ms: future, cap_uusd_month: 5, machine: "m".into() });
         for broken in [
             DevicePollResponse { r#box: false, ..p.clone() },
             DevicePollResponse { repo_slug: "nope".into(), ..p.clone() },

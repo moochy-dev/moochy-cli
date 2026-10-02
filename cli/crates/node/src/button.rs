@@ -2,9 +2,10 @@
 //! tokens" snippet for this repository, offline. The output is exactly the guide's snippets (a
 //! unit test compares them with the guide).
 //!
-//! URLs: GitHub projects use the two-segment form the guide shows (`/p/OWNER/NAME/…`, valid
-//! forever as GitHub, CONTRACT §9); GitLab projects use the provider-qualified form
-//! (`/p/gitlab/GROUP[/SUBGROUP…]/NAME/…`), since the two-segment form means GitHub.
+//! URLs: GitHub projects use the short two-segment form (`/p/OWNER/NAME/button.svg`, valid
+//! forever as GitHub, CONTRACT §9); GitLab projects use the provider-qualified form with actions
+//! after GitLab's `/-/` separator (`/p/gitlab/GROUP[/SUBGROUP…]/NAME/-/button.svg`, `/-/donate`,
+//! A229), since the two-segment form means GitHub.
 
 use crate::util::{Result, usage};
 
@@ -172,15 +173,31 @@ mod tests {
         step3.split(&format!("```{lang}\n")).skip(1).map(|b| b.split_once("\n```").unwrap().0.to_owned()).collect()
     }
 
+    /// Step 2's example answer for a field (`button_url`, `donate_url`).
+    fn guide_url(field: &str) -> String {
+        let (_, step2) = GUIDE.split_once("### 2.").unwrap();
+        let (_, json) = step2.split_once("```json\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(json.split_once("\n```").unwrap().0).unwrap();
+        v[field].as_str().unwrap().to_owned()
+    }
+
     #[test]
     fn output_is_the_guide() {
-        let p = Project { provider: "github", path: "OWNER/NAME".into() };
+        // Step 2's example project, in the GitHub short form the guide says `moochy button` prints.
+        let (button, donate) = (guide_url("button_url"), guide_url("donate_url"));
+        let short = |u: &str| u.replacen("/p/github/", "/p/", 1);
+        assert!(GUIDE.contains(&short(&button).replacen("https://moochy.dev", "", 1)), "the guide documents the short form");
+        let fill = |b: &str| b.replace("BUTTON_URL", &short(&button)).replace("DONATE_URL", &short(&donate));
+        let p = Project { provider: "github", path: "tinyhttp/arrow".into() };
         let o = |format: &str, theme: Option<&str>| Options { format: Some(format.into()), theme: theme.map(str::to_owned), ..Options::default() };
-        assert_eq!(snippet(&p, &o("markdown", None)).unwrap(), guide_blocks("markdown")[0]);
+        assert_eq!(snippet(&p, &o("markdown", None)).unwrap(), fill(&guide_blocks("markdown")[0]));
         let html = guide_blocks("html");
-        assert_eq!(snippet(&p, &o("html", None)).unwrap(), html[0], "theme-following HTML");
-        assert_eq!(snippet(&p, &o("html", Some("light"))).unwrap(), html[1], "one-theme HTML");
-        assert_eq!(snippet(&p, &o("rst", None)).unwrap(), guide_blocks("rst")[0]);
+        assert_eq!(snippet(&p, &o("html", None)).unwrap(), fill(&html[0]), "theme-following HTML");
+        assert_eq!(snippet(&p, &o("html", Some("light"))).unwrap(), fill(&html[1]), "one-theme HTML");
+        assert_eq!(snippet(&p, &o("rst", None)).unwrap(), fill(&guide_blocks("rst")[0]));
+        // The GitLab subgroup example, verbatim (actions after `/-/`, A229).
+        let gl = Project { provider: "gitlab", path: "group/subgroup/project".into() };
+        assert_eq!(snippet(&gl, &o("markdown", None)).unwrap(), guide_blocks("markdown")[1]);
     }
 
     #[test]

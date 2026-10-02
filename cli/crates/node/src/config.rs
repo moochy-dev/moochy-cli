@@ -76,7 +76,11 @@ pub struct RepoEntry {
 
 pub const DEFAULT_GATEWAY_ADDR: &str = "127.0.0.1:0";
 /// The public relay's gRPC listener (CONTRACT §14b R2).
-pub const DEFAULT_RELAY: &str = "https://relay.moochy.dev:8443";
+/// The public relay (integrator decision 2026-10-02: the link is multiplexed with the web on 443),
+/// spelled as `tls::Origin::url` prints it.
+pub const DEFAULT_RELAY: &str = "https://relay.moochy.dev:443";
+/// The earlier default (gRPC on 8443): a saved config naming it moves to `DEFAULT_RELAY`.
+const LEGACY_DEFAULT_RELAY: &str = "https://relay.moochy.dev:8443";
 
 /// Short stable tag of a relay origin (file names, keychain entries).
 pub fn origin_tag(origin: &str) -> String {
@@ -137,7 +141,13 @@ impl Home {
 
     pub fn load(&self) -> Result<Config> {
         match fs::read(self.config_path()) {
-            Ok(b) => serde_json::from_slice(&b).map_err(|e| usage(format!("bad config.json: {e}"))),
+            Ok(b) => {
+                let mut c: Config = serde_json::from_slice(&b).map_err(|e| usage(format!("bad config.json: {e}")))?;
+                if c.relay.as_deref() == Some(LEGACY_DEFAULT_RELAY) {
+                    c.relay = Some(DEFAULT_RELAY.into());
+                }
+                Ok(c)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(crate::util::internal(format!("read config: {e}"))),
         }
@@ -281,8 +291,8 @@ fn parse_bool(key: &str, v: &str) -> Result<bool> {
 fn valid_segment(p: &str) -> bool {
     (1..=100).contains(&p.len())
         && !p.starts_with(['.', '-'])
-        && !p.ends_with(".git")
-        && !p.ends_with(".atom")
+        && !p.to_ascii_lowercase().ends_with(".git")
+        && !p.to_ascii_lowercase().ends_with(".atom")
         && p.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
 }
 
@@ -314,7 +324,7 @@ mod tests {
         assert!(!super::valid_slug("acme/.."));
         assert!(!super::valid_slug("a/b c"));
         // Provider-qualified paths (CONTRACT §9).
-        use super::canonical_slug as c;
+        let c = super::canonical_slug;
         assert_eq!(c("github/acme/widget").as_deref(), Some("acme/widget"));
         assert_eq!(c("github/docs").as_deref(), Some("github/docs"), "two segments: owner github, repo docs");
         assert_eq!(c("gitlab/group/sub/project").as_deref(), Some("gitlab/group/sub/project"));

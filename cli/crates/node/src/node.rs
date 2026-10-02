@@ -413,8 +413,11 @@ impl Node {
         let changed = {
             let mut pools = lock(&self.pools);
             let p = pools.entry(v.repo_id.clone()).or_insert_with(|| RepoPool { repo_id: v.repo_id.clone(), ..RepoPool::default() });
-            if crate::config::valid_slug(&v.repo_slug) {
-                p.slug = Some(v.repo_slug.to_ascii_lowercase());
+            // GitLab projects are `gitlab/group[/sub…]/name` on the client (CONTRACT §9), with or
+            // without the prefix in the relay's slug.
+            let slug = if v.repo_provider == "gitlab" && !v.repo_slug.starts_with("gitlab/") { format!("gitlab/{}", v.repo_slug) } else { v.repo_slug.clone() };
+            if crate::config::valid_slug(&slug) {
+                p.slug = Some(slug.to_ascii_lowercase());
             }
             p.auto_cache = v.auto_cache;
             p.excluded_providers = v.excluded_providers.iter().take(16).filter(|x| plain_id(x)).cloned().collect();
