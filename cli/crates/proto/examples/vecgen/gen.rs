@@ -109,6 +109,7 @@ fn dev(s: &str) -> DeviceId {
 }
 
 pub const SONNET: &str = r#"{"model":"anthropic/claude-sonnet-5.5","provider":"anthropic","provider_model_id":"claude-sonnet-5-5","aliases":["claude-sonnet-5-5"],"dialects":["anthropic.messages"],"in":2000000,"out":10000000,"cache_write_5m":2500000,"cache_write_1h":4000000,"cache_read":200000,"max_image_tokens":1600,"max_page_tokens":3000,"fast_multiplier":6,"default_effort":"high","max_output":64000,"source":"curated"}"#;
+const GPT_RESPONSES: &str = r#"{"model":"openai/gpt-5.5","provider":"openai","provider_model_id":"gpt-5.5","dialects":["openai.chat","openai.responses"],"in":1250000,"out":10000000,"cache_write_5m":0,"cache_write_1h":0,"cache_read":125000,"max_image_tokens":1500,"max_page_tokens":0,"default_effort":"medium","max_output":128000,"source":"curated"}"#;
 const DEEPSEEK: &str = r#"{"model":"deepseek/deepseek-chat","provider":"openrouter","provider_model_id":"deepseek/deepseek-chat","dialects":["openai.chat","anthropic.messages"],"in":270000,"out":1100000,"cache_write_5m":0,"cache_write_1h":0,"cache_read":70000,"max_image_tokens":0,"max_page_tokens":0,"default_effort":"medium","max_output":8192,"source":"openrouter_import"}"#;
 
 fn route_text() -> String {
@@ -705,6 +706,10 @@ fn route() -> Value {
         ("openai max_tokens only, stream", Dialect::OpenAiChat, r#"{"model":"deepseek/deepseek-chat","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#.into()),
         ("openai both max fields equal", Dialect::OpenAiChat, r#"{"model":"m","max_completion_tokens":50,"max_tokens":50,"messages":[]}"#.into()),
         ("error: openai both max fields differ", Dialect::OpenAiChat, r#"{"model":"m","max_completion_tokens":50,"max_tokens":51,"messages":[]}"#.into()),
+        ("responses: Codex shape, no max_output_tokens (catalog max_output), reasoning.effort, inline image", Dialect::OpenAiResponses, r#"{"model":"gpt-5.5","stream":true,"store":false,"reasoning":{"effort":"high","summary":"auto"},"instructions":"be brief","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#.into()),
+        ("responses: explicit max_output_tokens, string input, default effort", Dialect::OpenAiResponses, r#"{"model":"openai/gpt-5.5","max_output_tokens":2048,"input":"hello"}"#.into()),
+        ("error: responses max_output_tokens negative", Dialect::OpenAiResponses, r#"{"model":"m","max_output_tokens":-1,"input":"x"}"#.into()),
+        ("error: responses reasoning.effort not a string", Dialect::OpenAiResponses, r#"{"model":"m","reasoning":{"effort":3},"input":"x"}"#.into()),
         ("error: max_tokens missing", Dialect::AnthropicMessages, r#"{"model":"m","messages":[]}"#.into()),
         ("error: max_tokens above u32", Dialect::AnthropicMessages, r#"{"model":"m","max_tokens":4294967296,"messages":[]}"#.into()),
         ("error: duplicate max_tokens", Dialect::AnthropicMessages, r#"{"model":"m","max_tokens":1,"max_tokens":9}"#.into()),
@@ -718,7 +723,7 @@ fn route() -> Value {
             Ok(f) => json!({
                 "name": name, "dialect": d.as_str(), "body_text": body, "outcome": "ok",
                 "facts": {
-                    "model": f.model, "effort": f.effort, "max_tokens": f.max_tokens, "stream": f.stream,
+                    "model": f.model, "effort": f.effort, "max_tokens": f.max_tokens, "max_tokens_effective": f.max_tokens_for(&c), "stream": f.stream,
                     "cache_ttl": serde_json::to_value(f.cache_ttl).unwrap(), "fast": f.fast, "text_bytes": f.text_bytes,
                     "images": f.images, "pages": f.pages, "est_input_tokens": f.est_input_tokens(&c).unwrap(), "flags": f.flags(),
                 },
@@ -752,7 +757,7 @@ fn route() -> Value {
         })
         .collect();
     json!({
-        "_schema": "Route header (plan 03 §7.1). parse[]: exact route-header bytes (text) → outcome ok | json (parser-differential) | malformed (unknown field, wrong type/enum/length). facts[]: provider body (body_text, exact bytes) → deterministic facts: est_input_tokens = ceil(text_bytes / 3) + images × catalog.max_image_tokens + pages × catalog.max_page_tokens, text_bytes = body length − Σ length of inline image data (Anthropic image source.data; OpenAI image_url.url starting 'data:'), pages = count of '/Type <ws>* /Page' (not /Pages) in each base64 PDF (min 1), cache_ttl = longest cache_control ttl (present without ttl = 5m), effort = output_config.effort | reasoning_effort (null = catalog default), flags = sorted subset of documents/fast/images. check[]: Worker comparison of route_text against facts of facts[0] and the catalog entry; mismatch = first failing field in order model, dialect, effort, max_tokens, est_input_tokens, cache_ttl, stream, flags (null = accepted).",
+        "_schema": "Route header (plan 03 §7.1). parse[]: exact route-header bytes (text) → outcome ok | json (parser-differential) | malformed (unknown field, wrong type/enum/length). facts[]: provider body (body_text, exact bytes) → deterministic facts: est_input_tokens = ceil(text_bytes / 3) + images × catalog.max_image_tokens + pages × catalog.max_page_tokens, text_bytes = body length − Σ length of inline image data (Anthropic image source.data; OpenAI image_url.url and Responses input_image.image_url starting 'data:'), pages = count of '/Type <ws>* /Page' (not /Pages) in each base64 PDF (min 1), cache_ttl = longest cache_control ttl (present without ttl = 5m), effort = output_config.effort | reasoning_effort | reasoning.effort (openai.responses) (null = catalog default), max_tokens = the body's cap (anthropic max_tokens; openai.chat max_completion_tokens|max_tokens; openai.responses max_output_tokens, may be null) and max_tokens_effective = max_tokens or, when null (openai.responses only), the catalog max_output, flags = sorted subset of documents/fast/images. check[]: Worker comparison of route_text against facts of facts[0] and the catalog entry; mismatch = first failing field in order model, dialect, effort, max_tokens, est_input_tokens, cache_ttl, stream, flags (null = accepted).",
         "catalog_entry": serde_json::from_str::<Value>(SONNET).unwrap(),
         "parse": parse_cases,
         "facts": fact_cases,
@@ -814,9 +819,41 @@ fn money_vectors() -> Value {
         json!({"text": s, "outcome": outcome(r), "uusd": r.ok()})
     })
     .collect();
+    // CONTRACT §18.6: openai.responses usage → receipt usage → cost, under entries[2] (openai),
+    // the same entry as xai and as openrouter.
+    let gpt: CatalogEntry = json::parse(GPT_RESPONSES.as_bytes()).unwrap();
+    let rs = |i: Option<u64>, o: Option<u64>, t: Option<u64>, c: Option<u64>, pc: Option<i64>| money::ResponsesUsage { input_tokens: i, output_tokens: o, total_tokens: t, cached_tokens: c, provider_cost_uusd: pc };
+    let responses: Vec<Value> = [
+        ("cached input + reasoning in output_tokens", "openai", rs(Some(10_000), Some(1_500), Some(11_500), Some(8_000), None)),
+        ("no cache details", "openai", rs(Some(1_234), Some(56), Some(1_290), None, None)),
+        ("reasoning outside output_tokens: total − input wins", "openai", rs(Some(100), Some(10), Some(400), None, None)),
+        ("total below input is ignored (never wraps)", "openai", rs(Some(500), Some(7), Some(3), None, None)),
+        ("one input token rounds up to 2 µ$", "openai", rs(Some(1), Some(0), None, None, None)),
+        ("cached above input: input counted whole, estimated", "openai", rs(Some(5), Some(1), None, Some(9), None)),
+        ("output_tokens missing: estimated", "openai", rs(Some(10), None, None, None, None)),
+        ("overflow is an error", "openai", rs(Some(u64::MAX), Some(u64::MAX), None, None, None)),
+        ("openai with a provider cost is refused", "openai", rs(Some(10), Some(10), None, None, Some(1))),
+        ("xai reported cost (cost_in_usd_ticks / 10^4, rounded up) is authoritative", "xai", rs(Some(10), Some(10), None, None, Some(43))),
+        ("xai without reported cost: catalog prices", "xai", rs(Some(10), Some(10), None, None, None)),
+        ("openrouter reported cost is authoritative", "openrouter", rs(Some(10), Some(10), None, Some(4), Some(42))),
+        ("openrouter without reported cost is refused", "openrouter", rs(Some(10), Some(10), None, None, None)),
+    ]
+    .iter()
+    .map(|(n, provider, raw)| {
+        let entry = CatalogEntry { provider: (*provider).into(), ..gpt.clone() };
+        let usage = money::responses_usage(raw);
+        let r = money::cost_uusd(&entry, &usage, false);
+        json!({
+            "name": n, "provider": provider,
+            "usage": {"input_tokens": raw.input_tokens, "output_tokens": raw.output_tokens, "total_tokens": raw.total_tokens, "input_tokens_details": {"cached_tokens": raw.cached_tokens}, "provider_cost_uusd": raw.provider_cost_uusd},
+            "receipt_usage": usage, "outcome": outcome(r), "cost_uusd": r.ok(),
+        })
+    })
+    .collect();
     json!({
-        "_schema": "Money (plan 05 §3, §5.1), all integer µ$, checked arithmetic. entries: [0] curated Anthropic entry, [1] OpenRouter-imported entry (prices µ$ per million tokens). cost[]: cost_uusd = ceil(Σ usage_i × price_i × (fast ? fast_multiplier : 1) / 1e6); OpenRouter entries use usage.provider_cost_uusd (required, ≥ 0); others MUST NOT carry it. reserve[]: ceil((est × in × m + max_tokens × out) × fast / 1e6) with m = 5/4 (5m), 2 (1h), 1 (none), computed exactly. decimal[]: OpenRouter usage.cost JSON number text → µ$ rounded up, no floating point; outcome ok | malformed | overflow.",
-        "entries": [serde_json::from_str::<Value>(SONNET).unwrap(), serde_json::from_str::<Value>(DEEPSEEK).unwrap()],
+        "_schema": "Money (plan 05 §3, §5.1), all integer µ$, checked arithmetic. entries: [0] curated Anthropic entry, [1] OpenRouter-imported entry (prices µ$ per million tokens). cost[]: cost_uusd = ceil(Σ usage_i × price_i × (fast ? fast_multiplier : 1) / 1e6); OpenRouter entries use usage.provider_cost_uusd (required, ≥ 0); others MUST NOT carry it. reserve[]: ceil((est × in × m + max_tokens × out) × fast / 1e6) with m = 5/4 (5m), 2 (1h), 1 (none), computed exactly. responses[] (CONTRACT §18.6, openai.responses): raw `usage` (null = absent) → receipt_usage: input = input_tokens − cached_tokens, cache_read = cached_tokens, output = max(output_tokens, total_tokens − input_tokens) (the total term is 0 when total < input), no cache writes; estimated when input_tokens or output_tokens is absent or cached_tokens > input_tokens (then input = input_tokens); cost per cost[] rules under entries[2] with `provider` replaced (openrouter: provider cost required; xai: optional, authoritative when present; others: refused). decimal[]: OpenRouter usage.cost JSON number text → µ$ rounded up, no floating point; outcome ok | malformed | overflow.",
+        "entries": [serde_json::from_str::<Value>(SONNET).unwrap(), serde_json::from_str::<Value>(DEEPSEEK).unwrap(), serde_json::from_str::<Value>(GPT_RESPONSES).unwrap()],
+        "responses": responses,
         "cost": cost_cases,
         "reserve": reserve_cases,
         "decimal": decimals,
