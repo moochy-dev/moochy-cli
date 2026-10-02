@@ -32,7 +32,7 @@ fn run(d: Dialect, stream: bool, b: &[u8], step: usize) -> Option<(Outcome, Vec<
 
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else { return };
-    let d = if sel & 1 == 0 { Dialect::AnthropicMessages } else { Dialect::OpenAiChat };
+    let d = moochy_worker_fuzz::dialect_of(sel);
     let stream = sel & 2 == 0;
     let step = usize::from(sel >> 2) + 1;
     let a = run(d, stream, rest, rest.len());

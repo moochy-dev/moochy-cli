@@ -47,7 +47,7 @@ fn malformed(d: Dialect, b: &[u8]) -> bool {
 
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else { return };
-    let d = if sel & 1 == 0 { Dialect::AnthropicMessages } else { Dialect::OpenAiChat };
+    let d = moochy_worker_fuzz::dialect_of(sel);
     let stream = sel & 2 == 0;
     let mut tape = Vec::new();
     if let Ok(doc) = json::parse(rest, &mut tape) {

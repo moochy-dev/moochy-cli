@@ -1,0 +1,147 @@
+{
+ "model": "gpt-5-codex",
+ "instructions": "You are Codex, a coding agent.",
+ "input": [
+  {
+   "type": "message",
+   "role": "developer",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "<permissions>workspace-write</permissions>"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "Fix the failing test in src/lib.rs"
+    }
+   ]
+  },
+  {
+   "type": "reasoning",
+   "id": "rs_01",
+   "summary": [
+    {
+     "type": "summary_text",
+     "text": "Looking at the test."
+    }
+   ],
+   "content": null,
+   "encrypted_content": "gAAAAABo-opaque"
+  },
+  {
+   "type": "function_call",
+   "id": "fc_01",
+   "call_id": "call_01",
+   "name": "shell",
+   "arguments": "{\"command\":[\"cargo\",\"test\"],\"workdir\":\"/repo\"}"
+  },
+  {
+   "type": "function_call_output",
+   "call_id": "call_01",
+   "output": "test result: FAILED. 1 failed"
+  },
+  {
+   "type": "custom_tool_call",
+   "id": "ctc_01",
+   "call_id": "call_02",
+   "name": "apply_patch",
+   "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-    a - b\n+    a + b\n*** End Patch\n"
+  },
+  {
+   "type": "custom_tool_call_output",
+   "call_id": "call_02",
+   "output": "Success. Updated the following files:\nM src/lib.rs"
+  },
+  {
+   "type": "message",
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "Patched.",
+     "annotations": []
+    }
+   ]
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "name": "shell",
+   "description": "Runs a shell command",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "workdir": {
+      "type": "string"
+     },
+     "timeout_ms": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "custom",
+   "name": "apply_patch",
+   "description": "Edit files with a patch",
+   "format": {
+    "type": "grammar",
+    "syntax": "lark",
+    "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\n"
+   }
+  },
+  {
+   "type": "function",
+   "name": "update_plan",
+   "description": "Updates the plan",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "plan": {
+      "type": "array",
+      "items": {
+       "type": "object"
+      }
+     }
+    },
+    "required": [
+     "plan"
+    ]
+   }
+  }
+ ],
+ "tool_choice": "auto",
+ "parallel_tool_calls": false,
+ "reasoning": {
+  "effort": "medium",
+  "summary": "auto"
+ },
+ "store": false,
+ "stream": true,
+ "include": [
+  "reasoning.encrypted_content"
+ ],
+ "prompt_cache_key": "0199a6f2-codex-session",
+ "text": {
+  "verbosity": "medium"
+ }
+}

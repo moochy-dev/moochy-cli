@@ -12,6 +12,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = ts.check_call("bash", data);
     let _ = inspect::response_tool_calls(Dialect::AnthropicMessages, data);
     let _ = inspect::response_tool_calls(Dialect::OpenAiChat, data);
+    let _ = inspect::response_tool_calls(Dialect::OpenAiResponses, data);
     let _ = firewall::pdf_pages(data);
     if let Ok(s) = std::str::from_utf8(data) {
         let _ = inspect::scan_text(s);

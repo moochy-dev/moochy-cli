@@ -23,7 +23,8 @@ fn main() {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("x");
         let sse = name.ends_with(".sse");
         let openai = !(name.contains("anthropic") || name.contains("_msg_") || name.contains("claude"));
-        let sel = u8::from(openai);
+        let responses = f.to_string_lossy().contains("/responses/");
+        let sel = u8::from(openai) | if responses { 0x80 } else { 0 };
         let put = |target: &str, sel: u8, body: &[u8]| {
             let d = Path::new(&dir).join(target);
             std::fs::create_dir_all(&d).expect("mkdir");
