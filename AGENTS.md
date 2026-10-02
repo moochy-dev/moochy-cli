@@ -30,7 +30,7 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 ## 4. Go (`relay/`, `e2e/`)
 
-- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later).
+- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later), `github.com/yuin/goldmark` (+ its GFM table extension) only in `relay/internal/docsite` to render our own docs, raw HTML disabled.
 - `http.Server` with `ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`, `MaxHeaderBytes`; `http.MaxBytesReader` on every body; bounded queues; context deadlines everywhere. `go vet` and `-race` clean.
 - No content (prompts/outputs) ever written to the DB or logs. The Scheduler owns its state in one goroutine (docs/plan/04).
 
