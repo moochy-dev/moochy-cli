@@ -1,7 +1,7 @@
 //! Command line (CONTRACT §6): tiny `lexopt` parser, JSON event lines on stdout, exit codes
 //! 0 ok, 2 usage, 3 auth/approval refused, 4 network, 10 internal.
 
-use crate::config::{Home, RepoEntry, valid_slug};
+use crate::config::{Home, RepoEntry};
 use crate::keystore::{self, ProviderKey};
 use crate::node::{Keys, Node, WorkerParts};
 use crate::pb::local::{EnvRequest, JournalRequest, McpOpen, McpUp, PauseRequest, ShutdownRequest, StatusRequest, mcp_up};
@@ -20,6 +20,8 @@ pub(crate) const HELP: &str = "moochy: donate tokens to open source, and use tok
 Open-source client (Apache-2.0) · 100% free
 
 USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
+PROJECT: owner/name or github/owner/name (GitHub), gitlab/group[/subgroup…]/name (GitLab);
+         default: the github.com or gitlab.com `origin` remote of the current directory
 
 COMMANDS:
   login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless]
@@ -36,17 +38,17 @@ COMMANDS:
   status [--json]                 Connection, slots in use, donations available to your projects
   pause | resume                  Stop or restart donating from this device (works offline)
   journal [--follow]              Recent requests (never prompts or outputs)
-  env [--repo OWNER/NAME] [--json] [--rotate]
+  env [--repo PROJECT] [--json] [--rotate]
                                   Base URLs and a project token for your tools
-  mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
-  run [--repo OWNER/NAME] [--worktree DIR] [--allow-host HOST]... [--git-writable]
+  mcp [--repo PROJECT]            MCP server on stdio (needs `moochy up`)
+  run [--repo PROJECT] [--worktree DIR] [--allow-host HOST]... [--git-writable]
       [--unsafe-no-sandbox | --box-is-sandbox] -- <cmd>
                                   Run your coding agent in a sandbox wired to Moochy: it sees only
                                   this repository (secrets hidden) and reaches only Moochy. Tool
                                   calls from donated tokens reach only sandboxed agents.
                                   --box-is-sandbox: in a single-purpose cloud box without user
                                   namespaces or Landlock, the box itself is the sandbox
-  box token create [--repo OWNER/NAME] [--ttl 24h] [--cap $20] [--max-boxes 1]
+  box token create [--repo PROJECT] [--ttl 24h] [--cap $20] [--max-boxes 1]
                                   A token that lets cloud boxes (boat.dev, E2B, Daytona, Modal,
                                   Codespaces) use this project's donations: each box gets its own
                                   keys, its own monthly limit and expires with the token. Shown once
@@ -83,7 +85,7 @@ COMMANDS:
                                   firewall_level (safety checks: strict or paranoid),
                                   allow_unsandboxed_tools (owner/name list: tool calls reach
                                   agents outside `moochy run`; warned at every start)
-  connect <client> [--repo OWNER/NAME] [--write]
+  connect <client> [--repo PROJECT] [--write]
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
   report <task> [--reason TEXT]   Save signed evidence about a bad response
@@ -92,7 +94,7 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
-  donate --repo OWNER/NAME --cap $N [--yes]
+  donate --repo PROJECT --cap $N [--yes]
                                   Donate tokens to a project, up to $N a month (it starts once
                                   the project owner accepts you)
   donations [--json] | donations <pause|resume|stop> <id>
@@ -103,14 +105,18 @@ COMMANDS:
                                   with its own passphrase, that signs approvals, memberships and
                                   claims; only used by these commands, never by the app
   pending                         Requests waiting for your signature (maintainers)
-  accept <donor> --repo OWNER/NAME [--revoke] [--yes]
+  decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] [--yes]
+            | decisions accept <id>
+                                  Donors asking to donate to your projects, and what was decided
+                                  (who, when, how); accepting is signed with your passkey on the web
+  accept <donor> --repo PROJECT [--revoke] [--yes]
                                   Accept a donor for your project (--revoke removes them);
                                   `approve` is the same command
-  members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N | --cap-uusd N] [--yes]
+  members <add|remove> <user> --repo PROJECT [--device] [--cap $N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
-  claim <OWNER/NAME> [--yes]      Confirm you maintain a project, signed by your owner key
-                                  (also: claim --repo OWNER/NAME)
+  claim <PROJECT> [--yes]         Confirm you maintain a project, signed by your owner key
+                                  (also: claim --repo PROJECT)
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_ENROLL (cloud box enrollment token),
      MOOCHY_INSECURE_DEV=1 (development only)
@@ -262,7 +268,7 @@ fn run() -> Result<()> {
     let home = Home::resolve(o.home.clone())?;
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     // A cloud box (§17.1) has no owner powers and no donor role.
-    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "pending" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
+    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
         crate::boxes::refuse_on_box(&home.load()?, cmd)?;
     }
     match w.as_slice() {
@@ -328,6 +334,7 @@ fn run() -> Result<()> {
         // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
         ["donations", act, id] => crate::donations::action(&home, act, id),
+        ["decisions", rest @ ..] => decisions_cmd(&home, &o, rest),
         ["owner", "init"] => crate::owner::init(&home, false),
         ["owner", "trust", id] => crate::owner::trust(&home, id, o.has("yes")),
         ["owner", "rotate"] => crate::owner::init(&home, true),
@@ -413,6 +420,16 @@ fn logout(home: &Home, o: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// `moochy decisions …` (CONTRACT §16.6).
+fn decisions_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    match w {
+        [] => crate::decisions::list(home, repo_filter(o)?.as_deref(), o.has("json")),
+        ["refuse", id] => crate::decisions::refuse(home, id, o.reason.as_deref(), o.has("yes")),
+        ["accept", id] => crate::decisions::accept_link(home, id),
+        _ => Err(usage("decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] | decisions accept <id>")),
+    }
+}
+
 /// `moochy box …` (CONTRACT §17.1).
 fn box_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     match w {
@@ -427,22 +444,28 @@ fn box_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
 
 /// `--repo` as a filter (optional, checked).
 fn repo_filter(o: &Opts) -> Result<Option<String>> {
-    match &o.repo {
-        Some(r) if !valid_slug(r) => Err(usage("--repo must be owner/name")),
-        r => Ok(r.clone()),
-    }
+    o.repo.as_deref().map(canonical_repo).transpose()
+}
+
+const REPO_FORMS: &str = "owner/name, github/owner/name or gitlab/group[/subgroup…]/name";
+
+/// A `--repo` value in the link's canonical form (`owner/name` = GitHub, `gitlab/…`).
+fn canonical_repo(r: &str) -> Result<String> {
+    crate::config::canonical_slug(r).ok_or_else(|| usage(format!("--repo is {REPO_FORMS}")))
 }
 
 /// `moochy up` on a cloud box (§17.1): enroll with `MOOCHY_ENROLL` when this machine has no device
-/// yet (or its box binding is stale), then refuse to start a box that is expired, copied or forked.
+/// yet (or its box expired); refuse to start an expired box; hint when the machine-id changed.
 fn box_enroll(home: &Home, o: &Opts) -> Result<()> {
     let token = crate::boxes::enroll_token()?;
     let cfg = home.load()?;
     if token.is_none() && cfg.box_device.is_none() {
         return Ok(());
     }
-    let fp = crate::boxes::fingerprint()?;
-    if crate::boxes::plan(&cfg, token.is_some(), crate::util::now_ms(), Some(&fp))? == crate::boxes::Start::Run {
+    if crate::boxes::plan(&cfg, token.is_some(), crate::util::now_ms())? == crate::boxes::Start::Run {
+        if let Some(h) = cfg.box_device.as_ref().and_then(|b| crate::boxes::machine_hint(b, crate::boxes::fingerprint().as_deref())) {
+            eprintln!("moochy: note: {h}");
+        }
         return Ok(());
     }
     let Some(token) = token else { return Err(internal("enrollment without a token")) };
@@ -467,27 +490,26 @@ fn checked_relay(o: &Opts, saved: Option<&str>) -> Result<String> {
 }
 
 fn slug_or_detect(o: &Opts) -> Result<String> {
-    let slug = match &o.repo {
-        Some(r) => r.clone(),
-        None => detect_repo().ok_or_else(|| usage("--repo owner/name is required (no git remote found)"))?,
-    };
-    if !valid_slug(&slug) {
-        return Err(usage("--repo must be owner/name"));
+    match &o.repo {
+        Some(r) => canonical_repo(r),
+        None => detect_repo().ok_or_else(|| usage(format!("--repo is required (no github.com or gitlab.com `origin` remote here): {REPO_FORMS}"))),
     }
-    Ok(slug)
 }
 
-/// `owner/name` from the `origin` remote of the current git repository.
+/// The project of the `origin` remote of the current git repository: github.com and gitlab.com
+/// (nested groups) exactly; any other remote (a mirror, a bundle) by its last two path segments,
+/// as before (two segments = GitHub; the relay decides whether the project exists).
 fn detect_repo() -> Option<String> {
     let out = crate::util::command("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
     let url = String::from_utf8(out.stdout).ok()?;
+    if let Ok(p) = crate::button::parse_remote(&url) {
+        return crate::config::canonical_slug(&if p.provider == "gitlab" { format!("gitlab/{}", p.path) } else { p.path });
+    }
     let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let path = url.rsplit_once(':').map_or(url, |(_, p)| p);
     let mut parts = path.rsplit('/');
-    let name = parts.next()?;
-    let owner = parts.next()?;
-    let slug = format!("{owner}/{name}");
-    valid_slug(&slug).then_some(slug)
+    let (name, owner) = (parts.next()?, parts.next()?);
+    crate::config::canonical_slug(&format!("{owner}/{name}"))
 }
 
 /// `moochy run -- <cmd…>` (CONTRACT §15.1). Fails closed until `moochy-sandbox` is in the build.
@@ -601,10 +623,8 @@ fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     // Plan 07 and the web claim page: `moochy claim <owner/repo>` (positional, E84).
     if let ["claim", repo] = w {
-        if !valid_slug(repo) {
-            return Err(usage("claim <owner/name>"));
-        }
-        return crate::owner::sign(home, &repo.to_ascii_lowercase(), &["claim"], o.has("yes"), false, false, 0);
+        let slug = crate::config::canonical_slug(repo).ok_or_else(|| usage(format!("claim <project>: {REPO_FORMS}")))?;
+        return crate::owner::sign(home, &slug.to_ascii_lowercase(), &["claim"], o.has("yes"), false, false, 0);
     }
     let slug = slug_or_detect(o)?;
     crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))?;
@@ -819,8 +839,12 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if provider == "local" {
         let url = o.base_url.as_deref().ok_or_else(|| usage("keys add local needs --base-url http://127.0.0.1:PORT, or --url https://… for a remote GPU server"))?;
         // A remote GPU server over TLS (CONTRACT §17.3): vetted host, keystore header, pinned trust.
-        if let Ok(host) = moochy_worker::provider::remote_host_key(url) {
-            let r = crate::keycheck::Remote { host, ca_file: o.ca_file.clone(), cert_sha256: o.cert_sha256.clone(), auth_header: o.auth_header.clone(), confirm_host: o.confirm_host.clone() };
+        // An https loopback/LAN server with a pinned certificate or a keystore header takes the
+        // same path, minus the vetted list (it needs none).
+        let pinned = url.starts_with("https://") && (o.ca_file.is_some() || o.cert_sha256.is_some() || o.auth_header.is_some() || o.confirm_host.is_some());
+        let vetted = moochy_worker::provider::remote_host_key(url).ok();
+        if let Some(host) = vetted.clone().or_else(|| pinned.then(|| crate::keycheck::origin_host(url)).flatten()) {
+            let r = crate::keycheck::Remote { host, vetted: vetted.is_some(), ca_file: o.ca_file.clone(), cert_sha256: o.cert_sha256.clone(), auth_header: o.auth_header.clone(), confirm_host: o.confirm_host.clone() };
             return crate::keycheck::add_remote(home, url, &r, o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
         }
         return crate::keycheck::add_local(home, o.base_url.as_deref(), o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
@@ -879,10 +903,20 @@ fn button(o: &Opts, rest: &[&str]) -> Result<()> {
         (true, ["github"]) => Some("github"),
         (true, ["gitlab"]) => Some("gitlab"),
         (false, []) => None,
-        _ => return Err(usage("button [--repo owner/name] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
+        _ => return Err(usage("button [--repo PROJECT] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
     };
     let project = if let Some(r) = &o.repo {
-        crate::button::project(provider.unwrap_or("github"), r)?
+        // `--provider gitlab --repo group/name`, or a provider-qualified `--repo`.
+        match provider {
+            Some(p) if !r.starts_with("github/") && !r.starts_with("gitlab/") => crate::button::project(p, r)?,
+            _ => {
+                let pr = crate::button::from_slug(r)?;
+                if provider.is_some_and(|x| x != pr.provider) {
+                    return Err(usage(format!("--repo names a {} project, not {}", pr.provider, provider.unwrap_or_default())));
+                }
+                pr
+            }
+        }
     } else {
         {
             let out = crate::util::command("git").args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().map_err(|e| usage(format!("git: {e}")))?;
@@ -981,7 +1015,7 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
     // The background process never sees the owner passphrase (CONTRACT §15.4, A190).
-    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE").env_remove(crate::boxes::ENROLL_ENV);
+    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE").env_remove(crate::boxes::ENROLL_ENV).env_remove("MOOCHY_ENROLL_FILE");
     if offline {
         cmd.arg("--offline");
     }

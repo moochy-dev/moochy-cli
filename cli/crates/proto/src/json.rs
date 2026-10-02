@@ -36,6 +36,17 @@ pub fn parse_value(bytes: &[u8]) -> Result<serde_json::Value, Error> {
 fn integer_literals_fit_i64(b: &[u8]) -> Result<(), Error> {
     let (mut i, mut in_str, mut esc) = (0usize, false, false);
     while let Some(&c) = b.get(i) {
+        // Inside a string, skip 8 bytes at a time while none of them is `"` or `\` (SWAR); the
+        // byte-wise state machine below still handles every byte that matters, so the
+        // accepted/rejected set is exactly the same.
+        if in_str
+            && !esc
+            && let Some(w) = b.get(i..).and_then(<[u8]>::first_chunk::<8>)
+            && !has_quote_or_backslash(u64::from_le_bytes(*w))
+        {
+            i = i.saturating_add(8);
+            continue;
+        }
         if in_str {
             match (esc, c) {
                 (true, _) => esc = false,
@@ -59,6 +70,16 @@ fn integer_literals_fit_i64(b: &[u8]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Does any byte of `w` equal `"` (0x22) or `\` (0x5C)? Classic "has zero byte" bit trick on
+/// `w ^ broadcast(c)`; exact (no false negatives; a false positive only falls back to the
+/// byte-wise path).
+fn has_quote_or_backslash(w: u64) -> bool {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let zero = |x: u64| x.wrapping_sub(LO) & !x & HI != 0;
+    zero(w ^ (LO.wrapping_mul(0x22))) || zero(w ^ (LO.wrapping_mul(0x5C)))
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +148,74 @@ impl<'de> Visitor<'de> for Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-SWAR byte-at-a-time scan, kept as the reference for the differential test.
+    fn reference_scan(b: &[u8]) -> Result<(), Error> {
+        let (mut i, mut in_str, mut esc) = (0usize, false, false);
+        while let Some(&c) = b.get(i) {
+            if in_str {
+                match (esc, c) {
+                    (true, _) => esc = false,
+                    (false, b'\\') => esc = true,
+                    (false, b'"') => in_str = false,
+                    _ => {}
+                }
+                i += 1;
+            } else if c == b'"' {
+                in_str = true;
+                i += 1;
+            } else if c == b'-' || c.is_ascii_digit() {
+                let len = b[i..].iter().take_while(|x| x.is_ascii_digit() || b"+-.eE".contains(x)).count();
+                let tok = &b[i..i + len];
+                if !tok.iter().any(|x| b".eE".contains(x)) {
+                    std::str::from_utf8(tok).ok().and_then(|t| t.parse::<i64>().ok()).ok_or(Error::Json)?;
+                }
+                i += len.max(1);
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn swar_mask_exact() {
+        for pos in 0..8 {
+            for v in 0..=255u8 {
+                let mut w = [b'a'; 8];
+                w[pos] = v;
+                assert_eq!(has_quote_or_backslash(u64::from_le_bytes(w)), v == b'"' || v == b'\\', "byte {v:#x} at {pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn swar_scan_equals_reference() {
+        // Pseudo-random documents over an alphabet dense in the bytes that matter, so quotes,
+        // escapes and big integers land at every offset relative to the 8-byte windows.
+        let alpha = b"\"\\\"\\0123456789-9e.{}[]:, abcxyz\xc3\xa9";
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for len in 0..400usize {
+            for _ in 0..40 {
+                let doc: Vec<u8> = (0..len)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        alpha[usize::try_from(x % alpha.len() as u64).unwrap()]
+                    })
+                    .collect();
+                assert_eq!(integer_literals_fit_i64(&doc), reference_scan(&doc), "{}", String::from_utf8_lossy(&doc));
+            }
+        }
+        // Long strings with an escaped quote and a big integer right after an 8-byte window.
+        for pad in 0..24 {
+            let doc = format!(r#"{{"s":"{}\"x","n":99999999999999999999}}"#, "a".repeat(pad));
+            assert_eq!(integer_literals_fit_i64(doc.as_bytes()), Err(Error::Json));
+            let doc = format!(r#"{{"s":"{}\\","n":-9223372036854775808}}"#, "a".repeat(pad));
+            assert_eq!(integer_literals_fit_i64(doc.as_bytes()), Ok(()));
+        }
+    }
 
     #[test]
     fn rules() {

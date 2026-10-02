@@ -223,8 +223,8 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
 }
 
 /// A218: what the server itself (dialed directly, not through `node.sock`) says the project and
-/// the handle are. `Ok(None)`: the server does not answer lookups yet.
-fn lookup(cfg: &crate::config::Config, rt: &tokio::runtime::Runtime, slug: &str, who: Option<(&str, &str, &SignKey)>) -> Result<Option<LookupResponse>> {
+/// the handle are. Fails closed: no answer (including a server without Lookup) means no signature.
+fn lookup(cfg: &crate::config::Config, rt: &tokio::runtime::Runtime, slug: &str, who: Option<(&str, &str, &SignKey)>) -> Result<LookupResponse> {
     let relay = cfg.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
     let mut q = LookupRequest { repo_slug: slug.into(), ..LookupRequest::default() };
     if let Some((handle, me, key)) = who {
@@ -238,9 +238,10 @@ fn lookup(cfg: &crate::config::Config, rt: &tokio::runtime::Runtime, slug: &str,
     let call = async {
         let (ch, _) = crate::link::dial(cfg.ca_file.as_deref(), &crate::tls::Origin::parse(relay)?).await?;
         match crate::link::client(ch).lookup(q).await {
-            Ok(r) => Ok(Some(r.into_inner())),
-            // ponytail: accepted only until the relay serves Lookup; then UNIMPLEMENTED refuses too.
-            Err(s) if s.code() == tonic::Code::Unimplemented => Ok(None),
+            Ok(r) => Ok(r.into_inner()),
+            Err(s) if s.code() == tonic::Code::Unimplemented => {
+                Err(usage("refusing to sign: this Moochy server cannot confirm names (no Lookup); update the relay".to_owned()))
+            }
             Err(s) if s.code() == tonic::Code::NotFound => Err(usage(match who {
                 Some((h, ..)) => format!("refusing to sign: the server does not know {} as a donor or member of {} (or the project is not yours); use their pseudonym (ps_…) shown on the web", clean(h), clean(slug)),
                 None => format!("refusing to sign: the server knows no claimed project {}", clean(slug)),
@@ -376,14 +377,10 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
             (Some(_), None) => return Err(auth("not logged in: run `moochy login` first")),
             _ => None,
         };
-        match lookup(&cfg, &rt, slug, who)? {
-            Some(l) => {
-                check_lookup(&main, handle, &l)?;
-                let person = handle.map(|h| format!("; {} is {}", clean(h), clean(&l.pseudonym))).unwrap_or_default();
-                eprintln!("Checked with the Moochy server (not through the app): {} is {}{person}", clean(&l.repo_slug), clean(&l.repo_id));
-            }
-            None => eprintln!("WARNING: the Moochy server cannot check names yet (Lookup pending): compare the ids below with the web before you sign"),
-        }
+        let l = lookup(&cfg, &rt, slug, who)?;
+        check_lookup(&main, handle, &l)?;
+        let person = handle.map(|h| format!("; {} is {}", clean(h), clean(&l.pseudonym))).unwrap_or_default();
+        eprintln!("Checked with the Moochy server (not through the app): {} is {}{person}", clean(&l.repo_slug), clean(&l.repo_id));
     }
     if let Some((b, p)) = &claim {
         confirm(b, p, &signer, "", yes)?;

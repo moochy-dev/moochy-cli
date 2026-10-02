@@ -42,15 +42,14 @@ fn with_sandbox(unit: &str) -> Result<String> {
 pub fn user_unit(exe: &Path, home: Option<&Path>) -> Result<String> {
     let exe = plain_path(exe)?;
     let mut u = with_sandbox(USER_UNIT)?;
-    let (tail, run) = ("' %h/.local/bin/moochy", "exec \"$0\" up --foreground");
-    need(&u, tail)?;
-    need(&u, run)?;
+    let start = "ExecStart=%h/.local/bin/moochy up --foreground";
+    need(&u, start)?;
     let env_dir = if let Some(h) = home {
         let h = plain_path(h)?;
-        u = u.replacen(run, "exec \"$0\" --home \"$1\" up --foreground", 1).replacen(tail, &format!("' {exe} {h}"), 1);
+        u = u.replacen(start, &format!("ExecStart={exe} --home {h} up --foreground"), 1);
         h
     } else {
-        u = u.replacen(tail, &format!("' {exe}"), 1);
+        u = u.replacen(start, &format!("ExecStart={exe} up --foreground"), 1);
         "%h/.config/moochy".to_owned()
     };
     u = u.replacen("Type=exec\n", &format!("Type=exec\n# Optional, 0600: MOOCHY_PASSPHRASE=… for the file keystore.\nEnvironmentFile=-{env_dir}/service.env\n"), 1);
@@ -61,8 +60,8 @@ pub fn user_unit(exe: &Path, home: Option<&Path>) -> Result<String> {
 pub fn system_unit(exe: &Path) -> Result<String> {
     let exe = plain_path(exe)?;
     let u = with_sandbox(SYSTEM_UNIT)?;
-    need(&u, "' /usr/local/bin/moochy")?;
-    Ok(u.replacen("' /usr/local/bin/moochy", &format!("' {exe}"), 1))
+    need(&u, "ExecStart=/usr/local/bin/moochy ")?;
+    Ok(u.replacen("ExecStart=/usr/local/bin/moochy ", &format!("ExecStart={exe} "), 1))
 }
 
 /// The launchd agent: `__HOME__`, the binary, and `--home` when it is not the default.
@@ -169,17 +168,17 @@ mod tests {
     #[test]
     fn units_are_the_reviewed_files_with_substitutions() {
         let u = user_unit(Path::new("/usr/local/bin/moochy"), None).unwrap();
-        assert!(u.contains("exec \"$0\" up --foreground' /usr/local/bin/moochy\n"), "{u}");
+        assert!(u.contains("\nExecStart=/usr/local/bin/moochy up --foreground\n") && !u.contains("/bin/sh"), "{u}");
         assert!(u.contains("SystemCallFilter=@system-service @sandbox landlock_create_ruleset"));
         assert!(u.contains("EnvironmentFile=-%h/.config/moochy/service.env"));
         assert!(u.contains("NoNewPrivileges=yes") && u.contains("WantedBy=default.target"));
         let c = user_unit(Path::new("/opt/m/moochy"), Some(Path::new("/srv/mh"))).unwrap();
-        assert!(c.contains("exec \"$0\" --home \"$1\" up --foreground' /opt/m/moochy /srv/mh\n"), "{c}");
+        assert!(c.contains("\nExecStart=/opt/m/moochy --home /srv/mh up --foreground\n"), "{c}");
         assert!(c.contains("EnvironmentFile=-/srv/mh/service.env"));
         assert!(user_unit(Path::new("/a b/moochy"), None).is_err(), "no spaces in a unit line");
         assert!(user_unit(Path::new("/x/%h"), None).is_err(), "no systemd specifiers");
         let s = system_unit(Path::new("/usr/bin/moochy")).unwrap();
-        assert!(s.contains("' /usr/bin/moochy\n") && s.contains("User=moochy") && s.contains("CapabilityBoundingSet=") && s.contains("@sandbox"));
+        assert!(s.contains("\nExecStart=/usr/bin/moochy up --foreground\n") && s.contains("User=moochy") && s.contains("CapabilityBoundingSet=") && s.contains("@sandbox"));
         let p = agent_plist(Path::new("/opt/homebrew/bin/moochy"), Path::new("/Users/ann"), Some(Path::new("/Users/ann/mh"))).unwrap();
         assert!(p.contains("<string>/opt/homebrew/bin/moochy</string>") && p.contains("/Users/ann/Library/Logs/moochy.log") && !p.contains("__HOME__"));
         assert!(p.contains("<string>--home</string>\n\t\t<string>/Users/ann/mh</string>\n\t\t<string>up</string>"), "{p}");

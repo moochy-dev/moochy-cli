@@ -175,8 +175,15 @@ fn passphrase() -> Result<Zeroizing<String>> {
 /// `$CREDENTIALS_DIRECTORY/moochy-passphrase` (LoadCredential/LoadCredentialEncrypted).
 /// One trailing newline is dropped; at most 4 KiB is read.
 pub fn passphrase_source() -> Result<Option<Zeroizing<String>>> {
+    secret_source("MOOCHY_PASSPHRASE", "moochy-passphrase", "passphrase")
+}
+
+/// A secret from `$VAR`, else the owner-only file named by `$VAR_FILE`, else the systemd
+/// credential `cred` (`$CREDENTIALS_DIRECTORY/<cred>`). Used for the keystore passphrase and the
+/// box enrollment token (`MOOCHY_ENROLL`, credential `moochy-enroll`).
+pub fn secret_source(var: &str, cred: &str, what: &str) -> Result<Option<Zeroizing<String>>> {
     use std::io::Read as _;
-    if let Ok(p) = std::env::var("MOOCHY_PASSPHRASE").map(Zeroizing::new)
+    if let Ok(p) = std::env::var(var).map(Zeroizing::new)
         && !p.is_empty()
     {
         return Ok(Some(p));
@@ -190,25 +197,26 @@ pub fn passphrase_source() -> Result<Option<Zeroizing<String>>> {
         let md = f.metadata().map_err(|e| auth(format!("{}: {e}", path.display())))?;
         let mine = md.uid() == rustix::process::geteuid().as_raw();
         if !md.is_file() || (owner_only && (md.permissions().mode() & 0o077 != 0 || !mine)) {
-            return Err(auth(format!("{}: the passphrase file must be a regular file of yours, readable only by you (chmod 600)", path.display())));
+            return Err(auth(format!("{}: the {what} file must be a regular file of yours, readable only by you (chmod 600)", path.display())));
         }
         let mut raw = Zeroizing::new(Vec::new());
         f.take(4097).read_to_end(&mut raw).map_err(|e| auth(format!("{}: {e}", path.display())))?;
         if raw.len() > 4096 {
-            return Err(auth("the passphrase file is larger than 4 KiB"));
+            return Err(auth(format!("the {what} file is larger than 4 KiB")));
         }
-        let s = std::str::from_utf8(&raw).map_err(|_| auth("the passphrase file is not UTF-8"))?;
+        let s = std::str::from_utf8(&raw).map_err(|_| auth(format!("the {what} file is not UTF-8")))?;
         let s = s.strip_suffix('\n').map_or(s, |t| t.strip_suffix('\r').unwrap_or(t));
         Ok((!s.is_empty()).then(|| Zeroizing::new(s.to_owned())))
     };
-    if let Some(p) = std::env::var_os("MOOCHY_PASSPHRASE_FILE") {
+    let file_var = format!("{var}_FILE");
+    if let Some(p) = std::env::var_os(&file_var) {
         return match read(std::path::Path::new(&p), true)? {
             Some(s) => Ok(Some(s)),
-            None => Err(auth("MOOCHY_PASSPHRASE_FILE names no readable, non-empty file")),
+            None => Err(auth(format!("{file_var} names no readable, non-empty file"))),
         };
     }
     match std::env::var_os("CREDENTIALS_DIRECTORY") {
-        Some(d) => read(&std::path::Path::new(&d).join("moochy-passphrase"), false),
+        Some(d) => read(&std::path::Path::new(&d).join(cred), false),
         None => Ok(None),
     }
 }

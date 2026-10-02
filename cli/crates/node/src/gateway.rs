@@ -38,6 +38,9 @@ const DEFAULT_MAX_TOKENS: u64 = 4096;
 pub enum Body {
     Full(Option<Bytes>),
     Chan(mpsc::Receiver<Bytes>),
+    /// A streamed task, read straight from the task's channel (no forwarding task per request,
+    /// no second channel hop per chunk). Dropping it (client gone) cancels the task.
+    Task { rx: mpsc::Receiver<TaskEv>, dialect: Dialect, done: bool },
 }
 
 impl hyper::body::Body for Body {
@@ -47,10 +50,27 @@ impl hyper::body::Body for Body {
         match self.get_mut() {
             Body::Full(b) => Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
             Body::Chan(rx) => rx.poll_recv(cx).map(|o| o.map(|b| Ok(Frame::data(b)))),
+            Body::Task { rx, dialect, done } => loop {
+                if *done {
+                    return Poll::Ready(None);
+                }
+                return match std::task::ready!(rx.poll_recv(cx)) {
+                    Some(TaskEv::Bytes(b)) => Poll::Ready(Some(Ok(Frame::data(b)))),
+                    Some(TaskEv::Failed(f)) => {
+                        *done = true;
+                        Poll::Ready(Some(Ok(Frame::data(crate::native::sse_error(*dialect, &f)))))
+                    }
+                    Some(TaskEv::Started { .. }) => continue,
+                    Some(TaskEv::End { .. }) | None => {
+                        *done = true;
+                        Poll::Ready(None)
+                    }
+                };
+            },
         }
     }
     fn is_end_stream(&self) -> bool {
-        matches!(self, Body::Full(None))
+        matches!(self, Body::Full(None) | Body::Task { done: true, .. })
     }
 }
 
@@ -300,57 +320,77 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         crate::util::log("info", "removed what donors refuse", &json!({"stripped": pool.stripped}));
     }
     let (mut body, headers, stripped) = (if strip_body { Bytes::from(pool.body) } else { body }, pool.headers, pool.stripped);
-    // Strict tape parse (no tree allocation): this is the per-request hot path (CONTRACT §13).
+    // One strict tape parse (no tree allocation): the per-request hot path (CONTRACT §13).
     let mut tape = Vec::new();
-    let (inject_max, auto_cache) = {
+    let (entry, affinity, inject_max, auto_cache) = {
         let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
         let root = doc.root();
         if root.kind() != Kind::Obj {
             return Err(bad("moochy: the body must be a JSON object".into()));
         }
         let model = root.get("model").and_then(Val::as_str).ok_or_else(|| bad("moochy: `model` is required".into()))?;
-        let max_out = catalog_entry(node, &model)?.max_output;
+        let entry = catalog_entry(node, &model)?;
         let missing = root.get("max_tokens").is_none() && root.get("max_completion_tokens").is_none();
         // 07 §4.2 step 4: multi-turn Anthropic conversation with no cache_control anywhere →
         // top-level automatic caching (5 m): cache reads cost donors a fraction of input.
         let turns = root.get("messages").map_or(0, |m| m.items().count());
         // Both the repo setting and the local config must allow it.
         let cache = dialect == Dialect::Anthropic && turns >= 2 && node.cfg.auto_cache() && !body.windows(15).any(|w| w == b"\"cache_control\"") && node.repo_auto_cache(&slug);
-        (missing.then(|| u64::from(max_out).min(DEFAULT_MAX_TOKENS)), cache)
+        // Affinity key over system, tools and the first user message (04 §5), each re-serialized
+        // canonically (`Val::raw` is empty for objects and arrays, which made every key equal).
+        // The members injected below are top-level and change none of them.
+        let first = |role: &str| root.get("messages").and_then(|m| m.items().find(|x| x.get("role").is_some_and(|r| r.is_str(role))));
+        let system = match dialect {
+            Dialect::Anthropic => root.get("system"),
+            Dialect::OpenAi => first("system").or_else(|| first("developer")),
+        };
+        let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"), body.len());
+        let inject = missing.then(|| u64::from(entry.max_output).min(DEFAULT_MAX_TOKENS));
+        (entry, affinity, inject, cache)
     };
+    drop(tape);
     if inject_max.is_some() || auto_cache {
-        let mut m = crate::json::parse_object(&body).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
-        if let Some(n) = inject_max {
-            if !MAX_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                crate::util::log("warn", "request without max_tokens: injected the catalog default (told once)", &json!({"max_tokens": n}));
-            }
-            m.insert("max_tokens".into(), n.into());
+        if let Some(n) = inject_max
+            && !MAX_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            crate::util::log("warn", "request without max_tokens: injected the catalog default (told once)", &json!({"max_tokens": n}));
         }
+        let mut members = inject_max.map(|n| format!("\"max_tokens\":{n},")).unwrap_or_default();
         if auto_cache {
-            m.insert("cache_control".into(), json!({"type": "ephemeral"}));
+            members.push_str("\"cache_control\":{\"type\":\"ephemeral\"},");
         }
-        body = Bytes::from(Value::Object(m).to_string());
+        body = insert_members(&body, &members);
     }
-    let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
-    let root = doc.root();
-    let model = root.get("model").and_then(Val::as_str).ok_or_else(|| bad("moochy: `model` is required".into()))?;
-    let entry = catalog_entry(node, &model)?;
-    // Affinity key over system, tools and the first user message (04 §5), each re-serialized
-    // canonically (`Val::raw` is empty for objects and arrays, which made every key equal).
-    let first = |role: &str| root.get("messages").and_then(|m| m.items().find(|x| x.get("role").is_some_and(|r| r.is_str(role))));
-    let system = match dialect {
-        Dialect::Anthropic => root.get("system"),
-        Dialect::OpenAi => first("system").or_else(|| first("developer")),
-    };
-    let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
-    drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
     let pinned = node.cfg.pinned_donors.get(&slug.to_ascii_lowercase()).cloned().unwrap_or_default();
     Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, platform_sandboxed: false, stripped, pinned })
 }
 
-fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
-    let mut buf = Vec::new();
+/// Members (`"k":v,` each, comma-terminated) spliced in right after the opening `{` of a body
+/// already parsed as a JSON object without them: no tree parse and re-serialization of the
+/// whole body (it can be megabytes) to add two top-level members.
+fn insert_members(body: &[u8], members: &str) -> Bytes {
+    let open = body.iter().position(|c| *c == b'{').unwrap_or(0);
+    let rest = body.get(open.saturating_add(1)..).unwrap_or_default();
+    let empty = rest.iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'}');
+    let members = if empty { members.trim_end_matches(',') } else { members };
+    let mut out = Vec::with_capacity(body.len().saturating_add(members.len()));
+    out.extend_from_slice(body.get(..=open).unwrap_or_default());
+    out.extend_from_slice(members.as_bytes());
+    out.extend_from_slice(rest);
+    Bytes::from(out)
+}
+
+/// `cap`: an upper bound of the canonical bytes (the body length), so the one buffer never
+/// regrows (each regrowth copied everything written so far).
+fn affinity_key(
+    secrets: &crate::keystore::Secrets,
+    system: Option<moochy_worker::json::Val<'_>>,
+    tools: Option<moochy_worker::json::Val<'_>>,
+    user: Option<moochy_worker::json::Val<'_>>,
+    cap: usize,
+) -> [u8; 16] {
+    let mut buf = Vec::with_capacity(cap.saturating_add(64));
     let mut ends = [0usize; 3];
     for (end, v) in ends.iter_mut().zip([system, tools, user]) {
         if let Some(v) = v {
@@ -416,25 +456,7 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         _ => return native_error(dialect, &Failure::new("overloaded", true, "moochy: task ended before start".to_owned())),
     };
     let mut resp = if stream {
-        let (tx, brx) = mpsc::channel::<Bytes>(32);
-        tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    TaskEv::Bytes(b) => {
-                        if tx.send(b).await.is_err() {
-                            return; // client gone: dropping rx cancels the task
-                        }
-                    }
-                    TaskEv::Failed(f) => {
-                        let _ = tx.send(crate::native::sse_error(dialect, &f)).await;
-                        return;
-                    }
-                    TaskEv::End { .. } => return,
-                    TaskEv::Started { .. } => {}
-                }
-            }
-        });
-        let mut r = Response::new(Body::Chan(brx));
+        let mut r = Response::new(Body::Task { rx, dialect, done: false });
         r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
         r
@@ -502,7 +524,7 @@ mod affinity_tests {
         let doc = moochy_worker::json::parse(body.as_bytes(), &mut tape).unwrap();
         let root = doc.root();
         let user = root.get("messages").and_then(|m| m.items().next());
-        affinity_key(&crate::keystore::Secrets::default(), root.get("system"), root.get("tools"), user)
+        affinity_key(&crate::keystore::Secrets::default(), root.get("system"), root.get("tools"), user, 0)
     }
 
     #[test]
@@ -514,5 +536,62 @@ mod affinity_tests {
         let t1 = key(r#"{"tools":[{"name":"x"}],"messages":[{"role":"user","content":"p"}]}"#);
         let t2 = key(r#"{"tools":[{"name":"y"}],"messages":[{"role":"user","content":"p"}]}"#);
         assert_ne!(t1, t2, "tools must change the key");
+    }
+
+    /// `cargo test --release -p moochy -- --ignored --nocapture prepare_cost`: the auto-cache
+    /// injection (splice vs the former serde round-trip) and the affinity key on a large body.
+    #[test]
+    #[ignore = "bench"]
+    fn prepare_cost() {
+        let tools: Vec<serde_json::Value> = (0..400).map(|i| json!({"name": format!("tool{i}"), "description": "x".repeat(200), "input_schema": {"type": "object"}})).collect();
+        let msgs: Vec<serde_json::Value> = (0..40).map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": "y".repeat(2000)})).collect();
+        let body = json!({"model": "m", "system": "s".repeat(20_000), "tools": tools, "messages": msgs}).to_string();
+        let n = 50u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let mut m = crate::json::parse_object(body.as_bytes()).unwrap();
+            m.insert("cache_control".into(), json!({"type": "ephemeral"}));
+            std::hint::black_box(Value::Object(m).to_string());
+        }
+        let serde = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(insert_members(body.as_bytes(), r#""cache_control":{"type":"ephemeral"},"#));
+        }
+        let splice = t.elapsed() / n;
+        let mut tape = Vec::new();
+        let doc = moochy_worker::json::parse(body.as_bytes(), &mut tape).unwrap();
+        let root = doc.root();
+        let user = root.get("messages").and_then(|m| m.items().next());
+        let s = crate::keystore::Secrets::default();
+        let time = |cap: usize| {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(affinity_key(&s, root.get("system"), root.get("tools"), user, cap));
+            }
+            t.elapsed() / n
+        };
+        let (grow, sized) = (time(0), time(body.len()));
+        println!("body {} KB: inject serde {serde:?} → splice {splice:?}; affinity growing {grow:?} → presized {sized:?}", body.len() / 1024);
+    }
+
+    #[test]
+    fn injected_members_keep_the_body_valid_json() {
+        let m = r#""max_tokens":4096,"cache_control":{"type":"ephemeral"},"#;
+        for (body, want) in [
+            (r#"{"model":"m","messages":[]}"#, r#"{"max_tokens":4096,"cache_control":{"type":"ephemeral"},"model":"m","messages":[]}"#),
+            (" \n { } ", " "),
+            ("{}", r#"{"max_tokens":4096,"cache_control":{"type":"ephemeral"}}"#),
+        ] {
+            let out = insert_members(body.as_bytes(), m);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap_or_else(|e| panic!("{body:?}: {e}: {:?}", String::from_utf8_lossy(&out)));
+            assert_eq!(v["max_tokens"], 4096);
+            assert_eq!(v["cache_control"]["type"], "ephemeral");
+            if want.len() > 2 {
+                assert_eq!(String::from_utf8_lossy(&out), want);
+            }
+            let mut tape = Vec::new();
+            assert!(moochy_worker::json::parse(&out, &mut tape).is_ok(), "strict parser accepts it");
+        }
     }
 }

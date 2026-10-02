@@ -388,7 +388,7 @@ async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'stati
     }
     let Some(l) = node.link() else { return Ok(()) };
     let mut c = l.client.clone();
-    match timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest {}))).await {
+    match timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest::default()))).await {
         Ok(Ok(r)) => {
             *last = now_ms();
             *lock(&node.own_pledges) = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, d.status)).collect();

@@ -76,7 +76,11 @@ pub struct RepoEntry {
 
 pub const DEFAULT_GATEWAY_ADDR: &str = "127.0.0.1:0";
 /// The public relay's gRPC listener (CONTRACT §14b R2).
-pub const DEFAULT_RELAY: &str = "https://relay.moochy.dev:8443";
+/// The public relay (integrator decision 2026-10-02: the link is multiplexed with the web on 443),
+/// spelled as `tls::Origin::url` prints it.
+pub const DEFAULT_RELAY: &str = "https://relay.moochy.dev:443";
+/// The earlier default (gRPC on 8443): a saved config naming it moves to `DEFAULT_RELAY`.
+const LEGACY_DEFAULT_RELAY: &str = "https://relay.moochy.dev:8443";
 
 /// Short stable tag of a relay origin (file names, keychain entries).
 pub fn origin_tag(origin: &str) -> String {
@@ -137,7 +141,13 @@ impl Home {
 
     pub fn load(&self) -> Result<Config> {
         match fs::read(self.config_path()) {
-            Ok(b) => serde_json::from_slice(&b).map_err(|e| usage(format!("bad config.json: {e}"))),
+            Ok(b) => {
+                let mut c: Config = serde_json::from_slice(&b).map_err(|e| usage(format!("bad config.json: {e}")))?;
+                if c.relay.as_deref() == Some(LEGACY_DEFAULT_RELAY) {
+                    c.relay = Some(DEFAULT_RELAY.into());
+                }
+                Ok(c)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(crate::util::internal(format!("read config: {e}"))),
         }
@@ -277,16 +287,31 @@ fn parse_bool(key: &str, v: &str) -> Result<bool> {
     }
 }
 
-/// `owner/name` with conservative characters.
+/// One project path segment as the providers allow it (relay `project.validSegment`).
+fn valid_segment(p: &str) -> bool {
+    (1..=100).contains(&p.len())
+        && !p.starts_with(['.', '-'])
+        && !p.to_ascii_lowercase().ends_with(".git")
+        && !p.to_ascii_lowercase().ends_with(".atom")
+        && p.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+/// A project as `--repo` and the link name it (CONTRACT §9): `owner/name` or
+/// `github/owner/name` (GitHub; two segments always mean GitHub), `gitlab/group[/subgroup…]/name`
+/// (up to 20 group levels). Canonical form: `owner/name` for GitHub, `gitlab/…` for GitLab.
+pub fn canonical_slug(s: &str) -> Option<String> {
+    let segs: Vec<&str> = s.split('/').collect();
+    let ok = s.len() <= 300 && segs.iter().all(|p| valid_segment(p));
+    match segs.as_slice() {
+        [_, _] if ok => Some(s.to_owned()),
+        ["github", o, n] if ok => Some(format!("{o}/{n}")),
+        ["gitlab", rest @ ..] if ok && (2..=21).contains(&rest.len()) => Some(s.to_owned()),
+        _ => None,
+    }
+}
+
 pub fn valid_slug(s: &str) -> bool {
-    let ok = |p: &str| {
-        !p.is_empty()
-            && p.len() <= 100
-            && p != "."
-            && p != ".."
-            && p.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-    };
-    matches!(s.split_once('/'), Some((o, n)) if ok(o) && ok(n))
+    canonical_slug(s).is_some()
 }
 
 #[cfg(test)]
@@ -298,5 +323,14 @@ mod tests {
         assert!(!super::valid_slug("acme/../x"));
         assert!(!super::valid_slug("acme/.."));
         assert!(!super::valid_slug("a/b c"));
+        // Provider-qualified paths (CONTRACT §9).
+        let c = super::canonical_slug;
+        assert_eq!(c("github/acme/widget").as_deref(), Some("acme/widget"));
+        assert_eq!(c("github/docs").as_deref(), Some("github/docs"), "two segments: owner github, repo docs");
+        assert_eq!(c("gitlab/group/sub/project").as_deref(), Some("gitlab/group/sub/project"));
+        assert_eq!(c("gitlab/g/p").as_deref(), Some("gitlab/g/p"));
+        assert!(c("bitbucket/a/b").is_none() && c("acme/x/y").is_none() && c("gitlab/a/-/b").is_none() && c("a/b.git").is_none());
+        let deep = format!("gitlab/{}p", "g/".repeat(20));
+        assert!(c(&deep).is_some() && c(&format!("gitlab/g/{}", &deep[7..])).is_none(), "20 group levels at most");
     }
 }
