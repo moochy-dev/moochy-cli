@@ -12,7 +12,7 @@ out. No dependency on `moochy-proto`: the node does sealing, signing and the gRP
 | 3. (in-child) firewall + route/body consistency | `firewall::prepare(&Request{..})` → `Prepared{facts, body, headers}`; then `prepared.facts.check_route(dialect, &Route{..})`. `Reject::code.nack()` gives `("firewall", false)`, `("route_mismatch", false)` or `("model_unavailable", true)`; `reject.to_string()` is the sealed detail |
 | 4. local reservation | `Store::reserve(&Reservation{..})` → `Cap(_)` = NACK `local_cap` (retryable). In memory + written, **no fsync** (CONTRACT §13) |
 | 6. call the provider | `Adapter::send(dialect, prepared.body, &prepared.headers)` → `Response` once headers arrive (= `task.started`), or `Failure` (`failure.nack()`; `failure.body` = native error to seal) |
-| 7. stream | loop `response.next()` → forward each `Bytes` **as-is, immediately** (seal + send per chunk); `parser.feed(&chunk, sink)?.tool_ends > 0` → sign a progress checkpoint after this chunk |
+| 7. stream | loop `response.next()` → forward each `Bytes` **as-is, immediately** (seal + send per chunk); `parser.feed(&chunk, sink)?.tool_ends > 0` → sign a progress checkpoint after this chunk. `next()` never waits to batch, but returns every frame already received merged into one chunk (≤ 16 KiB), and yields once after a chunk so the link writer you just woke runs first (see *Per-chunk performance*) |
 | 8. end | `parser.finish()` → `Outcome{usage, model, id, complete, provider_error, forbidden, malformed, tail}`; build/sign the receipt → `Store::put_receipt(key, receipt_bytes, cost_uusd, now)` (settles + **fsync**) → `task.end` |
 | 9. cancel / link lost | drop the `Response` (h2 `RST_STREAM` / h1 socket closed: the provider stops at once), then `finish()` → `usage.estimated` if final usage never came |
 | NACK before the provider call | `Store::release(key)` |
@@ -262,3 +262,16 @@ A donor's own OpenAI-compatible server (Ollama `:11434`, LM Studio `:1234`, vLLM
 - **Tests:** `tests/local.rs` covers per-server usage, tool calls, lossless re-emission, the host-vetting table, adapter rules and the firewall.
 - **Live test:** `MOOCHY_LOCAL_SERVERS=… cargo test --test local -- --ignored` passes end to end against both servers (text and tool call).
 - **Fuzz:** `local_url` (7 M executions), plus `stream`, `reemit` and `firewall` with local seeds and `Provider::Local`; no crash.
+
+## Per-chunk performance (E22, CONTRACT §13)
+
+- **`Response::next()`:**
+  - Returns as soon as one provider frame is there, merged with every frame already buffered (≤ 16 KiB). A lone event still comes out alone (`paced_events_are_not_batched`).
+  - Then yields once on the next call. The task you woke with `tx.send` sits in tokio's LIFO slot, which other workers cannot steal, so without the yield a whole burst was read and sealed before the first link write.
+  - `http://` connections (dev fakes, local donors) are polled by the awaiting task: no connection task and no cross-thread wake per chunk.
+  - The idle timer is re-armed only when it fires.
+- **Measured costs (this box, release):**
+  - `StreamParser::feed`: 0.34 µs (Anthropic) / 0.65 µs (OpenAI) per event.
+  - `Reemitter::push`: 0.67 / 1.2 µs per event.
+  - `firewall::analyze` / `prepare` on the E22 100 KB body: 19 / 22 µs (SWAR string scan, 5 GB/s).
+- **Consumer tip:** do not add per-chunk work between `next()` and the send. Seal and send at once, or hand the chunk to the task that writes the socket directly.
