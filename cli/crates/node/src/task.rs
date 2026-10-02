@@ -531,10 +531,11 @@ impl Driver {
         let current = self.acc.as_ref().map(|a| u32::from(a.attempt));
         match m {
             submit_down::Msg::NeedWraps(n) => {
-                // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool
-                // (still approval-filtered), not the snapshot taken at submit (E27).
-                if let Some(p) = crate::node::lock(&self.node.pools).get(&self.repo_id) {
-                    self.pool = p.clone();
+                // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool,
+                // read through the key-log-filtered accessor (never the raw `node.pools`: the seal
+                // check runs at read time, A174/E43), not the snapshot taken at submit (E27).
+                if let Some(p) = self.pool.slug.clone().and_then(|s| self.node.pool_for(&s)).filter(|p| p.repo_id == self.repo_id) {
+                    self.pool = p;
                 }
                 let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
                 let w = wraps(&ws, &self.task, &self.route, &self.ck);
