@@ -127,34 +127,86 @@ pub fn apply(home: &Home, boot: &mut Boot, unsafe_no_lockdown: bool) -> Result<(
     p.connect_ports = provider_ports(&boot.secrets);
     let r = lockdown_self(&p).map_err(|e| internal(format!("cannot lock the background process down ({e}); run `moochy doctor`, or `moochy up --unsafe-no-lockdown` for debugging only")))?;
     boot.locked = !unsafe_no_lockdown;
-    // A223: Landlock network rules exist from ABI 4, socket/signal scoping from ABI 6; read the
-    // ABI rather than "fully enforced" (never true below the newest ABI, which made every
-    // current kernel look unprotected and hid real losses).
-    let landlock_net = r.landlock_fs && r.abi >= 4;
-    let landlock_scope = r.landlock_fs && r.abi >= 6;
-    // macOS has no Landlock: the lockdown is a Seatbelt profile (process-exec/fork denied, files
-    // and network limited), so there is nothing per-ABI to report or warn about (A223).
-    let sandbox = if cfg!(target_os = "macos") { "seatbelt" } else { "landlock+seccomp" };
-    let rep = json!({
-        "locked": !unsafe_no_lockdown,
-        "sandbox": sandbox,
-        "landlock_scope": landlock_scope,
-        "no_new_privs": r.no_new_privs,
-        "seccomp": r.seccomp,
-        "landlock_fs": r.landlock_fs,
-        "landlock_net": landlock_net,
-        "landlock_abi": r.abi,
-        "all_threads": r.all_threads,
-    });
+    // The zygote locks itself down before it forks anything, and Boot::load filled the warm set:
+    // a live pool means its cage was applied.
+    let validator = boot.validator.as_ref().map(|v| v.alive());
+    let rep = if cfg!(target_os = "macos") { seatbelt_status(&p, validator) } else { landlock_status(&r, unsafe_no_lockdown) };
     log(if unsafe_no_lockdown { "error" } else { "info" }, if unsafe_no_lockdown { "UNSAFE: background process NOT locked down (--unsafe-no-lockdown)" } else { "background process locked down" }, &rep);
-    if cfg!(target_os = "linux") && !unsafe_no_lockdown && !landlock_net {
+    if cfg!(target_os = "linux") && !unsafe_no_lockdown && rep.get("landlock_net") != Some(&json!(true)) {
         log("warn", "kernel without Landlock network rules (ABI < 4): outbound connections are not limited by moochy; use the systemd unit's RestrictAddressFamilies", &json!({"landlock_abi": r.abi}));
     }
-    if cfg!(target_os = "linux") && !unsafe_no_lockdown && !landlock_scope {
+    if cfg!(target_os = "linux") && !unsafe_no_lockdown && rep.get("landlock_scope") != Some(&json!(true)) {
         log("warn", "kernel without Landlock scoping (ABI < 6): abstract Unix sockets and signals are not confined by moochy", &json!({"landlock_abi": r.abi}));
+    }
+    if validator == Some(false) {
+        log("error", "request validator cage not applied: not donating until the app restarts", &json!({}));
     }
     record(home, &rep);
     Ok(())
+}
+
+/// Linux (A223): Landlock network rules exist from ABI 4, socket/signal scoping from ABI 6; read
+/// the ABI rather than "fully enforced" (never true below the newest ABI).
+fn landlock_status(r: &moochy_sandbox::LockdownReport, unsafe_no_lockdown: bool) -> serde_json::Value {
+    json!({
+        "locked": !unsafe_no_lockdown,
+        "sandbox": "landlock+seccomp",
+        "landlock_scope": r.landlock_fs && r.abi >= 6,
+        "no_new_privs": r.no_new_privs,
+        "seccomp": r.seccomp,
+        "landlock_fs": r.landlock_fs,
+        "landlock_net": r.landlock_fs && r.abi >= 4,
+        "landlock_abi": r.abi,
+        "all_threads": r.all_threads,
+    })
+}
+
+/// macOS (A223): no Landlock and no ABI. What was applied is the Seatbelt donor profile built from
+/// this policy (moochy-sandbox `donor_profile`: exec and fork denied, the state dir rw, the
+/// read-only paths, TCP out to 443, the relay and the provider ports, the gateway port in) and,
+/// for a worker, the validator zygote's cage.
+fn seatbelt_status(p: &moochy_sandbox::DonorPolicy, validator: Option<bool>) -> serde_json::Value {
+    let mut ports = vec![443, p.relay_port];
+    ports.extend(&p.connect_ports);
+    ports.sort_unstable();
+    ports.dedup();
+    let applied = !p.unsafe_no_lockdown;
+    json!({
+        "locked": applied,
+        "sandbox": "seatbelt",
+        "seatbelt_donor": if applied { "applied" } else { "not applied" },
+        "seatbelt_validator": match validator { Some(true) => "applied", Some(false) => "failed", None => "not a worker" },
+        "exec": if applied { "denied" } else { "allowed" },
+        "fork": if applied { "denied" } else { "allowed" },
+        "read_only_paths": p.ro_paths.len(),
+        "tcp_out": ports,
+        "tcp_in": p.gateway_port,
+    })
+}
+
+/// The `moochy doctor` lockdown line for a locked record (Linux fields on Linux, Seatbelt's on macOS).
+fn locked_line(r: &serde_json::Value) -> String {
+    let f = |k: &str| r.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    if f("sandbox") == "seatbelt" {
+        let ports: Vec<String> = f("tcp_out").as_array().map(|a| a.iter().map(ToString::to_string).collect()).unwrap_or_default();
+        format!(
+            "background process locked: Seatbelt donor profile {} (exec and fork denied; files: state dir + {} read-only path(s); network out: ports {}); validator cage: {}",
+            f("seatbelt_donor").as_str().unwrap_or("unknown"),
+            f("read_only_paths"),
+            ports.join(", "),
+            f("seatbelt_validator").as_str().unwrap_or("unknown")
+        )
+    } else {
+        format!(
+            "background process locked: seccomp {}, no_new_privs {}, Landlock fs {}, net {}, scope {}, ABI {}",
+            f("seccomp"),
+            f("no_new_privs"),
+            f("landlock_fs"),
+            f("landlock_net"),
+            f("landlock_scope"),
+            f("landlock_abi")
+        )
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -181,23 +233,8 @@ pub fn doctor(home: &Home, running: bool) -> Vec<(bool, &'static str, String)> {
     let rec = std::fs::read(home.state_dir().join("lockdown.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let f = |r: &serde_json::Value, k: &str| r.get(k).cloned().unwrap_or(serde_json::Value::Null);
     match rec.filter(|_| running) {
-        Some(r) if f(&r, "locked") == true => out.push((
-            true,
-            "lockdown",
-            if f(&r, "sandbox") == "seatbelt" {
-                "background process locked: Seatbelt profile (no exec or fork; files and network limited)".to_owned()
-            } else {
-                format!(
-                    "background process locked: seccomp {}, no_new_privs {}, Landlock fs {}, net {}, scope {}, ABI {}",
-                    f(&r, "seccomp"),
-                    f(&r, "no_new_privs"),
-                    f(&r, "landlock_fs"),
-                    f(&r, "landlock_net"),
-                    f(&r, "landlock_scope"),
-                    f(&r, "landlock_abi")
-                )
-            },
-        )),
+        // A failed validator cage on macOS is a failed check (the worker does not donate).
+        Some(r) if f(&r, "locked") == true => out.push((f(&r, "seatbelt_validator") != "failed", "lockdown", locked_line(&r))),
         Some(r) => {
             let reason = f(&r, "reason").as_str().unwrap_or("--unsafe-no-lockdown").to_owned();
             // Only the debug flag is a failure; the other skips are known, logged gaps.
@@ -230,6 +267,51 @@ fn host_support(out: &mut Vec<(bool, &'static str, String)>) {
 
 #[cfg(test)]
 mod tests {
+    fn policy() -> moochy_sandbox::DonorPolicy {
+        let mut p = moochy_sandbox::DonorPolicy::new("/tmp/s".into(), 8443);
+        p.connect_ports = vec![11434, 443];
+        p.ro_paths = vec!["/a".into(), "/b".into()];
+        p.gateway_port = Some(7777);
+        p
+    }
+
+    /// A223: macOS describes the Seatbelt profiles applied and never a Landlock field or ABI.
+    #[test]
+    fn seatbelt_status_has_no_landlock() {
+        let r = super::seatbelt_status(&policy(), Some(true));
+        let line = super::locked_line(&r);
+        assert!(!r.to_string().contains("landlock") && !line.contains("Landlock") && !line.contains("ABI"), "{r} / {line}");
+        assert_eq!(r["tcp_out"], serde_json::json!([443, 8443, 11434]));
+        assert_eq!(
+            line,
+            "background process locked: Seatbelt donor profile applied (exec and fork denied; files: state dir + 2 read-only path(s); network out: ports 443, 8443, 11434); validator cage: applied"
+        );
+        assert_eq!(super::seatbelt_status(&policy(), None)["seatbelt_validator"], "not a worker");
+        let mut off = policy();
+        off.unsafe_no_lockdown = true;
+        assert_eq!(super::seatbelt_status(&off, Some(false))["locked"], false);
+    }
+
+    /// Linux unchanged: the Landlock ABI decides net (≥ 4) and scope (≥ 6).
+    #[test]
+    fn landlock_status_reads_the_abi() {
+        let r = moochy_sandbox::LockdownReport { no_new_privs: true, seccomp: true, landlock_fs: true, landlock_net: None, all_threads: true, abi: 5 };
+        let s = super::landlock_status(&r, false);
+        assert_eq!((s["landlock_net"].clone(), s["landlock_scope"].clone()), (serde_json::json!(true), serde_json::json!(false)));
+        assert_eq!(super::locked_line(&s), "background process locked: seccomp true, no_new_privs true, Landlock fs true, net true, scope false, ABI 5");
+    }
+
+    /// The status each platform records: Seatbelt on macOS, Landlock elsewhere (run on the Mac too).
+    #[test]
+    fn platform_status() {
+        let r = moochy_sandbox::LockdownReport { landlock_fs: true, abi: 0, ..Default::default() };
+        let s = if cfg!(target_os = "macos") { super::seatbelt_status(&policy(), Some(true)) } else { super::landlock_status(&r, false) };
+        #[cfg(target_os = "macos")]
+        assert!(super::locked_line(&s).starts_with("background process locked: Seatbelt donor profile applied") && s.get("landlock_abi").is_none());
+        #[cfg(not(target_os = "macos"))]
+        assert!(super::locked_line(&s).contains("ABI 0") && s["sandbox"] == "landlock+seccomp");
+    }
+
     #[test]
     fn origin_ports() {
         use super::origin_port;
