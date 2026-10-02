@@ -41,6 +41,8 @@ pub struct TaskReq {
     pub t_client_rx: u64,
     /// §15.4: tool calls may reach this client (sandboxed run token or project opt-in).
     pub release_tools: bool,
+    /// What `firewall::pool_compatible` removed (shown to the client as a `[moochy]` note).
+    pub stripped: Vec<String>,
 }
 
 pub enum TaskEv {
@@ -82,11 +84,41 @@ pub struct Evidence {
     pub task: String,
     pub attempt: u32,
     pub worker_device: String,
+    /// The worker's signing key the receipt was verified with (for `moochy verify`).
+    pub worker_sign_pub: Option<[u8; 32]>,
     pub receipt: pb::SignedReceipt,
     pub checkpoints: Vec<pb::Checkpoint>,
     pub response: Vec<Bytes>,
     pub truncated: bool,
     pub s_resp: [u8; 32],
+}
+
+/// `moochy verify <receipt_ref>`: check a public receipt (projection) of a task this Gateway
+/// consumed: the donor's signature over it, that it commits to the signed receipt, and, with a
+/// pinned key log, that the signing key is a logged key of that donor device.
+pub fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
+    let want = crate::util::b64d(receipt_ref.strip_prefix("r_").unwrap_or(receipt_ref)).filter(|b| b.len() == 16).ok_or("not a receipt reference")?;
+    let ev = crate::node::lock(&node.evidence);
+    for e in ev.iter() {
+        let (Some(pk), Ok(psig)) = (e.worker_sign_pub, <[u8; 64]>::try_from(e.receipt.projection_sig.as_ref())) else { continue };
+        let Ok(p) = crypto::open_projection(&pk, &e.receipt.projection, &psig) else { continue };
+        if p.receipt_ref.0[..] != want[..] {
+            continue;
+        }
+        let sig = <[u8; 64]>::try_from(e.receipt.donor_sig.as_ref()).map_err(|_| "bad receipt signature")?;
+        crypto::open_receipt(&pk, &e.receipt.receipt, &sig).map_err(|_| "the receipt signature does not verify")?;
+        if p.receipt_sha256.0 != crypto::sha256(&e.receipt.receipt) {
+            return Err("the public receipt does not commit to the signed receipt".into());
+        }
+        let key_log = match node.keylog.as_ref().filter(|l| l.verified()) {
+            Some(l) if l.device_by_key(&pk).as_deref() == Some(e.worker_device.as_str()) => "logged",
+            Some(_) => return Err("the donor key is not in the public key log".into()),
+            None => "not checked (no key log pinned)",
+        };
+        return Ok(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": p.donor, "model": p.model,
+            "cost_uusd": p.cost_uusd, "day": p.day, "worker_device": e.worker_device, "key_log": key_log}));
+    }
+    Err("no receipt with this reference among this device's recent requests".into())
 }
 
 impl Evidence {
@@ -165,6 +197,25 @@ fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>) ->
     c.into_iter().take(MAX_WRAPS).cloned().collect()
 }
 
+/// §15.4 provider exclusion: never seal to a donor serving through an excluded provider.
+/// ponytail: pool workers do not say which provider serves each model yet, so a model that an
+/// excluded provider can also serve is refused outright (fail closed); filter per worker in
+/// `pick` once `PoolWorker` carries the provider.
+fn excluded_check(cat: &engine::Catalog, model: &str, excluded: &[String]) -> Result<(), Failure> {
+    if excluded.is_empty() {
+        return Ok(());
+    }
+    let hit: Vec<&str> = cat.entries.iter().filter(|e| e.model == model && excluded.iter().any(|x| x == &e.provider)).map(|e| e.provider.as_str()).collect();
+    if hit.is_empty() {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "forbidden",
+        false,
+        format!("moochy: this project does not accept donations through {} for `{model}`, and donors of that model cannot be told apart by provider yet", hit.join(", ")),
+    ))
+}
+
 fn wraps(ws: &[PoolWorker], task: &TaskId, route: &[u8], ck: &ContentKey) -> Vec<pb::Wrap> {
     ws.iter()
         .filter_map(|w| crypto::wrap(&w.enc_pub, task, route, ck).ok().map(|x| pb::Wrap { worker_device: w.worker_device.clone(), wrap: Bytes::copy_from_slice(&x) }))
@@ -188,6 +239,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
     let route = header.to_bytes().map_err(internal)?;
     let sticky = node.session_worker(&aff);
+    excluded_check(&node.catalog(), &req.entry.model, &pool.excluded_providers)?;
     let chosen = pick(&pool, req.dialect, &req.entry.model, sticky.as_deref());
     if chosen.is_empty() {
         return Err(Failure::new("model_not_in_pool", false, format!("moochy: no donor offers `{}` for {}", req.entry.model, req.slug)));
@@ -393,6 +445,7 @@ impl Driver {
             task: self.task_text.clone(),
             attempt: u32::from(a.attempt),
             worker_device: a.worker.worker_device.clone(),
+            worker_sign_pub: a.worker.sign_pub,
             receipt,
             checkpoints: std::mem::take(&mut self.checkpoints),
             response: std::mem::take(&mut self.resp),
@@ -694,6 +747,24 @@ fn usage_mismatch(u: &moochy_proto::msg::Usage, model: &str, entry: &CatalogEntr
 
 async fn emit(tx: &mpsc::Sender<TaskEv>, ev: TaskEv) -> Step {
     if tx.send(ev).await.is_err() { Step::Gone } else { Step::Continue }
+}
+
+#[cfg(test)]
+mod exclusion {
+    use super::*;
+
+    #[test]
+    fn excluded_providers_fail_closed() {
+        let stub = engine::Catalog::stub();
+        let mut cat = engine::Catalog { entries: stub.entries.clone(), ..engine::Catalog::default() };
+        let mut or = cat.entries[0].clone();
+        or.provider = "openrouter".into();
+        cat.entries.push(or);
+        let m = cat.entries[0].model.clone();
+        assert!(excluded_check(&cat, &m, &[]).is_ok());
+        assert!(excluded_check(&cat, &m, &["deepseek".into()]).is_ok());
+        assert!(excluded_check(&cat, &m, &["openrouter".into()]).is_err(), "an excluded provider can serve it");
+    }
 }
 
 #[cfg(test)]

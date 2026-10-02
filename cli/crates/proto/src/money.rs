@@ -62,9 +62,8 @@ fn mul(a: u64, b: u64) -> Result<u128, Error> {
 pub fn cost_uusd(c: &CatalogEntry, u: &Usage, fast: bool) -> Result<i64, Error> {
     match (c.provider.as_str(), u.provider_cost_uusd) {
         ("openrouter" | "xai", Some(pc)) if pc >= 0 => return Ok(pc),
-        ("xai", None) => {}
         ("openrouter", _) | (_, Some(_)) => return Err(Error::Malformed),
-        (_, None) => {}
+        (_, None) => {} // xAI without a reported cost, and every other provider: catalog prices
     }
     let sum = [
         mul(u.input, c.input)?,

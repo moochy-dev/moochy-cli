@@ -128,11 +128,19 @@ impl Pool {
         let mut byte = [0u8; 1];
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut anc = rustix::net::RecvAncillaryBuffer::new(&mut space);
-        rustix::net::recvmsg(&*ctl, &mut [IoSliceMut::new(&mut byte)], &mut anc, rustix::net::RecvFlags::CMSG_CLOEXEC)?;
+        // MSG_CMSG_CLOEXEC is Linux-only; elsewhere the flag is set right after the receive (the
+        // background process never execs after its lockdown, so the window is harmless).
+        #[cfg(target_os = "linux")]
+        let flags = rustix::net::RecvFlags::CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = rustix::net::RecvFlags::empty();
+        rustix::net::recvmsg(&*ctl, &mut [IoSliceMut::new(&mut byte)], &mut anc, flags)?;
         for m in anc.drain() {
             if let rustix::net::RecvAncillaryMessage::ScmRights(mut fds) = m
                 && let Some(fd) = fds.next()
             {
+                #[cfg(not(target_os = "linux"))]
+                rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
                 return Ok(UnixStream::from(fd));
             }
         }

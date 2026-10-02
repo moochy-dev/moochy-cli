@@ -131,7 +131,7 @@ pub struct PoolSync {
     #[prost(bool, tag = "9")]
     pub allow_unsandboxed_tools: bool,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolWorker {
     #[prost(string, tag = "1")]
     pub worker_device: ::prost::alloc::string::String,
@@ -156,6 +156,18 @@ pub struct PoolWorker {
     /// Ed25519 key of the worker device (verifies receipts, progress checkpoints)
     #[prost(bytes = "bytes", tag = "9")]
     pub sign_pub: ::prost::bytes::Bytes,
+    /// which provider serves each model on this worker (project provider exclusion, §15.4)
+    #[prost(message, repeated, tag = "10")]
+    pub served: ::prost::alloc::vec::Vec<ServedModel>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ServedModel {
+    /// public model id
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    /// anthropic | openai | openrouter | deepseek | xai | local
+    #[prost(string, tag = "2")]
+    pub provider: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkerOffer {
@@ -179,6 +191,9 @@ pub struct ModelOffer {
     /// 0-100
     #[prost(uint32, tag = "3")]
     pub rl_headroom: u32,
+    /// the donor's provider serving this model (anthropic | openai | openrouter | deepseek | xai | local)
+    #[prost(string, tag = "4")]
+    pub provider: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KnownTasks {
@@ -744,6 +759,24 @@ pub struct Donation {
     #[prost(int64, tag = "13")]
     pub created_at_ms: i64,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetDeviceCapRequest {
+    #[prost(string, tag = "1")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// device id or name of a member's device
+    #[prost(string, tag = "2")]
+    pub device: ::prost::alloc::string::String,
+    /// 0 removes the device cap (the member cap still applies)
+    #[prost(int64, tag = "3")]
+    pub cap_uusd_month: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetDeviceCapResponse {
+    #[prost(string, tag = "1")]
+    pub device_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub cap_uusd_month: i64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Role {
@@ -1106,6 +1139,31 @@ pub mod node_link_client {
                 .insert(GrpcMethod::new("moochy.v1.NodeLink", "DonationAction"));
             self.inner.unary(req, path, codec).await
         }
+        /// Owner sets a member device's monthly cap for one repo (`moochy members add --device --cap`).
+        pub async fn set_device_cap(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SetDeviceCapRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SetDeviceCapResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/SetDeviceCap",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "SetDeviceCap"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1197,6 +1255,14 @@ pub mod node_link_server {
             &self,
             request: tonic::Request<super::DonationActionRequest>,
         ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status>;
+        /// Owner sets a member device's monthly cap for one repo (`moochy members add --device --cap`).
+        async fn set_device_cap(
+            &self,
+            request: tonic::Request<super::SetDeviceCapRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SetDeviceCapResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct NodeLinkServer<T> {
@@ -1657,6 +1723,51 @@ pub mod node_link_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DonationActionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/SetDeviceCap" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetDeviceCapSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::SetDeviceCapRequest>
+                    for SetDeviceCapSvc<T> {
+                        type Response = super::SetDeviceCapResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SetDeviceCapRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::set_device_cap(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetDeviceCapSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

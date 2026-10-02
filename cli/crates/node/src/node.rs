@@ -59,6 +59,9 @@ pub struct RepoPool {
     pub workers: Vec<PoolWorker>,
     /// Repo setting `PoolSync.auto_cache` (07 §4.2).
     pub auto_cache: bool,
+    /// Repo settings (§15.4): providers never sealed to, and the unsandboxed-tools opt-in.
+    pub excluded_providers: Vec<String>,
+    pub allow_unsandboxed_tools: bool,
 }
 
 impl RepoPool {
@@ -329,7 +332,7 @@ impl Node {
             };
             w.dialects = vec!["anthropic.messages".into(), "openai.chat".into()];
             w.models = vec![STUB_MODEL.into()];
-            return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true });
+            return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true, ..RepoPool::default() });
         }
         let repo = lock(&self.pools).values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).map(|p| p.repo_id.clone())?;
         let p = self.sealable_pool(&repo)?;
@@ -393,6 +396,11 @@ impl Node {
                 p.slug = Some(v.repo_slug.to_ascii_lowercase());
             }
             p.auto_cache = v.auto_cache;
+            p.excluded_providers = v.excluded_providers.iter().take(16).filter(|x| plain_id(x)).cloned().collect();
+            if v.allow_unsandboxed_tools && !p.allow_unsandboxed_tools {
+                crate::util::log("warn", "this project lets tool calls from donated tokens reach agents outside `moochy run`", &serde_json::json!({"repo_id": v.repo_id}));
+            }
+            p.allow_unsandboxed_tools = v.allow_unsandboxed_tools;
             let before = p.models();
             if v.full {
                 p.workers.clear();

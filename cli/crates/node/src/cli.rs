@@ -38,7 +38,8 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
-  run [--repo OWNER/NAME] [--worktree DIR] [--unsafe-no-sandbox] -- <command> [args]
+  run [--repo OWNER/NAME] [--worktree DIR] [--allow-host HOST]... [--git-writable]
+      [--unsafe-no-sandbox] -- <cmd>
                                   Run your coding agent in a sandbox wired to Moochy: it sees only
                                   this repository (secrets hidden) and reaches only Moochy. Tool
                                   calls from donated tokens reach only sandboxed agents
@@ -60,8 +61,9 @@ COMMANDS:
   connect <client> [--repo OWNER/NAME] [--write]
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
-  verify <receipt_ref>            Check a public receipt: signed by the donor's logged device key
   report <task> [--reason TEXT]   Save signed evidence about a bad response
+  verify <receipt_ref>            Check a public receipt of your request: donor signature,
+                                  link to the signed receipt, public key log
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
@@ -138,6 +140,7 @@ struct Opts {
     log_key: Option<String>,
     models: Vec<String>,
     worktree: Option<PathBuf>,
+    allow_hosts: Vec<String>,
     config: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
@@ -164,6 +167,7 @@ fn parse() -> Result<Opts> {
             Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("model") => o.models.push(s(p.value().map_err(err)?)?),
@@ -174,7 +178,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["allow-unvetted-host", "headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -371,7 +375,15 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
         let st = crate::run::run_unsandboxed(&env, &cmd)?;
         std::process::exit(st.code().unwrap_or(1));
     }
-    let gw = crate::run::GatewayInfo { anthropic: r.anthropic_base_url, openai: r.openai_base_url, mcp: r.mcp_url, repo_token: r.token, state_dir: home.state_dir() };
+    let gw = crate::run::GatewayInfo {
+        anthropic: r.anthropic_base_url,
+        openai: r.openai_base_url,
+        mcp: r.mcp_url,
+        repo_token: r.token,
+        state_dir: home.state_dir(),
+        allow_hosts: o.allow_hosts.clone(),
+        git_writable: o.has("git-writable"),
+    };
     let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
     let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
     std::process::exit(code);

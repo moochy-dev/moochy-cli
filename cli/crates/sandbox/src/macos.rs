@@ -34,7 +34,7 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         eprintln!("moochy: WARNING --unsafe-no-sandbox: running WITHOUT a sandbox (debugging only).");
         let mut cmd = Command::new(program);
         cmd.args(args).current_dir(&spec.worktree);
-        apply_env(&mut cmd, spec, Path::new("/tmp"), &spec.worktree);
+        apply_env(&mut cmd, spec, Path::new("/tmp"), &spec.worktree, None);
         return Ok(code(cmd.status().map_err(Error::Exec)?));
     }
     let worktree = spec
@@ -48,7 +48,22 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
     let scratch = make_scratch()?;
     let home = scratch.join("home");
     std::fs::create_dir(&home).map_err(|e| setup("create scratch home", e))?;
-    let profile = maintainer_profile(spec, &worktree, &scan.masks, &scratch);
+    // `--allow-host`: the proxy on an ephemeral loopback port, the only one
+    // besides the gateway the profile lets the agent reach.
+    let proxy = if spec.allow_hosts.is_empty() {
+        None
+    } else {
+        let allow = crate::proxy::Allowlist::new(&spec.allow_hosts);
+        match allow.and_then(crate::proxy::Proxy::bind_loopback) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(e);
+            }
+        }
+    };
+    let proxy_port = proxy.as_ref().and_then(crate::proxy::Proxy::port);
+    let profile = maintainer_profile(spec, &worktree, &scan.masks, &scratch, proxy_port);
     let profile = match profile {
         Ok(p) => p,
         Err(e) => {
@@ -61,11 +76,12 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
     cmd.arg("-p").arg(&profile).arg("--").arg(program).args(args);
     cmd.current_dir(&worktree);
     cmd.env_clear();
-    apply_env(&mut cmd, spec, &scratch, &home);
+    apply_env(&mut cmd, spec, &scratch, &home, proxy_port);
     // Own session (no controlling terminal: no TIOCSTI into the user's shell,
     // A192) + rlimits, set between fork and exec.
     crate::sys_macos::session_and_limits(&mut cmd, &spec.limits);
     let status = supervise(&mut cmd, spec.limits.wall_seconds);
+    drop(proxy);
     let _ = std::fs::remove_dir_all(&scratch);
     crate::git::notice_if_changed(&worktree, &git_before);
     status
@@ -121,12 +137,21 @@ fn real(p: &Path) -> String {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
 }
 
-fn apply_env(cmd: &mut Command, spec: &Spec, scratch: &Path, home: &Path) {
+fn apply_env(cmd: &mut Command, spec: &Spec, scratch: &Path, home: &Path, proxy_port: Option<u16>) {
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     // A private home in the scratch dir: tools' creds/history never land in
     // the repo (A198), and the real home stays out of reach.
     cmd.env("HOME", home);
     cmd.env("TMPDIR", scratch);
+    if let Some(port) = proxy_port {
+        let url = format!("http://127.0.0.1:{port}");
+        for k in ["HTTPS_PROXY", "https_proxy"] {
+            cmd.env(k, &url);
+        }
+        for k in ["NO_PROXY", "no_proxy"] {
+            cmd.env(k, "127.0.0.1,localhost");
+        }
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -144,7 +169,13 @@ fn code(s: std::process::ExitStatus) -> i32 {
 /// Deny-by-default maintainer profile: read system paths, read-write the
 /// worktree + scratch, deny the masked secret files explicitly, network only to
 /// the gateway loopback port, no exec of setuid helpers, no mach services.
-pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::PathBuf], scratch: &Path) -> Result<String, Error> {
+pub fn maintainer_profile(
+    spec: &Spec,
+    worktree: &Path,
+    masks: &[std::path::PathBuf],
+    scratch: &Path,
+    proxy_port: Option<u16>,
+) -> Result<String, Error> {
     let wt = sbpl_quote(&worktree.to_string_lossy());
     let wt_re = regex_escape(&worktree.to_string_lossy())
         .ok_or(Error::Unsupported("worktree path has characters the macOS profile cannot express"))?;
@@ -178,7 +209,7 @@ pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::Path
         let _ = writeln!(p, "(allow file-read* file-write* (subpath {}))", sbpl_quote(&real(p2)));
     }
     // Network: the gateway only (loopback port and/or its Unix socket).
-    if let Some(port) = spec.gateway_loopback_port {
+    for port in spec.gateway_loopback_port.into_iter().chain(proxy_port) {
         let _ = writeln!(p, "(allow network-outbound (remote ip \"localhost:{port}\"))");
     }
     if let Some(sock) = &spec.gateway_socket {

@@ -20,6 +20,15 @@ use std::collections::BTreeMap;
 
 use crate::Error;
 
+/// `kexec_file_load`, missing from the `libc` crate on aarch64-musl (a release
+/// target). Numbers from the kernel's syscall tables.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const SYS_KEXEC_FILE_LOAD: i64 = 320;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) const SYS_KEXEC_FILE_LOAD: i64 = 294; // asm-generic
+#[cfg(target_env = "gnu")]
+const _: () = assert!(SYS_KEXEC_FILE_LOAD == libc::SYS_kexec_file_load);
+
 // ioctl requests that inject into a terminal; compared as 32-bit (low word).
 const TIOCSTI: u64 = 0x5412;
 const TIOCLINUX: u64 = 0x541C;
@@ -98,7 +107,7 @@ fn deny_common() -> Result<BTreeMap<i64, Vec<SeccompRule>>, Error> {
         libc::SYS_perf_event_open,
         libc::SYS_userfaultfd,
         libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
+        SYS_KEXEC_FILE_LOAD,
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,

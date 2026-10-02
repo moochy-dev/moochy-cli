@@ -189,7 +189,14 @@ impl LocalControl for Ctl {
     }
 
     async fn verify(&self, r: Request<VerifyRequest>) -> std::result::Result<Response<VerifyResponse>, Status> {
-        let v = crate::keylog::verify_ref(&self.node, &r.into_inner().receipt_ref).await.map_err(Status::failed_precondition)?;
+        let r = r.into_inner().receipt_ref;
+        // A receipt of this device's own request: checked from local evidence (also its
+        // commitment to the signed receipt); any other public receipt: fetched from the relay
+        // and checked against the key log.
+        let v = match crate::task::verify(&self.node, &r) {
+            Ok(v) => v,
+            Err(_) => crate::keylog::verify_ref(&self.node, &r).await.map_err(Status::failed_precondition)?,
+        };
         Ok(Response::new(VerifyResponse { result_json: v.to_string() }))
     }
 

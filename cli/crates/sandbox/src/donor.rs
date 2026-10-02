@@ -3,6 +3,7 @@
 //! the only hostile bytes ([`spawn_validator`]).
 
 use std::os::unix::io::{AsRawFd as _, RawFd};
+use std::path::PathBuf;
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, RestrictSelfAttr, Ruleset,
@@ -23,7 +24,10 @@ fn ll(what: &'static str, e: landlock::RulesetError) -> Error {
 
 /// Highest Landlock ABI this build negotiates against. The crate clamps to what
 /// the running kernel supports (best-effort), so this is just a ceiling.
-const ABI_CEIL: ABI = ABI::V5;
+// V9 (Linux 7.1) adds `ResolveUnix`: with it the donor can connect() only to
+// UNIX sockets in its state dir and the resolver's (no docker.sock, no D-Bus).
+// Negotiated best-effort; DESIGN.md "Landlock ABI".
+const ABI_CEIL: ABI = ABI::V9;
 
 /// CONTRACT §15.2a.
 pub fn lockdown_self(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
@@ -97,6 +101,13 @@ fn build_landlock(policy: &DonorPolicy) -> Result<LockdownReport, Error> {
             AccessFs::from_read(abi),
         ))
         .map_err(|e| ll("landlock ro rule", e))?;
+    // systemd-resolved's varlink socket (nss-resolve): read + connect (ABI ≥ 9).
+    let created = created
+        .add_rules(path_beneath_rules(
+            [PathBuf::from("/run/systemd/resolve")].into_iter().filter(|p| p.is_dir()),
+            AccessFs::from_read(abi) | AccessFs::ResolveUnix,
+        ))
+        .map_err(|e| ll("landlock resolver socket rule", e))?;
 
     // Outbound TCP: providers (443), the relay port, DNS. Bind: the loopback
     // gateway port (§15.4). Everything else is refused.
