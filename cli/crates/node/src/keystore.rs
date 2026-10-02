@@ -62,6 +62,20 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[zeroize(skip)]
     pub served_ids: Vec<String>,
+    /// `local` over TLS (CONTRACT §17.3): the `host:port` the donor confirmed is their server
+    /// (`provider::remote_host_key`). In the keystore, not the plain config: it is authenticated
+    /// with the keys, so nobody can add a host behind the donor's back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub remote_host: Option<String>,
+    /// Certificate check of a remote server: `roots`, `ca:<base64url DER>`, `sha256:<hex>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub trust: Option<String>,
+    /// When set, `key` is the value of this header (e.g. `x-api-key`), not a Bearer API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub auth_header: Option<String>,
 }
 
 impl DeviceKeys {

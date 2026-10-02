@@ -36,7 +36,7 @@ fn stty(t: &std::fs::File, arg: &str) {
     }
 }
 
-fn ask(prompt: &str, hidden: bool) -> Result<Zeroizing<String>> {
+pub(crate) fn ask(prompt: &str, hidden: bool) -> Result<Zeroizing<String>> {
     let mut t = tty()?;
     let _ = write!(t, "{prompt}");
     if hidden {
