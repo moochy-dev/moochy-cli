@@ -170,7 +170,10 @@ fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -
         Some(Some(k)) => eprintln!("Owner key {id} is in the public key log at #{}: {}.", k.idx, proof_text(k.proof)),
         _ => eprintln!("Owner key {id} is in the public key log at #{} (`moochy owner status` shows how it was bound once this machine's copy of the log has it).", r.log_index),
     }
-    if prev.is_none() && row.is_some_and(|k| k.is_some_and(|k| k.proof == OwnerKeyProof::None)) {
+    // A224: unless this machine's log shows the proof, the residual is said plainly.
+    let proven = matches!(row, Some(Some(k)) if k.proof != OwnerKeyProof::None);
+    if prev.is_none() && !proven {
+        eprintln!("Unless the server bound it with your confirmed email, it took this key on this device's word alone (trust on first use).");
         eprintln!("Check on moochy.dev that your account lists exactly this owner key; your other devices alert on any owner key they did not see created.");
     }
     crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": id, "log_index": r.log_index, "first": prev.is_none(), "proof": proof}));
