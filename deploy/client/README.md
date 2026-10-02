@@ -59,7 +59,11 @@ Every script takes `--dry-run`. After `cli/Cargo.lock` changes: `cargo vet regen
 
 ## Ubuntu 23.10+ (AppArmor user-namespace restriction)
 
-`moochy run` needs unprivileged user namespaces: install `apparmor/moochy` with `sudo install -m 0644 deploy/client/apparmor/moochy /etc/apparmor.d/moochy && sudo apparmor_parser -r /etc/apparmor.d/moochy` (grants `userns` to `/usr/{,local/}bin/moochy` only; `moochy doctor` prints the same fix for the actual binary path).
+`moochy run` needs unprivileged user namespaces. Where `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 23.10+), `apparmor/moochy` grants `userns` to `/usr/bin/moochy` and `/usr/local/bin/moochy` only, and confines nothing else. Never widen it to a user-writable path (`~/.local/bin`, `~/.cargo/bin`): any program of that user could put itself there and obtain the right. `moochy doctor` and a refused `moochy run` print the same fix for the binary actually running, and tell the user to install it system-wide first when its path is writable by them.
+
+- **.deb** (when one is built; cargo-dist does not make them). Binary at `/usr/bin/moochy`. Ship `apparmor/moochy` as the conffile `/etc/apparmor.d/moochy`, only in packages for series with AppArmor ≥ 4.0 (24.04+; the `abi <abi/4.0>` / `userns` syntax does not parse on 22.04, which has no restriction anyway). `postinst configure`: `if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && aa-enabled --quiet 2>/dev/null; then apparmor_parser -r -T -W /etc/apparmor.d/moochy || true; fi` (`dh_apparmor --profile-name=moochy` generates the equivalent). `prerm remove`: `apparmor_parser -R /etc/apparmor.d/moochy 2>/dev/null || true`. dpkg removes the conffile on purge.
+- **Tarball / shell installer** (installs to `~/.local/bin`: user-writable, so not covered on purpose). For `moochy run` on such hosts, install system-wide from the extracted archive: `sudo install -m 0755 moochy /usr/local/bin/moochy && sudo install -m 0644 apparmor/moochy /etc/apparmor.d/moochy && sudo apparmor_parser -r /etc/apparmor.d/moochy`, and run `/usr/local/bin/moochy` (put it first in `PATH` or remove the `~/.local/bin` copy). The Linux archives therefore carry the profile as `apparmor/moochy` (dist `include`).
+- **Check:** `moochy doctor` shows `ok sandbox`; `aa-status | grep moochy` lists the profile.
 
 ## Headless donor container
 

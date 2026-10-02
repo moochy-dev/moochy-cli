@@ -23,13 +23,14 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 - gRPC: `tonic` (no default TLS features; our own `tokio-rustls` connector for channel binding) + `prost`; generated code committed, never built from `.proto` at compile time.
 - Crypto and TLS: `rustls` (ring provider), `ed25519-zebra` (ZIP-215), `x25519-dalek`, `hpke`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize` on every secret, `subtle` for every token/MAC comparison. No OpenSSL. No home-made crypto.
 - Dependency budget: every new crate must justify itself in the commit message; prefer `default-features = false`. Commit `Cargo.lock`. Target: release binary ≤ 15 MB, idle RSS ≤ 20 MB.
+- The client ships on Linux AND macOS: before you report, also run `cargo check --target aarch64-apple-darwin -p moochy-sandbox -p moochy-worker -p moochy-keylog` for the crates you touched among those (the target is installed on the box; crates with C dependencies — node, proto via zstd/ring — cannot be cross-checked here). Linux-only APIs (MSG_CMSG_CLOEXEC, memfd, openat2, prctl, …) need a `cfg` and a macOS path. The integrator builds and runs everything on a real Mac.
 - Every external input is hostile: lengths bounded before allocation, JSON parsed into typed structs with `deny_unknown_fields` where the contract says so, timeouts on every network operation.
 
 **Responsiveness is a hard requirement** (CONTRACT §13 budgets, measured by E22): flush every chunk immediately, `TCP_NODELAY`, warm connections, no avoidable allocation or lock per chunk, no fsync in the per-chunk path.
 
 ## 4. Go (`relay/`, `e2e/`)
 
-- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later).
+- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later), `github.com/yuin/goldmark` (+ its GFM table extension) only in `relay/internal/docsite` to render our own docs, raw HTML disabled.
 - `http.Server` with `ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`, `MaxHeaderBytes`; `http.MaxBytesReader` on every body; bounded queues; context deadlines everywhere. `go vet` and `-race` clean.
 - No content (prompts/outputs) ever written to the DB or logs. The Scheduler owns its state in one goroutine (docs/plan/04).
 
@@ -37,11 +38,12 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 - Read `docs/plan/06-security-and-trust.md`. Every mitigation listed there for your component is in scope.
 - `docs/security/attack-catalog.md` (owned by `mo-sec`) is the running list of attacks with their counter-measure and the E2E scenario that proves it. When it exists, check your component against it.
+- `security@moochy.dev` (in SECURITY.md) is confirmed by the product owner but NOT live yet: never send to it, test it, look it up, or configure anything for it; leave the text as it is.
 - Fail closed: on any doubt (bad signature, unknown field, oversize, wrong state) refuse with a specific code, never "best effort".
 
 ## 6. Web palette (fixed)
 
-Strictly monochrome from three base colors — Ink (dark), Paper (white), Sky (light blue) — and named variants derived from them; no gradients, glows, glass, sheen, constellations, cursor effects or scroll-jacking (CONTRACT §9, product owner review 2026-10-01). Calm, editorial, product-grade; a pet mascot as the brand mark; subtle functional motion only.
+Playful, warm and alive (CONTRACT §9, product owner 2026-10-02, supersedes strict monochrome): Ink/Paper/Sky base + the mascot's warm palette (Apricot, Blush) + Mint/Sun/Coral signals as named tokens; color-blocked sections and illustrations welcome; a living mascot and a real motion system (scroll-driven reveals, View Transitions, live micro-interactions). Still banned: purple/blue neon gradients and glows, glassmorphism, particles, shimmer text, scroll-jacking. Always: WCAG AA, `prefers-reduced-motion`, no-JS works, transform/opacity only, §13 budgets.
 
 ## 7. Final report (always, even when blocked)
 

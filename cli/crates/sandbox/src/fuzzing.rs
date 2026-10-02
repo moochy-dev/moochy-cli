@@ -79,7 +79,7 @@ mod bpf {
         libc::SYS_perf_event_open,
         libc::SYS_userfaultfd,
         libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
+        crate::seccomp::SYS_KEXEC_FILE_LOAD,
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,

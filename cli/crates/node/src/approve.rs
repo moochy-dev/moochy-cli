@@ -1,16 +1,18 @@
-//! Owner signatures for the key log (plan 06 §5, §10): donor approvals, memberships, repo claims.
+//! Owner signatures for the key log (plan 06 §5, §10; CONTRACT §15.4; spec/KEYLOG.md §4).
 //!
-//! The relay pushes `ApprovalRequests`; the Node keeps them and signs one **only** on an explicit
-//! `moochy approve` / `members add|remove` / `claim`, after decoding `body_to_sign` and checking
-//! that it says what the request claims (repo, subject, this device as signer, a sane timestamp).
-//! Formats follow the key-log spec (`moochy-keylog` `grant_body` / `claim_body` / `sig_message`);
-//! switch to that crate's functions once it is on main.
+//! The relay pushes `ApprovalRequests`; the Node keeps them and shows them (`moochy pending`,
+//! dry-run previews). It never signs them: approvals, memberships and claims are signed with the
+//! user's **owner key** by the foreground CLI (`owner.rs`) after the human confirmed, and the
+//! Node only relays the signed entry over its session (`SubmitEntry`). Even a fully compromised
+//! background process cannot approve a donor (A183).
 
 use crate::node::{Node, lock};
 use crate::pb::link::{ApprovalRequest, ApprovalRequests, LogEntryAck, NodeMsg, SignedLogEntry, node_msg};
-use crate::pb::local::SignResponse;
+use crate::pb::local::{SignResponse, SubmitEntryRequest};
 use crate::util::{clean, log, now_ms};
 use bytes::Bytes;
+use moochy_keylog::entry::{Body, parse_body};
+use moochy_keylog::Kind;
 use serde_json::json;
 use std::time::Duration;
 use tonic::Status;
@@ -43,39 +45,25 @@ pub fn on_ack(node: &Node, a: LogEntryAck) {
     }
 }
 
-/// Split an `lp(...)` byte string into exactly `n` fields.
-fn split_lp(mut b: &[u8], n: usize) -> Option<Vec<&[u8]>> {
-    let mut out = Vec::with_capacity(n);
-    while !b.is_empty() {
-        let (len, rest) = b.split_first_chunk::<4>()?;
-        let len = usize::try_from(u32::from_be_bytes(*len)).ok()?;
-        let (f, rest) = rest.split_at_checked(len)?;
-        out.push(f);
-        b = rest;
-    }
-    (out.len() == n).then_some(out)
-}
-
-fn text(b: &[u8]) -> Option<String> {
-    let s = std::str::from_utf8(b).ok()?;
-    s.bytes().all(|c| c.is_ascii_graphic()).then(|| s.to_owned())
-}
-
-/// Decode and check a request's body against the request and this device. `Err` = refuse to sign.
-fn decode(q: &ApprovalRequest, me: &str) -> Result<SignResponse, String> {
-    let claim = q.kind == "REPO_CLAIMED";
-    let f = split_lp(&q.body_to_sign, if claim { 6 } else { 4 }).ok_or("body is not the expected key-log format")?;
-    let get = |i: usize| f.get(i).and_then(|b| text(b)).ok_or("body field is not printable ASCII");
-    let repo_id = get(0)?;
-    let (subject, signer, ts) = if claim { (get(3)?, get(4)?, f.get(5)) } else { (get(1)?, get(2)?, f.get(3)) };
-    let ts = ts.and_then(|b| <[u8; 8]>::try_from(*b).ok()).map(u64::from_be_bytes).ok_or("bad timestamp")?;
+/// Decode and check a relay-proposed body against the request. `Err` = never offer it. The signer
+/// and timestamp are rebuilt by the CLI with the owner key (KEYLOG §5), so only what the human
+/// approves is checked here: repository and subject, both mandatory (A183).
+fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String> {
+    let kind = Kind::from_name(&q.kind).filter(|k| kind_num(k.name()).is_some()).ok_or("unknown entry kind")?;
+    let (repo_id, subject, signer, ts) = match parse_body(kind, &q.body_to_sign).map_err(|_| "body is not the expected key-log format")? {
+        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (repo_id, owner, signer, issued_at_ms),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } => (repo_id, subject, signer, issued_at_ms),
+        _ => return Err("body does not match its kind".into()),
+    };
     if repo_id != q.repo_id {
         return Err("body names another repository than the request".into());
     }
-    if signer != me {
-        return Err("body names another signer than this device".into());
-    }
-    if !claim && !q.subject_pseudonym.is_empty() && subject != q.subject_pseudonym {
+    if kind == Kind::RepoClaimed {
+        // A claim names its owner: it must be this user.
+        if me.is_none_or(|m| m != subject) {
+            return Err("claim names another owner than this account".into());
+        }
+    } else if q.subject_pseudonym.is_empty() || subject != q.subject_pseudonym {
         return Err("body names another subject than the request".into());
     }
     if ts.abs_diff(now_ms()) > MAX_SKEW_MS {
@@ -84,50 +72,88 @@ fn decode(q: &ApprovalRequest, me: &str) -> Result<SignResponse, String> {
     Ok(SignResponse {
         request_id: q.request_id.clone(),
         kind: q.kind.clone(),
-        repo_id,
+        repo_id: repo_id.to_owned(),
         repo_slug: clean(&q.repo_slug).into_owned(),
-        subject,
+        subject: subject.to_owned(),
         subject_username: clean(&q.subject_username).into_owned(),
-        signer,
+        signer: signer.to_owned(),
         issued_at_ms: i64::try_from(ts).unwrap_or(0),
         signed: false,
         log_index: 0,
+        body_to_sign: q.body_to_sign.to_vec(),
     })
 }
 
-/// Find the pending request, check it, and (unless `dry_run`) sign + submit it.
-pub async fn sign(node: &Node, kind: &str, repo: &str, subject: Option<&str>, dry_run: bool) -> Result<SignResponse, Status> {
-    let kn = kind_num(kind).ok_or_else(|| Status::invalid_argument("unknown entry kind"))?;
-    let (Some(keys), Some(me)) = (node.keys.as_ref(), node.device_id()) else {
-        return Err(Status::failed_precondition("not logged in"));
-    };
+/// Find the pending request and return its checked preview. Signing happens in the CLI.
+pub fn preview(node: &Node, kind: &str, repo: &str, subject: Option<&str>, dry_run: bool) -> Result<SignResponse, Status> {
+    if !dry_run {
+        return Err(Status::failed_precondition("approvals are signed with your owner key by `moochy approve|members|claim` in a terminal; this app never signs them"));
+    }
     let q = lock(&node.approvals)
         .iter()
         .find(|q| q.kind == kind && q.repo_slug.eq_ignore_ascii_case(repo) && subject.is_none_or(|s| q.subject_username.eq_ignore_ascii_case(s) || q.subject_pseudonym == s))
         .cloned()
         .ok_or_else(|| Status::not_found(format!("no pending {kind} request for {repo} (requests appear here after the relay pushes them)")))?;
-    let mut preview = decode(&q, me).map_err(|e| Status::failed_precondition(format!("refusing to sign: {e}")))?;
-    if dry_run {
-        return Ok(preview);
+    decode(&q, node.cfg.pseudonym.as_deref()).map_err(|e| Status::failed_precondition(format!("refusing this request: {e}")))
+}
+
+/// Relay an entry the foreground CLI signed with the owner key. The Node checks shape only (the
+/// relay and every monitor verify the signatures); an answer to a pending request must keep its
+/// kind, repository and subject.
+pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, Status> {
+    let kind = Kind::from_name(&r.kind).filter(|k| kind_num(k.name()).is_some() || matches!(k, Kind::OwnerKeyAdded | Kind::KeyAdded)).ok_or_else(|| Status::invalid_argument("entry kind not accepted here"))?;
+    // KEY_ADDED = device-key rotation (`moochy keys rotate`): successor PoP + current device.
+    let sigs_ok = match kind {
+        Kind::KeyAdded => r.sigs.len() == 2,
+        Kind::OwnerKeyAdded => (1..=2).contains(&r.sigs.len()),
+        _ => r.sigs.len() == 1,
+    };
+    if r.body.len() > 1024 || !sigs_ok || r.sigs.iter().any(|s| s.len() != 64) {
+        return Err(Status::invalid_argument("malformed entry"));
     }
-    let kind_k = moochy_keylog::Kind::from_u32(kn).ok_or_else(|| Status::invalid_argument("unknown entry kind"))?;
-    let sig = keys.sign.sign(&moochy_keylog::entry::sig_message(kind_k, &q.body_to_sign));
-    let ack = submit_entry(node, &q.request_id, &q.kind, q.body_to_sign.clone(), &sig, Duration::from_secs(15)).await?;
+    let body = parse_body(kind, &r.body).map_err(|_| Status::invalid_argument("body is not the expected key-log format"))?;
+    let mut out = SignResponse { request_id: r.request_id.clone(), kind: r.kind.clone(), ..SignResponse::default() };
+    match body {
+        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (out.repo_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), owner.into(), signer.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } => (out.repo_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), subject.into(), signer.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
+        Body::OwnerKey { pseudonym, issued_at_ms, .. } => (out.subject, out.issued_at_ms) = (pseudonym.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
+        Body::Key { device_id, pseudonym, .. } if Some(pseudonym) == node.cfg.pseudonym.as_deref() => (out.subject, out.signer) = (device_id.into(), node.device_id().unwrap_or_default().into()),
+        _ => return Err(Status::invalid_argument("body does not match its kind")),
+    }
+    if !matches!(kind, Kind::OwnerKeyAdded | Kind::KeyAdded) {
+        let q = lock(&node.approvals).iter().find(|q| q.request_id == r.request_id).cloned().ok_or_else(|| Status::not_found("no such pending request"))?;
+        if q.kind != r.kind || q.repo_id != out.repo_id || (kind != Kind::RepoClaimed && q.subject_pseudonym != out.subject) {
+            return Err(Status::failed_precondition("entry does not answer the pending request"));
+        }
+        out.repo_slug = clean(&q.repo_slug).into_owned();
+        out.subject_username = clean(&q.subject_username).into_owned();
+    }
+    // Our own new key: acknowledged before the relay logs it, so the monitor never flags it.
+    if let Some(l) = &node.keylog {
+        match body {
+            Body::OwnerKey { owner_pub, .. } => l.acknowledge(Some(owner_pub), None),
+            Body::Key { sign_pub, .. } => l.acknowledge(None, Some(sign_pub)),
+            _ => {}
+        }
+    }
+    let id = if r.request_id.is_empty() { format!("{}-{}", r.kind, now_ms()) } else { r.request_id.clone() };
+    let ack = submit_entry(node, &id, &r.kind, Bytes::from(r.body), r.sigs.into_iter().map(Bytes::from).collect(), Duration::from_secs(15)).await?;
     if !ack.error.is_empty() {
         return Err(Status::failed_precondition(format!("relay refused the entry: {}", clean(&ack.error))));
     }
-    lock(&node.approvals).retain(|x| x.request_id != q.request_id);
-    preview.signed = true;
-    preview.log_index = ack.index;
-    Ok(preview)
+    lock(&node.approvals).retain(|x| x.request_id != r.request_id);
+    out.signed = true;
+    out.log_index = ack.index;
+    log("info", "owner-signed key-log entry relayed", &json!({"kind": r.kind, "log_index": ack.index}));
+    Ok(out)
 }
 
 /// Send one signed key-log entry over the session and wait for its `LogEntryAck`.
-pub async fn submit_entry(node: &Node, request_id: &str, kind: &str, body: Bytes, sig: &[u8; 64], wait: Duration) -> Result<LogEntryAck, Status> {
+pub async fn submit_entry(node: &Node, request_id: &str, kind: &str, body: Bytes, sigs: Vec<Bytes>, wait: Duration) -> Result<LogEntryAck, Status> {
     let link = node.link().ok_or_else(|| Status::unavailable("relay link is down"))?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     lock(&node.log_acks).insert(request_id.to_owned(), tx);
-    let e = SignedLogEntry { request_id: request_id.into(), kind: kind.into(), body, sigs: vec![Bytes::copy_from_slice(sig)] };
+    let e = SignedLogEntry { request_id: request_id.into(), kind: kind.into(), body, sigs };
     if link.up.send(NodeMsg { msg: Some(node_msg::Msg::LogEntry(e)) }).await.is_err() {
         lock(&node.log_acks).remove(request_id);
         return Err(Status::unavailable("relay link is down"));
@@ -144,43 +170,41 @@ pub async fn revoke_self(node: &Node, reason: &str) -> Result<LogEntryAck, Statu
         return Err(Status::failed_precondition("not logged in"));
     };
     let pseudonym = node.cfg.pseudonym.as_deref().unwrap_or_default();
-    let body = moochy_keylog::entry::lp(&[me.as_bytes(), pseudonym.as_bytes(), reason.as_bytes()]);
-    let sig = keys.sign.sign(&moochy_keylog::entry::sig_message(moochy_keylog::Kind::KeyRevoked, &body));
-    submit_entry(node, &format!("revoke-{me}"), "KEY_REVOKED", Bytes::from(body), &sig, Duration::from_secs(5)).await
+    let body = moochy_keylog::entry::revoke_body(me, pseudonym, reason);
+    // A device's revocation request (KEYLOG §2a): not a log signature.
+    let sig = keys.sign.sign(&moochy_keylog::entry::revoke_request_message(&body));
+    submit_entry(node, &format!("revoke-{me}"), "KEY_REVOKED", Bytes::from(body), vec![Bytes::copy_from_slice(&sig)], Duration::from_secs(5)).await
 }
 
 pub fn pending(node: &Node) -> Vec<SignResponse> {
-    let me = node.device_id().unwrap_or_default();
+    let me = node.cfg.pseudonym.as_deref();
     lock(&node.approvals).iter().filter_map(|q| decode(q, me).ok()).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::lp;
-
-    fn grant(repo: &str, subj: &str, signer: &str, ts: u64) -> Vec<u8> {
-        lp(&[repo.as_bytes(), subj.as_bytes(), signer.as_bytes(), &ts.to_be_bytes()])
-    }
 
     #[test]
     fn decode_checks_what_is_signed() {
         let now = now_ms();
-        let q = |body: Vec<u8>| ApprovalRequest {
+        let q = |body: Vec<u8>, subj: &str| ApprovalRequest {
             request_id: "q1".into(),
             kind: "DONOR_APPROVED".into(),
-            repo_id: "r_1".into(),
+            repo_id: "r_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
             repo_slug: "acme/widget".into(),
             subject_username: "alice".into(),
-            subject_pseudonym: "ps_AAAA".into(),
+            subject_pseudonym: subj.into(),
             body_to_sign: body.into(),
             ..ApprovalRequest::default()
         };
-        assert!(decode(&q(grant("r_1", "ps_AAAA", "d_me", now)), "d_me").is_ok());
-        assert!(decode(&q(grant("r_2", "ps_AAAA", "d_me", now)), "d_me").is_err(), "other repo");
-        assert!(decode(&q(grant("r_1", "ps_BBBB", "d_me", now)), "d_me").is_err(), "other subject");
-        assert!(decode(&q(grant("r_1", "ps_AAAA", "d_other", now)), "d_me").is_err(), "other signer");
-        assert!(decode(&q(grant("r_1", "ps_AAAA", "d_me", now - 3 * MAX_SKEW_MS)), "d_me").is_err(), "stale");
-        assert!(decode(&q(b"garbage".to_vec()), "d_me").is_err());
+        let (r, ps, ok) = ("r_01ARZ3NDEKTSV4RRFFQ69G5FAV", "ps_aaaaaaaaaaaaaaaa", "ok_00000000000000000000000000000000");
+        let g = |repo: &str, subj: &str, ts: u64| moochy_keylog::entry::grant_body(repo, subj, ok, ts);
+        assert!(decode(&q(g(r, ps, now), ps), None).is_ok());
+        assert!(decode(&q(g("r_01ARZ3NDEKTSV4RRFFQ69G5FAW", ps, now), ps), None).is_err(), "other repo");
+        assert!(decode(&q(g(r, "ps_bbbbbbbbbbbbbbbb", now), ps), None).is_err(), "other subject");
+        assert!(decode(&q(g(r, ps, now), ""), None).is_err(), "empty subject is never a wildcard (A183)");
+        assert!(decode(&q(g(r, ps, now.saturating_sub(3 * MAX_SKEW_MS)), ps), None).is_err(), "stale");
+        assert!(decode(&q(b"garbage".to_vec(), ps), None).is_err());
     }
 }

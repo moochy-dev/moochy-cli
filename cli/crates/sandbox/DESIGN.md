@@ -29,7 +29,7 @@ user namespaces — <https://man7.org/linux/man-pages/man7/user_namespaces.7.htm
 Rust crates: `landlock` <https://docs.rs/landlock>, `seccompiler`
 <https://github.com/rust-vmm/seccompiler>, `rustix`.
 
-### Landlock ABI (from the kernel docs, checked 2026-10-01)
+### Landlock ABI (from the kernel docs, re-checked 2026-10-02)
 
 | ABI | Adds | Used for |
 |---|---|---|
@@ -41,13 +41,15 @@ Rust crates: `landlock` <https://docs.rs/landlock>, `seccompiler`
 | 6 | Scope: abstract Unix sockets, signals | both sides |
 | 7 | Audit logging flags | — |
 | 8 | `RESTRICT_SELF_TSYNC` (all threads) | donor `lockdown_self` |
-| 9 | Pathname Unix socket restriction | not yet (crate ceiling); the netns + mount view already confine the agent |
-| 10 | UDP bind, quiet rules | not yet |
-| 11 | `RESTRICT_SELF_NO_NEW_PRIVS` | not needed (we set NNP ourselves) |
+| 9 (7.1) | FS `RESOLVE_UNIX`: `connect`/`sendmsg` to pathname Unix sockets only beneath granted rules | **used** (ceiling V9): agent → sockets in its rw dirs only (gateway/proxy under `/run/moochy`, its own in `/tmp`, worktree), none in the ro system tree; donor → its state dir + `/run/systemd/resolve` only (no `docker.sock`, D-Bus, …: real reach today on ABI ≤ 8 for a compromised donor whose user is in `docker`) |
+| 10 | NET `BIND_UDP`, `CONNECT_SEND_UDP`; `ADD_RULE_QUIET` (log suppression) | **not yet**: `landlock` 0.4.7 (latest) stops at V9. Value: donor UDP → port 53 only (agent: its netns has no route already). Add when the crate gains V10 rather than hand-rolled syscalls no kernel here can test |
+| 11 | `RESTRICT_SELF_NO_NEW_PRIVS` flag | not needed (we set NNP ourselves) |
 
 Everything is negotiated best-effort through the `landlock` crate. The FS cage is
-**required** (we fail closed without it); higher ABIs add layers. This box runs kernel 7.0
-at Landlock ABI 8.
+**required** (we fail closed without it); higher ABIs add layers, and a right the kernel
+lacks is simply not handled. This box (kernel 7.0) is at ABI 8: everything through TSYNC is
+enforced and tested; `RESOLVE_UNIX` (9) is requested but inert here (no 7.1 kernel to test
+on: re-run the e2e suite on one). `moochy doctor` names the layers the host lacks.
 
 ## 2. Layering
 
@@ -152,9 +154,12 @@ Seatbelt entry points; Codex and sandbox-runtime use them too.
 
 ## 6. Not done yet
 
-- Landlock ABI 9/10 rules (pathname Unix sockets, UDP bind) once the crate ceiling allows.
+- Landlock ABI 10 (UDP port rules) once the `landlock` crate supports it; ABI 9 rules are
+  requested but untested (no 7.1 kernel here).
 - macOS: a descendant that starts its own session outlives the run (no PID namespace);
-  `RLIMIT_NPROC`/`RLIMIT_AS` not set (per user / not enforced there); `--allow-host`.
+  `RLIMIT_NPROC`/`RLIMIT_AS` not set (per user / not enforced there). `--allow-host` there
+  listens on host loopback, so other local processes could use it too (only toward the
+  allowlisted public hosts).
 - `core.hooksPath` pointing at a tracked dir (e.g. husky's `.husky/`): those hooks are
   ordinary repo files the agent may edit; they show in the diff, not in the notice.
 - The masking walk is repeated every run (≈1 s per million entries).

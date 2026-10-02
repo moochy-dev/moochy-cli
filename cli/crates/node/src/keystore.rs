@@ -49,6 +49,14 @@ pub struct ProviderKey {
     pub key: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// `local`: the server may be a public IP or host name (`--allow-unvetted-host`, dev only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[zeroize(skip)]
+    pub allow_unvetted_host: bool,
+    /// `local`: public catalog slug → the server's model id (`--model local/x=server-id`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[zeroize(skip)]
+    pub models: std::collections::BTreeMap<String, String>,
 }
 
 impl DeviceKeys {
@@ -152,12 +160,13 @@ fn derive(pass: &str, salt: &[u8], log_n: u8, r: u32, p: u32) -> Result<Zeroizin
     Ok(key)
 }
 
-fn seal(plain: &[u8], pass: &str) -> Result<Vec<u8>> {
+/// Encrypt under a passphrase; `aad` separates file kinds (keystore, owner key).
+pub(crate) fn seal(plain: &[u8], pass: &str, aad: &[u8]) -> Result<Vec<u8>> {
     let salt: [u8; 16] = rand_bytes()?;
     let nonce: [u8; 24] = rand_bytes()?;
     let key = derive(pass, &salt, LOG_N, 8, 1)?;
     let ct = XChaCha20Poly1305::new(key.as_ref().into())
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad: AAD })
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad })
         .map_err(|_| internal("keystore encrypt"))?;
     let f = FileV1 {
         v: 1,
@@ -172,7 +181,7 @@ fn seal(plain: &[u8], pass: &str) -> Result<Vec<u8>> {
     serde_json::to_vec(&f).ctx("encode keystore")
 }
 
-fn open(file: &[u8], pass: &str) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn open(file: &[u8], pass: &str, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let f: FileV1 = serde_json::from_slice(file).map_err(|_| auth("keystore file is corrupt"))?;
     // Bound the KDF cost an attacker-supplied file can impose.
     if f.v != 1 || f.kdf != "scrypt" || !(10..=20).contains(&f.log_n) || f.r != 8 || f.p != 1 {
@@ -186,7 +195,7 @@ fn open(file: &[u8], pass: &str) -> Result<Zeroizing<Vec<u8>>> {
     }
     let key = derive(pass, &salt, f.log_n, f.r, f.p)?;
     XChaCha20Poly1305::new(key.as_ref().into())
-        .decrypt(XNonce::from_slice(&nonce), Payload { msg: &ct, aad: AAD })
+        .decrypt(XNonce::from_slice(&nonce), Payload { msg: &ct, aad })
         .map(Zeroizing::new)
         .map_err(|_| auth("wrong passphrase or tampered keystore"))
 }
@@ -204,7 +213,7 @@ pub fn load(home: &Home, cfg: &Config) -> Result<Option<Secrets>> {
         }
     } else {
         match std::fs::read(home.keystore_path(cfg.relay.as_deref())) {
-            Ok(b) => open(&b, &passphrase()?)?,
+            Ok(b) => open(&b, &passphrase()?, AAD)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(internal(format!("read keystore: {e}"))),
         }
@@ -233,7 +242,7 @@ pub fn save(home: &Home, cfg: &Config, s: &Secrets) -> Result<()> {
     if use_keychain(cfg) {
         return keychain::set(home, cfg, &plain);
     }
-    write_private(&home.keystore_path(cfg.relay.as_deref()), &seal(&plain, &passphrase()?)?)
+    write_private(&home.keystore_path(cfg.relay.as_deref()), &seal(&plain, &passphrase()?, AAD)?)
 }
 
 #[cfg(feature = "keychain")]
@@ -297,13 +306,13 @@ mod tests {
         let mut s = Secrets::new().unwrap();
         s.device = Some(DeviceKeys::generate().unwrap());
         let plain = serde_json::to_vec(&s).unwrap();
-        let file = seal(&plain, "pw").unwrap();
-        assert_eq!(&*open(&file, "pw").unwrap(), &plain);
-        assert!(open(&file, "pW").is_err());
+        let file = seal(&plain, "pw", AAD).unwrap();
+        assert_eq!(&*open(&file, "pw", AAD).unwrap(), &plain);
+        assert!(open(&file, "pW", AAD).is_err());
         let mut f: serde_json::Value = serde_json::from_slice(&file).unwrap();
         let ct = f["ct"].as_str().unwrap().replace('A', "B");
         f["ct"] = ct.into();
-        assert!(open(&serde_json::to_vec(&f).unwrap(), "pw").is_err());
+        assert!(open(&serde_json::to_vec(&f).unwrap(), "pw", AAD).is_err());
 
         let t = s.local_token("acme/widget", 0);
         assert_eq!(s.check_token(&t, 0).as_deref(), Some("acme/widget"));

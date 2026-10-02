@@ -7,7 +7,7 @@ use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
     ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
-    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest,
+    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse, VerifyRequest, VerifyResponse,
     StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
@@ -152,9 +152,8 @@ impl LocalControl for Ctl {
         let n = &self.node;
         if r.rotate {
             let g = n.token_gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-            let mut cfg = n.home.load().map_err(|e| Status::internal(e.msg))?;
-            cfg.token_gen = g;
-            n.home.save(&cfg).map_err(|e| Status::internal(e.msg))?;
+            // In the state dir: the locked-down node cannot write its config (CONTRACT §15.2).
+            crate::config::write_private(&n.home.state_dir().join("token_gen"), g.to_string().as_bytes()).map_err(|e| Status::internal(e.msg))?;
         }
         let url = n.gateway_url();
         Ok(Response::new(EnvResponse {
@@ -168,7 +167,7 @@ impl LocalControl for Ctl {
     async fn approve(&self, r: Request<ApproveRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         let kind = if r.revoke { "DONOR_REVOKED" } else { "DONOR_APPROVED" };
-        crate::approve::sign(&self.node, kind, &r.repo, Some(&r.donor), r.dry_run).await.map(Response::new)
+        crate::approve::preview(&self.node, kind, &r.repo, Some(&r.donor), r.dry_run).map(Response::new)
     }
 
     async fn members(&self, r: Request<MembersRequest>) -> std::result::Result<Response<SignResponse>, Status> {
@@ -181,12 +180,32 @@ impl LocalControl for Ctl {
         if r.device && !r.user.starts_with("d_") {
             return Err(Status::invalid_argument("--device expects a device id (d_…)"));
         }
-        crate::approve::sign(&self.node, kind, &r.repo, Some(&r.user), r.dry_run).await.map(Response::new)
+        crate::approve::preview(&self.node, kind, &r.repo, Some(&r.user), r.dry_run).map(Response::new)
     }
 
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
-        crate::approve::sign(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).await.map(Response::new)
+        crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+    }
+
+    async fn verify(&self, r: Request<VerifyRequest>) -> std::result::Result<Response<VerifyResponse>, Status> {
+        let r = r.into_inner().receipt_ref;
+        // A receipt of this device's own request: checked from local evidence (also its
+        // commitment to the signed receipt); any other public receipt: fetched from the relay
+        // and checked against the key log.
+        let v = match crate::task::verify(&self.node, &r) {
+            Ok(v) => v,
+            Err(_) => crate::keylog::verify_ref(&self.node, &r).await.map_err(Status::failed_precondition)?,
+        };
+        Ok(Response::new(VerifyResponse { result_json: v.to_string() }))
+    }
+
+    async fn donations(&self, r: Request<DonationsRequest>) -> std::result::Result<Response<DonationsResponse>, Status> {
+        crate::donations::relay(&self.node, r.into_inner()).await.map(Response::new)
+    }
+
+    async fn submit_entry(&self, r: Request<SubmitEntryRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        crate::approve::submit(&self.node, r.into_inner()).await.map(Response::new)
     }
 
     async fn pending(&self, _: Request<PendingRequest>) -> std::result::Result<Response<PendingResponse>, Status> {

@@ -495,6 +495,17 @@ fn e93_refuses_to_expose_root_or_home() {
         assert_eq!(o.code, 125, "{wt}: {}{}", o.stdout, o.stderr);
         assert!(o.stderr.contains("would expose"), "{}", o.stderr);
     }
+    // The Moochy home is protected by default (here via $MOOCHY_HOME): a
+    // worktree containing it is refused.
+    let mh = f.root.join("mh");
+    std::fs::create_dir_all(&mh).unwrap();
+    let o = Command::new(BIN)
+        .args(["run", f.root.to_str().unwrap(), "--ro", bin_dir().to_str().unwrap(), "--", BIN, "stat", "/"])
+        .env("MOOCHY_HOME", &mh)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(125), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("would expose"));
     let parent = Path::new(&home).parent().unwrap().to_str().unwrap().to_string();
     let o = sandboxed(&f, &["--ro", &parent], &["stat", "/"]);
     assert_eq!(o.code, 125, "{}{}", o.stdout, o.stderr);
@@ -521,7 +532,9 @@ fn e94_allow_host_proxy_exact_hosts_only() {
         let o = sandboxed(&f, &allow, &["proxy", "127.0.0.1:3128", target]);
         assert!(has(&o, "403"), "{target}: {}{}", o.stdout, o.stderr);
     }
-    let o = sandboxed(&f, &allow, &["proxy", "127.0.0.1:3128", "evil.example.org:443"]);
+    // Through the address HTTPS_PROXY names (what package managers use).
+    let o = sandboxed(&f, &allow, &["proxy", "env", "evil.example.org:443"]);
+    assert!(has(&o, "403"), "{}{}", o.stdout, o.stderr);
     assert!(o.stderr.contains("refused evil.example.org:443"), "{}", o.stderr);
     // The proxy is the only new route: direct connections still fail.
     let o = sandboxed(&f, &allow, &["connect", "1.1.1.1:443"]);

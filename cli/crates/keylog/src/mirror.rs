@@ -138,6 +138,25 @@ impl Mirror {
         self.owner_keys = keys;
     }
 
+    /// The user just created (or confirmed) this device key: later entries for it are
+    /// not "unknown" any more. No effect without [`Me`].
+    pub fn acknowledge_device_key(&mut self, sign_pub: [u8; 32]) {
+        if let Some(me) = self
+            .me
+            .as_mut()
+            .filter(|m| !m.known_keys.contains(&sign_pub))
+        {
+            me.known_keys.push(sign_pub);
+        }
+    }
+
+    /// The user just created (or confirmed) this owner key.
+    pub fn acknowledge_owner_key(&mut self, owner_pub: [u8; 32]) {
+        if !self.owner_keys.contains(&owner_pub) {
+            self.owner_keys.push(owner_pub);
+        }
+    }
+
     #[must_use]
     pub fn size(&self) -> u64 {
         self.range.size()

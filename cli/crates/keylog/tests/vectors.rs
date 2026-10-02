@@ -417,3 +417,74 @@ fn receipt_log_vectors() {
         ));
     }
 }
+
+#[test]
+fn request_vectors() {
+    use ed25519_zebra::{Signature, VerificationKey};
+    let r = load("requests.json");
+    let pubk: [u8; 32] = unhex(r["device_pub_hex"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let vk = VerificationKey::try_from(pubk).unwrap();
+    let sig = |k: &str, v: &Value| {
+        Signature::from(<[u8; 64]>::try_from(unhex(v[k].as_str().unwrap())).unwrap())
+    };
+    let rv = &r["revoke"];
+    let body = unhex(rv["body_hex"].as_str().unwrap());
+    let rec = entry::record(moochy_keylog::Kind::KeyRevoked, 0, &body, &[]);
+    let p = parse_record(&rec).unwrap();
+    let entry::Body::Revoke {
+        device_id,
+        pseudonym,
+        reason,
+    } = p.body
+    else {
+        panic!()
+    };
+    assert_eq!(entry::revoke_body(device_id, pseudonym, reason), body);
+    let msg = entry::revoke_request_message(&body);
+    assert_eq!(msg, unhex(rv["message_hex"].as_str().unwrap()));
+    vk.verify(&sig("sig_hex", rv), &msg).unwrap();
+    // The log-signature label is a different message: refused.
+    assert!(vk.verify(&sig("wrong_label_sig_hex", rv), &msg).is_err());
+    assert_ne!(
+        entry::sig_message(moochy_keylog::Kind::KeyRevoked, &body),
+        msg
+    );
+
+    let ro = &r["rotate"];
+    let kb = unhex(ro["successor_body_hex"].as_str().unwrap());
+    let msg = entry::rotate_request_message(&kb);
+    assert_eq!(msg, unhex(ro["message_hex"].as_str().unwrap()));
+    vk.verify(&sig("sig_hex", ro), &msg).unwrap();
+    let entry::Body::Key {
+        device_id,
+        pseudonym,
+        sign_pub,
+        enc_pub,
+        suite,
+        ..
+    } = entry::parse_body(moochy_keylog::Kind::KeyAdded, &kb).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        entry::key_body(
+            device_id,
+            pseudonym,
+            sign_pub,
+            enc_pub,
+            suite,
+            "gateway,worker",
+            ""
+        ),
+        kb
+    );
+    VerificationKey::try_from(*sign_pub)
+        .unwrap()
+        .verify(
+            &sig("pop_sig_hex", ro),
+            &entry::pop_message(sign_pub, enc_pub, suite),
+        )
+        .unwrap();
+}

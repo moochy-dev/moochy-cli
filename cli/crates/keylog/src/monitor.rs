@@ -39,6 +39,12 @@ pub trait LogLink: Send {
     fn anchor(&mut self) -> impl Future<Output = Option<Vec<u8>>> + Send {
         async { None }
     }
+    /// Whether [`LogLink::anchor`] is wired to a public Git anchor. With no anchor
+    /// and no required witness cosignatures, a first-contact Node cannot detect a
+    /// split view, and [`Monitor::run`] says so loudly ([`Event::FailOpen`], A204).
+    fn anchor_configured(&self) -> bool {
+        false
+    }
 }
 
 /// Monitor configuration.
@@ -79,6 +85,10 @@ pub enum Event {
     Unwitnessed { size: u64, cosignatures: usize },
     /// Transport or format problem (retried at the next checkpoint).
     Error(String),
+    /// Split-view protection is off: no witness cosignatures required and no Git
+    /// anchor wired, so a relay could show this Node a history nobody else sees
+    /// (A204). Emitted once per [`Monitor::run`]; never silent outside tests.
+    FailOpen,
 }
 
 impl Event {
@@ -123,6 +133,7 @@ impl Event {
                 )
             }
             Self::Error(e) => format!("keylog: {e}"),
+            Self::FailOpen => "keylog: SECURITY: WARNING fail-open: split-view protection is OFF (no witness cosignatures required and no public Git anchor configured); forks within this Node's own history are still caught, but a relay could show this Node a log nobody else sees".to_owned(),
         }
     }
 }
@@ -217,6 +228,35 @@ impl View {
             return Err(Code::LogForked);
         }
         f(&g.mirror)
+    }
+
+    /// The user just created this device key (e.g. after `moochy keys rotate`): stop
+    /// reporting it as unknown. Persist it in the Node's config for the next `open`.
+    pub fn acknowledge_device_key(&self, sign_pub: [u8; 32]) {
+        if let Ok(mut g) = self.0.write() {
+            g.mirror.acknowledge_device_key(sign_pub);
+        }
+    }
+
+    /// The user just created this owner key (`moochy owner init` / `rotate`).
+    pub fn acknowledge_owner_key(&self, owner_pub: [u8; 32]) {
+        if let Ok(mut g) = self.0.write() {
+            g.mirror.acknowledge_owner_key(owner_pub);
+        }
+    }
+
+    /// Verifies a projection fetched by reference (E63) against the verified state:
+    /// see [`crate::projection::verify`].
+    pub fn verify_projection(
+        &self,
+        projection: &[u8],
+        sig: &[u8],
+        worker_device: &str,
+        key_log_index: u64,
+    ) -> Result<crate::projection::Verified, Code> {
+        self.with(|m| {
+            crate::projection::verify(m.state(), projection, sig, worker_device, key_log_index)
+        })
     }
 
     /// Mirrored tree size (0 when unavailable).
@@ -391,6 +431,9 @@ impl Monitor {
     /// The loop: check every checkpoint the link yields, then the anchor when due.
     /// Returns when `next_checkpoint` returns `None`.
     pub async fn run<L: LogLink>(&mut self, link: &mut L, mut on_event: impl FnMut(&Event) + Send) {
+        if self.fail_open(link) {
+            on_event(&Event::FailOpen);
+        }
         while let Some(note) = link.next_checkpoint().await {
             for e in self.on_checkpoint(link, &note).await {
                 on_event(&e);
@@ -401,6 +444,13 @@ impl Monitor {
                 }
             }
         }
+    }
+
+    /// True when this monitor cannot detect a split view (A204): no witness
+    /// cosignatures required and no Git anchor wired on the link.
+    #[must_use]
+    pub fn fail_open<L: LogLink>(&self, link: &L) -> bool {
+        self.cfg.min_cosignatures == 0 && !link.anchor_configured()
     }
 
     /// Checks one checkpoint note served by the relay and grows the mirror to it.
@@ -593,4 +643,22 @@ pub async fn fetch_checkpoint<L: LogLink>(link: &mut L) -> Result<Vec<u8>, Error
         return Err(Error::TooLarge);
     }
     Ok(n)
+}
+
+/// Fetches `GetLogTile("projection/<receipt_ref>")` (E63): the relay's JSON reply
+/// `{"projection_b64","sig_b64","worker_device","key_log_index"}`, size-capped. The
+/// caller parses it with its strict JSON parser and checks it with
+/// [`View::verify_projection`]; nothing in it is trusted.
+pub async fn fetch_projection<L: LogLink>(
+    link: &mut L,
+    receipt_ref: &str,
+) -> Result<Vec<u8>, Error> {
+    if !crate::projection::valid_ref(receipt_ref) {
+        return Err(Error::Format("receipt_ref"));
+    }
+    let b = link.get_tile(&format!("projection/{receipt_ref}")).await?;
+    if b.len() > crate::projection::MAX_REPLY {
+        return Err(Error::TooLarge);
+    }
+    Ok(b)
 }
