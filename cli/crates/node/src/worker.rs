@@ -60,7 +60,8 @@ fn slots_max(node: &Node) -> u32 {
 }
 
 /// `(dialect, public model)` this node can serve: adapters × catalog entries of their provider.
-fn served_models(node: &Node) -> Vec<(Dialect, String)> {
+/// (dialect, model, provider) for every catalog model an adapter of this device can serve.
+fn served_models(node: &Node) -> Vec<(Dialect, String, String)> {
     let cat = node.catalog();
     let only = node.cfg.models_override();
     let mut out = Vec::new();
@@ -68,8 +69,8 @@ fn served_models(node: &Node) -> Vec<(Dialect, String)> {
         for e in cat.entries.iter().filter(|e| e.provider == a.provider().as_str() && only.as_ref().is_none_or(|o| o.contains(&e.model.as_str()))) {
             for d in &e.dialects {
                 let Some(d) = Dialect::from_wire(d.as_str()) else { continue };
-                if a.provider().serves(d.worker()) && !out.contains(&(d, e.model.clone())) {
-                    out.push((d, e.model.clone()));
+                if a.provider().serves(d.worker()) && !out.iter().any(|(od, om, op)| *od == d && *om == e.model && *op == e.provider) {
+                    out.push((d, e.model.clone(), e.provider.clone()));
                 }
             }
         }
@@ -98,7 +99,7 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
     let now = now_ms();
     let rl = lock(&node.rl_headroom);
     let headroom = |m: &str| rl.get(m).filter(|(_, exp)| *exp > now).map_or(100, |(p, _)| u32::from(*p));
-    let models = served_models(node).into_iter().map(|(d, m)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m }).collect();
+    let models = served_models(node).into_iter().map(|(d, m, provider)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m, provider }).collect();
     drop(rl);
     let free = if paused || !can_serve(node) { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
     let cap = device_cap(node).unwrap_or(0);
