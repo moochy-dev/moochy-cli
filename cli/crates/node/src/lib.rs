@@ -9,6 +9,7 @@
 )]
 
 pub mod approve;
+pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod ctl;
@@ -18,6 +19,7 @@ pub mod engine;
 pub mod files;
 pub mod gate;
 pub mod gateway;
+pub mod journal;
 pub mod json;
 pub mod keycheck;
 pub mod keylog;
@@ -32,6 +34,7 @@ pub mod owner;
 pub mod run;
 pub mod pb;
 pub mod scrub;
+pub mod service;
 pub mod task;
 pub mod tls;
 pub mod util;

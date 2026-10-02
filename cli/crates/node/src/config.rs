@@ -52,6 +52,12 @@ pub struct Config {
     /// Projects (`owner/name`, comma-separated) whose clients receive tool calls from donated
     /// tokens outside `moochy run` (CONTRACT §15.4 opt-in; warned at every start).
     pub allow_unsandboxed_tools: Option<String>,
+    /// Donor safety step (07 §8.1 step 4) accepted at this Unix ms: a monthly cap for this
+    /// machine and the provider-side spend limit advice. No serving without it (outside dev).
+    pub donor_safety_ack_ms: Option<u64>,
+    /// Pinned donors per project (06 §8 "pinned donors"): `owner/name` → donor names; tasks for
+    /// that project are sealed only to these donors.
+    pub pinned_donors: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -219,6 +225,22 @@ impl Config {
                 self.log_anchor_url = Some(value.into());
             }
             "models_override" => self.models_override = Some(value.into()).filter(|v: &String| !v.is_empty()),
+            "pinned_donors" => {
+                // `owner/name=alice,bob` (empty list clears the project's pins).
+                let (slug, names) = value.split_once('=').ok_or_else(|| usage("pinned_donors is owner/name=donor1,donor2"))?;
+                if !valid_slug(slug) {
+                    return Err(usage("pinned_donors is owner/name=donor1,donor2"));
+                }
+                let names: Vec<String> = names.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect();
+                if names.len() > 64 || !names.iter().all(|n| n.len() <= 64 && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))) {
+                    return Err(usage("pinned_donors: at most 64 names of letters, digits, _ - ."));
+                }
+                if names.is_empty() {
+                    self.pinned_donors.remove(&slug.to_ascii_lowercase());
+                } else {
+                    self.pinned_donors.insert(slug.to_ascii_lowercase(), names);
+                }
+            }
             "allow_unsandboxed_tools" => {
                 if !value.is_empty() && !value.split(',').all(|s| valid_slug(s.trim())) {
                     return Err(usage("allow_unsandboxed_tools is a comma-separated list of owner/name projects (empty to clear)"));
@@ -227,7 +249,7 @@ impl Config {
             }
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, log_key, log_anchor_url)"
+                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, pinned_donors, log_key, log_anchor_url)"
                 )));
             }
         }

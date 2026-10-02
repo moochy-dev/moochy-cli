@@ -52,7 +52,14 @@ fn device_cap(node: &Node) -> Option<u64> {
 }
 
 fn can_serve(node: &Node) -> bool {
-    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && node.validator.as_ref().is_some_and(|v| v.alive()) && device_cap(node).is_some() && !node.adapters.is_empty()
+    node.cfg.has_role("worker")
+        && node.keys.is_some()
+        && node.store.is_some()
+        && node.validator.as_ref().is_some_and(|v| v.alive())
+        && device_cap(node).is_some()
+        && !node.adapters.is_empty()
+        // 07 §8.1 step 4 (mo-node `moochy safety`): the safety step was accepted.
+        && (node.insecure_dev || node.cfg.donor_safety_ack_ms.is_some())
 }
 
 fn slots_max(node: &Node) -> u32 {
@@ -129,7 +136,7 @@ fn attempt_key(task: &str, attempt: u32) -> Vec<u8> {
 /// After Welcome: what we have in flight / in the outbox, outbox replay, then the offer.
 pub fn on_welcome(node: &Arc<Node>) {
     if !can_serve(node) {
-        log("info", "not donating: add a provider key (`moochy keys add`) and a monthly limit (`moochy config set monthly_limit 20`)", &json!({}));
+        log("info", "not donating: add a provider key (`moochy keys add`) and finish the safety step (`moochy safety --monthly-limit 25 --accept-safety`)", &json!({}));
         return;
     }
     let node = node.clone();
