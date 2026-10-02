@@ -187,7 +187,7 @@ fn parse() -> Result<Opts> {
             Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("monthly-limit") => {
-                o.monthly_limit = Some(crate::util::parse_dollars(s(p.value().map_err(err)?)?.trim_start_matches('$')).ok_or_else(|| usage("--monthly-limit is a dollar amount, e.g. 25"))?);
+                o.monthly_limit = Some(crate::util::parse_amount(&s(p.value().map_err(err)?)?).map_err(|e| usage(format!("--monthly-limit (dollars, e.g. 25): {e}")))?);
             }
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => {
@@ -793,10 +793,13 @@ fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<()> {
             let _ = out.flush();
             lines.next()?.ok().map(|l| l.trim().to_owned())
         };
-        let cap = o.monthly_limit.or_else(|| {
-            let a = ask("Monthly limit for this machine in dollars [25]: ")?;
-            crate::util::parse_dollars(if a.is_empty() { "25" } else { a.trim_start_matches('$') })
-        });
+        let cap = match o.monthly_limit {
+            Some(c) => Some(c),
+            None => match ask("Monthly limit for this machine in dollars [25]: ") {
+                Some(a) => Some(crate::util::parse_amount(if a.is_empty() { "25" } else { &a }).map_err(|e| usage(format!("monthly limit: {e}")))?),
+                None => None,
+            },
+        };
         let ok = ask("[ ] I set a spend limit at my provider, or I accept the risk. Type yes to check this box: ").is_some_and(|a| a.eq_ignore_ascii_case("yes") || a.eq_ignore_ascii_case("y"));
         (cap, ok)
     } else {
