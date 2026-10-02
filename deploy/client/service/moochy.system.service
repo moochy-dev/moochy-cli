@@ -22,7 +22,8 @@ Environment=MOOCHY_HOME=/var/lib/moochy
 # Keystore passphrase: decrypted by systemd into this unit's private, non-swappable
 # credentials directory, never stored in plaintext or in the unit.
 LoadCredentialEncrypted=moochy-passphrase:/etc/moochy/moochy-passphrase.cred
-ExecStart=/bin/sh -c 'MOOCHY_PASSPHRASE=$$(cat "$$CREDENTIALS_DIRECTORY/moochy-passphrase") && export MOOCHY_PASSPHRASE && exec "$0" up --foreground' /usr/local/bin/moochy
+# moochy reads it from $CREDENTIALS_DIRECTORY/moochy-passphrase itself (no shell, no env var).
+ExecStart=/usr/local/bin/moochy up --foreground
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

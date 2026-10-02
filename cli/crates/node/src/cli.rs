@@ -987,7 +987,7 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
     // The background process never sees the owner passphrase (CONTRACT §15.4, A190).
-    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE").env_remove(crate::boxes::ENROLL_ENV);
+    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE").env_remove(crate::boxes::ENROLL_ENV).env_remove("MOOCHY_ENROLL_FILE");
     if offline {
         cmd.arg("--offline");
     }

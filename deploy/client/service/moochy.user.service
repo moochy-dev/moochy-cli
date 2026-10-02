@@ -15,8 +15,9 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-# $0 is the binary; the passphrase is exported only if a credential provides it.
-ExecStart=/bin/sh -c 'if [ -r "$${CREDENTIALS_DIRECTORY:-/nonexistent}/moochy-passphrase" ]; then MOOCHY_PASSPHRASE=$$(cat "$$CREDENTIALS_DIRECTORY/moochy-passphrase"); export MOOCHY_PASSPHRASE; fi; exec "$0" up --foreground' %h/.local/bin/moochy
+# The keystore passphrase, when a credential provides it, is read by moochy itself from
+# $CREDENTIALS_DIRECTORY/moochy-passphrase (never exported to an environment).
+ExecStart=%h/.local/bin/moochy up --foreground
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

@@ -98,7 +98,9 @@ impl KeyLog {
         let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
         let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
         let state = home.state_dir();
-        let me = match (cfg.pseudonym.clone(), sign_pub) {
+        // A cloud box runs the monitor for the gate only, without `Me` (keylog WIRING §9b): the
+        // owner's other devices and boxes are not its business.
+        let me = match (cfg.pseudonym.clone(), sign_pub.filter(|_| cfg.box_device.is_none())) {
             (Some(pseudonym), Some(pk)) => {
                 let mut known_keys = read_keys(&state.join("device_keys"));
                 known_keys.push(pk);

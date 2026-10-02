@@ -89,10 +89,11 @@ pub fn bind(p: &DevicePollResponse, machine: Option<String>) -> Result<BoxState>
     Ok(BoxState { repo: p.repo_slug.to_ascii_lowercase(), expires_at_ms: exp, cap_uusd_month: p.cap_uusd_month, machine: machine.unwrap_or_default() })
 }
 
-/// The enrollment token from the environment, checked for shape (never printed).
+/// The enrollment token, checked for shape (never printed): `MOOCHY_ENROLL`, else the owner-only
+/// file named by `MOOCHY_ENROLL_FILE`, else the systemd credential `moochy-enroll`.
 pub fn enroll_token() -> Result<Option<zeroize::Zeroizing<String>>> {
-    let Some(t) = std::env::var_os(ENROLL_ENV) else { return Ok(None) };
-    let t = zeroize::Zeroizing::new(t.into_string().map_err(|_| usage("MOOCHY_ENROLL is not a box enrollment token"))?.trim().to_owned());
+    let Some(t) = crate::keystore::secret_source(ENROLL_ENV, "moochy-enroll", "enrollment token")? else { return Ok(None) };
+    let t = zeroize::Zeroizing::new(t.trim().to_owned());
     let ok = t.strip_prefix(TOKEN_PREFIX).is_some_and(|r| (32..=128).contains(&r.len()) && r.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
     if !ok {
         return Err(usage("MOOCHY_ENROLL is not a box enrollment token (mbx_…, from `moochy box token create`)"));

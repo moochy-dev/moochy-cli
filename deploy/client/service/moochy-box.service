@@ -34,8 +34,9 @@ Environment=MOOCHY_HOME=/var/lib/moochy
 EnvironmentFile=-/etc/moochy/box.env
 ImportCredential=moochy-passphrase
 ImportCredential=moochy-enroll
-# A credential wins over the env file; both are exported to moochy only.
-ExecStart=/bin/sh -c 'd="$${CREDENTIALS_DIRECTORY:-/nonexistent}"; if [ -r "$$d/moochy-passphrase" ]; then MOOCHY_PASSPHRASE=$$(cat "$$d/moochy-passphrase"); export MOOCHY_PASSPHRASE; fi; if [ -r "$$d/moochy-enroll" ]; then MOOCHY_ENROLL=$$(cat "$$d/moochy-enroll"); export MOOCHY_ENROLL; fi; exec "$0" up --foreground' /usr/local/bin/moochy
+# moochy reads MOOCHY_PASSPHRASE / MOOCHY_ENROLL from the env file when set, else the
+# credentials moochy-passphrase / moochy-enroll from $CREDENTIALS_DIRECTORY itself (no shell).
+ExecStart=/usr/local/bin/moochy up --foreground
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
