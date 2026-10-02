@@ -192,7 +192,15 @@ impl Gate {
                 emit_to = self.base;
             }
             match k {
-                K::Fail(why) => return Err(why),
+                K::Fail(why) => {
+                    // The events before the bad one are valid: queue them exactly as if they had
+                    // come in their own chunk (chunking never changes what the client sees);
+                    // the caller flushes them, then fails the attempt.
+                    if self.hold.is_none() {
+                        self.emit_until(emit_to);
+                    }
+                    return Err(why);
+                }
                 K::Pass => {
                     self.scan_event(start, end);
                     if self.hold.is_none() {
@@ -611,6 +619,37 @@ mod tests {
         let w = o.find("[moochy] warning").expect("warning shown");
         assert!(w < o.find("message_stop").unwrap(), "before message_stop");
         assert!(o.contains(r#""index":1"#), "a new block after the last one");
+    }
+
+    /// Chunking never changes what the client sees: valid events that share a donor chunk with a
+    /// malformed one are released exactly as if they had come alone, then the attempt fails.
+    #[test]
+    fn valid_events_before_a_bad_one_in_the_same_chunk_are_released() {
+        let start = sse("message_start", r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"x","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#);
+        let block = sse("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#);
+        let hello = sse("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#);
+        let bad = sse("content_block_start", r#"{"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#);
+        let run = |chunks: &[String]| {
+            let mut g = Gate::new(Dialect::Anthropic, true, REQ, false);
+            let mut out = Vec::new();
+            let mut failed = false;
+            for (i, c) in chunks.iter().enumerate() {
+                let r = g.push(u32::try_from(i).unwrap(), c.as_bytes());
+                while let Some(b) = g.pop(None, false) {
+                    out.extend_from_slice(&b);
+                }
+                if r.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            (String::from_utf8(out).unwrap(), failed)
+        };
+        let alone = run(&[start.clone(), block.clone(), hello.clone(), bad.clone()]);
+        let merged = run(&[start.clone(), format!("{block}{hello}{bad}")]);
+        assert!(alone.1 && merged.1, "both fail closed");
+        assert!(alone.0.contains(r#""text":"Hello""#), "{}", alone.0);
+        assert_eq!(merged, alone);
     }
 
     /// `cargo test --release -p moochy -- --ignored --nocapture per_event_cost`: what the gate,
