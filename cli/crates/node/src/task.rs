@@ -43,6 +43,8 @@ pub struct TaskReq {
     pub release_tools: bool,
     /// What `firewall::pool_compatible` removed (shown to the client as a `[moochy]` note).
     pub stripped: Vec<String>,
+    /// Pinned donors for this task (project config, narrowed by `x-moochy-donors`); empty = any.
+    pub pinned: Vec<String>,
 }
 
 pub enum TaskEv {
@@ -196,11 +198,13 @@ fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
 }
 
 /// Affinity worker first, then the best `hint`s, ≤ 8 wraps (04 §7).
-fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>) -> Vec<PoolWorker> {
+fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>, pinned: &[String]) -> Vec<PoolWorker> {
     let mut c: Vec<&PoolWorker> = pool
         .workers
         .iter()
         .filter(|w| w.models.iter().any(|m| m == model) && w.dialects.iter().any(|d| d == dialect.wire()) && provider_allowed(w, model, &pool.excluded_providers))
+        // Pinned donors (06 §8): only these donors receive the task.
+        .filter(|w| pinned.is_empty() || pinned.iter().any(|p| p.eq_ignore_ascii_case(&w.donor)))
         .collect();
     c.sort_by_key(|w| (Some(w.worker_device.as_str()) != sticky, std::cmp::Reverse(w.hint)));
     c.into_iter().take(MAX_WRAPS).cloned().collect()
@@ -236,9 +240,12 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
     let route = header.to_bytes().map_err(internal)?;
     let sticky = node.session_worker(&aff);
-    let chosen = pick(&pool, req.dialect, &req.entry.model, sticky.as_deref());
+    let chosen = pick(&pool, req.dialect, &req.entry.model, sticky.as_deref(), &req.pinned);
     if chosen.is_empty() {
-        if !pool.excluded_providers.is_empty() && !pick(&RepoPool { excluded_providers: Vec::new(), ..pool.clone() }, req.dialect, &req.entry.model, None).is_empty() {
+        if !req.pinned.is_empty() && !pick(&pool, req.dialect, &req.entry.model, None, &[]).is_empty() {
+            return Err(Failure::new("forbidden", false, format!("moochy: none of the pinned donors ({}) offers `{}` right now", req.pinned.join(", "), req.entry.model)));
+        }
+        if !pool.excluded_providers.is_empty() && !pick(&RepoPool { excluded_providers: Vec::new(), ..pool.clone() }, req.dialect, &req.entry.model, None, &[]).is_empty() {
             return Err(Failure::new(
                 "forbidden",
                 false,
@@ -821,10 +828,14 @@ mod exclusion {
             excluded_providers: vec!["openrouter".into()],
             ..RepoPool::default()
         };
-        let got: Vec<String> = pick(&pool, Dialect::Anthropic, "m", None).into_iter().map(|w| w.worker_device).collect();
+        let got: Vec<String> = pick(&pool, Dialect::Anthropic, "m", None, &[]).into_iter().map(|w| w.worker_device).collect();
         assert_eq!(got, vec!["a".to_owned()], "openrouter excluded, the silent worker fails closed");
         let open = RepoPool { excluded_providers: Vec::new(), ..pool };
-        assert_eq!(pick(&open, Dialect::Anthropic, "m", None).len(), 3, "no exclusion: everyone");
+        assert_eq!(pick(&open, Dialect::Anthropic, "m", None, &[]).len(), 3, "no exclusion: everyone");
+        let mut named = open.clone();
+        named.workers[1].donor = "Alice".into();
+        let pinned = pick(&named, Dialect::Anthropic, "m", None, &["alice".into()]);
+        assert_eq!(pinned.iter().map(|w| w.worker_device.as_str()).collect::<Vec<_>>(), vec!["o"], "pinned donors only");
     }
 }
 

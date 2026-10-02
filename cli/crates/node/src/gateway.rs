@@ -230,6 +230,18 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
     }
 }
 
+/// Project pins narrowed by the session's `x-moochy-donors` list (a session can only narrow).
+fn narrow_pins(project: Vec<String>, session: Option<&str>) -> Vec<String> {
+    let Some(s) = session else { return project };
+    let names: Vec<String> = s.split(',').map(str::trim).filter(|n| !n.is_empty() && n.len() <= 64).take(64).map(str::to_owned).collect();
+    if project.is_empty() {
+        return names;
+    }
+    let kept: Vec<String> = project.into_iter().filter(|p| names.iter().any(|n| n.eq_ignore_ascii_case(p))).collect();
+    // Disjoint lists: nobody qualifies (fail closed, never "any donor").
+    if kept.is_empty() { vec!["(no session donor is pinned for this project)".into()] } else { kept }
+}
+
 /// One shape that satisfies both the Anthropic and the OpenAI model-list parsers.
 fn models(node: &Node, slug: &str) -> Resp {
     // Pool slugs, then the native aliases the catalog maps to them (05 §2.1).
@@ -325,7 +337,8 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
-    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, stripped })
+    let pinned = node.cfg.pinned_donors.get(&slug.to_ascii_lowercase()).cloned().unwrap_or_default();
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, stripped, pinned })
 }
 
 fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
@@ -352,6 +365,8 @@ fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::Catalo
 #[allow(clippy::too_many_lines, reason = "one request: read, prepare, submit, stream or buffer, headers")]
 async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: bool) -> Resp {
     let t_rx = crate::task::now_us();
+    // Session-level pinned donors (06 §8): `x-moochy-donors: alice,bob`.
+    let session_pins = req.headers().get("x-moochy-donors").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let headers: Vec<(String, String)> = ["anthropic-version", "anthropic-beta"]
         .iter()
         .filter(|_| dialect == Dialect::Anthropic)
@@ -376,7 +391,7 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         };
     }
     let treq = match prepare(&node, slug, dialect, raw, &headers, t_rx) {
-        Ok(t) => TaskReq { release_tools: release, ..t },
+        Ok(t) => TaskReq { release_tools: release, pinned: narrow_pins(t.pinned.clone(), session_pins.as_deref()), ..t },
         Err(f) => return native_error(dialect, &f),
     };
     let stream = treq.facts.stream;
@@ -452,6 +467,21 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         h.insert("x-moochy-note", v);
     }
     resp
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn session_pins_only_narrow() {
+        assert_eq!(narrow_pins(vec![], None), Vec::<String>::new());
+        assert_eq!(narrow_pins(vec![], Some("alice, bob")), vec!["alice", "bob"]);
+        assert_eq!(narrow_pins(vec!["alice".into(), "carol".into()], Some("Alice,bob")), vec!["alice"]);
+        let none = narrow_pins(vec!["alice".into()], Some("bob"));
+        assert_eq!(none.len(), 1);
+        assert!(none[0].contains(' '), "disjoint lists select nobody, never any donor");
+    }
 }
 
 #[cfg(test)]
