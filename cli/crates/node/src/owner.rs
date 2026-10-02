@@ -354,6 +354,31 @@ pub fn revoke_device(home: &Home, device_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `moochy owner trust <ok_id>` (CONTRACT §16.6): an owner key of this account created elsewhere
+/// (a passkey registered on the web) is shown, confirmed by the human, and marked known in the
+/// running app's key-log monitor (persisted), so it stops raising `unknown_*` alerts.
+pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
+    if !id.starts_with("ok_") || id.len() > 64 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        return Err(usage("owner trust <ok_…> (the id in the key-log alert)"));
+    }
+    let rt = rt()?;
+    let call = |dry_run: bool| {
+        rt.block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            c.trust_owner_key(crate::pb::local::TrustOwnerKeyRequest { owner_key_id: id.into(), dry_run }).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
+        })
+    };
+    let d = call(true)?;
+    eprintln!("Owner key {id} of your account, registered in the public key log at #{}{}.", d.log_index, if d.revoked { " (since revoked)" } else { "" });
+    eprintln!("Trust it only if YOU registered it (e.g. a passkey you added on moochy.dev). If not, your account may be compromised.");
+    if !yes && !matches!(ask("Type yes to trust it: ", false)?.as_str(), "yes" | "y") {
+        return Err(usage("not trusted"));
+    }
+    let r = call(false)?;
+    crate::util::emit(&json!({"event": "owner_key_trusted", "owner_key": id, "log_index": r.log_index, "revoked": r.revoked}));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

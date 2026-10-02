@@ -7,7 +7,7 @@ use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
     ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
-    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse, VerifyRequest, VerifyResponse,
+    LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse, VerifyRequest, VerifyResponse, TrustOwnerKeyRequest, TrustOwnerKeyResponse,
     StatusResponse, mcp_up, members_request,
 };
 use crate::util::{Result, internal, log, net};
@@ -188,6 +188,14 @@ impl LocalControl for Ctl {
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+    }
+
+    async fn trust_owner_key(&self, r: Request<TrustOwnerKeyRequest>) -> std::result::Result<Response<TrustOwnerKeyResponse>, Status> {
+        let r = r.into_inner();
+        let l = self.node.keylog.as_ref().ok_or_else(|| Status::failed_precondition("no key-log key: nothing to trust"))?;
+        let me = self.node.cfg.pseudonym.as_deref().ok_or_else(|| Status::failed_precondition("not logged in"))?;
+        let (idx, revoked) = l.trust_owner_key(&r.owner_key_id, me, r.dry_run).ok_or_else(|| Status::not_found("no such owner key on this account in the key log"))?;
+        Ok(Response::new(TrustOwnerKeyResponse { owner_key_id: r.owner_key_id, log_index: idx, revoked, trusted: !r.dry_run }))
     }
 
     async fn verify(&self, r: Request<VerifyRequest>) -> std::result::Result<Response<VerifyResponse>, Status> {

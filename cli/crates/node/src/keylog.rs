@@ -190,6 +190,18 @@ impl KeyLog {
         self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()
     }
 
+    /// `moochy owner trust <ok_id>`: an owner key of THIS account (e.g. a passkey registered on
+    /// the web) becomes known: no more `unknown_*` alerts for it, now and after restarts.
+    /// Returns `(log index, revoked)`; `None` when it is not this account's.
+    pub fn trust_owner_key(&self, id: &str, me: &str, dry_run: bool) -> Option<(u64, bool)> {
+        let view = self.view();
+        let info = view.state(|s| s.owner_key(id).filter(|k| k.pseudonym == me).map(|k| (k.owner_pub, k.idx, k.revoked))).ok().flatten()?;
+        if !dry_run {
+            self.acknowledge(Some(&info.0), None);
+        }
+        Some((info.1, info.2))
+    }
+
     /// Worker side (T-03-088): this donor device holds an owner-signed DONOR_APPROVED for
     /// `repo_id` in a fresh verified log.
     pub fn donor_approved(&self, device: &str, repo_id: &str) -> bool {
@@ -235,6 +247,17 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
             let mut f = alert_fields(a);
             if let Some(o) = f.as_object_mut() {
                 o.insert("detail".into(), json!(format!("{a:?}")));
+                // §16.6: a passkey bound on the relay's word that the mailbox was proven is a
+                // takeover path if the mailbox or the relay is compromised: say so plainly.
+                if let Alert::UnknownPasskey { owner_key, email_proof: true, .. } = a {
+                    o.insert(
+                        "warning".into(),
+                        json!(format!(
+                            "a passkey was registered as an owner key of your account using only an emailed link (email_proof). If it was not you, your mailbox or the server may be compromised: do not trust it. If it was you: moochy owner trust {}",
+                            clean(owner_key)
+                        )),
+                    );
+                }
             }
             ("error", "key log alert".into(), f)
         }

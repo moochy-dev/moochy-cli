@@ -97,6 +97,8 @@ COMMANDS:
                                   the project owner accepts you)
   donations [--json] | donations <pause|resume|stop> <id>
                                   Your donations: what each project used this month
+  owner trust <ok_id>             Mark an owner key you created elsewhere (a passkey added on
+                                  the web) as yours, so the key-log monitor stops alerting
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
                                   with its own passphrase, that signs approvals, memberships and
                                   claims; only used by these commands, never by the app
@@ -327,6 +329,7 @@ fn run() -> Result<()> {
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
         ["donations", act, id] => crate::donations::action(&home, act, id),
         ["owner", "init"] => crate::owner::init(&home, false),
+        ["owner", "trust", id] => crate::owner::trust(&home, id, o.has("yes")),
         ["owner", "rotate"] => crate::owner::init(&home, true),
         // VOICE.md: "accept a donor".
         ["accept", donor] => owner_ops(&home, &o, &["approve", donor]),
