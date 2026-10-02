@@ -130,6 +130,9 @@ pub struct PoolSync {
     /// repo setting (§15.4): release pooled tool calls to clients outside `moochy run` (default false)
     #[prost(bool, tag = "9")]
     pub allow_unsandboxed_tools: bool,
+    /// repo setting: donor pseudonyms the project prefers; the Gateway tries them first (empty = no preference)
+    #[prost(string, repeated, tag = "10")]
+    pub pinned_donors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolWorker {
