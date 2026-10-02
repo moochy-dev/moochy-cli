@@ -81,19 +81,23 @@ pub fn loopback_up() -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("loopback socket: {e}")))?;
     // SAFETY: `ifr` is a zeroed, properly sized `ifreq`; the kernel reads the
     // name and reads/writes `ifru_flags` only. The fd is valid for both calls.
+    // glibc takes the ioctl request as c_ulong, musl as c_int (the musl
+    // release builds): both values fit.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+    let (get, set) = (libc::SIOCGIFFLAGS as libc::Ioctl, libc::SIOCSIFFLAGS as libc::Ioctl);
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         for (dst, src) in ifr.ifr_name.iter_mut().zip(b"lo\0") {
             *dst = libc::c_char::from_ne_bytes([*src]);
         }
-        if libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) == -1 {
+        if libc::ioctl(sock.as_raw_fd(), get, &mut ifr) == -1 {
             return Err(io::Error::last_os_error());
         }
         // IFF_UP | IFF_RUNNING = 0x41: fits in c_short.
         #[allow(clippy::cast_possible_truncation)]
         let up = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         ifr.ifr_ifru.ifru_flags |= up;
-        if libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) == -1 {
+        if libc::ioctl(sock.as_raw_fd(), set, &ifr) == -1 {
             return Err(io::Error::last_os_error());
         }
     }
