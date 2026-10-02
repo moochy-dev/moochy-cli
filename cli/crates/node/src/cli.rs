@@ -304,8 +304,10 @@ fn run() -> Result<()> {
         ["pending"] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             let r = c.pending(crate::pb::local::PendingRequest {}).await.map_err(|s| internal(clean(s.message()).into_owned()))?.into_inner();
-            for q in r.requests {
-                emit(&sign_json(&q));
+            // Standing offers the relay pushes (members that can be removed, devices without a
+            // cap) are actions, not things waiting: `members remove` / `members add --device` use them.
+            for q in r.requests.iter().filter(|q| !q.request_id.starts_with("remove:") && !q.request_id.starts_with("member-device:")) {
+                emit(&sign_json(q));
             }
             Ok(())
         }),
