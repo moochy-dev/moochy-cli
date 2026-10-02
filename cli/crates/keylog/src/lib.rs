@@ -2,7 +2,8 @@
 //!
 //! - [`merkle`]: RFC 6962/9162 hashing, inclusion and consistency proof verification
 //! - [`note`]: signed-note checkpoint verification (C2SP tlog-checkpoint, Ed25519 ZIP-215)
-//! - [`entry`]: exact record formats of the nine entry kinds
+//! - [`entry`]: exact record formats of the entry kinds
+//! - [`webauthn`]: passkey owner keys (`webauthn-es256`): COSE key, assertion check
 //! - [`state`]: the authority state machine and the two pure questions
 //!   "is this worker key sealable for repo R" / "is this gateway allowed for repo R"
 //! - [`tiles`]: C2SP tlog-tiles paths and bounded entry-bundle parsing
@@ -38,6 +39,7 @@ pub mod projection;
 pub mod receipts;
 pub mod state;
 pub mod tiles;
+pub mod webauthn;
 
 pub use entry::{Entry, Kind};
 pub use merkle::Hash;

@@ -56,6 +56,10 @@ fn alert_str(a: &Alert) -> String {
         Alert::RepoClaimedByOther { idx, .. } => format!("RepoClaimedByOther:{idx}"),
         Alert::UnknownOwnerKey { idx, .. } => format!("UnknownOwnerKey:{idx}"),
         Alert::OwnerKeyRevoked { idx, .. } => format!("OwnerKeyRevoked:{idx}"),
+        Alert::UnknownPasskey {
+            idx, email_proof, ..
+        } => format!("UnknownPasskey:{idx}:{email_proof}"),
+        Alert::PasskeyCounter { idx, .. } => format!("PasskeyCounter:{idx}"),
     }
 }
 

@@ -134,3 +134,97 @@ relay exposes it (`receipts/…` tile prefix or a proof field; see the report's 
   closes when its own device is revoked, so confirm via the KEY_REVOKED entry rather than the ack.
   `moochy keys rotate`: body `entry::key_body(...)` for the successor, `sigs:[successor PoP,
   current.sign(entry::rotate_request_message(&body))]`.
+
+## 8. Passkey owner keys (`webauthn-es256`, CONTRACT §16.6, spec/KEYLOG.md §4a)
+
+Accept in emails and on the web is signed by the human with a passkey: a WebAuthn assertion over
+`SHA-256(sig_message(kind, body))`. Everything below is exact; the codes in the acks are the
+spec's (`webauthn_*`, `counter`, `high_s`, `owner_key_exists`, `dup_key`, `skew`, …).
+
+### 8a. mo-oauth: the web ceremonies (Go, `relay/internal/tlog` API)
+
+- **Config.** `rpID` (e.g. `moochy.dev`) and `origins` (e.g. `https://moochy.dev`, ≤ 4,
+  comma-joined, each host = rpID or a subdomain; dev `http://localhost:PORT`). The string is
+  logged with each passkey and checked byte for byte against `clientDataJSON.origin`: changing
+  domains later needs new passkeys.
+- **First passkey (account without any owner key: `len(KeyLog.OwnerKeys(ps)) == 0`).**
+  1. Email proof (A224): mail a one-time token to the confirmed address (mo-notify), redeemed in
+     the same browser session within 10 min; keep only `tokenHash = sha256(token)`, single use.
+  2. `navigator.credentials.create({publicKey: {rp: {id: rpID, name: "Moochy"}, user: {id:
+     <16 random bytes>, name, displayName}, challenge: <random>, pubKeyCredParams: [{type:
+     "public-key", alg: -7}], authenticatorSelection: {userVerification: "required", residentKey:
+     "preferred"}, attestation: "none"}})`. Read `response.getPublicKey()` (SPKI DER) →
+     `x509.ParsePKIXPublicKey` → `*ecdsa.PublicKey` (P-256 only, else refuse) → `x, y` (32 bytes
+     each, `FillBytes`) → `cose := tlog.CoseKey(x, y)`; `credID := rawId` (1..255 bytes). No CBOR
+     needed server-side; the create() challenge is not logged.
+  3. `b := tlog.OwnerPasskey{Pseudonym: ps, Cose: cose, IssuedAtMs: nowMs, CredentialID: credID,
+     RPID: rpID, Origins: origins, EmailProof: tlog.EmailProof(tokenHash, tlog.OwnerKeyID(cose),
+     ps)}`; `body := b.Body()`. Keep `body` server-side (session-bound, ≤ 5 min); never rebuild it.
+  4. `navigator.credentials.get({publicKey: {challenge: tlog.Challenge(tlog.SigMessage(
+     tlog.OwnerKeyAdded, body)), rpId: rpID, allowCredentials: [{type: "public-key", id: credID}],
+     userVerification: "required"}})` → `a := tlog.Assertion{AuthData: authenticatorData,
+     ClientDataJSON: clientDataJSON, Signature: signature}` (raw bytes as the browser returns them).
+  5. `KeyLog.Append(ctx, tlog.OwnerKeyAdded, body, tlog.PasskeySig(a, nil))`. Append checks
+     everything (grammar, skew, PoP, first-key rule) and rewrites high-S to low-S itself.
+- **Another passkey** (the user already has one): same steps without the email proof:
+  `Authorizer: <ok_id of an active passkey>`, `EmailProof: nil`; after the new credential's get()
+  (PoP), run a second get() with `allowCredentials: [authorizer's credential]` over the **same**
+  challenge; `sig = tlog.PasskeySig(pop, authAssertion.Encode())`. An Ed25519 authorizer (CLI key)
+  is valid in the log but has no web ceremony: not offered.
+- **Accept (email button or web) = `DONOR_APPROVED`** (same for `DONOR_REVOKED`, `MEMBER_*`,
+  `REPO_CLAIMED`): the signer id is inside the body, so pick the credential **before** signing:
+  the passkey last used in this browser (store its `ok_` id in localStorage after registration /
+  each approval), else a picker over `KeyLog.OwnerKeys(ps)` with `Alg == tlog.AlgWebAuthnES256`.
+  `body := tlog.Grant{RepoID, Subject: donorPseudonym, Signer: k.ID, IssuedAtMs: nowMs}.Body()`
+  (show the user what it means first: repo, donor, approve), then one get() with
+  `challenge = tlog.Challenge(tlog.SigMessage(tlog.DonorApproved, body))`, `allowCredentials:
+  [k.Passkey's credential: k.CredentialID]`, `userVerification: "required"`; then submit through
+  mo-relay's gate (8b) with `sig = a.Encode()`. The email link itself never approves: it opens
+  the page that runs the ceremony.
+- **UX of refusals.** `counter`: "this passkey's signature counter went backwards; it may have
+  been copied, use another one and revoke it"; `webauthn_origin`/`webauthn_rp`: wrong domain;
+  `owner_key_exists`: the account already has an owner key (co-sign with it).
+- **Revoking a passkey** (lost device, after re-authentication): relay-asserted
+  `KeyLog.Append(ctx, tlog.OwnerKeyRevoked, tlog.OwnerRevoke{Pseudonym: ps, Pub: k.Pub /* 77-byte
+  COSE */, Reason: "lost"}.Body(), nil)`. The user's Nodes alert on it.
+
+### 8b. mo-relay: append path and gate
+
+- **Append.** Passkey-signed kinds 3–7 go through the same `KeyLog.Append` /
+  `AppendSigned(kind, body, [][]byte{a.Encode()})` (one sig of any length). Passkey
+  `OWNER_KEY_ADDED` is refused by `AppendSigned` (it wants 64-byte sigs): web only, via `Append`.
+  The log does the rest: low-S rewrite, record bound (≤ 2048 with an assertion, else 480), `PAD`
+  entries before large records so every entry bundle stays ≤ 123,392 bytes (MaxTileBytes and the
+  128 KiB gRPC limit are unchanged), per-credential counters (moved only when the entry commits),
+  `KindByName` never yields `PAD` (`Append(PAD)` is refused).
+- **Gate (`sched/keylog.go`, EvLogGate).** Replace `ActiveOwnerKey(ps).ID == signer` by "signer is
+  one of `KeyLog.OwnerKeys(ps)`" (Ed25519 or passkey). Keep the verified-claimant / current-owner
+  checks as they are.
+- **ApprovalRequests to Nodes.** `hasKey := len(KeyLog.OwnerKeys(ps)) > 0`. Keep proposing bodies
+  with `ActiveOwnerKey` (the CLI's Ed25519 key) when there is one; when the user has only passkeys,
+  send no `owner_key` request (an Ed25519 first key would be refused with `owner_key_exists`) and
+  leave approvals to the web/email flow.
+- **Listings.** Anything that walks log entries for display (activity, admin) skips kind 12 `PAD`;
+  `Entry.Parse()` returns `(nil, nil)` for it.
+
+### 8c. mo-donor: Node verification
+
+- **Nothing to call for verification**: the mirror's `State` verifies passkey entries (assertion,
+  counter, first-key rule) and `sealable` / `gateway_allowed` work unchanged for passkey-signed
+  approvals. New `Body` variants (`OwnerPasskey`, `OwnerPasskeyRevoke`, `Pad`) fall into your
+  existing `_ =>` arms. Mac: `moochy-keylog` now depends on `ring` (already in the Node via rustls).
+- **Required patch** (`crates/node/src/keylog.rs`, `alert_fields`, exhaustive match): add
+
+  ```rust
+  Alert::UnknownPasskey { idx, owner_key, rp_id, email_proof } => json!({"alert": "unknown_passkey", "idx": idx, "kind": "OWNER_KEY_ADDED", "owner_key": clean(owner_key), "rp_id": clean(rp_id), "email_proof": email_proof}),
+  Alert::PasskeyCounter { idx, owner_key } => json!({"alert": "passkey_counter", "idx": idx, "code": "counter", "owner_key": clean(owner_key)}),
+  ```
+
+  (checked: with these two arms `cargo build -p moochy` and its tests build).
+- **Known passkeys.** A Node names a passkey by `state::passkey_digest(cose_key)` (=
+  `OwnerKeyInfo::owner_pub` for passkeys). Passkeys are created on the web, so the Node first
+  sees them as `UnknownPasskey`; after the user confirms (`moochy owner trust <ok_id>` or the
+  status UI), call `view.acknowledge_owner_key(digest)` with `digest = view.state(|s|
+  s.owner_key(id).map(|k| k.owner_pub))` and persist it with the other known owner keys. Show
+  `email_proof: true` prominently: the key was bound on the relay's word that the user's mailbox
+  was proven (takeover path if the mailbox or relay is compromised).

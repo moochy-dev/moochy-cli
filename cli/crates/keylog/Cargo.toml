@@ -16,6 +16,9 @@ http = ["dep:rustls", "dep:webpki-roots"]
 # Same versions as moochy-proto: one sha2 0.10 and one ed25519-zebra 4 (ZIP-215) in the tree.
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
+# P-256 ECDSA for passkey owner keys (webauthn-es256): the ring already in the tree via
+# rustls / moochy-proto, no new crypto crate.
+ring = { version = "0.17", default-features = false }
 # http feature only; both already in the Node's tree (ring provider, no OpenSSL).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 webpki-roots = { version = "1", default-features = false, optional = true }

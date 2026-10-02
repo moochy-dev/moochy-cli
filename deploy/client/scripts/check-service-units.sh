@@ -4,8 +4,8 @@
 #
 #   check-service-units.sh [--dry-run] [--live MOOCHY_BIN MOOCHY_HOME]
 #
-# Always: systemd-analyze verify of both units, exposure score of the system
-# unit (must stay <= 2.0), the launchd plist parses.
+# Always: systemd-analyze verify of the three units, exposure score of the
+# system and box units (must stay <= 2.0), the launchd plist parses.
 # --live: runs `moochy up --foreground` under the real user unit (a runtime
 # copy in $XDG_RUNTIME_DIR/systemd/user, binary and home substituted, the
 # keystore passphrase from $MOOCHY_PASSPHRASE passed as a credential) and
@@ -22,21 +22,23 @@ while (($#)); do
 	shift
 done
 if ((dry_run)); then
-	echo "[dry-run] systemd-analyze verify $here/moochy.{user,system}.service" >&2
-	echo "[dry-run] systemd-analyze security --offline=yes moochy.system.service (<= 2.0)" >&2
+	echo "[dry-run] systemd-analyze verify $here/moochy.{user,system}.service $here/moochy-box.service" >&2
+	echo "[dry-run] systemd-analyze security --offline=yes moochy.system.service moochy-box.service (<= 2.0)" >&2
 	echo "[dry-run] plistlib parse $here/dev.moochy.agent.plist" >&2
 	[[ -n $bin ]] && echo "[dry-run] systemctl --user start <runtime copy of moochy.user.service> with $bin, $home" >&2
 	exit 0
 fi
 
-for u in moochy.user.service moochy.system.service; do
+for u in moochy.user.service moochy.system.service moochy-box.service; do
 	out=$(systemd-analyze verify --man=no "$here/$u" 2>&1 | grep -v 'is not executable' || true)
 	[[ -z $out ]] || { echo "FAIL verify $u: $out" >&2; exit 1; }
 done
-score=$(systemd-analyze security --offline=yes "$here/moochy.system.service" | sed -n 's/.*exposure level for .*: \([0-9.]*\) .*/\1/p')
-awk -v s="$score" 'BEGIN { exit !(s <= 2.0) }' || { echo "FAIL system unit exposure $score > 2.0" >&2; exit 1; }
+for u in moochy.system.service moochy-box.service; do
+	score=$(systemd-analyze security --offline=yes "$here/$u" | sed -n 's/.*exposure level for .*: \([0-9.]*\) .*/\1/p')
+	awk -v s="$score" 'BEGIN { exit !(s <= 2.0) }' || { echo "FAIL $u exposure $score > 2.0" >&2; exit 1; }
+done
 python3 -c 'import plistlib,sys; d=plistlib.load(open(sys.argv[1],"rb")); assert d["Umask"]==0o077 and d["HardResourceLimits"]["Core"]==0' "$here/dev.moochy.agent.plist"
-echo "ok   units verify, system exposure $score, plist parses"
+echo "ok   units verify, system and box exposure <= 2.0 (box $score), plist parses"
 [[ -n $bin ]] || exit 0
 
 : "${MOOCHY_PASSPHRASE:?set MOOCHY_PASSPHRASE for the live check}"

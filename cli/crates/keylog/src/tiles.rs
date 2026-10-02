@@ -1,6 +1,9 @@
 //! C2SP tlog-tiles paths and bounded entry-bundle parsing.
 
-use crate::{Error, entry::MAX_RECORD};
+use crate::{
+    Error,
+    entry::{MAX_PLAIN_RECORD, MAX_RECORD},
+};
 use std::fmt::Write;
 
 /// 256 hashes or entries per tile (C2SP fixed height 8).
@@ -9,8 +12,9 @@ pub const TILE_WIDTH: u64 = 256;
 pub const MAX_CHECKPOINT_BYTES: usize = crate::note::MAX_NOTE;
 /// Largest hash tile: 256 × 32.
 pub const MAX_HASH_TILE_BYTES: usize = 8192;
-/// Largest entry bundle: 256 × (2 + MAX_RECORD).
-pub const MAX_BUNDLE_BYTES: usize = 256 * (2 + MAX_RECORD);
+/// Largest entry bundle: 256 × (2 + MAX_PLAIN_RECORD) = 123,392 bytes. Single
+/// records may reach MAX_RECORD; the relay pads bundles to stay within this budget.
+pub const MAX_BUNDLE_BYTES: usize = 256 * (2 + MAX_PLAIN_RECORD);
 
 /// Path of a tile relative to the log prefix: `tile/<L>/<N>[.p/<W>]`, or
 /// `tile/entries/<N>[.p/<W>]` when `level` is `None`. `width` 256 = full tile.
