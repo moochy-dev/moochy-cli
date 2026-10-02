@@ -11,6 +11,11 @@ pub const LABEL_POP: &[u8] = b"moochy/v1/key-pop";
 pub const MAX_RECORD: usize = 480;
 /// Label of receipt-log leaves: `lp("moochy/v1/receipt-log", sha256(receipt))`.
 pub const LABEL_RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
+/// Device-signed requests (spec/KEYLOG.md §2a): authenticate a request, never a log entry.
+pub const LABEL_KEY_REVOKE: &[u8] = b"moochy/v1/key-revoke";
+pub const LABEL_KEY_ROTATE: &[u8] = b"moochy/v1/key-rotate";
+/// Label of donor-signed projections (CONTRACT §2).
+pub const LABEL_PROJECTION: &[u8] = b"moochy/v1/projection";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -222,6 +227,52 @@ pub fn sig_message(kind: Kind, body: &[u8]) -> Vec<u8> {
 
 /// The proof-of-possession message a new device signs at DeviceStart:
 /// `lp("moochy/v1/key-pop", sign_pub, enc_pub, suite)`.
+/// KEY_REVOKED body: `lp(device_id, pseudonym, reason)`.
+#[must_use]
+pub fn revoke_body(device_id: &str, pseudonym: &str, reason: &str) -> Vec<u8> {
+    lp(&[
+        device_id.as_bytes(),
+        pseudonym.as_bytes(),
+        reason.as_bytes(),
+    ])
+}
+
+/// What a device signs to ask for a revocation (`moochy logout`, `keys revoke`):
+/// `lp("moochy/v1/key-revoke", revoke_body)`. Not a log signature (§2a).
+#[must_use]
+pub fn revoke_request_message(body: &[u8]) -> Vec<u8> {
+    lp(&[LABEL_KEY_REVOKE, body])
+}
+
+/// KEY_ADDED body (e.g. the successor's, for `moochy keys rotate`); `repo_scope` "" = none.
+#[must_use]
+pub fn key_body(
+    device_id: &str,
+    pseudonym: &str,
+    sign_pub: &[u8; 32],
+    enc_pub: &[u8; 32],
+    suite: &str,
+    roles: &str,
+    repo_scope: &str,
+) -> Vec<u8> {
+    lp(&[
+        device_id.as_bytes(),
+        pseudonym.as_bytes(),
+        sign_pub,
+        enc_pub,
+        suite.as_bytes(),
+        roles.as_bytes(),
+        repo_scope.as_bytes(),
+    ])
+}
+
+/// What the current device signs over its successor's KEY_ADDED body (`moochy keys
+/// rotate`): `lp("moochy/v1/key-rotate", key_body)`; sent with the successor's PoP first.
+#[must_use]
+pub fn rotate_request_message(successor_body: &[u8]) -> Vec<u8> {
+    lp(&[LABEL_KEY_ROTATE, successor_body])
+}
+
 #[must_use]
 pub fn pop_message(sign_pub: &[u8; 32], enc_pub: &[u8; 32], suite: &str) -> Vec<u8> {
     lp(&[LABEL_POP, sign_pub, enc_pub, suite.as_bytes()])
