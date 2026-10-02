@@ -257,3 +257,48 @@ async fn live_local_servers() {
         }
     }
 }
+
+/// Opt-in: a real model server over TLS (§17.3 transport: HTTP/1.1 over TLS, pinned CA, auth
+/// header). `MOOCHY_LOCAL_TLS="https://127.0.0.1:28443|/path/ca.der|authorization|Bearer KEY|model"`
+/// (e.g. llama.cpp with `--ssl-cert-file`, `--ssl-key-file`, `--api-key KEY`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MOOCHY_LOCAL_TLS (a running TLS model server)"]
+async fn live_local_tls_server() {
+    use provider::{LocalOptions, RemoteTrust};
+    let spec = std::env::var("MOOCHY_LOCAL_TLS").unwrap();
+    let f: Vec<&str> = spec.split('|').collect();
+    let (url, ca, hname, hvalue, model) = (f[0], f[1], f[2], f[3], f[4]);
+    let ca = rustls::pki_types::CertificateDer::from(std::fs::read(ca).unwrap());
+    let cfg = AdapterConfig {
+        provider: Provider::Local,
+        api_key: Zeroizing::new(String::new()),
+        base_url: Some(url.into()),
+        insecure_dev: false,
+        dev_root: None,
+        limits: Limits::local(),
+    };
+    let opts = |trust: RemoteTrust, header: bool| LocalOptions {
+        auth_header: header.then(|| (hname.to_owned(), Zeroizing::new(hvalue.to_owned()))),
+        trust,
+        ..LocalOptions::default()
+    };
+    let body = r#"{"model":"local/m","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Say hi."}]}"#;
+    let p = prep(body, model).unwrap();
+    // Pinned CA + auth header: a full, exact-usage stream.
+    let a = Adapter::new_local_with(&cfg, &opts(RemoteTrust::Ca(ca.clone()), true)).unwrap();
+    a.warm().await.unwrap();
+    let mut r = a.send(O, p.body.clone(), &p.headers).await.unwrap();
+    let mut parser = StreamParser::new(O, true);
+    while let Some(c) = r.next().await.unwrap() {
+        parser.feed(&c, &mut |_, _| {}).unwrap();
+    }
+    let o = parser.finish();
+    assert!(o.complete && !o.usage.estimated && o.usage.output > 0, "{o:?}");
+    println!("tls: {:?} model={:?}", o.usage, o.model);
+    // Without the header: the server's 401 (Auth), not a stream.
+    let a = Adapter::new_local_with(&cfg, &opts(RemoteTrust::Ca(ca), false)).unwrap();
+    assert_eq!(a.send(O, p.body.clone(), &p.headers).await.unwrap_err().kind, provider::FailKind::Auth);
+    // Mozilla roots do not trust the box's own CA: refused before any byte is sent.
+    let a = Adapter::new_local_with(&cfg, &opts(RemoteTrust::Roots, true)).unwrap();
+    assert_eq!(a.send(O, p.body, &p.headers).await.unwrap_err().kind, provider::FailKind::Network);
+}
