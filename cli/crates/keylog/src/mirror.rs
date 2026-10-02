@@ -11,7 +11,7 @@ use crate::{
     entry::{Body, Kind, MAX_RECORD, parse_record},
     merkle::{CompactRange, Hash, leaf_hash, root_of},
     note::{Checkpoint, NoteKey, open_checkpoint},
-    state::{Code, State},
+    state::{Code, State, passkey_digest},
 };
 
 /// Who this Node is, for the monitor rules.
@@ -61,6 +61,19 @@ pub enum Alert {
     /// One of my owner keys was revoked by the relay (first step of an account takeover,
     /// or a recovery I asked for).
     OwnerKeyRevoked { idx: u64, owner_key: String },
+    /// A passkey owner key was registered on my account that I neither created nor
+    /// acknowledged. `email_proof`: registered as the account's first owner key on the
+    /// relay's word that the confirmed email was proven (A224), the takeover path of a
+    /// compromised mailbox or relay.
+    UnknownPasskey {
+        idx: u64,
+        owner_key: String,
+        rp_id: String,
+        email_proof: bool,
+    },
+    /// An assertion of one of my passkeys came with a sign counter not above the last
+    /// one: a cloned authenticator or a replayed signature (the entry was rejected).
+    PasskeyCounter { idx: u64, owner_key: String },
 }
 
 /// Result of comparing a checkpoint (e.g. the Git anchor) with the mirror.
@@ -150,7 +163,8 @@ impl Mirror {
         }
     }
 
-    /// The user just created (or confirmed) this owner key.
+    /// The user just created (or confirmed) this owner key: an Ed25519 public key, or
+    /// [`passkey_digest`] of a passkey's COSE key.
     pub fn acknowledge_owner_key(&mut self, owner_pub: [u8; 32]) {
         if !self.owner_keys.contains(&owner_pub) {
             self.owner_keys.push(owner_pub);
@@ -255,6 +269,20 @@ impl Mirror {
                 kind: e.kind,
                 code,
             });
+            let signer = match e.body {
+                Body::Claim { signer, .. } | Body::Grant { signer, .. } => Some(signer),
+                Body::OwnerPasskey { authorizer, .. } => authorizer,
+                _ => None,
+            };
+            if let (Code::Counter, Some(me), Some(k)) =
+                (code, &self.me, signer.and_then(|s| self.state.owner_key(s)))
+                && k.pseudonym == me.pseudonym
+            {
+                alerts.push(Alert::PasskeyCounter {
+                    idx,
+                    owner_key: k.id.clone(),
+                });
+            }
             return Ok(());
         }
         let Some(me) = &self.me else { return Ok(()) };
@@ -294,6 +322,37 @@ impl Mirror {
                 alerts.push(Alert::OwnerKeyRevoked {
                     idx,
                     owner_key: crate::entry::owner_key_id(owner_pub),
+                });
+            }
+            Body::OwnerPasskey {
+                pseudonym,
+                cose,
+                rp_id,
+                email_proof,
+                ..
+            } if pseudonym == me.pseudonym && !knows_owner(&passkey_digest(cose)) => {
+                alerts.push(Alert::UnknownPasskey {
+                    idx,
+                    owner_key: crate::entry::owner_key_id(cose),
+                    rp_id: rp_id.to_owned(),
+                    email_proof: email_proof.is_some(),
+                });
+            }
+            Body::OwnerPasskey {
+                pseudonym, cose, ..
+            } if pseudonym != me.pseudonym && knows_owner(&passkey_digest(cose)) => {
+                alerts.push(Alert::KeyHijack {
+                    idx,
+                    device_id: crate::entry::owner_key_id(cose),
+                    pseudonym: pseudonym.to_owned(),
+                });
+            }
+            Body::OwnerPasskeyRevoke {
+                pseudonym, cose, ..
+            } if pseudonym == me.pseudonym => {
+                alerts.push(Alert::OwnerKeyRevoked {
+                    idx,
+                    owner_key: crate::entry::owner_key_id(cose),
                 });
             }
             Body::Key {

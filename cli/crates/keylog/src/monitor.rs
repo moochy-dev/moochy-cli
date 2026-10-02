@@ -182,6 +182,22 @@ fn alert_message(a: &Alert) -> String {
         Alert::Invalid { idx } => {
             format!("keylog: SECURITY: malformed entry at log #{idx}; it is ignored")
         }
+        Alert::UnknownPasskey {
+            idx,
+            owner_key,
+            rp_id,
+            email_proof,
+        } => format!(
+            "keylog: SECURITY: unknown_owner_key: a passkey {owner_key} for {rp_id} you did not create was registered on your account (log #{idx}){}; approvals it signs are not yours",
+            if *email_proof {
+                " as its first owner key on the relay's word that your email was confirmed: if this wasn't you, your mailbox or the relay is compromised"
+            } else {
+                ""
+            }
+        ),
+        Alert::PasskeyCounter { idx, owner_key } => format!(
+            "keylog: SECURITY: passkey_counter: an assertion of your passkey {owner_key} reused or lowered its sign counter (log #{idx}): a cloned authenticator or a replayed signature; the entry is ignored"
+        ),
     }
 }
 

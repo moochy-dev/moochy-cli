@@ -1,8 +1,10 @@
 //! The authority state machine (spec/KEYLOG.md §4), identical to Go's
 //! `relay/internal/tlog/state.go`, plus the two pure questions Gateways and Workers ask.
 
-use crate::entry::{Body, Entry, Kind, Roles, owner_key_id, pop_message, sig_message};
+use crate::entry::{Body, Entry, Kind, Roles, owner_key_id, pop_message, sig_message, unlp};
+use crate::webauthn::{self, Assertion, Passkey, verify_assertion};
 use ed25519_zebra::{Signature, VerificationKey};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// Stable rejection/denial codes (same strings as Go).
@@ -37,6 +39,17 @@ pub enum Code {
     /// Sealing gate: no verified checkpoint yet (or it is too old).
     NoCheckpoint,
     StaleLog,
+    /// Passkey assertion checks (spec/KEYLOG.md §4a).
+    WebAuthnType,
+    WebAuthnChallenge,
+    WebAuthnOrigin,
+    WebAuthnRp,
+    WebAuthnFlags,
+    WebAuthnFormat,
+    /// Sign counter not above the credential's last one (cloned authenticator or replay).
+    Counter,
+    /// ECDSA signature with s > n/2 (relays normalize before appending).
+    HighS,
 }
 
 impl Code {
@@ -65,6 +78,14 @@ impl Code {
             Self::OwnerKeyExists => "owner_key_exists",
             Self::NoCheckpoint => "no_checkpoint",
             Self::StaleLog => "stale_log",
+            Self::WebAuthnType => "webauthn_type",
+            Self::WebAuthnChallenge => "webauthn_challenge",
+            Self::WebAuthnOrigin => "webauthn_origin",
+            Self::WebAuthnRp => "webauthn_rp",
+            Self::WebAuthnFlags => "webauthn_flags",
+            Self::WebAuthnFormat => "webauthn_format",
+            Self::Counter => "counter",
+            Self::HighS => "high_s",
         }
     }
 }
@@ -107,10 +128,34 @@ struct Repo {
 pub struct OwnerKeyInfo {
     pub id: String,
     pub pseudonym: String,
+    /// The Ed25519 key; for a passkey, SHA-256 of its COSE key (the digest monitors
+    /// know and acknowledge).
     pub owner_pub: [u8; 32],
     /// Index of the OWNER_KEY_ADDED entry.
     pub idx: u64,
     pub revoked: bool,
+    /// `webauthn-es256` owner keys only.
+    pub passkey: Option<PasskeyInfo>,
+}
+
+/// A logged passkey owner key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasskeyInfo {
+    /// `04 ‖ x ‖ y`.
+    pub point: [u8; 65],
+    pub credential_id: Vec<u8>,
+    pub rp_id: String,
+    pub origins: String,
+    /// Last sign counter seen (strictly increasing unless 0).
+    pub counter: u32,
+    /// First owner key of the account, registered with the relay-attested email proof.
+    pub email_proof: bool,
+}
+
+/// SHA-256 of a passkey's COSE key: how monitors name a passkey they know.
+#[must_use]
+pub fn passkey_digest(cose: &[u8]) -> [u8; 32] {
+    Sha256::digest(cose).into()
 }
 
 /// The result of a successful [`State::sealable`] check.
@@ -130,8 +175,12 @@ pub struct State {
     catalog: u64,
     /// owner key id → key.
     owners: HashMap<String, OwnerKeyInfo>,
-    /// pseudonym → active owner key id.
+    /// pseudonym → active Ed25519 owner key id.
     owner_of: HashMap<String, String>,
+    /// pseudonym → number of active passkeys.
+    passkeys_of: HashMap<String, u32>,
+    /// passkey credential id → owner key id.
+    creds: HashMap<Vec<u8>, String>,
 }
 
 fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
@@ -207,7 +256,7 @@ impl State {
                 signer,
                 issued_at_ms,
             } => {
-                self.check_signer(signer, owner, e, check_sigs)?;
+                let ctr = self.check_signer(signer, owner, e, check_sigs)?;
                 if let Some(r) = self.repos.get(repo_id) {
                     if r.provider != provider || r.provider_repo_id != provider_repo_id {
                         return Err(Code::RepoBinding);
@@ -216,6 +265,7 @@ impl State {
                         return Err(Code::Replay);
                     }
                 }
+                self.bump(signer, ctr);
                 let r = self
                     .repos
                     .entry(repo_id.to_owned())
@@ -247,20 +297,23 @@ impl State {
                     .ok_or(Code::Unclaimed)?
                     .owner
                     .clone();
-                self.check_signer(signer, &owner, e, check_sigs)?;
+                let ctr = self.check_signer(signer, &owner, e, check_sigs)?;
                 let member = matches!(e.kind, Kind::MemberAdded | Kind::MemberRemoved);
-                let r = self.repos.get_mut(repo_id).ok_or(Code::Unclaimed)?;
-                let grants = if member {
-                    &mut r.members
-                } else {
-                    &mut r.donors
-                };
+                let r = self.repos.get(repo_id).ok_or(Code::Unclaimed)?;
+                let grants = if member { &r.members } else { &r.donors };
                 if grants
                     .get(subject)
                     .is_some_and(|g| issued_at_ms <= g.issued)
                 {
                     return Err(Code::Replay);
                 }
+                self.bump(signer, ctr);
+                let r = self.repos.get_mut(repo_id).ok_or(Code::Unclaimed)?;
+                let grants = if member {
+                    &mut r.members
+                } else {
+                    &mut r.donors
+                };
                 let active = matches!(e.kind, Kind::DonorApproved | Kind::MemberAdded);
                 grants.insert(
                     subject.to_owned(),
@@ -280,7 +333,7 @@ impl State {
                 self.catalog = version;
                 self.catalogs.insert(version, *sha256);
             }
-            Body::Moderation { .. } => {}
+            Body::Moderation { .. } | Body::Pad => {}
             Body::OwnerKey {
                 pseudonym,
                 owner_pub,
@@ -296,6 +349,10 @@ impl State {
                     .and_then(|id| self.owners.get(id));
                 match (cur, prev) {
                     (None, Some(_)) => return Err(Code::UnknownOwnerKey),
+                    // A passkey exists: an unauthorized first CLI key would be trust-on-first-use.
+                    (None, None) if self.passkeys_of.get(pseudonym).is_some_and(|n| *n > 0) => {
+                        return Err(Code::OwnerKeyExists);
+                    }
                     (Some(c), p) if p != Some(&c.owner_pub) => return Err(Code::OwnerKeyExists),
                     _ => {}
                 }
@@ -322,9 +379,102 @@ impl State {
                         owner_pub: *owner_pub,
                         idx,
                         revoked: false,
+                        passkey: None,
                     },
                 );
                 self.owner_of.insert(pseudonym.to_owned(), id);
+            }
+            Body::OwnerPasskey {
+                pseudonym,
+                cose,
+                authorizer,
+                credential_id,
+                rp_id,
+                origins,
+                email_proof,
+                ..
+            } => {
+                let id = owner_key_id(cose);
+                if self.owners.contains_key(&id) || self.creds.contains_key(credential_id) {
+                    return Err(Code::DupKey);
+                }
+                let [pop, auth] = unlp::<2>(e.sig).map_err(|_| Code::BadSig)?;
+                let pop = Assertion::parse(pop).map_err(|_| Code::BadSig)?;
+                let point = webauthn::point_of(cose);
+                let msg = sig_message(Kind::OwnerKeyAdded, e.raw_body);
+                if check_sigs {
+                    let k = Passkey {
+                        point: &point,
+                        rp_id,
+                        origins,
+                    };
+                    verify_assertion(&k, &msg, &pop, 0)?;
+                }
+                let bump = match authorizer {
+                    // First owner key of the account: only with the email proof (grammar), A224.
+                    None => {
+                        if self.owner_of.contains_key(pseudonym)
+                            || self.passkeys_of.get(pseudonym).is_some_and(|n| *n > 0)
+                        {
+                            return Err(Code::OwnerKeyExists);
+                        }
+                        None
+                    }
+                    Some(a) => {
+                        let k = self.owners.get(a).ok_or(Code::UnknownOwnerKey)?;
+                        if k.revoked {
+                            return Err(Code::Revoked);
+                        }
+                        if k.pseudonym != pseudonym {
+                            return Err(Code::NotOwner);
+                        }
+                        if auth.is_empty() {
+                            return Err(Code::BadSig);
+                        }
+                        Self::owner_sig(k, Kind::OwnerKeyAdded, e.raw_body, auth, check_sigs)?
+                    }
+                };
+                if let Some(a) = authorizer {
+                    self.bump(a, bump);
+                }
+                self.creds.insert(credential_id.to_vec(), id.clone());
+                let n = self.passkeys_of.entry(pseudonym.to_owned()).or_default();
+                *n = n.saturating_add(1);
+                self.owners.insert(
+                    id.clone(),
+                    OwnerKeyInfo {
+                        id,
+                        pseudonym: pseudonym.to_owned(),
+                        owner_pub: passkey_digest(cose),
+                        idx,
+                        revoked: false,
+                        passkey: Some(PasskeyInfo {
+                            point,
+                            credential_id: credential_id.to_vec(),
+                            rp_id: rp_id.to_owned(),
+                            origins: origins.to_owned(),
+                            counter: pop.counter(),
+                            email_proof: email_proof.is_some(),
+                        }),
+                    },
+                );
+            }
+            Body::OwnerPasskeyRevoke {
+                pseudonym, cose, ..
+            } => {
+                let id = owner_key_id(cose);
+                let k = self
+                    .owners
+                    .get_mut(&id)
+                    .filter(|k| k.pseudonym == pseudonym)
+                    .ok_or(Code::UnknownOwnerKey)?;
+                if k.revoked {
+                    return Err(Code::Revoked);
+                }
+                k.revoked = true;
+                if let Some(n) = self.passkeys_of.get_mut(pseudonym) {
+                    *n = n.saturating_sub(1);
+                }
             }
             Body::OwnerRevoke {
                 pseudonym,
@@ -349,13 +499,15 @@ impl State {
         Ok(())
     }
 
+    /// Checks the owner signature of kinds 3–7; returns the passkey's new sign counter
+    /// (applied by the caller with [`Self::bump`] once every other check passed).
     fn check_signer(
         &self,
         key_id: &str,
         owner: &str,
         e: &Entry<'_>,
         check_sigs: bool,
-    ) -> Result<(), Code> {
+    ) -> Result<Option<u32>, Code> {
         let k = self.owners.get(key_id).ok_or(Code::UnknownOwnerKey)?;
         if k.revoked {
             return Err(Code::Revoked);
@@ -363,10 +515,45 @@ impl State {
         if k.pseudonym != owner {
             return Err(Code::NotOwner);
         }
-        if check_sigs && !verify(&k.owner_pub, &sig_message(e.kind, e.raw_body), e.sig) {
-            return Err(Code::BadSig);
+        Self::owner_sig(k, e.kind, e.raw_body, e.sig, check_sigs)
+    }
+
+    /// `sig` by owner key `k` over `sig_message(kind, body)`: Ed25519, or a WebAuthn
+    /// assertion for passkeys (then `Some(new counter)`; without `check_sigs`, the
+    /// counter is still replayed from the stored assertion).
+    fn owner_sig(
+        k: &OwnerKeyInfo,
+        kind: Kind,
+        body: &[u8],
+        sig: &[u8],
+        check_sigs: bool,
+    ) -> Result<Option<u32>, Code> {
+        let Some(p) = &k.passkey else {
+            if sig.len() != 64 || check_sigs && !verify(&k.owner_pub, &sig_message(kind, body), sig)
+            {
+                return Err(Code::BadSig);
+            }
+            return Ok(None);
+        };
+        let a = Assertion::parse(sig).map_err(|_| Code::BadSig)?;
+        if !check_sigs {
+            return Ok(Some(a.counter()));
         }
-        Ok(())
+        let pk = Passkey {
+            point: &p.point,
+            rp_id: &p.rp_id,
+            origins: &p.origins,
+        };
+        verify_assertion(&pk, &sig_message(kind, body), &a, p.counter).map(Some)
+    }
+
+    fn bump(&mut self, key_id: &str, ctr: Option<u32>) {
+        if let (Some(c), Some(p)) = (
+            ctr,
+            self.owners.get_mut(key_id).and_then(|k| k.passkey.as_mut()),
+        ) {
+            p.counter = c;
+        }
     }
 
     /// A logged owner key by id (`ok_…`), active or not.
