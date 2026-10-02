@@ -129,6 +129,27 @@ impl KeyLog {
         }
     }
 
+    /// Foreground CLI (owner commands): the pseudonym that owns `device` in this node's persisted
+    /// mirror, read from disk — independent of `node.sock`, and trustworthy: the records must
+    /// reproduce a checkpoint signed by the pinned log key (`Monitor::open`). Outer `None`: no
+    /// key log on this node; inner `None`: the device is not in the log.
+    pub fn device_owner(home: &Home, cfg: &Config, device: &str) -> Option<Option<String>> {
+        let key = NoteKey::parse(&effective_log_key(cfg)?).ok()?;
+        let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
+        let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
+        let mc = monitor::Config {
+            origin,
+            key,
+            dir: Some(home.state_dir().join(format!("keylog-{tag}"))),
+            me: None,
+            known_owner_keys: Vec::new(),
+            witnesses: Vec::new(),
+            min_cosignatures: 0,
+        };
+        let m = Monitor::open(mc).ok()?;
+        Some(m.view().state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
+    }
+
     /// Run the monitor for the node's lifetime (once).
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
@@ -190,6 +211,18 @@ impl KeyLog {
         self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()
     }
 
+    /// `moochy owner trust <ok_id>`: an owner key of THIS account (e.g. a passkey registered on
+    /// the web) becomes known: no more `unknown_*` alerts for it, now and after restarts.
+    /// Returns `(log index, revoked)`; `None` when it is not this account's.
+    pub fn trust_owner_key(&self, id: &str, me: &str, dry_run: bool) -> Option<(u64, bool)> {
+        let view = self.view();
+        let info = view.state(|s| s.owner_key(id).filter(|k| k.pseudonym == me).map(|k| (k.owner_pub, k.idx, k.revoked))).ok().flatten()?;
+        if !dry_run {
+            self.acknowledge(Some(&info.0), None);
+        }
+        Some((info.1, info.2))
+    }
+
     /// Worker side (T-03-088): this donor device holds an owner-signed DONOR_APPROVED for
     /// `repo_id` in a fresh verified log.
     pub fn donor_approved(&self, device: &str, repo_id: &str) -> bool {
@@ -235,6 +268,17 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
             let mut f = alert_fields(a);
             if let Some(o) = f.as_object_mut() {
                 o.insert("detail".into(), json!(format!("{a:?}")));
+                // §16.6: a passkey bound on the relay's word that the mailbox was proven is a
+                // takeover path if the mailbox or the relay is compromised: say so plainly.
+                if let Alert::UnknownPasskey { owner_key, email_proof: true, .. } = a {
+                    o.insert(
+                        "warning".into(),
+                        json!(format!(
+                            "a passkey was registered as an owner key of your account using only an emailed link (email_proof). If it was not you, your mailbox or the server may be compromised: do not trust it. If it was you: moochy owner trust {}",
+                            clean(owner_key)
+                        )),
+                    );
+                }
             }
             ("error", "key log alert".into(), f)
         }

@@ -97,6 +97,8 @@ COMMANDS:
                                   the project owner accepts you)
   donations [--json] | donations <pause|resume|stop> <id>
                                   Your donations: what each project used this month
+  owner trust <ok_id>             Mark an owner key you created elsewhere (a passkey added on
+                                  the web) as yours, so the key-log monitor stops alerting
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
                                   with its own passphrase, that signs approvals, memberships and
                                   claims; only used by these commands, never by the app
@@ -169,6 +171,9 @@ struct Opts {
     from_file: Option<PathBuf>,
     log_key: Option<String>,
     models: Vec<String>,
+    cert_sha256: Option<String>,
+    auth_header: Option<String>,
+    confirm_host: Option<String>,
     worktree: Option<PathBuf>,
     allow_hosts: Vec<String>,
     /// `moochy box token create`: `--ttl`, `--max-boxes`.
@@ -196,7 +201,10 @@ fn parse() -> Result<Opts> {
             Long("roles") => o.roles = Some(s(p.value().map_err(err)?)?),
             Long("name") => o.name = Some(s(p.value().map_err(err)?)?),
             Long("repo") => o.repo = Some(s(p.value().map_err(err)?)?),
-            Long("base-url") => o.base_url = Some(s(p.value().map_err(err)?)?),
+            Long("base-url" | "url") => o.base_url = Some(s(p.value().map_err(err)?)?),
+            Long("cert-sha256") => o.cert_sha256 = Some(s(p.value().map_err(err)?)?),
+            Long("header-from-keystore") => o.auth_header = Some(s(p.value().map_err(err)?)?),
+            Long("confirm-host") => o.confirm_host = Some(s(p.value().map_err(err)?)?),
             Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
             Long("label") => o.button.label = Some(s(p.value().map_err(err)?)?),
@@ -321,6 +329,7 @@ fn run() -> Result<()> {
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
         ["donations", act, id] => crate::donations::action(&home, act, id),
         ["owner", "init"] => crate::owner::init(&home, false),
+        ["owner", "trust", id] => crate::owner::trust(&home, id, o.has("yes")),
         ["owner", "rotate"] => crate::owner::init(&home, true),
         // VOICE.md: "accept a donor".
         ["accept", donor] => owner_ops(&home, &o, &["approve", donor]),
@@ -349,7 +358,15 @@ fn keys_cmd(home: &Home, w: &[&str]) -> Result<()> {
             let cfg = home.load()?;
             let sec = keystore::load(home, &cfg)?.unwrap_or_default();
             for p in &sec.providers {
-                emit(&json!({"provider": p.provider, "base_url": p.base_url, "key": format!("…{}", p.key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>())}));
+                let mut v = json!({"provider": p.provider, "base_url": p.base_url, "key": format!("…{}", p.key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>())});
+                // A remote GPU server (§17.3): vetted host and checks, never the header value.
+                if let (Some(h), Some(o)) = (&p.remote_host, v.as_object_mut()) {
+                    o.insert("remote".into(), json!(h));
+                    o.insert("trust".into(), json!(crate::keycheck::trust_name(p)));
+                    o.insert("auth_header".into(), json!(p.auth_header));
+                    o.remove("key");
+                }
+                emit(&v);
             }
             Ok(())
         }
@@ -628,7 +645,12 @@ fn doctor(home: &Home) -> Result<()> {
         println!("{} {what:<9} {}", if ok { "ok  " } else { "FAIL" }, clean(&detail));
     };
     match keystore::load(home, &cfg) {
-        Ok(Some(s)) => line(true, "keystore", format!("opens ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" })),
+        Ok(Some(s)) => {
+            for p in s.providers.iter().filter(|p| p.remote_host.is_some()) {
+                println!("ok   local     remote, vetted {}, trust: {}", clean(p.remote_host.as_deref().unwrap_or("")), crate::keycheck::trust_name(p));
+            }
+            line(true, "keystore", format!("opens ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" }));
+        }
         Ok(None) => line(false, "keystore", "no keystore: run `moochy login`".into()),
         Err(e) => line(false, "keystore", e.msg),
     }
@@ -795,6 +817,12 @@ fn login_cmd(home: &Home, o: &Opts) -> Result<()> {
 
 fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if provider == "local" {
+        let url = o.base_url.as_deref().ok_or_else(|| usage("keys add local needs --base-url http://127.0.0.1:PORT, or --url https://… for a remote GPU server"))?;
+        // A remote GPU server over TLS (CONTRACT §17.3): vetted host, keystore header, pinned trust.
+        if let Ok(host) = moochy_worker::provider::remote_host_key(url) {
+            let r = crate::keycheck::Remote { host, ca_file: o.ca_file.clone(), cert_sha256: o.cert_sha256.clone(), auth_header: o.auth_header.clone(), confirm_host: o.confirm_host.clone() };
+            return crate::keycheck::add_remote(home, url, &r, o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
+        }
         return crate::keycheck::add_local(home, o.base_url.as_deref(), o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
     }
     if !crate::keycheck::PROVIDERS.contains(&provider) {
@@ -822,7 +850,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     let mut cfg = home.load()?;
     let mut sec = keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != provider);
-    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new(), served_ids: Vec::new() });
+    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new(), served_ids: Vec::new(), remote_host: None, trust: None, auth_header: None });
     keystore::save(home, &cfg, &sec)?;
     emit(&json!({"event": "key_added", "provider": provider}));
     safety(home, o, Some(provider))
@@ -1030,7 +1058,20 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
             log("error", "local model server refused: --allow-unvetted-host is development only (MOOCHY_INSECURE_DEV=1)", &json!({}));
             continue;
         }
-        let built = if local { Adapter::new_local(&cfg, p.allow_unvetted_host) } else { Adapter::new(&cfg) };
+        let built = if local {
+            match crate::keycheck::local_options(p, dev_mode()) {
+                Ok(opts) => {
+                    if let Some(h) = &p.remote_host {
+                        log("info", "remote model server", &json!({"host": clean(h), "trust": crate::keycheck::trust_name(p)}));
+                    }
+                    let cfg = AdapterConfig { api_key: zeroize::Zeroizing::new(if p.auth_header.is_some() { String::new() } else { p.key.clone() }), ..cfg };
+                    Adapter::new_local_with(&cfg, &opts)
+                }
+                Err(e) => Err(moochy_worker::provider::ConfigError(e)),
+            }
+        } else {
+            Adapter::new(&cfg)
+        };
         match built {
             Ok(a) => adapters.push(Arc::new(a)),
             Err(e) => log("error", "provider key not usable", &json!({"provider": p.provider, "error": e.to_string()})),
