@@ -330,8 +330,9 @@ mod tests {
     fn dollars() {
         assert_eq!(parse_limit("$20"), Some(20_000_000));
         assert_eq!(parse_limit("$12.50"), Some(12_500_000));
-        assert_eq!(parse_limit("1000"), Some(1000), "bare integer = µ$");
-        assert_eq!(parse_limit("$0.000001"), Some(1));
+        // CONTRACT §6: command-line amounts are dollars (a bare integer is NOT µ$).
+        assert_eq!(parse_limit("1000"), Some(1_000_000_000));
+        assert_eq!(parse_limit("$0.000001"), None, "at most 2 decimals");
         assert_eq!(parse_limit("$1.0000001"), None);
         assert_eq!(parse_limit("$-3"), None);
         assert_eq!(parse_dollars("20"), Some(20_000_000));
