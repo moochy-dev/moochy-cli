@@ -438,10 +438,15 @@ impl Canon {
         Self(moochy_worker::reemit::Reemitter::new(dialect.worker(), stream))
     }
 
-    pub fn push(&mut self, b: &[u8]) -> Result<Bytes, &'static str> {
+    /// Canonical bytes of the events this chunk completes. On a refused event, `Err` carries
+    /// the canonical events completed before it (deliver them, then fail): the client sees the
+    /// same thing however the donor chunked its stream.
+    pub fn push(&mut self, b: &[u8]) -> Result<Bytes, (Bytes, &'static str)> {
         let mut out = Vec::with_capacity(b.len());
-        self.0.push(b, &mut out).map_err(|e| e.0)?;
-        Ok(Bytes::from(out))
+        match self.0.push(b, &mut out) {
+            Ok(()) => Ok(Bytes::from(out)),
+            Err(e) => Err((Bytes::from(out), e.0)),
+        }
     }
 
     pub fn finish(&mut self) -> Result<Bytes, &'static str> {
@@ -650,6 +655,19 @@ mod tests {
         assert!(alone.1 && merged.1, "both fail closed");
         assert!(alone.0.contains(r#""text":"Hello""#), "{}", alone.0);
         assert_eq!(merged, alone);
+    }
+
+    /// A refused event keeps the canonical events before it (delivered, then the attempt fails).
+    #[test]
+    fn canon_error_returns_the_valid_prefix() {
+        let start = sse("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#);
+        let hello = sse("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#);
+        let bad = sse("totally_new", r#"{"type":"totally_new"}"#);
+        let mut c = Canon::new(Dialect::Anthropic, true);
+        let (done, why) = c.push(format!("{start}{hello}{bad}").as_bytes()).unwrap_err();
+        let done = String::from_utf8(done.to_vec()).unwrap();
+        assert!(done.contains(r#""text":"Hello""#) && !done.contains("totally_new"), "{done}");
+        assert_eq!(why, "unknown event or block type");
     }
 
     /// `cargo test --release -p moochy -- --ignored --nocapture per_event_cost`: what the gate,

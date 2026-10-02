@@ -595,7 +595,9 @@ impl Reemitter {
     }
 
     /// Feed decrypted donor bytes (any chunking); canonical bytes of every event completed by
-    /// this chunk are appended to `out`. An error fails the attempt: write nothing more.
+    /// this chunk are appended to `out`. On an error `out` still holds exactly the complete
+    /// canonical events before the refused one (none of it): deliver those, then fail the
+    /// attempt and write nothing more. What the client gets never depends on chunking.
     pub fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> Result<(), ReemitError> {
         if self.done {
             return fail("bytes after the end of the response");

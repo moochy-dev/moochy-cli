@@ -760,7 +760,16 @@ impl Driver {
         while let Some(b) = self.gate.pop(self.verified, finale) {
             let b = match self.canon.push(&b) {
                 Ok(b) => b,
-                Err(why) => return retry_fail("provider_error", why),
+                Err((done, why)) => {
+                    // Valid events ahead of the refused one go out first (chunk-independent).
+                    if !done.is_empty() {
+                        let s = emit(&self.tx, TaskEv::Bytes(done)).await;
+                        if !matches!(s, Step::Continue) {
+                            return s;
+                        }
+                    }
+                    return retry_fail("provider_error", why);
+                }
             };
             if b.is_empty() {
                 continue;

@@ -53,7 +53,25 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(doc) = json::parse(rest, &mut tape) {
         reemit::visible_texts(d, stream, doc.root(), &mut |_| {});
     }
-    let Ok(out) = reemit::reemit(d, stream, rest) else { return };
+    let Ok(out) = reemit::reemit(d, stream, rest) else {
+        // Refused: whatever the chunking, the canonical prefix written before the error is the
+        // same (the client sees the valid events before the bad one, never a chunk-dependent cut).
+        if stream {
+            let prefix = |n: usize| {
+                let mut r = Reemitter::new(d, true);
+                let mut o = Vec::new();
+                for c in rest.chunks(n) {
+                    if r.push(c, &mut o).is_err() {
+                        return o;
+                    }
+                }
+                let _ = r.finish(&mut o);
+                o
+            };
+            assert_eq!(prefix(rest.len().max(1)), prefix(usize::from(sel >> 2) + 1), "prefix depends on chunking");
+        }
+        return;
+    };
     if stream {
         for ev in out.split(|b| *b == b'\n').filter_map(|l| l.strip_prefix(b"data: ")).filter(|l| *l != b"[DONE]") {
             covered(d, true, ev);
