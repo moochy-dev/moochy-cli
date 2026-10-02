@@ -72,12 +72,17 @@ pub struct Peer {
 /// `/proc` is readable, the peer must also be the `moochy` binary itself. Under the background
 /// process's own lockdown (§15.2, Landlock) `/proc` is not visible, and the uid + run key
 /// binding stands alone.
-fn launcher_ok(peer: Option<Peer>, state_dir: &Path) -> bool {
+/// A Unix-socket peer running as the owner of the state dir (SO_PEERCRED / LOCAL_PEERCRED).
+pub fn same_user(peer: Option<Peer>, state_dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    let Some(p) = peer else { return false };
-    if std::fs::metadata(state_dir).map(|m| m.uid()).ok() != Some(p.uid) {
+    peer.is_some_and(|p| std::fs::metadata(state_dir).map(|m| m.uid()).ok() == Some(p.uid))
+}
+
+fn launcher_ok(peer: Option<Peer>, state_dir: &Path) -> bool {
+    if !same_user(peer, state_dir) {
         return false;
     }
+    let Some(p) = peer else { return false };
     #[cfg(target_os = "linux")]
     {
         let Some(pid) = p.pid else { return false };
@@ -212,6 +217,7 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
         spec.git_writable = gw.git_writable;
         // A197, second layer: nothing visible may contain the Moochy home (keys, run key, state).
         spec.protected.push(gw.state_dir.parent().unwrap_or(&gw.state_dir).to_path_buf());
+        spec.protected.push(gw.state_dir.clone());
         // Agents installed outside the system dirs (e.g. ~/.local/bin): their install dir, ro.
         if let Some(dirs) = install_dirs(prog) {
             spec.ro_paths.extend(dirs);

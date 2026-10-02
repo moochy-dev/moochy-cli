@@ -82,7 +82,8 @@ COMMANDS:
   members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
-  claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by your owner key
+  claim <OWNER/NAME> [--yes]      Confirm you maintain a project, signed by your owner key
+                                  (also: claim --repo OWNER/NAME)
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (development only)
 ";
@@ -251,7 +252,7 @@ fn run() -> Result<()> {
             println!("{}", crate::util::clean_value(&serde_json::to_value(&cfg).ctx("config")?));
             Ok(())
         }
-        ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["approve" | "claim", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
         ["verify", r] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             let v = c.verify(crate::pb::local::VerifyRequest { receipt_ref: (*r).into() }).await.map_err(|s| auth(format!("not verified: {}", clean(s.message()))))?;
@@ -466,6 +467,13 @@ fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
 
 /// Owner signatures (CONTRACT §15.4): previewed by the Node, signed here with the owner key.
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    // Plan 07 and the web claim page: `moochy claim <owner/repo>` (positional, E84).
+    if let ["claim", repo] = w {
+        if !valid_slug(repo) {
+            return Err(usage("claim <owner/name>"));
+        }
+        return crate::owner::sign(home, &repo.to_ascii_lowercase(), &["claim"], o.has("yes"), false, false, 0);
+    }
     let slug = slug_or_detect(o)?;
     crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))
 }

@@ -96,7 +96,13 @@ pub struct Evidence {
 /// `moochy verify <receipt_ref>`: check a public receipt (projection) of a task this Gateway
 /// consumed: the donor's signature over it, that it commits to the signed receipt, and, with a
 /// pinned key log, that the signing key is a logged key of that donor device.
+/// Any other public receipt is checked by `keylog::verify_ref` (relay-served projection).
 pub fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
+    verify_local(node, receipt_ref)?.ok_or_else(|| "no receipt with this reference among this device's recent requests".to_owned())
+}
+
+/// A request this device made: checked against the receipt kept in the evidence store.
+fn verify_local(node: &Node, receipt_ref: &str) -> Result<Option<Value>, String> {
     let want = crate::util::b64d(receipt_ref.strip_prefix("r_").unwrap_or(receipt_ref)).filter(|b| b.len() == 16).ok_or("not a receipt reference")?;
     let ev = crate::node::lock(&node.evidence);
     for e in ev.iter() {
@@ -115,10 +121,10 @@ pub fn verify(node: &Node, receipt_ref: &str) -> Result<Value, String> {
             Some(_) => return Err("the donor key is not in the public key log".into()),
             None => "not checked (no key log pinned)",
         };
-        return Ok(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": p.donor, "model": p.model,
-            "cost_uusd": p.cost_uusd, "day": p.day, "worker_device": e.worker_device, "key_log": key_log}));
+        return Ok(Some(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": p.donor, "model": p.model,
+            "cost_uusd": p.cost_uusd, "day": p.day, "worker_device": e.worker_device, "key_log": key_log, "source": "local"})));
     }
-    Err("no receipt with this reference among this device's recent requests".into())
+    Ok(None)
 }
 
 impl Evidence {
@@ -191,29 +197,20 @@ fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
 
 /// Affinity worker first, then the best `hint`s, ≤ 8 wraps (04 §7).
 fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>) -> Vec<PoolWorker> {
-    let mut c: Vec<&PoolWorker> =
-        pool.workers.iter().filter(|w| w.models.iter().any(|m| m == model) && w.dialects.iter().any(|d| d == dialect.wire())).collect();
+    let mut c: Vec<&PoolWorker> = pool
+        .workers
+        .iter()
+        .filter(|w| w.models.iter().any(|m| m == model) && w.dialects.iter().any(|d| d == dialect.wire()) && provider_allowed(w, model, &pool.excluded_providers))
+        .collect();
     c.sort_by_key(|w| (Some(w.worker_device.as_str()) != sticky, std::cmp::Reverse(w.hint)));
     c.into_iter().take(MAX_WRAPS).cloned().collect()
 }
 
-/// §15.4 provider exclusion: never seal to a donor serving through an excluded provider.
-/// ponytail: pool workers do not say which provider serves each model yet, so a model that an
-/// excluded provider can also serve is refused outright (fail closed); filter per worker in
-/// `pick` once `PoolWorker` carries the provider.
-fn excluded_check(cat: &engine::Catalog, model: &str, excluded: &[String]) -> Result<(), Failure> {
-    if excluded.is_empty() {
-        return Ok(());
-    }
-    let hit: Vec<&str> = cat.entries.iter().filter(|e| e.model == model && excluded.iter().any(|x| x == &e.provider)).map(|e| e.provider.as_str()).collect();
-    if hit.is_empty() {
-        return Ok(());
-    }
-    Err(Failure::new(
-        "forbidden",
-        false,
-        format!("moochy: this project does not accept donations through {} for `{model}`, and donors of that model cannot be told apart by provider yet", hit.join(", ")),
-    ))
+/// §15.4 provider exclusion, per worker: never seal to a donor serving `model` through an
+/// excluded provider. Fail closed: when the project excludes anything, a worker that does not
+/// say which provider serves the model is left out too.
+fn provider_allowed(w: &PoolWorker, model: &str, excluded: &[String]) -> bool {
+    excluded.is_empty() || w.served.iter().find(|(m, _)| m == model).is_some_and(|(_, p)| !excluded.iter().any(|x| x.eq_ignore_ascii_case(p)))
 }
 
 fn wraps(ws: &[PoolWorker], task: &TaskId, route: &[u8], ck: &ContentKey) -> Vec<pb::Wrap> {
@@ -239,9 +236,15 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
     let route = header.to_bytes().map_err(internal)?;
     let sticky = node.session_worker(&aff);
-    excluded_check(&node.catalog(), &req.entry.model, &pool.excluded_providers)?;
     let chosen = pick(&pool, req.dialect, &req.entry.model, sticky.as_deref());
     if chosen.is_empty() {
+        if !pool.excluded_providers.is_empty() && !pick(&RepoPool { excluded_providers: Vec::new(), ..pool.clone() }, req.dialect, &req.entry.model, None).is_empty() {
+            return Err(Failure::new(
+                "forbidden",
+                false,
+                format!("moochy: no donor offers `{}` through a provider this project accepts (it excludes {})", req.entry.model, pool.excluded_providers.join(", ")),
+            ));
+        }
         return Err(Failure::new("model_not_in_pool", false, format!("moochy: no donor offers `{}` for {}", req.entry.model, req.slug)));
     }
     let task = TaskId::new(now_ms()).map_err(internal)?;
@@ -269,9 +272,13 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         body_chunks: u32::try_from(n).unwrap_or(u32::MAX),
     };
     let route = open.route.clone();
-    let _ = up_tx.try_send(up(submit_up::Msg::Open(open)));
-    for c in sealed.chunks {
-        let _ = up_tx.try_send(up(submit_up::Msg::Body(c)));
+    // Kept (refcounted Bytes) until the provider starts, to resubmit the same task on a new
+    // session after a relay link loss (03 §14, E50).
+    let mut resend = Vec::with_capacity(n.saturating_add(1));
+    resend.push(up(submit_up::Msg::Open(open)));
+    resend.extend(sealed.chunks.into_iter().map(|c| up(submit_up::Msg::Body(c))));
+    for m in &resend {
+        let _ = up_tx.try_send(m.clone());
     }
     // E22: stamp the moment the transport takes the first body chunk.
     let first_tx = Arc::new(AtomicU64::new(0));
@@ -288,6 +295,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         .await
         .map_err(|s| Failure::new("overloaded", true, format!("moochy: the server refused the request ({:?})", s.code())))?
         .into_inner();
+    let session = link.session.clone();
     let (tx, rx) = mpsc::channel(16);
     let ttl = if req.facts.cache_ttl == moochy_worker::firewall::CacheTtl::H1 { 3_600_000 } else { 300_000 };
     let drv = Driver {
@@ -317,6 +325,8 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         truncated: false,
         checkpoints: Vec::new(),
         receipt: None,
+        resend,
+        session,
         entry: req.entry.clone(),
         est_input: req.facts.est_input_tokens,
         ttl: req.facts.cache_ttl,
@@ -378,6 +388,10 @@ struct Driver {
     truncated: bool,
     checkpoints: Vec<pb::Checkpoint>,
     receipt: Option<pb::SignedReceipt>,
+    /// The Submit messages, until the provider starts (resubmission after a link loss).
+    resend: Vec<SubmitUp>,
+    /// Relay session the current Submit stream belongs to.
+    session: tonic::metadata::AsciiMetadataValue,
     /// What the receipt's usage and model are checked against (03 §12.2).
     entry: CatalogEntry,
     est_input: u64,
@@ -407,8 +421,20 @@ impl Driver {
             let step = match m {
                 Ok(Some(SubmitDown { msg: Some(m) })) => self.on_msg(m).await,
                 Ok(Some(SubmitDown { msg: None })) => Step::Continue,
+                // Nothing reached the client yet: resubmit the same task on the next session;
+                // the relay moves its route or replays the final state (03 §14, E50).
+                Ok(None) | Err(_) if !self.started && !self.resend.is_empty() => match self.resubmit().await {
+                    Some(d) => {
+                        down = d;
+                        Step::Continue
+                    }
+                    None => retry_fail("overloaded", "relay link lost"),
+                },
                 Ok(None) | Err(_) => retry_fail("overloaded", "relay link lost"),
             };
+            if self.started && !self.resend.is_empty() {
+                self.resend = Vec::new(); // started: no resubmission any more, free the body
+            }
             if !matches!(step, Step::Continue) {
                 break step;
             }
@@ -459,7 +485,8 @@ impl Driver {
         match m {
             submit_down::Msg::NeedWraps(n) => {
                 // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool,
-                // not the snapshot taken at submit (E27), filtered by the key-log seal rule (A174).
+                // not the snapshot taken at submit (E27), filtered by the key-log seal rule (A174):
+                // never the raw `node.pools` on the submit path.
                 if let Some(p) = self.node.sealable_pool(&self.repo_id) {
                     self.pool = p;
                 }
@@ -505,6 +532,28 @@ impl Driver {
             }
             _ => Step::Continue,
         }
+    }
+
+    /// Wait (≤ 15 s) for a new relay session, then send the identical Submit on it.
+    async fn resubmit(&mut self) -> Option<tonic::Streaming<SubmitDown>> {
+        let deadline = tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(15))?;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(link) = self.node.link_now(std::time::Duration::from_secs(3)).await.filter(|l| l.session != self.session) {
+                let (up_tx, up_rx) = mpsc::channel::<SubmitUp>(self.resend.len().saturating_add(4));
+                for m in &self.resend {
+                    up_tx.try_send(m.clone()).ok()?;
+                }
+                let mut client = link.client.clone();
+                if let Ok(r) = client.submit(crate::link::with_session(&link, ReceiverStream::new(up_rx))).await {
+                    log("info", "task resubmitted after a relay link loss", &json!({"task": self.task_text}));
+                    self.up = up_tx;
+                    self.session = link.session.clone();
+                    return Some(r.into_inner());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        None
     }
 
     fn on_accepted(&mut self, a: &pb::Accepted) -> Step {
@@ -754,16 +803,28 @@ mod exclusion {
     use super::*;
 
     #[test]
-    fn excluded_providers_fail_closed() {
-        let stub = engine::Catalog::stub();
-        let mut cat = engine::Catalog { entries: stub.entries.clone(), ..engine::Catalog::default() };
-        let mut or = cat.entries[0].clone();
-        or.provider = "openrouter".into();
-        cat.entries.push(or);
-        let m = cat.entries[0].model.clone();
-        assert!(excluded_check(&cat, &m, &[]).is_ok());
-        assert!(excluded_check(&cat, &m, &["deepseek".into()]).is_ok());
-        assert!(excluded_check(&cat, &m, &["openrouter".into()]).is_err(), "an excluded provider can serve it");
+    fn excluded_providers_per_worker_fail_closed() {
+        let w = |dev: &str, served: &[(&str, &str)]| PoolWorker {
+            worker_device: dev.into(),
+            enc_pub: [0; 32],
+            sign_pub: None,
+            key_log_index: 0,
+            approval_log_index: 0,
+            donor: String::new(),
+            dialects: vec!["anthropic.messages".into()],
+            models: vec!["m".into()],
+            hint: 50,
+            served: served.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect(),
+        };
+        let pool = RepoPool {
+            workers: vec![w("a", &[("m", "anthropic")]), w("o", &[("m", "openrouter")]), w("silent", &[])],
+            excluded_providers: vec!["openrouter".into()],
+            ..RepoPool::default()
+        };
+        let got: Vec<String> = pick(&pool, Dialect::Anthropic, "m", None).into_iter().map(|w| w.worker_device).collect();
+        assert_eq!(got, vec!["a".to_owned()], "openrouter excluded, the silent worker fails closed");
+        let open = RepoPool { excluded_providers: Vec::new(), ..pool };
+        assert_eq!(pick(&open, Dialect::Anthropic, "m", None).len(), 3, "no exclusion: everyone");
     }
 }
 

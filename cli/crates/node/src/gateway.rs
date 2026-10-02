@@ -186,13 +186,21 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
         if !crate::run::key_ok(key) {
             return json_resp(403, &json!({"error": "run_key_required"}));
         }
-        return match crate::task::verify(&node, r) {
+        let v = match crate::task::verify(&node, r) {
+            Ok(v) => Ok(v),
+            Err(_) => crate::keylog::verify_ref(&node, r.strip_prefix("r_").unwrap_or(r)).await,
+        };
+        return match v {
             Ok(v) => json_resp(200, &v),
             Err(e) => json_resp(422, &json!({"verified": false, "error": e})),
         };
     }
     // 4. A live sandboxed run token (§15.4), else a repo-scoped local token.
-    let caller = token(req.headers()).and_then(|t| crate::run::check(t).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
+    // A215: a run token is honoured only on the 0600 Unix socket (the sandbox bridge), from a
+    // peer running as this user; over TCP it is just an unknown token.
+    let on_socket = crate::run::same_user(peer, &node.home.state_dir());
+    let caller = token(req.headers())
+        .and_then(|t| crate::run::check(t).filter(|_| on_socket).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
     let Some((slug, sandboxed)) = caller else {
         if path == "/mcp" {
             let mut r = json_resp(401, &json!({"error": "unauthorized"}));
