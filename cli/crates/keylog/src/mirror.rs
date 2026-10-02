@@ -74,6 +74,14 @@ pub enum Alert {
     /// An assertion of one of my passkeys came with a sign counter not above the last
     /// one: a cloned authenticator or a replayed signature (the entry was rejected).
     PasskeyCounter { idx: u64, owner_key: String },
+    /// My account's first CLI owner key was bound without any proof (before the A224
+    /// cutover, spec/KEYLOG.md §4c): on the relay's word that the session was mine.
+    /// `known`: I created or acknowledged it (then it is a reminder, not an intrusion).
+    UnprovenOwnerKey {
+        idx: u64,
+        owner_key: String,
+        known: bool,
+    },
     /// A box device (§17.1) was enrolled on my account: listed apart from my devices
     /// (its keys are made in the box, so it is never "known"); revoke it if it is not mine.
     BoxEnrolled {
@@ -310,6 +318,22 @@ impl Mirror {
                 .owner_key(signer)
                 .is_some_and(|k| knows_owner(&k.owner_pub))
         };
+        if let Body::OwnerKey {
+            pseudonym,
+            owner_pub,
+            prev: None,
+            authorizer: None,
+            email_proof: None,
+            ..
+        } = e.body
+            && pseudonym == me.pseudonym
+        {
+            alerts.push(Alert::UnprovenOwnerKey {
+                idx,
+                owner_key: crate::entry::owner_key_id(owner_pub),
+                known: knows_owner(owner_pub),
+            });
+        }
         match e.body {
             Body::OwnerKey {
                 pseudonym,

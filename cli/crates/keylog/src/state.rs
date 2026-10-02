@@ -50,6 +50,9 @@ pub enum Code {
     Counter,
     /// ECDSA signature with s > n/2 (relays normalize before appending).
     HighS,
+    /// A first CLI owner key with neither the confirmed-email proof nor an authorizer,
+    /// past the A224 cutover (spec/KEYLOG.md §4c).
+    OwnerKeyProof,
     /// A box device past its expiry (§17.1).
     Expired,
     /// A box KEY_ADDED whose expiry is not within (logged_at, logged_at + 30 days].
@@ -90,6 +93,7 @@ impl Code {
             Self::WebAuthnFormat => "webauthn_format",
             Self::Counter => "counter",
             Self::HighS => "high_s",
+            Self::OwnerKeyProof => "owner_key_proof",
             Self::Expired => "expired",
             Self::BoxExpiry => "box_expiry",
         }
@@ -156,7 +160,27 @@ pub struct OwnerKeyInfo {
     pub revoked: bool,
     /// `webauthn-es256` owner keys only.
     pub passkey: Option<PasskeyInfo>,
+    /// How the key was bound (spec/KEYLOG.md §4c).
+    pub proof: OwnerKeyProof,
 }
+
+/// How an owner key was bound (spec/KEYLOG.md §4c, A224).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerKeyProof {
+    /// A first CLI key before the cutover: on the session's word alone (monitors flag it).
+    None,
+    /// The relay's confirmed-email proof (first key of the account).
+    Email,
+    /// Co-signed by an active owner key of the same user (§4a / §4b).
+    Authorizer,
+    /// A CLI key rotation signed by the previous key.
+    Rotation,
+}
+
+/// The A224 cutover (2026-10-05T00:00:00Z): from the first accepted entry logged at or
+/// after it, an account's first CLI owner key needs a proof (spec/KEYLOG.md §4c). Earlier
+/// proofless keys stay valid: verified history never changes.
+pub const OWNER_KEY_PROOF_FROM_MS: u64 = 1_791_158_400_000;
 
 /// A logged passkey owner key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +225,10 @@ pub struct State {
     passkeys_of: HashMap<String, u32>,
     /// passkey credential id → owner key id.
     creds: HashMap<Vec<u8>, String>,
+    /// Largest `logged_at_ms` of an accepted entry (the §4c cutover reads the running max).
+    max_logged: u64,
+    /// §4c cutover override (tests, dev logs); `None` = [`OWNER_KEY_PROOF_FROM_MS`].
+    proof_from: Option<u64>,
 }
 
 fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
@@ -219,6 +247,22 @@ impl State {
     /// reloading entries this mirror already verified.
     #[allow(clippy::too_many_lines)] // one flat arm per entry kind
     pub fn apply(&mut self, idx: u64, e: &Entry<'_>, check_sigs: bool) -> Result<(), Code> {
+        self.apply_entry(idx, e, check_sigs)?;
+        self.max_logged = self.max_logged.max(e.logged_at_ms);
+        Ok(())
+    }
+
+    /// A state whose §4c cutover is `ms` instead of [`OWNER_KEY_PROOF_FROM_MS`] (0 = always).
+    #[must_use]
+    pub fn with_owner_key_proof_from(ms: u64) -> Self {
+        Self {
+            proof_from: Some(ms),
+            ..Self::default()
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // one flat arm per entry kind
+    fn apply_entry(&mut self, idx: u64, e: &Entry<'_>, check_sigs: bool) -> Result<(), Code> {
         match e.body {
             Body::Key {
                 device_id,
@@ -369,6 +413,7 @@ impl State {
                 owner_pub,
                 prev,
                 authorizer,
+                email_proof,
                 ..
             } => {
                 if self.pubs.contains_key(owner_pub) {
@@ -388,12 +433,23 @@ impl State {
                         return Err(Code::OwnerKeyExists);
                     }
                     // A CLI key exists: rotate it (prev) instead.
-                    (Some(_), _) if authorizer.is_some() => return Err(Code::OwnerKeyExists),
+                    (Some(_), _) if authorizer.is_some() || email_proof.is_some() => {
+                        return Err(Code::OwnerKeyExists);
+                    }
+                    // A224: no first key on the session's word alone (running max of logged_at).
+                    (None, None)
+                        if authorizer.is_none()
+                            && email_proof.is_none()
+                            && self.max_logged.max(e.logged_at_ms)
+                                >= self.proof_from.unwrap_or(OWNER_KEY_PROOF_FROM_MS) =>
+                    {
+                        return Err(Code::OwnerKeyProof);
+                    }
                     (Some(c), p) if p != Some(&c.owner_pub) => return Err(Code::OwnerKeyExists),
                     _ => {}
                 }
                 let msg = sig_message(Kind::OwnerKeyAdded, e.raw_body);
-                let (new_sig, auth_sig) = match authorizer {
+                let (new_sig, auth_sig) = match authorizer.or(email_proof.map(|_| "")) {
                     Some(_) => unlp::<2>(e.sig)
                         .map(|[n, a]| (n, a))
                         .map_err(|_| Code::BadSig)?,
@@ -437,6 +493,12 @@ impl State {
                         idx,
                         revoked: false,
                         passkey: None,
+                        proof: match (prev, email_proof, authorizer) {
+                            (Some(_), ..) => OwnerKeyProof::Rotation,
+                            (None, Some(_), _) => OwnerKeyProof::Email,
+                            (None, None, Some(_)) => OwnerKeyProof::Authorizer,
+                            (None, None, None) => OwnerKeyProof::None,
+                        },
                     },
                 );
                 self.owner_of.insert(pseudonym.to_owned(), id);
@@ -513,6 +575,11 @@ impl State {
                             counter: pop.counter(),
                             email_proof: email_proof.is_some(),
                         }),
+                        proof: if email_proof.is_some() {
+                            OwnerKeyProof::Email
+                        } else {
+                            OwnerKeyProof::Authorizer
+                        },
                     },
                 );
             }

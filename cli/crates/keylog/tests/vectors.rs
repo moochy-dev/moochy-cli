@@ -61,6 +61,7 @@ fn alert_str(a: &Alert) -> String {
         } => format!("UnknownPasskey:{idx}:{email_proof}"),
         Alert::PasskeyCounter { idx, .. } => format!("PasskeyCounter:{idx}"),
         Alert::BoxEnrolled { idx, .. } => format!("BoxEnrolled:{idx}"),
+        Alert::UnprovenOwnerKey { idx, known, .. } => format!("UnprovenOwnerKey:{idx}:{known}"),
         Alert::BoxOutsideRepo { idx, .. } => format!("BoxOutsideRepo:{idx}"),
     }
 }

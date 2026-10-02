@@ -178,6 +178,9 @@ pub enum Body<'a> {
         /// 5-field form (spec/KEYLOG.md §4b): an active owner key (a passkey) of the same
         /// user co-signs the account's first CLI key; `sig = lp(new_sig, authorizer_sig)`.
         authorizer: Option<&'a str>,
+        /// The relay's confirmed-email proof for the account's first CLI key (§4c), carried
+        /// in the sig (`lp(new_sig, email_proof)`); set by [`parse_record`] only.
+        email_proof: Option<&'a [u8; 32]>,
     },
     OwnerRevoke {
         pseudonym: &'a str,
@@ -410,7 +413,7 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
         Kind::OwnerKeyAdded if passkey_add => unlp::<2>(sig).is_ok_and(|[pop, auth]| {
             Assertion::parse(pop).is_ok() && (auth.is_empty() || owner_sig_form(auth))
         }),
-        Kind::OwnerKeyAdded => sig.len() == 64 || sig.len() == 128,
+        Kind::OwnerKeyAdded => sig.len() == 64 || sig.len() == 128 || proven_sig(sig).is_some(),
         k if k.owner_signed() => owner_sig_form(sig),
         _ => sig.len() == if want_sig { 64 } else { 0 },
     };
@@ -422,15 +425,18 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
     {
         return Err(Error::TooLarge);
     }
-    let body_p = parse_body(kind, body)?;
+    let mut body_p = parse_body(kind, body)?;
     if let Body::OwnerKey {
         prev,
         authorizer: None,
+        ref mut email_proof,
         ..
     } = body_p
-        && prev.is_some() != (sig.len() == 128)
     {
-        return Err(Error::Format("OWNER_KEY_ADDED sig count"));
+        if prev.is_some() != (sig.len() == 128) {
+            return Err(Error::Format("OWNER_KEY_ADDED sig count"));
+        }
+        *email_proof = proven_sig(sig).map(|(_, p)| p);
     }
     Ok(Entry {
         kind,
@@ -439,6 +445,13 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
         raw_body: body,
         sig,
     })
+}
+
+/// The sig of a first CLI owner key bound with the confirmed-email proof (spec/KEYLOG.md
+/// §4c): `lp(new_sig(64), email_proof(32))`, 104 bytes.
+fn proven_sig(sig: &[u8]) -> Option<(&[u8; 64], &[u8; 32])> {
+    let [n, p] = unlp::<2>(sig).ok()?;
+    Some((n.try_into().ok()?, p.try_into().ok()?))
 }
 
 /// Kinds 3–7: 64 bytes (Ed25519 owner key) or an encoded assertion (passkey).
@@ -626,6 +639,7 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 prev,
                 issued_at_ms: t,
                 authorizer,
+                email_proof: None,
             }
         }
         Kind::OwnerKeyRevoked => {

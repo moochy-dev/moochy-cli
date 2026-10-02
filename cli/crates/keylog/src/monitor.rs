@@ -195,6 +195,21 @@ fn alert_message(a: &Alert) -> String {
                 ""
             }
         ),
+        Alert::UnprovenOwnerKey {
+            idx,
+            owner_key,
+            known,
+        } => {
+            if *known {
+                format!(
+                    "keylog: unproven_owner_key: your owner key {owner_key} was bound before the email-proof rule (log #{idx}), on the relay's word alone; it is yours, nothing to do"
+                )
+            } else {
+                format!(
+                    "keylog: SECURITY: unproven_owner_key: an owner key {owner_key} you did not create was bound on your account with no email proof and no authorization (log #{idx}); approvals it signs are not yours"
+                )
+            }
+        }
         Alert::BoxEnrolled {
             idx,
             device_id,
