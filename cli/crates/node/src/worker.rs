@@ -150,10 +150,15 @@ pub fn on_welcome(node: &Arc<Node>) {
 }
 
 /// `ReceiptAck` on the session: mark the outbox entry acknowledged.
-pub fn on_receipt_ack(node: &Arc<Node>, task: &str, attempt: u32) {
+pub fn on_receipt_ack(node: &Arc<Node>, ack: pb::ReceiptAck) {
     let node = node.clone();
-    let key = attempt_key(task, attempt);
+    let key = attempt_key(&ack.task, ack.attempt);
     tokio::spawn(async move {
+        let k2 = key.clone();
+        let receipt = with_store(&node, move |s| s.since(0).find(|(k, _)| *k == k2.as_slice()).map(|(_, p)| p.to_vec())).await.flatten();
+        if let Some(r) = receipt.and_then(|p| pb::SignedReceipt::decode(p.as_slice()).ok()) {
+            crate::keylog::check_receipt_ack(&node, &r.receipt, &ack);
+        }
         let _ = with_store(&node, move |s| s.ack(&key, now_ms())).await;
     });
 }
@@ -333,6 +338,45 @@ fn gateway_key(node: &Node, device: &str, repo_id: &str) -> Option<[u8; 32]> {
     node.keylog.as_ref().and_then(|l| l.gateway_key(device, repo_id))
 }
 
+const OWN_PLEDGES_REFRESH_MS: u64 = 5_000;
+
+/// T-03-088: the relay's pledge/repo assignment is never trusted alone. The pledge must be one of
+/// this donor's own active donations (listed on our own authenticated session), and with a
+/// verified key log this device must hold an owner-signed DONOR_APPROVED for the repo.
+async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<(), &'static str> {
+    if let Some(l) = &node.keylog
+        && l.verified()
+        && !l.donor_approved(node.device_id().unwrap_or_default(), repo_id)
+    {
+        return Err("this project has not approved this donor (key log)");
+    }
+    let known = |n: &Node| lock(&n.own_pledges).1.get(pledge).map(|s| s == "active");
+    if known(node) == Some(true) {
+        return Ok(());
+    }
+    // Unknown (new donation) or stale: refresh, at most every 5 s.
+    let due = now_ms().saturating_sub(lock(&node.own_pledges).0) >= OWN_PLEDGES_REFRESH_MS;
+    if due && let Some(l) = node.link() {
+        lock(&node.own_pledges).0 = now_ms();
+        let mut c = l.client.clone();
+        let r = timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest {}))).await;
+        match r {
+            Ok(Ok(r)) => {
+                let map = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, d.status)).collect();
+                lock(&node.own_pledges).1 = map;
+            }
+            // A relay without the donation RPCs: relay-asserted only in insecure dev mode.
+            Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => return Ok(()),
+            _ => {}
+        }
+    }
+    match known(node) {
+        Some(true) => Ok(()),
+        Some(false) => Err("this donation is not active"),
+        None => Err("not one of this donor's donations"),
+    }
+}
+
 /// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
 /// whatever the relay decided; the firewall level is the donor's own setting (06 §7.3).
 fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<Policy, String> {
@@ -413,6 +457,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("unauthorized_task", false, Some("task id outside the freshness window".into())));
     }
     let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
+    own_donation(node, &assign.pledge_id, &assign.repo_id).await.map_err(|d| with_ck("unauthorized_task", false, Some(d.into())))?;
     // 2. Adapter + catalog entry, pledge policy, route expectations for the validator.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
     let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
@@ -744,20 +789,23 @@ async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }
     let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
-    let acked = sent
-        && matches!(
-            timeout(Duration::from_secs(5), async {
-                while let Some(m) = next(down).await {
-                    if matches!(m, serve_down::Msg::ReceiptAck(_)) {
-                        return true;
-                    }
+    let ack = if sent {
+        timeout(Duration::from_secs(5), async {
+            while let Some(m) = next(down).await {
+                if let serve_down::Msg::ReceiptAck(a) = m {
+                    return Some(a);
                 }
-                false
-            })
-            .await,
-            Ok(true)
-        );
-    if acked {
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    if let Some(ack) = ack {
+        crate::keylog::check_receipt_ack(node, &signed.receipt, &ack);
         let key = a.key.clone();
         let _ = with_store(node, move |s| s.ack(&key, now_ms())).await;
     } else if let Some(l) = node.link() {

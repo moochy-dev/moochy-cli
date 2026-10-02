@@ -236,7 +236,7 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
                         Ok(_) => log("warn", "catalog refused", &json!({"error": "version field mismatch"})),
                         Err(e) => log("warn", "catalog refused", &json!({"error": e})),
                     },
-                    relay_msg::Msg::ReceiptAck(a) => crate::worker::on_receipt_ack(node, &a.task, a.attempt),
+                    relay_msg::Msg::ReceiptAck(a) => crate::worker::on_receipt_ack(node, a),
                     relay_msg::Msg::ReplaySince(r) => crate::worker::on_replay_since(node, r.since_ms),
                     relay_msg::Msg::ApprovalRequests(r) => crate::approve::on_requests(node, r),
                     relay_msg::Msg::LogEntryAck(a) => crate::approve::on_ack(node, a),

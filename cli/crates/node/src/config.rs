@@ -45,6 +45,10 @@ pub struct Config {
     /// it the node trusts relay-asserted membership and approvals (D14, dev only).
     pub log_key: Option<String>,
     pub log_origin: Option<String>,
+    /// Receipt transparency log note key (KEYLOG §8, origin `moochy.dev/receipts`): inclusion
+    /// proofs in `ReceiptAck` are verified against it (compiled in for the default relay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts_log_key: Option<String>,
     /// Public Git anchor of the key log (hourly fork check), e.g. a raw-file base URL.
     pub log_anchor_url: Option<String>,
     /// Worker: serve only these public models (comma-separated), below what the keys allow.
@@ -212,6 +216,10 @@ impl Config {
                 moochy_keylog::NoteKey::parse(value).map_err(|e| usage(format!("log_key: {e}")))?;
                 self.log_key = Some(value.into());
             }
+            "receipts_log_key" => {
+                moochy_keylog::NoteKey::parse(value).map_err(|e| usage(format!("receipts_log_key: {e}")))?;
+                self.receipts_log_key = Some(value.into());
+            }
             "log_anchor_url" => {
                 if !value.starts_with("https://") {
                     return Err(usage("log_anchor_url must be https://"));
@@ -227,7 +235,7 @@ impl Config {
             }
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, log_key, log_anchor_url)"
+                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, log_key, receipts_log_key, log_anchor_url)"
                 )));
             }
         }

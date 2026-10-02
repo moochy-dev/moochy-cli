@@ -110,6 +110,10 @@ pub struct Node {
     pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
+    /// Worker: this donor's own donations (pledge id → status), from `ListDonations` on our own
+    /// session, and when they were fetched (ms). The relay's pledge assignment is never trusted
+    /// alone (T-03-088).
+    pub own_pledges: Mutex<(u64, HashMap<String, String>)>,
     /// Worker: local model server mapping, public slug → server model id.
     pub local_models: HashMap<String, String>,
     /// Worker: single-use jailed request validators (CONTRACT §15.2).
@@ -176,6 +180,7 @@ impl Node {
             store: w.store,
             validator: w.validator,
             local_models: w.local_models,
+            own_pledges: Mutex::new((0, HashMap::new())),
             approvals: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
