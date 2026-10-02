@@ -371,6 +371,14 @@ mod tests {
     }
 
     #[test]
+    fn presets_share_one_setup_script() {
+        // A devcontainer feature must be self-contained: its copy stays byte-identical.
+        let canonical = include_str!("../../../../deploy/client/boxes/moochy-box.sh");
+        assert_eq!(include_str!("../../../../deploy/client/devcontainer/moochy/moochy-box.sh"), canonical, "cp deploy/client/boxes/moochy-box.sh deploy/client/devcontainer/moochy/");
+        assert!(canonical.contains(ENROLL_ENV) && !canonical.contains("mbx_"), "secret-free: the token comes from the environment");
+    }
+
+    #[test]
     fn bind_needs_a_full_scope() {
         let future = i64::try_from(now_ms()).unwrap() + 3_600_000;
         let p = DevicePollResponse { r#box: true, repo_slug: "Acme/Widget".into(), expires_at_ms: future, cap_uusd_month: 5, ..DevicePollResponse::default() };

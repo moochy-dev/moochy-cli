@@ -323,7 +323,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         body: req.body.clone(),
         repo_id: pool.repo_id.clone(),
         route,
-        gate: Gate::new(req.dialect, req.facts.stream, &req.body, req.release_tools),
+        gate: Gate::new(req.dialect, req.facts.stream, &req.body, req.release_tools).platform(req.platform_sandboxed),
         canon: crate::gate::Canon::new(req.dialect, req.facts.stream),
         pool,
         tx,

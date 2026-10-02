@@ -1,0 +1,14 @@
+#cloud-config
+# SPDX-License-Identifier: Apache-2.0
+# Moochy on a cloud VM that takes cloud-init user-data (boat.dev, or any Ubuntu/Debian VM),
+# CONTRACT §17. Installs moochy at first boot and nothing else: user-data is not a secret store, so
+# the enrollment token is NEVER put here. Enroll as the box user, with the token from the
+# platform's secret store:
+#   MOOCHY_ENROLL=<token> moochy-box.sh            (or MOOCHY_ENROLL_FILE=/path/to/secret)
+# Pin a release tag instead of `main` for reproducible boxes.
+package_update: true
+packages: [curl, xz-utils, ca-certificates, git]
+runcmd:
+  - curl --proto '=https' --tlsv1.2 -fsSL -o /usr/local/bin/moochy-box.sh https://raw.githubusercontent.com/moochy-dev/moochy-cli/main/deploy/client/boxes/moochy-box.sh
+  - chmod 0755 /usr/local/bin/moochy-box.sh
+  - /usr/local/bin/moochy-box.sh --install

@@ -1,0 +1,11 @@
+{
+    "id": "moochy",
+    "version": "0.1.0",
+    "name": "Moochy",
+    "description": "Use the tokens donated to your open-source project from this dev container (Codespaces, Daytona, any devcontainer). Add a box enrollment token as the MOOCHY_ENROLL secret.",
+    "documentationURL": "https://github.com/moochy-dev/moochy-cli/tree/main/deploy/client/boxes",
+    "licenseURL": "https://github.com/moochy-dev/moochy-cli/blob/main/LICENSE",
+    "options": {},
+    "postStartCommand": "/usr/local/share/moochy/moochy-box.sh",
+    "installsAfter": ["ghcr.io/devcontainers/features/common-utils"]
+}
