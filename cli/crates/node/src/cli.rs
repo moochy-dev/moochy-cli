@@ -818,6 +818,9 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
     let mut parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
     parts.validator = validator;
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
+    // Durable journal (E62): the writer thread, and the recent entries back in memory.
+    crate::journal::start(&home.state_dir());
+    crate::node::lock(&node.journal).extend(crate::journal::load_recent(&home.state_dir(), 512));
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));
     if let Some(p) = node.cfg.allow_unsandboxed_tools.as_deref() {

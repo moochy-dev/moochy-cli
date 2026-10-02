@@ -465,6 +465,7 @@ impl Node {
 
     /// Record a finished task in the local journal (metadata only, never content).
     pub fn journal(&self, e: JournalEntry) {
+        crate::journal::append(&e); // durable copy (E62; mo-node journal.rs)
         {
             let mut j = lock(&self.journal);
             if j.len() >= JOURNAL_KEEP {
