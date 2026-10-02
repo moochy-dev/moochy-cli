@@ -768,6 +768,63 @@ impl Reemitter {
     }
 }
 
+/// Every human-visible text field ([`T::Text`]) that the re-emitter writes for one parsed
+/// stream event (`stream`, the JSON of its `data:` line) or whole body, in order and cleaned
+/// as the client will see it. This is what the tripwire must scan (A216): it walks the
+/// re-emission allowlists themselves, so every text-bearing field the client can receive is
+/// covered, with no raw-byte prefilter. Fields the re-emitter would refuse are skipped (the
+/// event fails re-emission anyway); opaque fields (signatures, tool arguments) are not text.
+pub fn visible_texts(dialect: Dialect, stream: bool, root: Val<'_>, f: &mut dyn FnMut(&str)) {
+    let schema = match (dialect, stream) {
+        (Dialect::AnthropicMessages, true) => &ANTHROPIC_EVENT,
+        (Dialect::AnthropicMessages, false) => &ANTHROPIC_BODY,
+        (Dialect::OpenAiChat, _) if root.get("error").is_some() => &O_ERROR,
+        (Dialect::OpenAiChat, true) => &OPENAI_CHUNK,
+        (Dialect::OpenAiChat, false) => &OPENAI_BODY,
+    };
+    visit(schema, root, f);
+}
+
+fn visit(t: &T, v: Val<'_>, f: &mut dyn FnMut(&str)) {
+    match t {
+        T::Text(_) => {
+            if let Some(s) = v.as_str() {
+                f(&clean_text(&s));
+            }
+        }
+        T::Or(alts) => {
+            if let Some(a) = alts.iter().find(|a| kind_of(a).is_none_or(|k| k == v.kind())) {
+                visit(a, v, f);
+            }
+        }
+        T::Arr(item, _) => {
+            if v.kind() == Kind::Arr {
+                for it in v.items() {
+                    visit(item, it, f);
+                }
+            }
+        }
+        T::Obj(members) => {
+            if v.kind() == Kind::Obj {
+                for m in *members {
+                    if let Some(x) = v.get(m.0) {
+                        visit(&m.1, x, f);
+                    }
+                }
+            }
+        }
+        T::Tag(key, cases) => {
+            if v.kind() == Kind::Obj
+                && let Some(tag) = v.get(key)
+                && let Some((_, case)) = cases.iter().find(|(name, _)| tag.is_str(name))
+            {
+                visit(case, v, f);
+            }
+        }
+        T::Raw(_) | T::Ident(_) | T::Lit(_) | T::U64 | T::Zero | T::Num | T::Bool | T::Null | T::AnyObj(_) | T::EmptyObj | T::EmptyArr => {}
+    }
+}
+
 /// One-shot re-emission of a whole response (tests, non-streamed bodies).
 pub fn reemit(dialect: Dialect, stream: bool, input: &[u8]) -> Result<Vec<u8>, ReemitError> {
     let mut r = Reemitter::new(dialect, stream);
