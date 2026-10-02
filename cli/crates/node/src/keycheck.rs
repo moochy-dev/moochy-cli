@@ -164,7 +164,13 @@ pub fn add_local(home: &crate::config::Home, base_url: Option<&str>, key_stdin: 
         zeroize::Zeroizing::new(String::new())
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| net(format!("runtime: {e}")))?;
-    let (status, body) = rt.block_on(fetch("local", &key, url, "/v1/models"))?;
+    let (status, body) = rt.block_on(fetch("local", &key, url, "/v1/models")).map_err(|e| {
+        if url.starts_with("https://") {
+            net(format!("{}; a self-signed server needs its certificate pinned: --ca-file PEM or --cert-sha256 HEX", e.msg))
+        } else {
+            e
+        }
+    })?;
     match status {
         200..=299 => {}
         401 | 403 => return Err(auth(format!("the server refused the key ({status}); nothing was stored"))),
@@ -201,12 +207,25 @@ pub fn add_local(home: &crate::config::Home, base_url: Option<&str>, key_stdin: 
 pub struct Remote {
     /// `provider::remote_host_key(url)`: the canonical `host:port`.
     pub host: String,
+    /// A remote host (stored on the vetted list); `false`: an https loopback/LAN server.
+    pub vetted: bool,
     pub ca_file: Option<std::path::PathBuf>,
     pub cert_sha256: Option<String>,
     /// Header name for the secret read on stdin (e.g. `x-api-key`); else a Bearer API key.
     pub auth_header: Option<String>,
     /// Headless confirmation: must be exactly `host`.
     pub confirm_host: Option<String>,
+}
+
+/// `host:port` of an `https://host[:port][/]` origin (lowercase, port explicit), as shown and
+/// confirmed for an https loopback/LAN server. `None`: not such an origin.
+pub fn origin_host(url: &str) -> Option<String> {
+    let a = url.strip_prefix("https://")?.strip_suffix('/').unwrap_or(url.strip_prefix("https://")?).to_ascii_lowercase();
+    if a.is_empty() || a.contains(['/', '@', '?', '#']) {
+        return None;
+    }
+    let has_port = a.rsplit_once(':').is_some_and(|(h, p)| !h.ends_with(':') && (h.ends_with(']') || !h.contains(':')) && p.parse::<u16>().is_ok());
+    Some(if has_port { a } else { format!("{a}:443") })
 }
 
 /// First certificate of a PEM file, as DER.
@@ -304,7 +323,7 @@ pub fn add_remote(home: &crate::config::Home, url: &str, r: &Remote, key_stdin: 
         allow_unvetted_host: allow_unvetted,
         models: map.clone(),
         served_ids: Vec::new(),
-        remote_host: Some(r.host.clone()),
+        remote_host: r.vetted.then(|| r.host.clone()),
         trust: Some(trust),
         auth_header: r.auth_header.clone(),
     };
@@ -322,7 +341,7 @@ pub fn add_remote(home: &crate::config::Home, url: &str, r: &Remote, key_stdin: 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| net(format!("runtime: {e}")))?;
     rt.block_on(async { moochy_worker::provider::Adapter::new_local_with(&cfg, &opts).map(drop) }).map_err(|e| usage(format!("remote server: {e}")))?;
     // The donor states the exact host is theirs: requests (prompts) will be sent to it.
-    eprintln!("Remote model server {} (certificate check: {}{}).", r.host, trust_name(&p), p.auth_header.as_deref().map(|h| format!(", header {h} from the keystore")).unwrap_or_default());
+    eprintln!("{} model server {} (certificate check: {}{}).", if r.vetted { "Remote" } else { "Local" }, r.host, trust_name(&p), p.auth_header.as_deref().map(|h| format!(", header {h} from the keystore")).unwrap_or_default());
     eprintln!("Prompts of the projects you donate to will be sent to this server. Only add a server you control.");
     let confirmed = match &r.confirm_host {
         Some(c) => c.trim() == r.host,
@@ -353,6 +372,12 @@ mod tests {
         assert!(hex32(&"zz".repeat(32)).is_none());
         assert_eq!(pem_cert("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n"), Some(vec![1, 2, 3]));
         assert!(pem_cert("no pem").is_none());
+        assert_eq!(origin_host("https://127.0.0.1:8443/").as_deref(), Some("127.0.0.1:8443"));
+        assert_eq!(origin_host("https://[::1]:9").as_deref(), Some("[::1]:9"));
+        assert_eq!(origin_host("https://[::1]").as_deref(), Some("[::1]:443"));
+        assert_eq!(origin_host("https://GPU.lan").as_deref(), Some("gpu.lan:443"));
+        assert!(origin_host("https://x/v1").is_none());
+        assert!(origin_host("http://127.0.0.1:9").is_none());
     }
 
     #[test]

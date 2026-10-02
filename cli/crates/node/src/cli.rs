@@ -819,8 +819,12 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if provider == "local" {
         let url = o.base_url.as_deref().ok_or_else(|| usage("keys add local needs --base-url http://127.0.0.1:PORT, or --url https://… for a remote GPU server"))?;
         // A remote GPU server over TLS (CONTRACT §17.3): vetted host, keystore header, pinned trust.
-        if let Ok(host) = moochy_worker::provider::remote_host_key(url) {
-            let r = crate::keycheck::Remote { host, ca_file: o.ca_file.clone(), cert_sha256: o.cert_sha256.clone(), auth_header: o.auth_header.clone(), confirm_host: o.confirm_host.clone() };
+        // An https loopback/LAN server with a pinned certificate or a keystore header takes the
+        // same path, minus the vetted list (it needs none).
+        let pinned = url.starts_with("https://") && (o.ca_file.is_some() || o.cert_sha256.is_some() || o.auth_header.is_some() || o.confirm_host.is_some());
+        let vetted = moochy_worker::provider::remote_host_key(url).ok();
+        if let Some(host) = vetted.clone().or_else(|| pinned.then(|| crate::keycheck::origin_host(url)).flatten()) {
+            let r = crate::keycheck::Remote { host, vetted: vetted.is_some(), ca_file: o.ca_file.clone(), cert_sha256: o.cert_sha256.clone(), auth_header: o.auth_header.clone(), confirm_host: o.confirm_host.clone() };
             return crate::keycheck::add_remote(home, url, &r, o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
         }
         return crate::keycheck::add_local(home, o.base_url.as_deref(), o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
