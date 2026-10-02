@@ -1,6 +1,17 @@
 //! `moochy connect <client>`: ready-made configuration for known clients, matching
 //! `docs/guides/integrations.md`. Prints only: tokens appear as `$MOOCHY_TOKEN` / `{env:…}`
 //! references or the client's own secret prompt, never inline (06 §13 token placement).
+//!
+//! The agents of CONTRACT §18 (`GUIDE_CLIENTS`) print their section of the guide itself
+//! (embedded at build time): its prose as comments and its code blocks byte for byte, with the
+//! guide's placeholders filled in (`http://127.0.0.1:PORT`, `owner/repo`,
+//! `anthropic/claude-sonnet-5`); `MOOCHY_TOKEN` stays an environment reference.
+
+/// The integrations guide (open source, like this crate).
+const GUIDE: &str = include_str!("../../../../docs/guides/integrations.md");
+
+/// Agents whose preset is their section of the guide (CONTRACT §18.1).
+pub const GUIDE_CLIENTS: &[&str] = &["codex", "copilot-cli", "gemini-cli", "amp", "antigravity", "openclaw", "droid", "kilo-code", "kiro-cli", "hermes", "roo-code", "trae"];
 
 pub const CLIENTS: &[&str] = &[
     "claude-code",
@@ -14,6 +25,18 @@ pub const CLIENTS: &[&str] = &[
     "vscode",
     "claude-desktop",
     "aider",
+    "codex",
+    "copilot-cli",
+    "gemini-cli",
+    "amp",
+    "antigravity",
+    "openclaw",
+    "droid",
+    "kilo-code",
+    "kiro-cli",
+    "hermes",
+    "roo-code",
+    "trae",
     "generic-mcp",
     "generic-openai",
     "generic-anthropic",
@@ -62,13 +85,117 @@ pub fn snippet(client: &str, url: &str, repo: &str, main: &str, small: &str) -> 
         "generic-mcp" => format!("# stdio\ncommand: moochy mcp --repo {repo}\n# Streamable HTTP\n{token}url: {url}/mcp\nheader: Authorization: Bearer $MOOCHY_TOKEN\n"),
         "generic-openai" => format!("{token}base_url: {url}/v1\napi_key: $MOOCHY_TOKEN\nmodel: {main}\n"),
         "generic-anthropic" => format!("{token}base_url: {url}\napi_key: $MOOCHY_TOKEN   (x-api-key or Authorization: Bearer)\nmodel: {main}\n"),
+        c if GUIDE_CLIENTS.contains(&c) => format!(
+            "{}\n# The token: moochy env --repo {repo} --json prints it; export it as MOOCHY_TOKEN (sent as Authorization: Bearer or x-api-key), never write it into a file tracked by git.\n",
+            guide_snippet(c, url, repo, main)?
+        ),
         _ => return None,
     };
     Some(format!("{s}\n# Models are the ones donated to this project (Claude, GPT, DeepSeek, Grok and others): `moochy status` lists them.\n# Keep command approval on in your agent when it uses donated tokens.\n"))
 }
 
+/// The guide's section for `id`: from its `### ` heading to the next heading.
+fn section(id: &str) -> Option<&'static str> {
+    let at = GUIDE.find(&format!("\n`moochy connect {id}`"))?;
+    let start = GUIDE.get(..at)?.rfind("\n### ")?.checked_add(1)?;
+    let rest = GUIDE.get(at.checked_add(1)?..)?;
+    let len = [rest.find("\n### "), rest.find("\n## ")].into_iter().flatten().min().unwrap_or(rest.len());
+    GUIDE.get(start..at.checked_add(1)?.checked_add(len)?)
+}
+
+/// Why the guide's code block is held back: Codex's Responses provider needs `POST /v1/responses`
+/// in the gateway (CONTRACT §18.6), not served by this version.
+fn held_back(id: &str, block: &str) -> bool {
+    id == "codex" && block.contains("wire_api = \"responses\"")
+}
+
+/// The guide section of a §18 agent as a preset: prose as `# ` comments, code blocks verbatim
+/// (placeholders filled), and a plain line when the agent reaches donated tokens through MCP only.
+fn guide_snippet(id: &str, url: &str, repo: &str, main: &str) -> Option<String> {
+    let fill = |l: &str| l.replace("http://127.0.0.1:PORT", url).replace("owner/repo", repo).replace("anthropic/claude-sonnet-5", main);
+    let mut out = String::new();
+    let mut block: Option<String> = None;
+    for l in section(id)?.lines() {
+        if let Some(b) = block.as_mut() {
+            if l.starts_with("```") {
+                if held_back(id, b) {
+                    out.push_str("# (this provider block applies once moochy serves POST /v1/responses: not in this version)\n");
+                } else {
+                    out.push_str(b);
+                }
+                block = None;
+            } else {
+                b.push_str(&fill(l));
+                b.push('\n');
+            }
+            continue;
+        }
+        if l.starts_with("```") {
+            block = Some(String::new());
+        } else if let Some(row) = l.strip_prefix("| API") {
+            // The "Tool" cell of the API row says when the agent is MCP only.
+            let tool = row.split('|').nth(2).unwrap_or_default().trim().replace("**", "");
+            if tool.contains("MCP only") || tool.contains("not yet") {
+                out.push_str("# API: ");
+                out.push_str(&tool);
+                out.push_str(". This agent uses donated tokens through MCP (moochy_delegate).\n");
+            }
+        } else if l.starts_with('|') {
+        } else if l.trim().is_empty() {
+            if !out.ends_with("\n\n") && !out.is_empty() {
+                out.push('\n');
+            }
+        } else {
+            out.push_str("# ");
+            // Comments are plain text: no markdown emphasis; code spans in single quotes.
+            out.push_str(&fill(l.trim_start_matches("### ")).replace("**", "").replace('`', "'"));
+            out.push('\n');
+        }
+    }
+    (block.is_none() && !out.is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The guide's code blocks of `id`'s section, placeholders filled (what the preset must
+    /// contain byte for byte).
+    fn guide_blocks(id: &str, url: &str, repo: &str, main: &str) -> Vec<String> {
+        let sec = super::section(id).unwrap();
+        sec.split("```")
+            .skip(1)
+            .step_by(2)
+            .map(|b| b.split_once('\n').unwrap().1.replace("http://127.0.0.1:PORT", url).replace("owner/repo", repo).replace("anthropic/claude-sonnet-5", main))
+            .filter(|b| !super::held_back(id, b))
+            .collect()
+    }
+
+    #[test]
+    fn guide_presets_are_the_guide() {
+        let (url, repo, main) = ("http://127.0.0.1:4100", "gitlab/acme/tools/widget", "deepseek/deepseek-chat");
+        // Every id in the guide's agents table has a preset, and every guide preset has a section.
+        let table = super::GUIDE.split_once("| Agent | `moochy connect` |").unwrap().1.split("\n\n").next().unwrap();
+        for id in table.lines().filter_map(|l| l.split('|').nth(2)).filter_map(|c| c.trim().strip_prefix('`')?.strip_suffix('`')) {
+            assert!(super::CLIENTS.contains(&id), "guide lists `moochy connect {id}`");
+        }
+        for id in super::GUIDE_CLIENTS {
+            let s = super::snippet(id, url, repo, main, main).unwrap();
+            let blocks = guide_blocks(id, url, repo, main);
+            assert!(!blocks.is_empty(), "{id}");
+            for b in &blocks {
+                assert!(s.contains(b.as_str()), "{id}: guide block missing or changed:\n{b}\n--- preset:\n{s}");
+            }
+            assert!(!s.contains("PORT") && !s.contains("owner/repo") && !s.contains("mooch_local_"), "{id}: {s}");
+            assert!(s.contains("moochy mcp") || s.contains(r#""mcp", "--repo""#), "{id}: an MCP door");
+        }
+        // MCP-only agents say so; Codex's Responses provider is held back for now.
+        for id in ["gemini-cli", "amp", "antigravity", "kiro-cli", "codex"] {
+            assert!(super::snippet(id, url, repo, main, main).unwrap().contains("# API: "), "{id}");
+        }
+        let codex = super::snippet("codex", url, repo, main, main).unwrap();
+        assert!(!codex.contains("wire_api") || !codex.lines().any(|l| l.starts_with("wire_api")), "{codex}");
+        assert!(super::snippet("droid", url, repo, main, main).unwrap().lines().all(|l| !l.starts_with("# API: ")));
+    }
+
     #[test]
     fn every_client_has_a_snippet_without_inline_tokens() {
         for c in super::CLIENTS {
@@ -88,7 +215,9 @@ pub type Plan = Vec<(Vec<&'static str>, serde_json::Value)>;
 pub fn write_plan(client: &str, home: &std::path::Path, repo: &str, url: &str, main: &str, small: &str) -> Option<(std::path::PathBuf, Plan)> {
     use serde_json::json;
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), std::path::PathBuf::from);
+    let vscode_user = if cfg!(target_os = "macos") { home.join("Library/Application Support/Code/User") } else { xdg.join("Code/User") };
     let stdio = json!({"command": "moochy", "args": ["mcp", "--repo", repo]});
+    let servers = |file: std::path::PathBuf, entry: serde_json::Value| (file, vec![(vec!["mcpServers", "moochy"], entry)]);
     Some(match client {
         "claude-code" => (home.join(".claude.json"), vec![(vec!["mcpServers", "moochy"], json!({"type": "stdio", "command": "moochy", "args": ["mcp", "--repo", repo]}))]),
         "cursor" => (home.join(".cursor/mcp.json"), vec![(vec!["mcpServers", "moochy"], stdio)]),
@@ -96,7 +225,7 @@ pub fn write_plan(client: &str, home: &std::path::Path, repo: &str, url: &str, m
         "claude-desktop" => (xdg.join("Claude/claude_desktop_config.json"), vec![(vec!["mcpServers", "moochy"], stdio)]),
         // Cline keeps its settings inside the editor profile: pass --config.
         "cline" => (home.join("cline_mcp_settings.json"), vec![(vec!["mcpServers", "moochy"], json!({"command": "moochy", "args": ["mcp", "--repo", repo], "timeout": 300}))]),
-        "vscode" => (xdg.join("Code/User/mcp.json"), vec![(vec!["servers", "moochy"], json!({"type": "stdio", "command": "moochy", "args": ["mcp", "--repo", repo]}))]),
+        "vscode" => (vscode_user.join("mcp.json"), vec![(vec!["servers", "moochy"], json!({"type": "stdio", "command": "moochy", "args": ["mcp", "--repo", repo]}))]),
         "zed" => (xdg.join("zed/settings.json"), vec![(vec!["context_servers", "moochy"], stdio)]),
         "opencode" => (
             xdg.join("opencode/opencode.json"),
@@ -111,8 +240,104 @@ pub fn write_plan(client: &str, home: &std::path::Path, repo: &str, url: &str, m
                 (vec!["small_model"], json!(format!("moochy/{small}"))),
             ],
         ),
+        // CONTRACT §18: the MCP stdio entry of each agent's own config file (guide paths). TOML and
+        // YAML files are edited in place (`toml_edit`, `yaml_edit`), JSON merged.
+        "codex" => (home.join(".codex/config.toml"), vec![(vec!["mcp_servers", "moochy"], stdio)]),
+        "copilot-cli" => servers(home.join(".copilot/mcp-config.json"), json!({"type": "local", "command": "moochy", "args": ["mcp", "--repo", repo], "tools": ["*"]})),
+        "gemini-cli" => servers(home.join(".gemini/settings.json"), stdio),
+        "amp" => (xdg.join("amp/settings.json"), vec![(vec!["amp.mcpServers", "moochy"], stdio)]),
+        "antigravity" => servers(home.join(".gemini/config/mcp_config.json"), stdio),
+        // JSON5 in general: a file that is plain JSON is merged, anything else is refused.
+        "openclaw" => (home.join(".openclaw/openclaw.json"), vec![(vec!["mcp", "servers", "moochy"], stdio)]),
+        "droid" => servers(home.join(".factory/mcp.json"), json!({"type": "stdio", "command": "moochy", "args": ["mcp", "--repo", repo]})),
+        "kilo-code" => (xdg.join("kilo/kilo.json"), vec![(vec!["mcp", "moochy"], json!({"type": "local", "command": ["moochy", "mcp", "--repo", repo]}))]),
+        "kiro-cli" => servers(home.join(".kiro/settings/mcp.json"), stdio),
+        "hermes" => (home.join(".hermes/config.yaml"), vec![(vec!["mcp_servers", "moochy"], stdio)]),
+        "roo-code" => servers(vscode_user.join("globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json"), stdio),
+        // Trae reads MCP servers from the project (stdio only: no token in it).
+        "trae" => servers(std::path::PathBuf::from(".trae/mcp.json"), stdio),
         _ => return None,
     })
+}
+
+/// A plan entry as `key = value` / `key: value` lines (scalars and string arrays in JSON
+/// notation, which TOML basic strings and YAML flow style both read).
+fn flat_entries(v: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let obj = v.as_object().ok_or("not a table")?;
+    obj.iter()
+        .map(|(k, v)| {
+            let ok_key = !k.is_empty() && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+            let ok_val = !v.is_object() && v.as_array().is_none_or(|a| a.iter().all(|x| !x.is_object() && !x.is_array()));
+            if ok_key && ok_val { Ok((k.clone(), v.to_string().replace(",\"", ", \""))) } else { Err(format!("cannot write `{k}` here")) }
+        })
+        .collect()
+}
+
+/// Codex `config.toml`: replace the `[a.b]` table of each entry (up to the next table header), or
+/// append it; everything else stays byte for byte.
+pub fn toml_edit(old: &str, plan: &Plan) -> Result<String, String> {
+    let mut lines: Vec<String> = old.lines().map(str::to_owned).collect();
+    for (path, v) in plan {
+        if path.iter().any(|k| !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')) {
+            return Err("unsupported key".into());
+        }
+        let header = format!("[{}]", path.join("."));
+        let mut table = vec![header.clone()];
+        table.extend(flat_entries(v)?.into_iter().map(|(k, v)| format!("{k} = {v}")));
+        if let Some(at) = lines.iter().position(|l| l.trim() == header) {
+            let end = lines.iter().skip(at.saturating_add(1)).position(|l| l.trim_start().starts_with('[')).map_or(lines.len(), |n| at.saturating_add(1).saturating_add(n));
+            let blank = lines.get(..end).and_then(|s| s.last()).is_some_and(|l| l.trim().is_empty()) && end > at.saturating_add(1);
+            if blank {
+                table.push(String::new());
+            }
+            lines.splice(at..end, table);
+        } else {
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.extend(table);
+        }
+    }
+    Ok(lines.join("\n") + if lines.is_empty() { "" } else { "\n" })
+}
+
+/// Hermes `config.yaml` (block style): the entry under its top-level key, replaced or inserted;
+/// a top-level key written in flow style (`mcp_servers: {…}`) is refused (edit by hand).
+pub fn yaml_edit(old: &str, plan: &Plan) -> Result<String, String> {
+    let indent = |l: &str| l.len().saturating_sub(l.trim_start().len());
+    let mut lines: Vec<String> = old.lines().map(str::to_owned).collect();
+    for (path, v) in plan {
+        let [top, child] = path.as_slice() else { return Err("unsupported path".into()) };
+        let entries = flat_entries(v)?;
+        let block = |ci: usize| -> Vec<String> {
+            let mut b = vec![format!("{}{child}:", " ".repeat(ci))];
+            b.extend(entries.iter().map(|(k, v)| format!("{}{k}: {v}", " ".repeat(ci.saturating_add(2)))));
+            b
+        };
+        let top_line = format!("{top}:");
+        let Some(at) = lines.iter().position(|l| l.trim_end() == top_line) else {
+            if lines.iter().any(|l| l.starts_with(&top_line)) {
+                return Err(format!("`{top}` is written in flow style: edit it by hand"));
+            }
+            lines.push(top_line);
+            lines.extend(block(2));
+            continue;
+        };
+        let body_end = lines.iter().skip(at.saturating_add(1)).position(|l| !l.trim().is_empty() && indent(l) == 0).map_or(lines.len(), |n| at.saturating_add(1).saturating_add(n));
+        let body = lines.get(at.saturating_add(1)..body_end).unwrap_or_default();
+        let ci = body.iter().find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).map_or(2, |l| indent(l));
+        match body.iter().position(|l| indent(l) == ci && l.trim_end().trim_start() == format!("{child}:")) {
+            Some(rel) => {
+                let start = at.saturating_add(1).saturating_add(rel);
+                let end = lines.iter().take(body_end).skip(start.saturating_add(1)).position(|l| !l.trim().is_empty() && indent(l) <= ci).map_or(body_end, |n| start.saturating_add(1).saturating_add(n));
+                lines.splice(start..end, block(ci));
+            }
+            None => {
+                lines.splice(at.saturating_add(1)..at.saturating_add(1), block(ci));
+            }
+        }
+    }
+    Ok(lines.join("\n") + if lines.is_empty() { "" } else { "\n" })
 }
 
 /// Merge `(path, value)` pairs into a JSON object, creating intermediate objects.
@@ -159,5 +384,27 @@ mod write_tests {
         let d = super::diff("{\n  \"theme\": \"dark\"\n}", &serde_json::to_string_pretty(&v).unwrap());
         assert!(d.contains("+ ") && !d.contains("- \"theme\""));
         assert!(super::write_plan("aider", std::path::Path::new("/h"), "a/b", "", "", "").is_none());
+        for c in super::GUIDE_CLIENTS {
+            assert!(super::write_plan(c, std::path::Path::new("/h"), "a/b", "", "", "").is_some(), "{c}");
+        }
+    }
+
+    #[test]
+    fn toml_and_yaml_edits_keep_everything_else() {
+        let (_, plan) = super::write_plan("codex", std::path::Path::new("/h"), "acme/w", "", "", "").unwrap();
+        let old = "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"x\"\n";
+        let new = super::toml_edit(old, &plan).unwrap();
+        assert_eq!(new, "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.moochy]\nargs = [\"mcp\", \"--repo\", \"acme/w\"]\ncommand = \"moochy\"\n");
+        assert_eq!(super::toml_edit(&new, &plan).unwrap(), new, "idempotent");
+        let stale = new.replace("acme/w", "old/repo") + "\n[profiles.x]\nmodel = \"y\"\n";
+        let fixed = super::toml_edit(&stale, &plan).unwrap();
+        assert!(fixed.contains("acme/w") && !fixed.contains("old/repo") && fixed.ends_with("[profiles.x]\nmodel = \"y\"\n"), "{fixed}");
+        let (_, plan) = super::write_plan("hermes", std::path::Path::new("/h"), "acme/w", "", "", "").unwrap();
+        let old = "model:\n  default: x\nmcp_servers:\n  github:\n    command: gh\n    args: [mcp]\n# end\n";
+        let new = super::yaml_edit(old, &plan).unwrap();
+        assert_eq!(new, "model:\n  default: x\nmcp_servers:\n  moochy:\n    args: [\"mcp\", \"--repo\", \"acme/w\"]\n    command: \"moochy\"\n  github:\n    command: gh\n    args: [mcp]\n# end\n");
+        assert_eq!(super::yaml_edit(&new, &plan).unwrap(), new, "idempotent");
+        assert_eq!(super::yaml_edit("", &plan).unwrap(), "mcp_servers:\n  moochy:\n    args: [\"mcp\", \"--repo\", \"acme/w\"]\n    command: \"moochy\"\n");
+        assert!(super::yaml_edit("mcp_servers: {}\n", &plan).is_err(), "flow style is left to the human");
     }
 }
