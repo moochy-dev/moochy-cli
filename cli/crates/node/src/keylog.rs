@@ -182,6 +182,11 @@ impl KeyLog {
         }
     }
 
+    /// The logged device whose signing key this is (`moochy verify`, mo-node).
+    pub fn device_by_key(&self, sign_pub: &[u8; 32]) -> Option<String> {
+        self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()
+    }
+
     /// Worker side (03 §7.2 1–2): the logged signing key of a Gateway device allowed to use
     /// `repo_id`. Only from a fresh verified log.
     pub fn gateway_key(&self, device: &str, repo_id: &str) -> Option<[u8; 32]> {

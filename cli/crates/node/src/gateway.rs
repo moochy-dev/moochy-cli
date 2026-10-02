@@ -92,11 +92,12 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
-                conn(&node, &allowed, &conns, stream);
+                conn(&node, &allowed, &conns, stream, None);
             }
             r = async { unix.as_ref()?.accept().await.ok() }, if unix.is_some() => {
                 if let Some((stream, _)) = r {
-                    conn(&node, &allowed, &conns, stream);
+                    let peer = stream.peer_cred().ok().map(|c| crate::run::Peer { uid: c.uid(), pid: c.pid() });
+                    conn(&node, &allowed, &conns, stream, peer);
                 }
             }
             _ = shutdown.changed() => return,
@@ -118,7 +119,8 @@ fn gateway_socket(node: &Node) -> Option<tokio::net::UnixListener> {
     Some(l)
 }
 
-fn conn<S>(node: &Arc<Node>, allowed: &Arc<[String; 3]>, conns: &Arc<Semaphore>, stream: S)
+/// `peer`: the Unix-socket peer's credentials (A201); `None` over TCP.
+fn conn<S>(node: &Arc<Node>, allowed: &Arc<[String; 3]>, conns: &Arc<Semaphore>, stream: S, peer: Option<crate::run::Peer>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -129,7 +131,7 @@ where
         let svc = hyper::service::service_fn(move |req| {
             let node = node.clone();
             let allowed = allowed.clone();
-            async move { Ok::<_, Infallible>(handle(node, &allowed, req).await) }
+            async move { Ok::<_, Infallible>(handle(node, &allowed, req, peer).await) }
         });
         let _ = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
@@ -150,7 +152,7 @@ fn token(h: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
 }
 
-async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) -> Resp {
+async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, peer: Option<crate::run::Peer>) -> Resp {
     let path = req.uri().path().to_owned();
     let dialect = if path.ends_with("/chat/completions") || (path.ends_with("/models") && req.headers().get("anthropic-version").is_none()) {
         Dialect::OpenAi
@@ -178,6 +180,17 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         r.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
         return r;
     }
+    // Local-only endpoints for the CLI, authenticated by the 0600 run key (no repo needed).
+    if let Some(r) = path.strip_prefix("/moochy/verify/") {
+        let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
+        if !crate::run::key_ok(key) {
+            return json_resp(403, &json!({"error": "run_key_required"}));
+        }
+        return match crate::task::verify(&node, r) {
+            Ok(v) => json_resp(200, &v),
+            Err(e) => json_resp(422, &json!({"verified": false, "error": e})),
+        };
+    }
     // 4. A live sandboxed run token (§15.4), else a repo-scoped local token.
     let caller = token(req.headers()).and_then(|t| crate::run::check(t).map(|s| (s, true)).or_else(|| node.check_token(t).map(|s| (s, false))));
     let Some((slug, sandboxed)) = caller else {
@@ -189,11 +202,13 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>) 
         return native_error(dialect, &Failure::new("unauthorized", false, "moochy: invalid local token (see `moochy env`)".to_owned()));
     };
     // Tool calls are released only to sandboxed sessions or projects that opted in (§15.4).
-    let release = sandboxed || node.cfg.unsandboxed_tools_allowed(&slug);
+    // The project's own setting (PoolSync), or the local override in development only.
+    let repo_allows = crate::node::lock(&node.pools).values().any(|p| p.allow_unsandboxed_tools && p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&slug)));
+    let release = sandboxed || repo_allows || (node.insecure_dev && node.cfg.unsandboxed_tools_allowed(&slug));
     match (req.method(), path.as_str()) {
         (&Method::POST, "/moochy/run") if !sandboxed => {
             let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
-            crate::run::open(slug, key)
+            crate::run::open(slug, key, peer, &node.home.state_dir())
         }
         (_, "/mcp") => crate::mcp::http(node, slug, req).await,
         (&Method::GET, "/v1/models") => {
@@ -240,10 +255,23 @@ pub async fn read_body(b: Incoming, limit: usize) -> Result<Bytes, Failure> {
 }
 
 /// Validate + scrub a provider-dialect body into a task request.
-pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: Vec<(String, String)>, t_client_rx: u64) -> Result<TaskReq, Failure> {
+pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers: &[(String, String)], t_client_rx: u64) -> Result<TaskReq, Failure> {
     use moochy_worker::json::{self as wj, Kind, Val};
     let bad = |m: String| Failure::new("invalid_request", false, m);
-    let mut body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
+    let body = crate::scrub::scrub(&raw).map_or(raw, Bytes::from);
+    // Drop what a pooled donor refuses but the client can do without (Claude Code `safeguards`,
+    // unknown betas, extra headers) before anything else; the client is told (x-moochy-note).
+    let hdr: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    // The body is re-serialized only when it can hold a stripped member (CONTRACT §13: no extra
+    // pass over a large body otherwise); headers are always filtered.
+    let strip_body = body.windows(12).any(|w| w == b"\"safeguards\"");
+    let pool = moochy_worker::firewall::pool_compatible(dialect.worker(), if strip_body { &body } else { b"{}" }, &hdr)
+        .map_err(|r| Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)")))?;
+    drop(hdr);
+    if !pool.stripped.is_empty() {
+        crate::util::log("info", "removed what donors refuse", &json!({"stripped": pool.stripped}));
+    }
+    let (mut body, headers, stripped) = (if strip_body { Bytes::from(pool.body) } else { body }, pool.headers, pool.stripped);
     // Strict tape parse (no tree allocation): this is the per-request hot path (CONTRACT §13).
     let mut tape = Vec::new();
     let (inject_max, auto_cache) = {
@@ -289,7 +317,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"));
     drop(model);
     let facts = crate::engine::analyze(&entry, dialect, &body, &headers)?;
-    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false })
+    Ok(TaskReq { slug, dialect, body, affinity, facts, entry, headers, t_client_rx, release_tools: false, stripped })
 }
 
 fn affinity_key(secrets: &crate::keystore::Secrets, system: Option<moochy_worker::json::Val<'_>>, tools: Option<moochy_worker::json::Val<'_>>, user: Option<moochy_worker::json::Val<'_>>) -> [u8; 16] {
@@ -313,6 +341,7 @@ fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::Catalo
     })
 }
 
+#[allow(clippy::too_many_lines, reason = "one request: read, prepare, submit, stream or buffer, headers")]
 async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incoming>, count_only: bool, release: bool) -> Resp {
     let t_rx = crate::task::now_us();
     let headers: Vec<(String, String)> = ["anthropic-version", "anthropic-beta"]
@@ -338,11 +367,12 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
             Err(f) => native_error(dialect, &f),
         };
     }
-    let treq = match prepare(&node, slug, dialect, raw, headers, t_rx) {
+    let treq = match prepare(&node, slug, dialect, raw, &headers, t_rx) {
         Ok(t) => TaskReq { release_tools: release, ..t },
         Err(f) => return native_error(dialect, &f),
     };
     let stream = treq.facts.stream;
+    let note = (!treq.stripped.is_empty()).then(|| format!("[moochy] removed before sending to donors: {}", treq.stripped.join(", ")));
     let mut rx = match submit(&node, treq).await {
         Ok(rx) => rx,
         Err(f) => return native_error(dialect, &f),
@@ -409,6 +439,9 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
     }
     if let Ok(v) = HeaderValue::from_str(&donor) {
         h.insert("x-moochy-donor", v);
+    }
+    if let Some(v) = note.and_then(|n| HeaderValue::from_str(&crate::util::clean(&n)).ok()) {
+        h.insert("x-moochy-note", v);
     }
     resp
 }
