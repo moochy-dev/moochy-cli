@@ -44,6 +44,9 @@ pub enum Dialect {
     AnthropicMessages,
     #[serde(rename = "openai.chat")]
     OpenAiChat,
+    /// OpenAI Responses API (`POST /v1/responses`, CONTRACT §18.6; Codex).
+    #[serde(rename = "openai.responses")]
+    OpenAiResponses,
 }
 
 impl Dialect {
@@ -52,6 +55,7 @@ impl Dialect {
         match self {
             Self::AnthropicMessages => "anthropic.messages",
             Self::OpenAiChat => "openai.chat",
+            Self::OpenAiResponses => "openai.responses",
         }
     }
 }

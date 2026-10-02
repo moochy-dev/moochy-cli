@@ -532,7 +532,7 @@ fn body_facts_and_route_check() {
     let c = sonnet();
     let body = br#"{"model":"claude-sonnet-5-5","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]}"#;
     let f = money::body_facts(Dialect::AnthropicMessages, body).unwrap();
-    assert_eq!((f.max_tokens, f.stream, f.cache_ttl, f.images, f.pages, f.fast), (1024, true, CacheTtl::H1, 1, 0, false));
+    assert_eq!((f.max_tokens, f.stream, f.cache_ttl, f.images, f.pages, f.fast), (Some(1024), true, CacheTtl::H1, 1, 0, false));
     assert_eq!(f.text_bytes, body.len() as u64 - 12);
     assert_eq!(f.est_input_tokens(&c).unwrap(), (body.len() as u64 - 12).div_ceil(3) + 1600);
     assert_eq!(f.flags(), ["images"]);
@@ -558,7 +558,7 @@ fn body_facts_and_route_check() {
     // OpenAI dialect: both max fields must agree; data URL images excluded; effort explicit.
     let ob = br#"{"model":"deepseek/deepseek-chat","max_completion_tokens":50,"reasoning_effort":"low","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}"#;
     let f = money::body_facts(Dialect::OpenAiChat, ob).unwrap();
-    assert_eq!((f.max_tokens, f.effort.as_deref(), f.images, f.stream, f.cache_ttl), (50, Some("low"), 2, false, CacheTtl::None));
+    assert_eq!((f.max_tokens, f.effort.as_deref(), f.images, f.stream, f.cache_ttl), (Some(50), Some("low"), 2, false, CacheTtl::None));
     assert_eq!(f.text_bytes, ob.len() as u64 - "data:image/png;base64,AAAA".len() as u64);
     let both = br#"{"model":"m","max_completion_tokens":50,"max_tokens":51,"messages":[]}"#;
     assert_eq!(money::body_facts(Dialect::OpenAiChat, both), Err(Error::Malformed));
@@ -576,4 +576,72 @@ fn body_facts_and_route_check() {
     assert_eq!((f.pages, f.fast, f.text_bytes), (3, true, db.len() as u64));
     assert_eq!(f.flags(), ["documents", "fast"]);
     assert_eq!(f.est_input_tokens(&c).unwrap(), (db.len() as u64).div_ceil(3) + 9000);
+}
+
+const GPT: &str = r#"{"model":"openai/gpt-5.5","provider":"openai","provider_model_id":"gpt-5.5","dialects":["openai.chat","openai.responses"],"in":1250000,"out":10000000,"cache_write_5m":0,"cache_write_1h":0,"cache_read":125000,"max_image_tokens":1500,"max_page_tokens":0,"default_effort":"medium","max_output":128000,"source":"curated"}"#;
+
+/// CONTRACT §18.6: `openai.responses` request facts and route check.
+#[test]
+fn responses_body_facts_and_route() {
+    let c: CatalogEntry = json::parse(GPT.as_bytes()).unwrap();
+    assert_eq!(serde_json::to_string(&Dialect::OpenAiResponses).unwrap(), "\"openai.responses\"");
+    assert_eq!(Dialect::OpenAiResponses.as_str(), "openai.responses");
+    assert_eq!(json::parse::<Dialect>(b"\"openai.responses\"").unwrap(), Dialect::OpenAiResponses);
+    // Codex: no max_output_tokens → catalog max_output; reasoning.effort; inline image.
+    let b = br#"{"model":"gpt-5.5","stream":true,"reasoning":{"effort":"high","summary":"auto"},"instructions":"be brief","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#;
+    let f = money::body_facts(Dialect::OpenAiResponses, b).unwrap();
+    assert_eq!((f.max_tokens, f.max_tokens_for(&c), f.effort.as_deref(), f.stream, f.images), (None, 128_000, Some("high"), true, 1));
+    assert_eq!(f.text_bytes, b.len() as u64 - "data:image/png;base64,AAAA".len() as u64);
+    let repo: RepoId = "r_01K6A0000000000000000000R1".parse().unwrap();
+    let route = f.route(&c, Dialect::OpenAiResponses, repo, [0; 16]).unwrap();
+    assert_eq!((route.max_tokens, route.effort.as_str(), route.flags.clone()), (128_000, "high", vec!["images".to_owned()]));
+    assert_eq!(money::check_route(&route, &f, &c), Ok(()));
+    let mut r2 = route.clone();
+    r2.max_tokens = 1_000;
+    assert_eq!(money::check_route(&r2, &f, &c), Err("max_tokens"), "absent cap = catalog max_output, exactly");
+    // Explicit cap, default effort, no images.
+    let b = br#"{"model":"openai/gpt-5.5","max_output_tokens":2048,"input":"hello"}"#;
+    let f = money::body_facts(Dialect::OpenAiResponses, b).unwrap();
+    assert_eq!((f.max_tokens_for(&c), f.effort.as_deref(), f.stream, f.images), (2048, None, false, 0));
+    assert_eq!(f.route(&c, Dialect::OpenAiResponses, repo, [0; 16]).unwrap().effort, "medium");
+    // Wrong types are refused; the other dialects still require their cap.
+    for bad in [&br#"{"model":"m","max_output_tokens":-1}"#[..], br#"{"model":"m","reasoning":{"effort":3}}"#, br#"{"model":"m","max_output_tokens":4294967296}"#, br#"{"input":"x"}"#] {
+        assert_eq!(money::body_facts(Dialect::OpenAiResponses, bad).err(), Some(Error::Malformed), "{}", String::from_utf8_lossy(bad));
+    }
+    assert_eq!(money::body_facts(Dialect::OpenAiChat, br#"{"model":"m","messages":[]}"#).err(), Some(Error::Malformed));
+}
+
+/// CONTRACT §18.6: Responses `usage` → receipt usage → cost (checked math, never wrapping).
+#[test]
+fn responses_usage_and_cost() {
+    use money::{ResponsesUsage, responses_usage};
+    let c: CatalogEntry = json::parse(GPT.as_bytes()).unwrap();
+    let ru = |i, o, t, cached| ResponsesUsage { input_tokens: i, output_tokens: o, total_tokens: t, cached_tokens: cached, provider_cost_uusd: None };
+    // 10,000 input of which 8,000 cached, 1,500 output (incl. reasoning).
+    let u = responses_usage(&ru(Some(10_000), Some(1_500), Some(11_500), Some(8_000)));
+    assert_eq!((u.input, u.cache_read, u.output, u.cache_write_5m, u.cache_write_1h, u.estimated), (2_000, 8_000, 1_500, 0, 0, false));
+    // 2,000 × 1.25 + 8,000 × 0.125 + 1,500 × 10 = 2,500 + 1,000 + 15,000 µ$
+    assert_eq!(money::cost_uusd(&c, &u, false).unwrap(), 18_500);
+    // A provider that leaves reasoning out of output_tokens: total − input wins.
+    let u = responses_usage(&ru(Some(100), Some(10), Some(400), None));
+    assert_eq!((u.input, u.output, u.estimated), (100, 300, false));
+    // Ceil to the next µ$: 1 input token = 1.25 µ$ → 2.
+    assert_eq!(money::cost_uusd(&c, &responses_usage(&ru(Some(1), Some(0), None, None)), false).unwrap(), 2);
+    // cached > input: no wrap; input counted whole, usage estimated (settles at the reservation).
+    let u = responses_usage(&ru(Some(5), Some(1), None, Some(9)));
+    assert_eq!((u.input, u.cache_read, u.estimated), (5, 9, true));
+    // total < input: the total term is ignored, never wraps.
+    assert_eq!(responses_usage(&ru(Some(500), Some(7), Some(3), None)).output, 7);
+    // Missing fields → estimated.
+    assert!(responses_usage(&ru(None, Some(1), None, None)).estimated && responses_usage(&ru(Some(1), None, None, None)).estimated);
+    // Overflow is an error, never a wrapped amount.
+    let huge = responses_usage(&ru(Some(u64::MAX), Some(u64::MAX), None, None));
+    assert_eq!(money::cost_uusd(&c, &huge, false), Err(Error::Overflow));
+    // Provider-reported cost: OpenRouter required and authoritative, xAI optional, openai refused.
+    let with = |p: &str, pc: Option<i64>| {
+        let e = CatalogEntry { provider: p.into(), ..c.clone() };
+        money::cost_uusd(&e, &responses_usage(&ResponsesUsage { provider_cost_uusd: pc, ..ru(Some(10), Some(10), None, None) }), false)
+    };
+    assert_eq!((with("openrouter", Some(42)), with("xai", Some(43)), with("xai", None)), (Ok(42), Ok(43), Ok(113)));
+    assert_eq!((with("openrouter", None), with("openai", Some(1))), (Err(Error::Malformed), Err(Error::Malformed)));
 }
