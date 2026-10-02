@@ -43,6 +43,9 @@ pub struct PoolWorker {
     pub worker_device: String,
     pub enc_pub: [u8; 32],
     pub sign_pub: Option<[u8; 32]>,
+    /// Key-log indexes the relay claims for this worker's KEY_ADDED / DONOR_APPROVED.
+    pub key_log_index: u64,
+    pub approval_log_index: u64,
     pub donor: String,
     pub dialects: Vec<String>,
     pub models: Vec<String>,
@@ -100,8 +103,12 @@ pub struct Node {
     /// Process start (ms): the served-task boot floor (D18).
     pub boot_ms: u64,
     pub catalog: Mutex<Arc<Catalog>>,
+    /// Recent catalog versions (bounded): a Worker prices with the version named in `Assign`.
+    pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
+    /// Worker: single-use jailed request validators (CONTRACT §15.2).
+    pub validator: Option<Arc<crate::validator::Pool>>,
     /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
     pub store: Option<Arc<Mutex<Store>>>,
     /// Owner: requests waiting for this device's signature (pushed by the relay).
@@ -126,21 +133,30 @@ pub struct Node {
     pub journal: Mutex<VecDeque<JournalEntry>>,
     pub journal_tx: broadcast::Sender<JournalEntry>,
     pub shutdown: watch::Sender<bool>,
+    /// When the relay link last came up (ms): the relay's pools refill as donors reconnect.
+    pub link_up_ms: AtomicU64,
     /// Relay server_time − node clock at the last Hello.
     pub clock_skew_ms: std::sync::atomic::AtomicI64,
     /// Evidence of the last consumed tasks, for `moochy report` (bounded).
     pub evidence: Mutex<VecDeque<crate::task::Evidence>>,
-    /// Key-log mirror (None = no pinned log key: relay-asserted trust).
-    pub keylog: Option<Arc<crate::keylog::LogMirror>>,
+    /// Workers already reported as not sealable (log once).
+    pub seal_refused: Mutex<std::collections::HashSet<String>>,
+    /// Key-log monitor (None = no pinned log key: nothing trusted outside insecure dev).
+    pub keylog: Option<Arc<crate::keylog::KeyLog>>,
 }
 
 const MAX_SESSIONS: usize = 4096;
+const MAX_CATALOGS: usize = 8;
+/// Relays ask workers to reconnect within 10 s of a drain (jitter), plus backoff.
+const POOL_REFILL_MS: u64 = 20_000;
 const JOURNAL_KEEP: usize = 512;
 
 impl Node {
     pub fn new(home: Home, cfg: Config, secrets: Secrets, keys: Option<Keys>, w: WorkerParts, offline: bool) -> Arc<Self> {
-        let keylog = crate::keylog::LogMirror::open(&home, &cfg, keys.as_ref().map(|k| k.sign.public()));
-        let token_gen = AtomicU64::new(cfg.token_gen);
+        let keylog = crate::keylog::KeyLog::open(&home, &cfg, keys.as_ref().map(|k| k.sign.public()));
+        // Rotations persist in the state dir (`ctl.rs`); config's value is the older location.
+        let rotated = std::fs::read_to_string(home.state_dir().join("token_gen")).ok().and_then(|s| s.trim().parse::<u64>().ok());
+        let token_gen = AtomicU64::new(rotated.unwrap_or(0).max(cfg.token_gen));
         Arc::new(Self {
             home,
             cfg,
@@ -150,8 +166,10 @@ impl Node {
             insecure_dev: std::env::var("MOOCHY_INSECURE_DEV").as_deref() == Ok("1"),
             boot_ms: now_ms(),
             catalog: Mutex::new(if offline { Catalog::stub() } else { Arc::new(Catalog::default()) }),
+            catalogs: Mutex::new(VecDeque::new()),
             adapters: w.adapters,
             store: w.store,
+            validator: w.validator,
             approvals: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
@@ -169,8 +187,10 @@ impl Node {
             journal: Mutex::new(VecDeque::new()),
             journal_tx: broadcast::channel(64).0,
             shutdown: watch::channel(false).0,
+            link_up_ms: AtomicU64::new(0),
             clock_skew_ms: std::sync::atomic::AtomicI64::new(0),
             evidence: Mutex::new(VecDeque::new()),
+            seal_refused: Mutex::new(std::collections::HashSet::new()),
             keylog,
         })
     }
@@ -201,12 +221,50 @@ impl Node {
         .await;
     }
 
-    /// Accept a newer catalog (versions never go down).
-    pub fn set_catalog(&self, c: Catalog) {
+    /// Accept a newer catalog: versions never go down and a version, once seen, never changes
+    /// content (a relay could otherwise swap prices under the same number). `false` = refused.
+    pub fn set_catalog(&self, c: Catalog) -> bool {
         let mut cur = lock(&self.catalog);
-        if c.version >= cur.version {
-            *cur = Arc::new(c);
+        if c.version <= cur.version {
+            return false;
         }
+        let c = Arc::new(c);
+        let mut h = lock(&self.catalogs);
+        if h.len() >= MAX_CATALOGS {
+            h.pop_front();
+        }
+        h.push_back(c.clone());
+        *cur = c;
+        true
+    }
+
+    /// The catalog a Worker prices an `Assign` with: its `catalog_version` (0 = current, older relay).
+    pub fn catalog_v(&self, version: u64) -> Option<Arc<Catalog>> {
+        if version == 0 {
+            return Some(self.catalog());
+        }
+        lock(&self.catalogs).iter().find(|c| c.version == version).cloned()
+    }
+
+    /// The relay's catalog key = the pinned key-log key (`log_key`, `<name>+<hash>+<b64(0x01‖pub)>`).
+    pub fn catalog_key(&self) -> Option<[u8; 32]> {
+        let vkey = self.cfg.log_key.as_deref()?;
+        moochy_keylog::NoteKey::parse(vkey).ok()?;
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, vkey.splitn(3, '+').nth(2)?).ok()?;
+        match raw.split_first() {
+            Some((1, k)) => k.try_into().ok(),
+            _ => None,
+        }
+    }
+
+    /// `CatalogUpdate.sig` = Ed25519(catalog key, lp("moochy/v1/catalog", catalog_json)) (E41).
+    /// Without a pinned key the catalog is relay-asserted: accepted only in insecure dev mode.
+    pub fn catalog_trusted(&self, json: &[u8], sig: &[u8]) -> Result<(), &'static str> {
+        let Some(pk) = self.catalog_key() else {
+            return if self.insecure_dev { Ok(()) } else { Err("no pinned key-log key to verify the catalog") };
+        };
+        let sig = <[u8; 64]>::try_from(sig).map_err(|_| "catalog signature missing")?;
+        moochy_proto::crypto::verify(&pk, &crate::util::lp(&[b"moochy/v1/catalog", json]), &sig).map_err(|_| "bad catalog signature")
     }
 
     pub fn device_id(&self) -> Option<&str> {
@@ -249,6 +307,8 @@ impl Node {
                 worker_device: "local".into(),
                 enc_pub: [0; 32],
                 sign_pub: None,
+                key_log_index: 0,
+                approval_log_index: 0,
                 donor: "local".into(),
                 dialects: Vec::new(),
                 models: Vec::new(),
@@ -259,7 +319,16 @@ impl Node {
             return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true });
         }
         let pools = lock(&self.pools);
-        pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()
+        let mut p = pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()?;
+        drop(pools);
+        // Seal-time check (A174): every read of the pool on the submit path re-applies the
+        // key-log rule, so a later DONOR_REVOKED or a stale/forked log drops workers at once.
+        let repo = p.repo_id.clone();
+        p.workers.retain_mut(|w| self.sealable(&repo, w));
+        // Right after a (re)connect, e.g. a relay restart, donors are still reconnecting: an empty
+        // pool then means "not loaded yet" (retryable), not "nobody donates this model".
+        let fresh = now_ms().saturating_sub(self.link_up_ms.load(Ordering::Relaxed)) < POOL_REFILL_MS;
+        (!(p.workers.is_empty() && fresh)).then_some(p)
     }
 
     /// Whether the repo behind `slug` allows auto-caching (no clone of the pool).
@@ -267,14 +336,32 @@ impl Node {
         self.offline || lock(&self.pools).values().any(|p| p.auto_cache && p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug)))
     }
 
-    /// Key-log hook (06 §10): a Gateway seals only to worker keys that are logged, unrevoked, and
-    /// belong to a donor with an owner-signed `DONOR_APPROVED` for the repo. Until the
-    /// key-log mirror has a verified checkpoint, the relay's pool is accepted as-is (D14).
-    fn worker_approved(&self, repo_id: &str, worker_device: &str, enc_pub: &[u8; 32]) -> bool {
-        match self.keylog.as_ref().filter(|l| l.active()) {
-            Some(l) => l.sealable(worker_device, repo_id).is_some_and(|k| crate::util::ct_eq(&k, enc_pub)),
-            None => true,
+    /// The sealing rule (CONTRACT §15.4, 06 §10): a Gateway seals only to worker keys that are
+    /// logged, unrevoked and owner-approved for the repo in a fresh verified key log, and then
+    /// verifies receipts and checkpoints with the LOGGED signing key (A184). No verified log ⇒
+    /// nothing is sealed; the relay's pool is taken as-is only under `MOOCHY_INSECURE_DEV=1`
+    /// with no verified checkpoint yet (D14). A refusal is logged once per worker.
+    fn sealable(&self, repo_id: &str, w: &mut PoolWorker) -> bool {
+        let r = match &self.keylog {
+            Some(l) => match l.seal(repo_id, w) {
+                Ok(sign_pub) => {
+                    w.sign_pub = Some(sign_pub);
+                    return true;
+                }
+                Err(moochy_keylog::Code::NoCheckpoint) if self.insecure_dev => return true,
+                Err(c) => c.as_str(),
+            },
+            None if self.insecure_dev => return true,
+            None => "no_log_key",
+        };
+        let mut seen = lock(&self.seal_refused);
+        if seen.len() >= 4096 {
+            seen.clear();
         }
+        if seen.insert(w.worker_device.clone()) {
+            crate::util::log("warn", "not sealing to a worker the key log does not approve", &serde_json::json!({"worker": w.worker_device, "repo_id": repo_id, "code": r}));
+        }
+        false
     }
 
     pub fn apply_pool_sync(&self, v: &PoolSync) {
@@ -296,19 +383,21 @@ impl Node {
             for w in v.workers.iter().take(4096) {
                 let Ok(enc_pub) = <[u8; 32]>::try_from(w.enc_pub.as_ref()) else { continue };
                 let sign_pub = <[u8; 32]>::try_from(w.sign_pub.as_ref()).ok();
-                if !self.worker_approved(&v.repo_id, &w.worker_device, &enc_pub) {
-                    continue;
-                }
-                p.workers.retain(|x| x.worker_device != w.worker_device);
-                p.workers.push(PoolWorker {
+                let pw = PoolWorker {
                     worker_device: w.worker_device.clone(),
                     enc_pub,
                     sign_pub,
+                    key_log_index: w.key_log_index,
+                    approval_log_index: w.approval_log_index,
                     donor: clean(&w.donor_pseudonym).into_owned(),
                     dialects: w.dialects.iter().filter(|d| plain_id(d)).cloned().collect(),
                     models: w.models.iter().filter(|m| plain_id(m)).cloned().collect(),
                     hint: w.hint.min(100),
-                });
+                };
+                // Kept as advertised; the key-log rule is applied when the pool is read
+                // (`pool_for`), so a worker refused before the first checkpoint is not lost.
+                p.workers.retain(|x| x.worker_device != pw.worker_device);
+                p.workers.push(pw);
             }
             before != p.models()
         };
@@ -358,7 +447,7 @@ impl Node {
 }
 
 /// Model / dialect ids from the relay: short plain ASCII only (they reach agents and terminals).
-fn plain_id(s: &str) -> bool {
+pub fn plain_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 200 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:/-@+".contains(&c))
 }
 
@@ -367,6 +456,7 @@ fn plain_id(s: &str) -> bool {
 pub struct WorkerParts {
     pub adapters: Vec<Arc<Adapter>>,
     pub store: Option<Arc<Mutex<Store>>>,
+    pub validator: Option<Arc<crate::validator::Pool>>,
 }
 
 /// RAII counter for in-flight work (`gateway_tasks`, `worker_busy`).

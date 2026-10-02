@@ -27,7 +27,10 @@ COMMANDS:
                                   tokens, worker donates yours. Only the default server unless
                                   MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
   logout                          Remove this device: revoke its keys, then delete them here
-  up [--foreground]               Start the Moochy app on this machine
+  up [--foreground] [--unsafe-no-lockdown]
+                                  Start the Moochy app on this machine. It locks itself down
+                                  (no commands, files limited to its state); the flag disables
+                                  that for debugging only
   down                            Stop it
   status [--json]                 Connection, slots in use, donations available to your projects
   pause | resume                  Stop or restart donating from this device (works offline)
@@ -42,7 +45,9 @@ COMMANDS:
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
-  keys list | keys remove <provider>
+  keys list | keys remove <provider> | keys rotate
+                                  rotate = new device keys for this machine (the old ones stop
+                                  working 24 h later)
   config set <KEY> <VALUE> | config show
                                   monthly_limit (dollars, e.g. 20), slots_max (1-64),
                                   gateway_addr, journal_full_text, auto_cache,
@@ -53,8 +58,17 @@ COMMANDS:
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
   report <task> [--reason TEXT]   Save signed evidence about a bad response
-  doctor                          Check the keystore, connection, clock, provider keys and socket
+  doctor                          Check the keystore, connection, clock, provider keys, socket
+                                  and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
+  donate --repo OWNER/NAME --cap $N [--yes]
+                                  Donate tokens to a project, up to $N a month (it starts once
+                                  the project owner accepts you)
+  donations [--json] | donations <pause|resume|stop> <id>
+                                  Your donations: what each project used this month
+  owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
+                                  with its own passphrase, that signs approvals, memberships and
+                                  claims; only used by these commands, never by the app
   pending                         Requests waiting for your signature (maintainers)
   accept <donor> --repo OWNER/NAME [--revoke] [--yes]
                                   Accept a donor for your project (--revoke removes them);
@@ -62,12 +76,16 @@ COMMANDS:
   members <add|remove> <user> --repo OWNER/NAME [--device] [--cap $N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
-  claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by this device
+  claim --repo OWNER/NAME [--yes] Confirm you maintain a project, signed by your owner key
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (development only)
 ";
 
 pub fn main() -> ExitCode {
+    // The validator zygote (CONTRACT §15.2): nothing else may run before it.
+    if let Some(code) = crate::validator::zygote_entry() {
+        return ExitCode::from(code);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -142,12 +160,13 @@ fn parse() -> Result<Opts> {
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-sandbox"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -198,14 +217,12 @@ fn run() -> Result<()> {
         ["report", task] => report(&home, &o, task),
         ["doctor"] => doctor(&home),
         ["update"] => update(&o),
-        ["keys", "rotate"] => Err(internal(
-            "key rotation is not available yet: the server cannot accept a rotation signed by the current device",
-        )),
+        ["keys", "rotate"] => crate::owner::rotate_device(&home),
         ["up"] => {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
             }
-            if o.has("foreground") { up_foreground(home, o.has("offline")) } else { up_background(&home, &o) }
+            if o.has("foreground") { up_foreground(home, o.has("offline"), o.has("unsafe-no-lockdown")) } else { up_background(&home, &o) }
         }
         ["down"] => rt_small()?.block_on(async {
             crate::ctl::connect(&home.socket_path()).await?.shutdown(ShutdownRequest {}).await.map_err(|s| internal(s.message().to_owned()))?;
@@ -239,6 +256,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["donate"] => crate::donations::donate(&home, &slug_or_detect(&o)?, o.cap.unwrap_or(0), o.has("yes")),
+        // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
+        ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
+        ["donations", act, id] => crate::donations::action(&home, act, id),
+        ["owner", "init"] => crate::owner::init(&home, false),
+        ["owner", "rotate"] => crate::owner::init(&home, true),
         // VOICE.md: "accept a donor".
         ["accept", donor] => owner_ops(&home, &o, &["approve", donor]),
         ["pending"] => rt_small()?.block_on(async {
@@ -431,52 +454,10 @@ fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
         "subject_username": q.subject_username, "signer": q.signer, "issued_at_ms": q.issued_at_ms, "signed": q.signed, "log_index": q.log_index})
 }
 
-/// Owner signatures: show exactly what will be signed, then sign only on explicit consent.
+/// Owner signatures (CONTRACT §15.4): previewed by the Node, signed here with the owner key.
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
-    use crate::pb::local::{ApproveRequest, ClaimRequest, MembersRequest, members_request::Op};
-    use std::io::IsTerminal as _;
     let slug = slug_or_detect(o)?;
-    rt_small()?.block_on(async {
-        let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        let call = |c: &mut crate::pb::local::local_control_client::LocalControlClient<tonic::transport::Channel>, dry_run: bool| {
-            let mut c = c.clone();
-            let (slug, w) = (slug.clone(), w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
-            let (revoke, device, cap) = (o.has("revoke"), o.has("device"), o.cap.unwrap_or(0));
-            async move {
-                let r = match w.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-                    ["approve", donor] => c.approve(ApproveRequest { repo: slug, donor: (*donor).into(), dry_run, revoke }).await,
-                    ["members", op, user] => {
-                        let op = if *op == "add" { Op::Add } else { Op::Remove };
-                        c.members(MembersRequest { repo: slug, op: op as i32, user: (*user).into(), cap_uusd_month: cap, device, dry_run }).await
-                    }
-                    _ => c.claim(ClaimRequest { repo: slug, dry_run }).await,
-                };
-                r.map(tonic::Response::into_inner).map_err(|s| match s.code() {
-                    tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => usage(clean(s.message()).into_owned()),
-                    _ => internal(clean(s.message()).into_owned()),
-                })
-            }
-        };
-        let preview = call(&mut c, true).await?;
-        eprintln!(
-            "You are about to sign {} for {} ({}):\n  for     {} ({})\n  signer  {} (this device)\n  issued  {} ms",
-            preview.kind, preview.repo_slug, preview.repo_id, preview.subject, preview.subject_username, preview.signer, preview.issued_at_ms
-        );
-        if !o.has("yes") {
-            if !std::io::stdin().is_terminal() {
-                return Err(usage("pass --yes to sign non-interactively"));
-            }
-            eprint!("Sign it? [y/N] ");
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            if !matches!(line.trim(), "y" | "Y" | "yes") {
-                return Err(usage("not signed"));
-            }
-        }
-        let done = call(&mut c, false).await?;
-        emit(&sign_json(&done));
-        Ok(())
-    })
+    crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))
 }
 
 /// `moochy report <task> [--out file] [--reason text]`: evidence bundle (06 §9).
@@ -527,6 +508,9 @@ fn doctor(home: &Home) -> Result<()> {
         line(false, "clock", "unknown: measured when the app connects".into());
     }
     line(true, "safety", format!("checks level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
+    for (ok, what, detail) in crate::lockdown::doctor(home, st.is_some()) {
+        line(ok, what, detail);
+    }
     // `moochy run` (§15.1): host support, and what the agent will not see (A163). Informational.
     let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_ok_and(|v| v.trim() == "1");
     if restricted {
@@ -663,7 +647,8 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if raw.len() > 4096 {
         return Err(usage("key too long"));
     }
-    let key = zeroize::Zeroizing::new(String::from_utf8(raw.to_vec()).map_err(|_| usage("key must be UTF-8"))?.trim().to_owned());
+    // A190: borrow, never an un-zeroized intermediate copy of the key.
+    let key = zeroize::Zeroizing::new(std::str::from_utf8(&raw).map_err(|_| usage("key must be UTF-8"))?.trim().to_owned());
     if key.is_empty() || !key.bytes().all(|c| c.is_ascii_graphic()) {
         return Err(usage("key must be non-empty printable ASCII"));
     }
@@ -675,6 +660,8 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     sec.providers.retain(|p| p.provider != provider);
     sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone() });
     keystore::save(home, &cfg, &sec)?;
+    // CONTRACT §15.2 "bounded worst case": a dedicated key with a spend limit at the provider.
+    eprintln!("Tip: use a key made only for Moochy, with a monthly spend limit set at {provider}: the most it can ever cost you is that limit.");
     emit(&json!({"event": "key_added", "provider": provider}));
     Ok(())
 }
@@ -693,7 +680,8 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(home.state_dir().join("node.log")).ctx("open node.log")?;
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]);
+    // The background process never sees the owner passphrase (CONTRACT §15.4, A190).
+    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE");
     if offline {
         cmd.arg("--offline");
     }
@@ -722,10 +710,13 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     })
 }
 
-fn up_foreground(home: Home, offline: bool) -> Result<()> {
+fn up_foreground(home: Home, offline: bool, unsafe_no_lockdown: bool) -> Result<()> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    // CONTRACT §15.2: load, bind, lock down while single-threaded, then start the runtime.
+    let boot = crate::lockdown::Boot::load(&home, offline)?;
+    crate::lockdown::apply(&home, &boot, unsafe_no_lockdown)?;
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().ctx("runtime")?;
-    rt.block_on(up(home, offline))
+    rt.block_on(up(home, offline, boot))
 }
 
 /// Provider adapters (one per stored key) and the outbox store.
@@ -753,36 +744,21 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         }
     }
     let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
-    Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))) })
+    Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
 }
 
-async fn up(home: Home, offline: bool) -> Result<()> {
-    home.ensure()?;
-    let mut cfg = home.load()?;
-    let secrets = if offline {
-        keystore::load_or_init(&home, &mut cfg)?
-    } else {
-        let s = keystore::load(&home, &cfg)?.ok_or_else(|| auth("no keystore: run `moochy login` first"))?;
-        if cfg.device_id.is_none() || s.device.is_none() || cfg.relay.is_none() {
-            return Err(auth("not logged in: run `moochy login` first"));
-        }
-        s
-    };
-    let addr = cfg.gateway_addr()?;
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| usage(format!("bind {addr}: {e}")))?;
-    let port = listener.local_addr().ctx("local addr")?.port();
-    if cfg.gateway_addr.is_none() {
-        // First start: keep this port so clients keep a stable base URL (CONTRACT §6).
-        cfg.gateway_addr = Some(format!("127.0.0.1:{port}"));
-        home.save(&cfg)?;
-    }
+async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
+    let port = boot.port();
+    let crate::lockdown::Boot { cfg, secrets, listener, validator } = boot;
+    let listener = tokio::net::TcpListener::from_std(listener).ctx("gateway listener")?;
     let sock_path = home.socket_path();
     let sock = crate::ctl::bind(&sock_path).await?;
     let keys = match (&secrets.device, cfg.device_id.as_deref()) {
         (Some(d), Some(id)) => Some(Keys { sign: d.sign_key(), enc: d.enc_key()?, device_id: id.parse().map_err(|_| auth("stored device id is invalid"))? }),
         _ => None,
     };
-    let parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
+    let mut parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
+    parts.validator = validator;
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
     tokio::spawn(crate::gateway::serve(node.clone(), listener));
@@ -794,12 +770,11 @@ async fn up(home: Home, offline: bool) -> Result<()> {
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));
     }
-    match (&node.keylog, node.cfg.log_anchor_url.clone()) {
-        (Some(l), Some(u)) => {
-            tokio::spawn(l.clone().anchor_loop(u, node.shutdown.subscribe()));
-        }
-        (None, _) if !offline => log("warn", "no key-log key pinned (log_key): approvals and memberships are relay-asserted", &json!({})),
-        _ => {}
+    match &node.keylog {
+        Some(l) => l.start(&node),
+        None if offline => {}
+        None if node.insecure_dev => log("warn", "no key-log key pinned (log_key): approvals and memberships are relay-asserted (MOOCHY_INSECURE_DEV)", &json!({})),
+        None => log("error", "no key-log key pinned (log_key): this device seals to no donor and accepts no task until it is set", &json!({})),
     }
     if !offline {
         tokio::spawn(crate::link::run(node.clone()));

@@ -11,12 +11,13 @@ use crate::pb::local::JournalEntry;
 use crate::task::now_us;
 use crate::util::{clean, log, now_ms};
 use bytes::Bytes;
-use moochy_proto::crypto::{self, ContentKey, RequestOpener, ResponseSealer, SaltName};
+use moochy_proto::crypto::{self, ContentKey, RequestDecryptor, ResponseSealer, SaltName};
 use moochy_proto::money::{self, CatalogEntry};
 use moochy_proto::msg::{InnerPayload, Projection, Receipt, ReceiptStatus, RouteHeader, Usage};
 use moochy_proto::{PledgeId, TaskId};
 use moochy_worker::Effort;
 use moochy_worker::firewall::{self, MaxPrice, Policy, Route};
+use moochy_worker::validate::ValidateRequest;
 use moochy_worker::provider::Adapter;
 use moochy_worker::store::{Reservation, Store, StoreError};
 use moochy_worker::stream::StreamParser;
@@ -51,7 +52,7 @@ fn device_cap(node: &Node) -> Option<u64> {
 }
 
 fn can_serve(node: &Node) -> bool {
-    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && device_cap(node).is_some() && !node.adapters.is_empty()
+    node.cfg.has_role("worker") && node.keys.is_some() && node.store.is_some() && node.validator.as_ref().is_some_and(|v| v.alive()) && device_cap(node).is_some() && !node.adapters.is_empty()
 }
 
 fn slots_max(node: &Node) -> u32 {
@@ -99,7 +100,7 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
     let headroom = |m: &str| rl.get(m).filter(|(_, exp)| *exp > now).map_or(100, |(p, _)| u32::from(*p));
     let models = served_models(node).into_iter().map(|(d, m)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m }).collect();
     drop(rl);
-    let free = if paused { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
+    let free = if paused || !can_serve(node) { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
     let cap = device_cap(node).unwrap_or(0);
     let left = node.store.as_ref().map_or(0, |s| lock(s).device_left(cap, now_ms()));
     let local_cap_left_uusd = i64::try_from(left).unwrap_or(i64::MAX);
@@ -108,7 +109,9 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
 
 /// Send a fresh offer (after a task ends, pause/resume, catalog change).
 pub fn reoffer(node: &Node) {
-    if can_serve(node)
+    // Also when we can no longer serve (validator gone): the offer then says 0 slots.
+    if node.cfg.has_role("worker")
+        && node.keys.is_some()
         && let Some(l) = node.link()
     {
         let _ = l.up.try_send(offer(node));
@@ -129,6 +132,9 @@ pub fn on_welcome(node: &Arc<Node>) {
     }
     let node = node.clone();
     tokio::spawn(async move {
+        if let Some(keys) = &node.keys {
+            recover_inflight(&node, keys).await;
+        }
         let unacked = with_store(&node, |s| s.unacked().map(|(_, p)| p.to_vec()).collect::<Vec<_>>()).await.unwrap_or_default();
         let receipts: Vec<pb::SignedReceipt> = unacked.iter().filter_map(|p| pb::SignedReceipt::decode(p.as_slice()).ok()).collect();
         let tasks = receipts.iter().map(|r| pb::KnownTask { task: r.task.clone(), attempt: r.attempt, state: "outbox".into() }).collect();
@@ -322,7 +328,7 @@ async fn receive(task: &str, attempt: u32, down: &mut tonic::Streaming<ServeDown
 /// Hook for the key-log mirror (moochy-keylog): the signing key of a Gateway device whose user is
 /// an owner-signed member of `repo_id`. `None` until the mirror is wired.
 fn gateway_key(node: &Node, device: &str, repo_id: &str) -> Option<[u8; 32]> {
-    node.keylog.as_ref().filter(|l| l.active()).and_then(|l| l.gateway_key(device, repo_id))
+    node.keylog.as_ref().and_then(|l| l.gateway_key(device, repo_id))
 }
 
 /// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
@@ -373,6 +379,7 @@ struct Admitted {
     prepared: firewall::Prepared,
     pledge: PledgeId,
     key: Vec<u8>,
+    catalog_version: u64,
 }
 
 /// Steps 1–4 of 07 §6.1. `Err((ck, failure))` = NACK (with CK when known, to seal the detail).
@@ -382,50 +389,31 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let task: TaskId = assign.task.parse().map_err(|_| refuse("bad_envelope", false, None))?;
     let attempt = u8::try_from(assign.attempt).map_err(|_| refuse("bad_envelope", false, None))?;
     let wrap = <[u8; crypto::WRAP_LEN]>::try_from(assign.wrap.as_ref()).map_err(|_| refuse("bad_envelope", false, None))?;
-    // 1. unwrap (fails if the route header was touched: HPKE AAD) → decrypt → decompress.
+    // 1. unwrap (fails if the route header was touched: HPKE AAD) → decrypt only. The stranger's
+    // bytes (zstd, JSON) are parsed in the jailed single-use validator, never here (§15.2).
     let ck = crypto::unwrap(&keys.enc, &task, &assign.route, &wrap).map_err(|_| refuse("bad_envelope", false, None))?;
     let with_ck = |code: &str, retry: bool, d: Option<String>| (Some(ck.clone()), Failure::new(code, retry, d));
-    let mut opener = RequestOpener::new(&ck, &task).map_err(|_| with_ck("bad_envelope", false, None))?;
+    let mut dec = RequestDecryptor::new(&ck, &task).map_err(|_| with_ck("bad_envelope", false, None))?;
     for c in body {
-        opener.push(c).map_err(|_| with_ck("bad_envelope", false, None))?;
+        dec.push(c).map_err(|_| with_ck("bad_envelope", false, None))?;
     }
-    if opener.chunks() != assign.body_chunks {
+    if dec.chunks() != assign.body_chunks {
         return Err(with_ck("bad_envelope", false, None));
     }
-    let payload = opener.finish().map_err(|_| with_ck("bad_envelope", false, None))?;
-    let inner = InnerPayload::parse(&payload).map_err(|_| with_ck("bad_envelope", false, None))?;
-    drop(payload);
+    let payload = dec.finish().map_err(|_| with_ck("bad_envelope", false, None))?;
+    // The route header is fixed-size-ish signed JSON: the parent's strict parser (CONTRACT §1).
     let route = RouteHeader::parse(&assign.route).map_err(|_| with_ck("bad_envelope", false, None))?;
-    // 2. Task authenticity (03 §7.2).
     if route.repo_id.text() != assign.repo_id {
         return Err(with_ck("unauthorized_task", false, Some("the request is for another project than this donation".into())));
-    }
-    let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
-    match gateway_key(node, &inner.gateway_device.text(), &assign.repo_id) {
-        Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
-        // D14: relay-asserted membership only without a verified key log and in insecure dev
-        // mode; the body hash still binds.
-        None if node.insecure_dev && !node.keylog.as_ref().is_some_and(|l| l.active()) => {
-            if !crypto::ct_eq(&crypto::sha256(&inner.body_b64.0), &inner.body_sha256.0) {
-                return Err(with_ck("bad_envelope", false, None));
-            }
-        }
-        None => return Err(with_ck("unauthorized_task", false, Some("gateway key not in the key log".into()))),
     }
     let now = now_ms();
     if !task.admissible(now, node.boot_ms) {
         return Err(with_ck("unauthorized_task", false, Some("task id outside the freshness window".into())));
     }
-    let (gw, tid, ts) = (inner.gateway_device.text(), task.text(), task.0.timestamp_ms());
-    match with_store(node, move |s| s.check_served(&gw, &tid, ts, now)).await {
-        Some(Ok(())) => {}
-        Some(Err(StoreError::Stale | StoreError::Replay)) => return Err(with_ck("unauthorized_task", false, Some("task already served".into()))),
-        _ => return Err(with_ck("busy", true, None)),
-    }
     let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
-    // 3. Adapter + catalog entry, firewall, route/body consistency.
+    // 2. Adapter + catalog entry, pledge policy, route expectations for the validator.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
-    let cat = node.catalog();
+    let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
     let Some((adapter, entry)) = node.adapters.iter().find_map(|a| {
         let e = cat.entry(&route.model, a.provider().as_str())?;
         (a.provider().serves(dialect.worker()) && e.dialects.contains(&route.dialect)).then(|| (a.clone(), e.clone()))
@@ -434,41 +422,74 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     };
     let fwc = engine::fw_catalog(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
     let policy = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
-    let hdrs: Vec<(&str, &str)> = inner.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let pseudo = user_pseudonym(&assign.repo_id, &inner.gateway_device.text());
-    let fw = firewall::Request {
-        provider: adapter.provider(),
-        dialect: dialect.worker(),
-        body: &inner.body_b64.0,
-        headers: &hdrs,
-        policy: &policy,
-        catalog: &fwc,
-        provider_model_id: &entry.provider_model_id,
-        user_pseudonym: &pseudo,
-        max_price: Some(MaxPrice { prompt_uusd_per_mtok: entry.input, completion_uusd_per_mtok: entry.out }),
-    };
-    let prepared = firewall::prepare(&fw).map_err(|r| {
-        let (code, retry) = r.code.nack();
-        with_ck(code, retry, Some(r.to_string()))
-    })?;
     let mut aliases: Vec<&str> = vec![entry.model.as_str(), entry.provider_model_id.as_str()];
     aliases.extend(entry.aliases.iter().map(String::as_str));
     let effort = Effort::parse(&route.effort).ok_or_else(|| with_ck("route_mismatch", false, Some("effort".into())))?;
     let flags = engine::route_flags(&route).ok_or_else(|| with_ck("route_mismatch", false, Some("flags".into())))?;
-    let r = Route {
+    // ponytail: the gateway device is only known inside the payload, which the parent must not
+    // parse; until Assign carries it (verified against the child's answer), the provider-facing
+    // pseudonym is per (repo, donation) rather than per (repo, member device).
+    let pseudo = user_pseudonym(&assign.repo_id, &assign.pledge_id);
+    let req = ValidateRequest {
+        provider: adapter.provider(),
         dialect: dialect.worker(),
-        model_aliases: &aliases,
-        effort,
-        max_tokens: route.max_tokens.into(),
-        est_input_tokens: route.est_input_tokens,
-        cache_ttl: engine::cache_ttl_w(route.cache_ttl),
-        stream: route.stream,
-        flags,
+        policy,
+        catalog: fwc,
+        provider_model_id: &entry.provider_model_id,
+        user_pseudonym: &pseudo,
+        max_price: Some(MaxPrice { prompt_uusd_per_mtok: entry.input, completion_uusd_per_mtok: entry.out }),
+        route: Route {
+            dialect: dialect.worker(),
+            model_aliases: &aliases,
+            effort,
+            max_tokens: route.max_tokens.into(),
+            est_input_tokens: route.est_input_tokens,
+            cache_ttl: engine::cache_ttl_w(route.cache_ttl),
+            stream: route.stream,
+            flags,
+        },
+        payload: &payload,
     };
-    prepared.facts.check_route(dialect.worker(), &r).map_err(|e| {
-        let (code, retry) = e.code.nack();
+    // 3. Decompress + inner payload + firewall + route/body consistency, in the jailed child.
+    let validator = node.validator.as_ref().ok_or_else(|| with_ck("busy", true, None))?;
+    let v = validator.validate(&req).await.map_err(|e| {
+        let (code, retry) = e.nack();
+        if code == "busy" {
+            log("warn", "request validator failed", &json!({"task": task.text(), "error": e.to_string()}));
+        }
         with_ck(code, retry, Some(e.to_string()))
     })?;
+    drop(payload);
+    // The child's verdict is the firewall, but authenticity is checked here, by the parent:
+    // body hash + task signature over the exact bytes the child returned (03 §7.2).
+    let inner = InnerPayload {
+        v: 1,
+        body_b64: moochy_proto::Blob(v.body.to_vec()),
+        body_sha256: moochy_proto::B(v.body_sha256),
+        headers: v.headers.iter().cloned().collect(),
+        s: moochy_proto::B(v.s),
+        gateway_device: v.gateway_device.parse().map_err(|_| with_ck("bad_envelope", false, None))?,
+        task_sig: moochy_proto::B(v.task_sig),
+    };
+    let prepared = v.prepared;
+    let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
+    match gateway_key(node, &inner.gateway_device.text(), &assign.repo_id) {
+        Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
+        // D14: relay-asserted membership only without a verified key log and in insecure dev
+        // mode; the body hash still binds.
+        None if node.insecure_dev && !node.keylog.as_ref().is_some_and(|l| l.verified()) => {
+            if !crypto::ct_eq(&crypto::sha256(&inner.body_b64.0), &inner.body_sha256.0) {
+                return Err(with_ck("bad_envelope", false, None));
+            }
+        }
+        None => return Err(with_ck("unauthorized_task", false, Some("gateway key not in the key log".into()))),
+    }
+    let (gw, tid, ts) = (inner.gateway_device.text(), task.text(), task.0.timestamp_ms());
+    match with_store(node, move |s| s.check_served(&gw, &tid, ts, now)).await {
+        Some(Ok(())) => {}
+        Some(Err(StoreError::Stale | StoreError::Replay)) => return Err(with_ck("unauthorized_task", false, Some("task already served".into()))),
+        _ => return Err(with_ck("busy", true, None)),
+    }
     // 4. Local reservation: device cap, plus the pledge's per-task cap and headroom from Assign.
     let amount = money::reserve_for_route(&entry, &route).ok().and_then(|a| u64::try_from(a).ok()).ok_or_else(|| with_ck("local_cap", true, None))?;
     let positive = |v: i64| u64::try_from(v).ok().filter(|v| *v > 0);
@@ -496,7 +517,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         Some(Err(StoreError::Cap(w))) => return Err(with_ck("local_cap", true, Some(w.into()))),
         _ => return Err(with_ck("busy", true, None)),
     }
-    Ok(Admitted { ck, task, inner, route, entry, adapter, prepared, pledge, key })
+    Ok(Admitted { ck, task, inner, route, entry, adapter, prepared, pledge, key, catalog_version: cat.version })
 }
 
 /// Returns `(journal status, model, cost)`.
@@ -534,8 +555,16 @@ async fn serve(
     };
     drop(body);
     let _ = tx.send(up(serve_up::Msg::Ack(pb::Ack { r: Bytes::copy_from_slice(&r) }))).await;
+    let reserved = money::reserve_for_route(&a.entry, &a.route).unwrap_or(0);
+    let record = provisional(keys, &a, u8::try_from(attempt).unwrap_or(0), t_start).and_then(|rc| write_inflight(node, &rc, &a.route.model, reserved));
     log("info", "timing", &json!({"task": task_s, "attempt": attempt, "t_assign_rx": t_assign_rx, "t_ack_tx": now_us()}));
-    run_provider(node, keys, a, attempt, r, t_start, down, &refuse).await
+    let out = run_provider(node, keys, a, attempt, r, t_start, down, &refuse).await;
+    // The attempt is settled (receipt in the outbox): the record has served its purpose.
+    if let Some(h) = record {
+        let _ = h.await;
+        drop_inflight(node, task_s, attempt);
+    }
+    out
 }
 
 /// Steps 6–9: provider call, sealed streaming, receipt.
@@ -563,12 +592,12 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
             fl.retry_after_ms = f.retry_after_ms;
             refuse.nack(Some(&a.ck), &fl).await;
             // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
-            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
+            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
             finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
             return (format!("refused:{code}"), String::new(), 0, None);
         }
         None => {
-            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
+            let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
             finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
             return ("cancelled".into(), String::new(), 0, None);
         }
@@ -650,9 +679,13 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let fast = a.route.flags.iter().any(|f| f == "fast");
     // Fallback when a cost cannot be computed (e.g. OpenRouter without a reported cost): the reservation.
     let cost = money::cost_uusd(&a.entry, &usage, fast).unwrap_or(reserved);
+    // xAI bills reasoning beyond `max_tokens` and reports the charge (`cost_in_usd_ticks`). The
+    // receipt stays catalog-priced (only OpenRouter may carry a provider cost today), but the
+    // donor's own cap settles at what xAI actually charged when that is higher.
+    let local = if a.entry.provider == "xai" { out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok()).map_or(cost, |c| c.max(cost)) } else { cost };
     let model = clean(out.model.as_deref().unwrap_or("")).into_owned();
     let req_id = request_id.or(out.id).unwrap_or_default();
-    let end = Ending { status, usage, cost, model: model.clone(), req_id, times: (t_start, t_started) };
+    let end = Ending { status, usage, cost, local, model: model.clone(), req_id, times: (t_start, t_started) };
     finish(node, keys, &a, attempt8, &sealer, end, down, refuse).await;
     let st = match status {
         ReceiptStatus::Ok => "ok",
@@ -670,6 +703,8 @@ struct Ending {
     status: ReceiptStatus,
     usage: Usage,
     cost: i64,
+    /// What the donor's local cap settles at (≥ `cost`).
+    local: i64,
     model: String,
     req_id: String,
     times: (u64, u64),
@@ -679,8 +714,8 @@ struct Ending {
 /// the Serve stream, hand it to the session (`ReplayReceipt`) so it is never lost.
 #[allow(clippy::too_many_arguments)]
 async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer: &ResponseSealer, e: Ending, down: &mut tonic::Streaming<ServeDown>, refuse: &Refuse<'_>) {
-    let ucost = u64::try_from(e.cost).unwrap_or(0);
-    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times, node.catalog().version) else {
+    let ucost = u64::try_from(e.local).unwrap_or(0);
+    let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times) else {
         log("error", "receipt signing failed", &json!({"task": refuse.task}));
         return;
     };
@@ -732,10 +767,28 @@ fn build_receipt(
     status: ReceiptStatus,
     model: &str,
     (t_start, t_started): (u64, u64),
-    catalog_version: u64,
 ) -> Option<pb::SignedReceipt> {
     let s = &a.inner.s.0;
-    let rc = Receipt {
+    let mut rc = provisional(keys, a, attempt, t_start)?;
+    rc.model_reported = model.into();
+    rc.usage = usage;
+    rc.cost_uusd = cost;
+    rc.resp_commit = moochy_proto::B(crypto::resp_commit(&crypto::salt(s, SaltName::Resp).ok()?, &sealer.running_hash()).ok()?);
+    rc.provider_req_hash = moochy_proto::B(crypto::provider_req_hash(&crypto::salt(s, SaltName::Pid).ok()?, provider_req_id).ok()?);
+    rc.status = status;
+    rc.t_started = if status == ReceiptStatus::NotStarted { 0 } else { t_started };
+    sign_receipt(keys, &rc, &a.route.model)
+}
+
+/// The receipt as known at the Ack: what a crash mid-stream settles at (05 §5.2): usage
+/// unknown (estimated), cost = the reservation, status `partial`.
+fn provisional(keys: &Keys, a: &Admitted, attempt: u8, t_start: u64) -> Option<Receipt> {
+    let s = &a.inner.s.0;
+    let reserved = money::reserve_for_route(&a.entry, &a.route).ok()?;
+    let usage = Usage { estimated: true, provider_cost_uusd: (a.entry.provider == "openrouter").then_some(reserved), ..Usage::default() };
+    // The relay recomputes cost from usage and settles estimated receipts at the reservation.
+    let cost = money::cost_uusd(&a.entry, &usage, a.route.flags.iter().any(|f| f == "fast")).ok()?;
+    Some(Receipt {
         v: 1,
         task_id: a.task,
         attempt,
@@ -745,38 +798,112 @@ fn build_receipt(
         gateway_device: a.inner.gateway_device,
         dialect: a.route.dialect,
         provider: a.entry.provider.clone(),
-        model_reported: model.into(),
+        model_reported: String::new(),
         usage,
-        catalog_version,
+        catalog_version: a.catalog_version,
         cost_uusd: cost,
         req_commit: moochy_proto::B(crypto::req_commit(&crypto::salt(s, SaltName::Req).ok()?, &a.inner.body_b64.0).ok()?),
-        resp_commit: moochy_proto::B(crypto::resp_commit(&crypto::salt(s, SaltName::Resp).ok()?, &sealer.running_hash()).ok()?),
-        provider_req_hash: moochy_proto::B(crypto::provider_req_hash(&crypto::salt(s, SaltName::Pid).ok()?, provider_req_id).ok()?),
-        status,
+        resp_commit: moochy_proto::B(crypto::resp_commit(&crypto::salt(s, SaltName::Resp).ok()?, &crypto::sha256(b"")).ok()?),
+        provider_req_hash: moochy_proto::B(crypto::provider_req_hash(&crypto::salt(s, SaltName::Pid).ok()?, "").ok()?),
+        status: ReceiptStatus::Partial,
         t_start,
-        t_started: if status == ReceiptStatus::NotStarted { 0 } else { t_started },
-        t_end: now_ms(),
-    };
+        t_started: t_start,
+        t_end: 0,
+    })
+}
+
+/// Sign a receipt and its public projection (`model` = the public model id).
+fn sign_receipt(keys: &Keys, rc: &Receipt, model: &str) -> Option<pb::SignedReceipt> {
+    let mut rc = rc.clone();
+    rc.t_end = now_ms();
     let (rbytes, rsig) = crypto::sign_receipt(&keys.sign, &rc).ok()?;
     let p = Projection {
         v: 1,
         receipt_ref: moochy_proto::B(crate::util::rand_bytes::<16>().ok()?),
-        repo_id: a.route.repo_id,
+        repo_id: rc.repo_id,
         donor: None,
-        model: a.route.model.clone(),
-        cost_uusd: cost,
+        model: model.into(),
+        cost_uusd: rc.cost_uusd,
         day: utc_day(now_ms()),
         receipt_sha256: moochy_proto::B(crypto::sha256(&rbytes)),
     };
     let (pbytes, psig) = crypto::sign_projection(&keys.sign, &p).ok()?;
     Some(pb::SignedReceipt {
-        task: a.task.text(),
-        attempt: attempt.into(),
+        task: rc.task_id.text(),
+        attempt: rc.attempt.into(),
         receipt: Bytes::from(rbytes),
         donor_sig: Bytes::copy_from_slice(&rsig),
         projection: Bytes::from(pbytes),
         projection_sig: Bytes::copy_from_slice(&psig),
     })
+}
+
+// ---- durable in-flight record (E37) ----
+//
+// Written right after the Ack (off the Ack path, no fsync: it must survive a crash of this
+// process, not a power loss, where the relay settles at the reservation after 24 h anyway) and
+// removed once the real receipt is in the outbox. A record left over at start means the process
+// died mid-attempt: its provisional receipt goes to the outbox and is replayed on Welcome, so the
+// relay replaces its pessimistic settlement.
+
+fn inflight_dir(node: &Node) -> std::path::PathBuf {
+    node.home.state_dir().join("inflight")
+}
+
+fn inflight_path(node: &Node, task: &str, attempt: u32) -> std::path::PathBuf {
+    inflight_dir(node).join(format!("{task}-{attempt}"))
+}
+
+/// Record: `<public model> <reserved µ$>\n<receipt JSON>`; the donor's own cap settles at the
+/// reservation.
+fn write_inflight(node: &Node, rc: &Receipt, model: &str, reserved: i64) -> Option<tokio::task::JoinHandle<()>> {
+    let path = inflight_path(node, &rc.task_id.text(), rc.attempt.into());
+    let mut data = format!("{model} {reserved}\n").into_bytes();
+    data.extend_from_slice(&serde_json::to_vec(rc).ok()?);
+    Some(tokio::task::spawn_blocking(move || {
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        // A torn write (crash mid-write) fails to parse at recovery and is discarded.
+        if std::fs::write(&path, &data).is_err() {
+            log("warn", "in-flight record write failed", &json!({}));
+        }
+    }))
+}
+
+fn drop_inflight(node: &Node, task: &str, attempt: u32) {
+    let path = inflight_path(node, task, attempt);
+    tokio::task::spawn_blocking(move || std::fs::remove_file(path));
+}
+
+/// At start: turn every leftover in-flight record into an outbox receipt (bounded).
+async fn recover_inflight(node: &Arc<Node>, keys: &Keys) {
+    let dir = inflight_dir(node);
+    let files = tokio::task::spawn_blocking(move || {
+        let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+        rd.filter_map(Result::ok).take(1024).filter_map(|e| Some((e.path(), std::fs::read(e.path()).ok().filter(|b| b.len() <= 64 << 10)?))).collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (path, data) in files {
+        let parsed = data.iter().position(|b| *b == b'\n').and_then(|i| {
+            let (head, json) = (std::str::from_utf8(data.get(..i)?).ok()?, data.get(i.checked_add(1)?..)?);
+            let (model, reserved) = head.split_once(' ')?;
+            Some((model.to_owned(), reserved.parse::<u64>().ok()?, serde_json::from_slice::<Receipt>(json).ok()?))
+        });
+        let signed = parsed
+            .as_ref()
+            .filter(|(m, _, rc)| crate::node::plain_id(m) && rc.worker_device == keys.device_id)
+            .and_then(|(m, reserved, rc)| Some((sign_receipt(keys, rc, m)?, *reserved, rc)));
+        if let Some((signed, cost, rc)) = signed {
+            let (key, payload) = (attempt_key(&rc.task_id.text(), rc.attempt.into()), signed.encode_to_vec());
+            if with_store(node, move |s| s.put_receipt(&key, &payload, cost, now_ms())).await.is_none_or(|r| r.is_err()) {
+                continue; // keep the record: retried at the next start
+            }
+            log("warn", "recovered an attempt interrupted by a crash: estimated receipt queued", &json!({"task": rc.task_id.text(), "attempt": rc.attempt}));
+        }
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+    }
 }
 
 /// `YYYY-MM-DD` (UTC) of a Unix time in ms (Howard Hinnant's civil_from_days).
