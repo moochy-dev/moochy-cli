@@ -182,6 +182,12 @@ impl KeyLog {
         }
     }
 
+    /// `moochy verify` of a relay-served projection (E63): the device logged at `key_log_index`
+    /// signed it (mo-node).
+    pub fn verify_projection(&self, projection: &[u8], sig: &[u8], worker_device: &str, key_log_index: u64) -> Result<moochy_keylog::projection::Verified, Code> {
+        self.view().verify_projection(projection, sig, worker_device, key_log_index)
+    }
+
     /// The logged device whose signing key this is (`moochy verify`, mo-node).
     pub fn device_by_key(&self, sign_pub: &[u8; 32]) -> Option<String> {
         self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()

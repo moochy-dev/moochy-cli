@@ -186,7 +186,7 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
         if !crate::run::key_ok(key) {
             return json_resp(403, &json!({"error": "run_key_required"}));
         }
-        return match crate::task::verify(&node, r) {
+        return match crate::task::verify(&node, r).await {
             Ok(v) => json_resp(200, &v),
             Err(e) => json_resp(422, &json!({"verified": false, "error": e})),
         };
