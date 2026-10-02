@@ -49,6 +49,9 @@ COMMANDS:
   keys add local --base-url http://127.0.0.1:11434 --model local/<slug>=<server id> [--key-stdin]
                                   Donate your own GPU: an OpenAI-compatible server on this
                                   machine or your LAN (Ollama, LM Studio, vLLM, llama.cpp)
+  service install [--system] [--print] | service uninstall [--system]
+                                  Start Moochy at login (systemd user unit, launchd agent);
+                                  --print shows the unit only
   safety [--monthly-limit $N] [--accept-safety]
                                   The safety step before donating: a monthly limit for this
                                   machine, and a provider-side spend limit (required once)
@@ -186,7 +189,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -244,6 +247,8 @@ fn run() -> Result<()> {
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
         ["safety"] => safety(&home, &o, None),
+        ["service", "install"] => crate::service::install(&home, o.has("system"), o.has("print")),
+        ["service", "uninstall"] => crate::service::uninstall(o.has("system")),
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
