@@ -19,6 +19,7 @@ use moochy_keylog::{
     tiles::{TILE_WIDTH, tile_path},
 };
 use serde_json::Value;
+use sha2::Digest;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -87,6 +88,9 @@ impl LogLink for FakeLink {
     }
     async fn anchor(&mut self) -> Option<Vec<u8>> {
         self.anchor.take()
+    }
+    fn anchor_configured(&self) -> bool {
+        self.anchor.is_some()
     }
 }
 
@@ -421,4 +425,105 @@ fn sealing_gate() {
     block_on(m.on_checkpoint(&mut f.link, &f.fork23));
     assert_eq!(v.gate(), Gate::Forked);
     assert_eq!(v.seal_check(w, r, s.key_idx, ai), Err(Code::LogForked));
+}
+
+// A204: with no witnesses required and no anchor, the monitor says loudly that it
+// fails open; with either protection it stays quiet.
+#[test]
+fn fail_open_is_loud() {
+    let mut f = fx();
+    let mut m = monitor(&f, None, 0);
+    f.link.notes.extend([f.n23.clone()]);
+    let mut events = Vec::new();
+    block_on(m.run(&mut f.link, |e| events.push(e.clone())));
+    assert_eq!(events[0], Event::FailOpen);
+    assert!(events[0].is_security() && events[0].message().contains("fail-open"));
+    assert_eq!(events.iter().filter(|e| **e == Event::FailOpen).count(), 1);
+    // An anchor wired: no warning.
+    let mut f = fx();
+    let m = monitor(&f, None, 0);
+    f.link.anchor = Some(f.n23.clone());
+    assert!(!m.fail_open(&f.link));
+    // Witnesses required: no warning either.
+    let m = monitor(&f, None, 1);
+    f.link.anchor = None;
+    assert!(!m.fail_open(&f.link));
+}
+
+// mo-node: a key the user just created stops being "unknown" without reopening.
+#[test]
+fn acknowledge_keys_at_runtime() {
+    let mut f = fx();
+    let mut m = monitor(&f, None, 0);
+    m.view().acknowledge_owner_key([7; 32]);
+    // The vectors' rogue owner key (UnknownOwnerKey:21) is unknown until acknowledged.
+    let entries = load("entries.json");
+    let rogue_ok = entries["entries"][21]["record_hex"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rec = unhex(&rogue_ok);
+    let e = moochy_keylog::entry::parse_record(&rec).unwrap();
+    let moochy_keylog::entry::Body::OwnerKey { owner_pub, .. } = e.body else {
+        panic!()
+    };
+    m.view().acknowledge_owner_key(*owner_pub);
+    let ev = block_on(m.on_checkpoint(&mut f.link, &f.n23));
+    let msgs: Vec<String> = ev.iter().map(Event::message).collect();
+    assert!(
+        !msgs.iter().any(|x| x.contains("unknown_owner_key: an owner key")),
+        "{msgs:?}"
+    );
+    // The device-key alert still fires for the rogue device until acknowledged.
+    assert!(msgs.iter().any(|x| x.contains("unknown_key: a new device")), "{msgs:?}");
+}
+
+#[test]
+fn projection_verify() {
+    use moochy_keylog::projection::{valid_ref, verify};
+    let mut f = fx();
+    let mut m = monitor(&f, None, 0);
+    block_on(m.on_checkpoint(&mut f.link, &f.n23));
+    // A device logged in the vectors with a known seed: newDev(1) = sha256("dev-1").
+    let seed: [u8; 32] = sha2::Sha256::digest(b"dev-1").into();
+    let sk = ed25519_zebra::SigningKey::from(seed);
+    let pj = br#"{"v":1,"receipt_ref":"abc"}"#;
+    let sig: [u8; 64] = sk
+        .sign(&moochy_keylog::entry::lp(&[b"moochy/v1/projection", pj]))
+        .into();
+    let dev = "d_01HZX000000000000000000001";
+    let idx = m.view().state(|s| s.device(dev).unwrap().idx).unwrap();
+    let ok = m.view().verify_projection(pj, &sig, dev, idx).unwrap();
+    assert!(ok.donor_pseudonym.starts_with("ps_"));
+    assert_eq!(
+        m.view().verify_projection(br#"{"v":1}"#, &sig, dev, idx),
+        Err(Code::BadSig)
+    );
+    assert_eq!(
+        m.view().verify_projection(pj, &sig, dev, idx + 1),
+        Err(Code::IndexMismatch)
+    );
+    assert_eq!(
+        m.view()
+            .verify_projection(pj, &sig, "d_01HZX000000000000000000099", idx),
+        Err(Code::UnknownDevice)
+    );
+    assert!(
+        m.view()
+            .state(|s| verify(s, pj, &sig[..63], dev, idx))
+            .unwrap()
+            .is_err()
+    );
+    for r in ["", "a/b", "..", &"A".repeat(65)] {
+        assert!(!valid_ref(r), "{r}");
+    }
+    assert!(valid_ref("4k5BnpfZq4wPOCCDMZvRGA"));
+    // fetch_projection refuses a bad ref before any I/O and caps the reply.
+    assert!(
+        block_on(moochy_keylog::monitor::fetch_projection(
+            &mut f.link,
+            "../x"
+        ))
+        .is_err()
+    );
 }
