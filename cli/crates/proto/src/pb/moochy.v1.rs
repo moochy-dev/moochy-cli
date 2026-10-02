@@ -92,6 +92,11 @@ pub struct Auth {
     pub sig: ::prost::bytes::Bytes,
     #[prost(string, tag = "4")]
     pub client_version: ::prost::alloc::string::String,
+    /// §17.1 clone detection (integrator decision): 16 random bytes generated at every process start.
+    /// Two live sessions of one device key with different instance values inside the session lease
+    /// are a clone: the relay refuses the newer one and alerts the owner (BoxCloneRefused).
+    #[prost(bytes = "bytes", tag = "5")]
+    pub instance: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Welcome {
