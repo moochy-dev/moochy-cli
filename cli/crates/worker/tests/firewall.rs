@@ -1,6 +1,6 @@
 //! Table-driven firewall tests (plan 06 §7): every deny, nested content, strict JSON,
 //! huge inputs, header allowlist, route facts, safe mutations.
-#![allow(clippy::panic, clippy::format_push_string, clippy::needless_raw_string_hashes, clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines)]
+#![allow(clippy::panic, clippy::format_push_string, clippy::needless_raw_string_hashes, clippy::expect_used, clippy::format_collect, clippy::range_plus_one, clippy::cast_possible_truncation, clippy::assert_is_empty, clippy::items_after_statements, clippy::redundant_closure_for_method_calls, clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::too_many_lines, clippy::cast_precision_loss)]
 
 use moochy_worker::firewall::{self, Catalog, CacheTtl, Level, MaxPrice, Policy, RejectCode, Request, Route};
 use moochy_worker::{Dialect, Effort, Flags, Provider};
@@ -539,4 +539,41 @@ fn recorded_claude_code_corpus() {
     assert!(firewall::analyze(Dialect::AnthropicMessages, ctx("clear_thinking_20251015").as_bytes(), &[], &all, &CAT).is_ok());
     assert!(firewall::analyze(Dialect::AnthropicMessages, ctx("clear_tool_uses_20250919").as_bytes(), &[], &all, &CAT).is_ok());
     assert!(firewall::analyze(Dialect::AnthropicMessages, ctx("compact_20260101").as_bytes(), &[], &all, &CAT).is_err());
+}
+
+/// CONTRACT §13 row 1: the E22 100 KB request (one long prompt string) through `analyze`
+/// (Gateway) and `prepare` (Worker). Release builds assert a floor; debug builds only print.
+#[test]
+fn request_throughput() {
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(2300);
+    let body = anth(&format!("{prompt:?}"), r#","stream":true"#);
+    let p = policy(Flags::NONE);
+    let release = !cfg!(debug_assertions);
+    let n = if release { 2000 } else { 20 };
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        analyze(Dialect::AnthropicMessages, &body, &[], p).unwrap();
+    }
+    let an = t.elapsed() / n;
+    let req = Request {
+        provider: Provider::Anthropic,
+        dialect: Dialect::AnthropicMessages,
+        body: body.as_bytes(),
+        headers: &[],
+        policy: &p,
+        catalog: &CAT,
+        provider_model_id: "claude-sonnet-5-5",
+        user_pseudonym: "ps_1",
+        max_price: None,
+    };
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        firewall::prepare(&req).unwrap();
+    }
+    let pr = t.elapsed() / n;
+    let mbs = |d: std::time::Duration| body.len() as f64 / d.as_secs_f64() / 1e6;
+    println!("{} B request: analyze {an:?} ({:.0} MB/s), prepare {pr:?} ({:.0} MB/s)", body.len(), mbs(an), mbs(pr));
+    if release {
+        assert!(an < std::time::Duration::from_micros(60) && pr < std::time::Duration::from_micros(80), "100 KB request too slow");
+    }
 }
