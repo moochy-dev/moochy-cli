@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Moochy background process (gateway + donor), per-user launchd agent (macOS).
+  launchd has no declarative sandbox: the process applies its own Seatbelt
+  profile after boot (process-exec and process-fork denied, files limited to
+  its state dir and CA roots; CONTRACT §15.2). This agent adds the rest of the
+  bounded worst case: no core dumps (keys), private umask, restart on failure,
+  one process group (validators die with it). Keys live in the login Keychain.
+  Install (replace __HOME__ and the binary path; Homebrew on Apple silicon:
+  /opt/homebrew/bin/moochy):
+    sed "s#__HOME__#$HOME#g" dev.moochy.agent.plist > ~/Library/LaunchAgents/dev.moochy.agent.plist
+    plutil -lint ~/Library/LaunchAgents/dev.moochy.agent.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.moochy.agent.plist
+  Remove: launchctl bootout gui/$(id -u)/dev.moochy.agent
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.moochy.agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/moochy</string>
+		<string>up</string>
+		<string>--foreground</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>AbandonProcessGroup</key>
+	<false/>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>Core</key>
+		<integer>0</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>Core</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/moochy.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/moochy.log</string>
+</dict>
+</plist>

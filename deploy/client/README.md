@@ -14,7 +14,7 @@ The export copies these files into place; everything else stays where it is.
 | `dist-workspace.toml` | `/dist-workspace.toml` |
 | `github/build-setup.yml` | `/.github/build-setup.yml` |
 | `github/workflows/*.yml` | `/.github/workflows/` |
-| `deny.toml`, `supply-chain/`, `scripts/`, `container/` | `/deploy/client/` (unchanged) |
+| `deny.toml`, `supply-chain/`, `scripts/`, `container/`, `service/`, `apparmor/` | `/deploy/client/` (unchanged) |
 
 Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release"` in `cli/Cargo.toml`; `[package.metadata.dist] dist = true`, `repository`, `homepage` in `cli/crates/node/Cargo.toml`.
 
@@ -54,8 +54,23 @@ deploy/client/scripts/repro-check.sh --target x86_64-unknown-linux-musl --agains
 | `scripts/repro-check.sh` | two builds at different paths, umask, TZ, locale are bit-identical; `--against` compares with a release | `supply-chain/reproducible`, `attest-release/rebuild` |
 | `scripts/supply-chain.sh` | `cargo deny` (advisories, licences, bans incl. OpenSSL, sources) + `cargo vet` + the crypto/TLS trust base is audited, never exempted (`hpke` included) | `supply-chain/deny-vet` |
 | `scripts/dco-check.sh` | every commit has the author's `Signed-off-by:` | `supply-chain/dco` |
+| `scripts/check-service-units.sh` | both systemd units verify, system unit exposure ≤ 2.0, plist parses; `--live BIN HOME` runs `moochy up` under the user unit and requires the self-lockdown + ready | — (needs systemd; run before changing `service/`) |
 
 Every script takes `--dry-run`. After `cli/Cargo.lock` changes: `cargo vet regenerate imports` and `cargo vet regenerate exemptions` with `--manifest-path cli/Cargo.toml --store-path deploy/client/supply-chain`, then audit (`cargo vet certify`) any trust-base crate the regeneration exempted.
+
+## Service units (bounded worst case, CONTRACT §15.2)
+
+The background process locks itself down after boot (Landlock, seccomp, no exec; Seatbelt on macOS). The units add the platform half:
+
+| File | Where | What it adds |
+|---|---|---|
+| `service/moochy.system.service` | always-on donor on a server (`/etc/systemd/system/moochy.service`, user `moochy`, state in `/var/lib/moochy`) | everything: read-only system, no `/home`, private `/tmp` and `/dev`, no capabilities, `NoNewPrivileges`, syscall filter (`@system-service` + Landlock/seccomp syscalls), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, `LockPersonality`, no core dumps, memory/task limits; keystore passphrase as an encrypted credential. `systemd-analyze security`: **1.2** |
+| `service/moochy.user.service` | desktop (`~/.config/systemd/user/moochy.service`, keys in the OS keychain) | the seccomp-based subset, which a user manager enforces everywhere: `NoNewPrivileges`, syscall filter, address families, `RestrictNamespaces`, `MemoryDenyWriteExecute`, `LockPersonality`, `RestrictRealtime`/`SUIDSGID`, no core dumps, limits. Filesystem confinement is moochy's own Landlock. Exposure **6.2** by design, see below |
+| `service/dev.moochy.agent.plist` | macOS (`~/Library/LaunchAgents`) | no core dumps, umask 077, restart on failure, one process group; the process applies Seatbelt itself |
+
+Why the user unit has no `ProtectSystem=`/`ProtectHome=`/`PrivateTmp=` (verified on Ubuntu 24.04, systemd 255): a user manager needs an unprivileged user namespace for them. With `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu ≥ 23.10 default) systemd silently skips every mount *and* the process lands in AppArmor's `unprivileged_userns` profile; exec'ing `moochy` from there under `apparmor/moochy` denies `socket(AF_INET)`, so the donor cannot even bind its gateway. Options that imply dropping capabilities (`PrivateDevices`, `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectClock`, `CapabilityBoundingSet`) fail with `218/CAPABILITIES`. Use the system unit when you want them; elsewhere add them in a drop-in (instructions in the unit).
+
+Verified live on this recipe (Linux arm64): `moochy up` under the system unit runs locked down with `CapBnd=0`, `NoNewPrivs=1`, `Seccomp=2`, `/` and `/dev` read-only, `/home` inaccessible, only the state dir writable; under the user unit it locks down and serves (`scripts/check-service-units.sh --live`).
 
 ## Ubuntu 23.10+ (AppArmor user-namespace restriction)
 

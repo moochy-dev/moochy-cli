@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# Moochy headless donor (always-on server, plan 07 §8.3), system unit.
+# Platform half of CONTRACT §15.2 "bounded worst case"; the process also locks
+# itself down after boot (Landlock + seccomp, no exec). Install:
+#   sudo useradd --system --home /var/lib/moochy --shell /usr/sbin/nologin moochy
+#   sudo install -m 0755 moochy /usr/local/bin/moochy   # path covered by deploy/client/apparmor/moochy
+#   systemd-ask-password -n "Keystore passphrase:" | sudo systemd-creds encrypt --name=moochy-passphrase - /etc/moochy/moochy-passphrase.cred
+#   sudo install -m 0644 moochy.system.service /etc/systemd/system/moochy.service
+#   sudo -u moochy MOOCHY_HOME=/var/lib/moochy moochy login --headless …   # once, then keys add
+#   sudo systemctl enable --now moochy
+[Unit]
+Description=Moochy headless donor
+Documentation=https://github.com/moochy-dev/moochy-cli/tree/main/docs/guides
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=moochy
+Group=moochy
+Environment=MOOCHY_HOME=/var/lib/moochy
+# Keystore passphrase: decrypted by systemd into this unit's private, non-swappable
+# credentials directory, never stored in plaintext or in the unit.
+LoadCredentialEncrypted=moochy-passphrase:/etc/moochy/moochy-passphrase.cred
+ExecStart=/bin/sh -c 'MOOCHY_PASSPHRASE=$$(cat "$$CREDENTIALS_DIRECTORY/moochy-passphrase") && export MOOCHY_PASSPHRASE && exec "$0" up --foreground' /usr/local/bin/moochy
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+LimitCORE=0
+TasksMax=256
+MemoryMax=1G
+
+StateDirectory=moochy
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @clock @module
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
