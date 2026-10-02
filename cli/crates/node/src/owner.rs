@@ -200,7 +200,7 @@ fn proof_name(p: OwnerKeyProof) -> &'static str {
 fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
     let say = |m: &str| usage(format!("{m}; nothing was registered"));
     if e.msg.contains("owner_key_proof") {
-        say("the server refused an owner key without proof: this server does not offer the email confirmation (update moochy, or add a passkey on moochy.dev first and run `moochy owner init` again so the passkey approves it)")
+        say("the server refused an owner key without proof: this server does not offer the email confirmation yet (add a passkey on moochy.dev first, then run `moochy owner init` again so the passkey approves it)")
     } else if e.msg.contains("email_changed_recently") {
         say("your email address changed less than 72 hours ago: for your safety the server binds a first owner key by email only after that (or approve it with a passkey you already have)")
     } else if e.msg.contains("skew") {
