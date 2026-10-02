@@ -112,3 +112,25 @@ D14 relay-asserted path for tests only).
 `receipts::verify(&receipt_bytes, index, &cp, &proof)` with `cp` opened from a receipt-log note
 (origin `moochy.dev/receipts`, its own pinned key) and the proof fetched over the link once the
 relay exposes it (`receipts/…` tile prefix or a proof field; see the report's requests).
+
+## 7. Round additions (A203–A205, E63, device requests)
+
+- **Fail-open warning (A204).** Implement `LogLink::anchor_configured()` → `true` when the
+  public Git anchor URL is configured. With no anchor and `min_cosignatures == 0`,
+  `Monitor::run` emits `Event::FailOpen` once (security event: show it in `moochy status`);
+  `Monitor::fail_open(&link)` answers the same question for `moochy doctor`.
+- **New own keys at runtime.** After `moochy keys rotate` or `moochy owner init/rotate`, call
+  `view.acknowledge_device_key(pub)` / `view.acknowledge_owner_key(pub)` (and persist the key in
+  config for the next `Monitor::open`); no need to reopen the monitor.
+- **`moochy verify <receipt_ref>` (E63).** `monitor::fetch_projection(&mut link, ref)` returns the
+  relay's JSON `{"projection_b64","sig_b64","worker_device","key_log_index"}` (≤ 16 KiB). Parse
+  it with the Node's strict JSON parser, base64url-decode, then
+  `view.verify_projection(&projection, &sig, &worker_device, key_log_index)` → donor pseudonym
+  (+ `revoked`), checking the device's KEY_ADDED in your own mirror. Finally check the projection
+  JSON names the requested `receipt_ref`.
+- **Device requests (spec/KEYLOG.md §2a).** `moochy logout` / `keys revoke`:
+  `SignedLogEntry{kind:"KEY_REVOKED", body: entry::revoke_body(id, ps, reason),
+  sigs:[sign(entry::revoke_request_message(&body))]}` — NOT `sig_message` (refused). The session
+  closes when its own device is revoked, so confirm via the KEY_REVOKED entry rather than the ack.
+  `moochy keys rotate`: body `entry::key_body(...)` for the successor, `sigs:[successor PoP,
+  current.sign(entry::rotate_request_message(&body))]`.
