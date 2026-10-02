@@ -736,6 +736,10 @@ async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer
     let (key, payload) = (a.key.clone(), signed.encode_to_vec());
     if with_store(node, move |s| s.put_receipt(&key, &payload, ucost, now_ms())).await.is_none_or(|r| r.is_err()) {
         log("error", "outbox write failed", &json!({"task": refuse.task}));
+    } else {
+        // The receipt is in the outbox: the in-flight record has served its purpose.
+        let path = inflight_path(node, refuse.task, refuse.attempt);
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }
     let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
     let acked = sent
@@ -911,10 +915,21 @@ async fn recover_inflight(node: &Arc<Node>, keys: &Keys) {
             .and_then(|(m, reserved, rc)| Some((sign_receipt(keys, rc, m)?, *reserved, rc)));
         if let Some((signed, cost, rc)) = signed {
             let (key, payload) = (attempt_key(&rc.task_id.text(), rc.attempt.into()), signed.encode_to_vec());
-            if with_store(node, move |s| s.put_receipt(&key, &payload, cost, now_ms())).await.is_none_or(|r| r.is_err()) {
-                continue; // keep the record: retried at the next start
+            // Never a second receipt for an attempt the outbox already holds one for (the real
+            // receipt is fsynced before `End`): the relay treats different bytes for a settled
+            // attempt as a conflict.
+            let put = with_store(node, move |s| {
+                if s.since(0).any(|(k, _)| k == key.as_slice()) {
+                    return Ok(false);
+                }
+                s.put_receipt(&key, &payload, cost, now_ms()).map(|()| true)
+            })
+            .await;
+            match put {
+                Some(Ok(true)) => log("warn", "recovered an attempt interrupted by a crash: estimated receipt queued", &json!({"task": rc.task_id.text(), "attempt": rc.attempt})),
+                Some(Ok(false)) => {}
+                _ => continue, // keep the record: retried at the next start
             }
-            log("warn", "recovered an attempt interrupted by a crash: estimated receipt queued", &json!({"task": rc.task_id.text(), "attempt": rc.attempt}));
         }
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }

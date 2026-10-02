@@ -405,10 +405,10 @@ impl Driver {
         let current = self.acc.as_ref().map(|a| u32::from(a.attempt));
         match m {
             submit_down::Msg::NeedWraps(n) => {
-                // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool
-                // (still approval-filtered), not the snapshot taken at submit (E27).
-                if let Some(p) = crate::node::lock(&self.node.pools).get(&self.repo_id) {
-                    self.pool = p.clone();
+                // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool,
+                // not the snapshot taken at submit (E27), filtered by the key-log seal rule (A174).
+                if let Some(p) = self.node.sealable_pool(&self.repo_id) {
+                    self.pool = p;
                 }
                 let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
                 let w = wraps(&ws, &self.task, &self.route, &self.ck);

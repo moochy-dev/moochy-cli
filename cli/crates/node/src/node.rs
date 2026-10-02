@@ -331,17 +331,22 @@ impl Node {
             w.models = vec![STUB_MODEL.into()];
             return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true });
         }
-        let pools = lock(&self.pools);
-        let mut p = pools.values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).cloned()?;
-        drop(pools);
-        // Seal-time check (A174): every read of the pool on the submit path re-applies the
-        // key-log rule, so a later DONOR_REVOKED or a stale/forked log drops workers at once.
-        let repo = p.repo_id.clone();
-        p.workers.retain_mut(|w| self.sealable(&repo, w));
+        let repo = lock(&self.pools).values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).map(|p| p.repo_id.clone())?;
+        let p = self.sealable_pool(&repo)?;
         // Right after a (re)connect, e.g. a relay restart, donors are still reconnecting: an empty
         // pool then means "not loaded yet" (retryable), not "nobody donates this model".
         let fresh = now_ms().saturating_sub(self.link_up_ms.load(Ordering::Relaxed)) < POOL_REFILL_MS;
         (!(p.workers.is_empty() && fresh)).then_some(p)
+    }
+
+    /// The pool of `repo_id` with only the workers this Gateway may seal to. The ONLY way the
+    /// submit path reads a pool (submit, NeedWraps): every read re-applies the key-log rule
+    /// (A174), so a later DONOR_REVOKED or a stale/forked log drops workers at once, and the
+    /// signing key is replaced by the logged one (A184).
+    pub fn sealable_pool(&self, repo_id: &str) -> Option<RepoPool> {
+        let mut p = lock(&self.pools).get(repo_id).cloned()?;
+        p.workers.retain_mut(|w| self.sealable(repo_id, w));
+        Some(p)
     }
 
     /// Whether the repo behind `slug` allows auto-caching (no clone of the pool).
