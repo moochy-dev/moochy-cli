@@ -248,13 +248,39 @@ pub fn token_create(home: &Home, slug: &str, ttl: Option<&str>, cap: Option<i64>
     Ok(())
 }
 
-/// `moochy box token list` / `moochy box list` (`tokens`: which half to print).
+/// `moochy box token list` / `moochy box list` (`tokens`: which half to print). `box list` checks
+/// the relay's answer against the verified key-log mirror on disk (`in_key_log`) and also shows
+/// the boxes the log has and the relay did not list (`"source": "key_log"`); with a relay that
+/// cannot list boxes yet, the key log alone.
 pub fn list(home: &Home, slug: Option<&str>, tokens: bool) -> Result<()> {
-    let r: ListBoxesResponse = call(home, "list_boxes", &ListBoxesRequest { repo_slug: slug.unwrap_or_default().into() })?;
+    let relay: Result<ListBoxesResponse> = call(home, "list_boxes", &ListBoxesRequest { repo_slug: slug.unwrap_or_default().into() });
     if tokens {
-        r.tokens.iter().for_each(|t| emit(&token_json(t)));
-    } else {
-        r.boxes.iter().for_each(|b| emit(&box_json(b)));
+        relay?.tokens.iter().for_each(|t| emit(&token_json(t)));
+        return Ok(());
+    }
+    let cfg = home.load()?;
+    let log = cfg.pseudonym.as_deref().and_then(|ps| crate::keylog::KeyLog::boxes_on_disk(home, &cfg, ps));
+    let r = match (relay, &log) {
+        (Ok(r), _) => r,
+        (Err(e), Some(_)) => {
+            eprintln!("moochy: {} — showing the boxes in the key log only", e.msg);
+            ListBoxesResponse::default()
+        }
+        (Err(e), None) => return Err(e),
+    };
+    for b in &r.boxes {
+        let mut v = box_json(b);
+        if let (Some(o), Some(l)) = (v.as_object_mut(), &log) {
+            o.insert("in_key_log".into(), json!(l.iter().any(|(id, ..)| *id == b.device_id)));
+        }
+        emit(&v);
+    }
+    // The key log is per account, not per project: only unfiltered lists add its extra boxes.
+    if slug.is_none() {
+        let now = now_ms();
+        for (id, token, exp, revoked) in log.iter().flatten().filter(|(id, ..)| !r.boxes.iter().any(|b| b.device_id == *id)) {
+            emit(&json!({"device_id": clean(id), "token_id": clean(token), "expires_at_ms": exp, "revoked": revoked, "expired": now >= *exp, "source": "key_log"}));
+        }
     }
     Ok(())
 }

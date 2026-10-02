@@ -136,6 +136,21 @@ impl KeyLog {
     /// reproduce a checkpoint signed by the pinned log key (`Monitor::open`). Outer `None`: no
     /// key log on this node; inner `None`: the device is not in the log.
     pub fn device_owner(home: &Home, cfg: &Config, device: &str) -> Option<Option<String>> {
+        let m = Self::on_disk(home, cfg)?;
+        Some(m.view().state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
+    }
+
+    /// Foreground CLI (`moochy box list`, §17.1): the boxes of `pseudonym` in the persisted,
+    /// checkpoint-verified mirror, as (device id, box token id, expires_at_ms, revoked), log order.
+    /// `None`: no key log on this node.
+    pub fn boxes_on_disk(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Vec<(String, String, u64, bool)>> {
+        let m = Self::on_disk(home, cfg)?;
+        m.view()
+            .state(|s| s.boxes(pseudonym).into_iter().map(|(id, d)| (id.to_owned(), d.box_id.clone().unwrap_or_default(), d.expires_at_ms, d.revoked)).collect())
+            .ok()
+    }
+
+    fn on_disk(home: &Home, cfg: &Config) -> Option<Monitor> {
         let key = NoteKey::parse(&effective_log_key(cfg)?).ok()?;
         let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
         let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
@@ -148,8 +163,7 @@ impl KeyLog {
             witnesses: Vec::new(),
             min_cosignatures: 0,
         };
-        let m = Monitor::open(mc).ok()?;
-        Some(m.view().state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
+        Monitor::open(mc).ok()
     }
 
     /// Run the monitor for the node's lifetime (once).
