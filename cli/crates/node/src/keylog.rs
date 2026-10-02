@@ -45,12 +45,9 @@ pub struct KeyLog {
     view: Mutex<View>,
     /// Taken by [`KeyLog::start`].
     monitor: Mutex<Option<Monitor>>,
-    cfg: monitor::Config,
     state: std::path::PathBuf,
     /// Newest checkpoint note served by the relay (latest wins).
     notes: watch::Sender<Option<Vec<u8>>>,
-    /// Reopen the monitor (new own keys) at the next point between two checkpoints.
-    reopen: Arc<tokio::sync::Notify>,
 }
 
 /// Own keys created while the node runs (`<state>/owner_keys`, `<state>/device_keys`): one
@@ -103,14 +100,12 @@ impl KeyLog {
             witnesses: Vec::new(),
             min_cosignatures: 0,
         };
-        match Monitor::open(mc.clone()) {
+        match Monitor::open(mc) {
             Ok(m) => Some(Arc::new(Self {
                 view: Mutex::new(m.view()),
                 monitor: Mutex::new(Some(m)),
-                cfg: mc,
                 state,
                 notes: watch::channel(None).0,
-                reopen: Arc::new(tokio::sync::Notify::new()),
             })),
             Err(e) => {
                 log("error", "key log disabled: mirror cannot be opened", &json!({"error": e.to_string()}));
@@ -122,53 +117,31 @@ impl KeyLog {
     /// Run the monitor for the node's lifetime (once).
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
-        let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now(), reopen: self.reopen.clone() };
-        let me = self.clone();
-        let node = node.clone();
+        let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now() };
         tokio::spawn(async move {
-            loop {
-                m.run(&mut link, |e| {
-                    let (level, msg, mut fields) = event_fields(e);
-                    if let Some(o) = fields.as_object_mut() {
-                        o.insert("keylog".into(), json!(e.message()));
-                    }
-                    log(level, &msg, &fields);
-                })
-                .await;
-                if *node.shutdown.borrow() {
-                    return;
+            m.run(&mut link, |e| {
+                let (level, msg, mut fields) = event_fields(e);
+                if let Some(o) = fields.as_object_mut() {
+                    o.insert("keylog".into(), json!(e.message()));
                 }
-                // Reopen with the own keys acknowledged meanwhile (restored from disk, no network).
-                let mut cfg = me.cfg.clone();
-                cfg.known_owner_keys = read_keys(&me.state.join("owner_keys"));
-                if let Some(mine) = cfg.me.as_mut() {
-                    for k in read_keys(&me.state.join("device_keys")) {
-                        if !mine.known_keys.contains(&k) {
-                            mine.known_keys.push(k);
-                        }
-                    }
-                }
-                match Monitor::open(cfg) {
-                    Ok(n) => {
-                        *lock(&me.view) = n.view();
-                        m = n;
-                    }
-                    Err(e) => log("error", "key log monitor could not reopen", &json!({"error": e.to_string()})),
-                }
-            }
+                log(level, &msg, &fields);
+            })
+            .await;
         });
     }
 
     /// A key this user just created (owner key, or a rotated device key), relayed by this node:
     /// remember it so the monitor does not report it as someone else's (`unknown_*`).
     pub fn acknowledge(&self, owner_key: Option<&[u8; 32]>, device_key: Option<&[u8; 32]>) {
+        let view = self.view();
         if let Some(k) = owner_key {
             add_key(&self.state.join("owner_keys"), k);
+            view.acknowledge_owner_key(*k);
         }
         if let Some(k) = device_key {
             add_key(&self.state.join("device_keys"), k);
+            view.acknowledge_device_key(*k);
         }
-        self.reopen.notify_one();
     }
 
     fn view(&self) -> View {
@@ -242,6 +215,8 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
         Event::Fork { size, .. } => ("error", format!("KEY LOG FORK: {}", e.message()), json!({"event": "fork", "size": size})),
         Event::Stale { served, mirrored } => ("error", "key log alert".into(), json!({"event": "stale", "served": served, "mirrored": mirrored})),
         Event::Rollback { anchored, served } => ("error", "KEY LOG FORK: rollback vs the public anchor".into(), json!({"event": "rollback", "anchored": anchored, "served": served})),
+        // A204: no witnesses and no public anchor — a relay could show this node a split view.
+        Event::FailOpen => ("warn", "key log alert".into(), json!({"event": "fail_open"})),
         Event::Unwitnessed { size, cosignatures } => ("error", "key log alert".into(), json!({"event": "unwitnessed", "size": size, "cosignatures": cosignatures})),
     }
 }
@@ -265,10 +240,13 @@ struct Link {
     node: Arc<Node>,
     notes: watch::Receiver<Option<Vec<u8>>>,
     anchor_due: Instant,
-    reopen: Arc<tokio::sync::Notify>,
 }
 
 impl moochy_keylog::LogLink for Link {
+    fn anchor_configured(&self) -> bool {
+        self.node.cfg.log_anchor_url.is_some()
+    }
+
     async fn get_tile(&mut self, path: &str) -> Result<Vec<u8>, moochy_keylog::Error> {
         let mut c = self.node.link().ok_or_else(|| moochy_keylog::Error::Io("relay link down".into()))?.client;
         let r = tokio::time::timeout(TILE_TIMEOUT, c.get_log_tile(LogTileRequest { path: path.into() }))
@@ -294,8 +272,6 @@ impl moochy_keylog::LogLink for Link {
                         return Some(n);
                     }
                 }
-                // Between two checkpoints: a clean point to end `run` and reopen.
-                () = self.reopen.notified() => return None,
                 r = stop.changed() => {
                     if r.is_err() || *stop.borrow() {
                         return None;
@@ -318,4 +294,44 @@ impl moochy_keylog::LogLink for Link {
         log("warn", "key-log anchor fetch failed", &json!({}));
         None
     }
+}
+
+/// `moochy verify <receipt_ref>` (E63): fetch the public projection over the link and check the
+/// donor's signature against the device key logged at `key_log_index` in this node's verified
+/// mirror, then that the projection names the requested reference. Without a key log, only in
+/// insecure dev mode, the relay-advertised pool key is used and the answer says so.
+pub async fn verify_ref(node: &Arc<Node>, receipt_ref: &str) -> Result<serde_json::Value, String> {
+    if !moochy_keylog::projection::valid_ref(receipt_ref) {
+        return Err("not a receipt reference".into());
+    }
+    if node.link_now(Duration::from_secs(5)).await.is_none() {
+        return Err("not connected to the Moochy server".into());
+    }
+    let mut link = Link { node: node.clone(), notes: watch::channel(None).1, anchor_due: Instant::now() };
+    let reply = monitor::fetch_projection(&mut link, receipt_ref).await.map_err(|e| format!("no public receipt {receipt_ref}: {e}"))?;
+    let v = crate::json::parse_object(&reply).map_err(|e| format!("malformed answer: {e}"))?;
+    let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str).ok_or_else(|| format!("answer lacks {k}"));
+    let projection = crate::util::b64d(field("projection_b64")?).ok_or("bad projection_b64")?;
+    let sig = crate::util::b64d(field("sig_b64")?).ok_or("bad sig_b64")?;
+    let worker = field("worker_device")?;
+    let idx = v.get("key_log_index").and_then(serde_json::Value::as_u64).ok_or("answer lacks key_log_index")?;
+    let p: moochy_proto::msg::Projection = serde_json::from_slice(&projection).map_err(|_| "the projection is not a valid projection".to_owned())?;
+    if crate::util::b64e(&p.receipt_ref.0) != receipt_ref {
+        return Err("the server answered with another receipt".into());
+    }
+    let (donor, revoked, trust) = match &node.keylog {
+        Some(l) => {
+            let ok = l.view().verify_projection(&projection, &sig, worker, idx).map_err(|c| format!("signature does not verify against the key log: {}", c.as_str()))?;
+            (ok.donor_pseudonym, ok.revoked, "key_log")
+        }
+        None if node.insecure_dev => {
+            let pk = lock(&node.pools).values().flat_map(|p| p.workers.iter()).find(|w| w.worker_device == worker).and_then(|w| w.sign_pub).ok_or("signer unknown (no key log; MOOCHY_INSECURE_DEV)")?;
+            let sig: [u8; 64] = sig.as_slice().try_into().map_err(|_| "bad signature length".to_owned())?;
+            moochy_proto::crypto::open_projection(&pk, &projection, &sig).map_err(|_| "signature does not verify".to_owned())?;
+            (p.donor.clone().unwrap_or_default(), false, "relay_asserted_dev")
+        }
+        None => return Err("no key-log key: cannot verify (`moochy login --log-key …`)".into()),
+    };
+    Ok(serde_json::json!({"verified": true, "receipt_ref": receipt_ref, "donor": clean(&donor), "revoked": revoked, "repo_id": p.repo_id.text(),
+        "model": clean(&p.model), "cost_uusd": p.cost_uusd, "day": clean(&p.day), "trust": trust}))
 }

@@ -60,6 +60,7 @@ COMMANDS:
   connect <client> [--repo OWNER/NAME] [--write]
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)
+  verify <receipt_ref>            Check a public receipt: signed by the donor's logged device key
   report <task> [--reason TEXT]   Save signed evidence about a bad response
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
@@ -247,6 +248,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["verify", r] => rt_small()?.block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            let v = c.verify(crate::pb::local::VerifyRequest { receipt_ref: (*r).into() }).await.map_err(|s| auth(format!("not verified: {}", clean(s.message()))))?;
+            println!("{}", v.into_inner().result_json);
+            Ok(())
+        }),
         ["donate"] => crate::donations::donate(&home, &slug_or_detect(&o)?, o.cap.unwrap_or(0), o.has("yes")),
         // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
