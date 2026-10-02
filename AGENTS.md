@@ -30,7 +30,7 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 ## 4. Go (`relay/`, `e2e/`)
 
-- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later).
+- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later), `github.com/yuin/goldmark` (+ its GFM table extension) only in `relay/internal/docsite` to render our own docs, raw HTML disabled.
 - `http.Server` with `ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`, `MaxHeaderBytes`; `http.MaxBytesReader` on every body; bounded queues; context deadlines everywhere. `go vet` and `-race` clean.
 - No content (prompts/outputs) ever written to the DB or logs. The Scheduler owns its state in one goroutine (docs/plan/04).
 
@@ -38,11 +38,12 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 - Read `docs/plan/06-security-and-trust.md`. Every mitigation listed there for your component is in scope.
 - `docs/security/attack-catalog.md` (owned by `mo-sec`) is the running list of attacks with their counter-measure and the E2E scenario that proves it. When it exists, check your component against it.
+- `security@moochy.dev` (in SECURITY.md) is confirmed by the product owner but NOT live yet: never send to it, test it, look it up, or configure anything for it; leave the text as it is.
 - Fail closed: on any doubt (bad signature, unknown field, oversize, wrong state) refuse with a specific code, never "best effort".
 
 ## 6. Web palette (fixed)
 
-Strictly monochrome from three base colors — Ink (dark), Paper (white), Sky (light blue) — and named variants derived from them; no gradients, glows, glass, sheen, constellations, cursor effects or scroll-jacking (CONTRACT §9, product owner review 2026-10-01). Calm, editorial, product-grade; a pet mascot as the brand mark; subtle functional motion only.
+Playful, warm and alive (CONTRACT §9, product owner 2026-10-02, supersedes strict monochrome): Ink/Paper/Sky base + the mascot's warm palette (Apricot, Blush) + Mint/Sun/Coral signals as named tokens; color-blocked sections and illustrations welcome; a living mascot and a real motion system (scroll-driven reveals, View Transitions, live micro-interactions). Still banned: purple/blue neon gradients and glows, glassmorphism, particles, shimmer text, scroll-jacking. Always: WCAG AA, `prefers-reduced-motion`, no-JS works, transform/opacity only, §13 budgets.
 
 ## 7. Final report (always, even when blocked)
 

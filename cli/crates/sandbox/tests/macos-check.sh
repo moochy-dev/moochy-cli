@@ -63,5 +63,8 @@ echo "$d" | grep -q "(BAD)" && { fail=$((fail+1)); echo "FAIL  donor: $(echo "$d
 for m in echo open socket exec; do
   if "$B" validator $m >/dev/null; then pass=$((pass+1)); echo "PASS  validator $m"; else fail=$((fail+1)); echo "FAIL  validator $m"; fi
 done
+# Validator zygote (A219): caged once, forks single-use validators; each can parse but cannot
+# open files, sockets, run programs or fork.
+if "$B" zygote >/dev/null; then pass=$((pass+1)); echo "PASS  validator zygote (echo works; open/socket/exec/fork denied)"; else fail=$((fail+1)); echo "FAIL  validator zygote"; fi
 echo "macOS sandbox checks: $pass pass, $fail fail"; [ -e $J/outside/x.txt ] && { echo "LEAK: wrote outside"; fail=$((fail+1)); }
 [ $fail -eq 0 ]

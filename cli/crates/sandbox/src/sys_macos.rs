@@ -214,3 +214,17 @@ impl Drop for Forwarding {
         FORWARD_TO.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// In a validator child forked by an already-caged zygote (macOS cannot stack a second
+/// Seatbelt profile, A219): forbid further processes and bound CPU time with rlimits.
+/// RLIMIT_NPROC is checked against the user's process count, so 0 makes every fork fail.
+pub fn limit_validator_child() -> io::Result<()> {
+    let set = |res: libc::c_int, v: libc::rlim_t| -> io::Result<()> {
+        let lim = libc::rlimit { rlim_cur: v, rlim_max: v };
+        // SAFETY: setrlimit reads `lim` only; lowering limits is always permitted.
+        if unsafe { libc::setrlimit(res, &raw const lim) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    };
+    set(libc::RLIMIT_NPROC, 0)?;
+    set(libc::RLIMIT_CPU, 5)
+}
+
