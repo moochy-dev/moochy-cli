@@ -807,10 +807,10 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
 
 async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
     let port = boot.port();
-    let crate::lockdown::Boot { cfg, secrets, listener, validator } = boot;
+    let crate::lockdown::Boot { cfg, secrets, listener, ctl, gateway_unix, validator } = boot;
     let listener = tokio::net::TcpListener::from_std(listener).ctx("gateway listener")?;
     let sock_path = home.socket_path();
-    let sock = crate::ctl::bind(&sock_path).await?;
+    let sock = tokio::net::UnixListener::from_std(ctl).ctx("control socket")?;
     let keys = match (&secrets.device, cfg.device_id.as_deref()) {
         (Some(d), Some(id)) => Some(Keys { sign: d.sign_key(), enc: d.enc_key()?, device_id: id.parse().map_err(|_| auth("stored device id is invalid"))? }),
         _ => None,
@@ -819,7 +819,7 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
     parts.validator = validator;
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     node.gateway_port.store(u32::from(port), Ordering::Relaxed);
-    tokio::spawn(crate::gateway::serve(node.clone(), listener));
+    tokio::spawn(crate::gateway::serve(node.clone(), listener, gateway_unix));
     if let Some(p) = node.cfg.allow_unsandboxed_tools.as_deref() {
         eprintln!("WARNING: tool calls from donated tokens reach agents outside `moochy run` for: {}. A donor's model can make such an agent run commands on this machine.", clean(p));
         log("warn", "allow_unsandboxed_tools is set: tool calls reach unsandboxed clients", &json!({"projects": p}));

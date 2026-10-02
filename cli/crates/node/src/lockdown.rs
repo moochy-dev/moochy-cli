@@ -18,6 +18,9 @@ pub struct Boot {
     pub cfg: Config,
     pub secrets: Secrets,
     pub listener: std::net::TcpListener,
+    /// The local control socket and the `moochy run` gateway socket, bound before the lockdown.
+    pub ctl: std::os::unix::net::UnixListener,
+    pub gateway_unix: Option<std::os::unix::net::UnixListener>,
     /// Worker role: the key-less validator zygote, exec'd before the lockdown (§15.2).
     pub validator: Option<std::sync::Arc<crate::validator::Pool>>,
 }
@@ -56,7 +59,9 @@ impl Boot {
         } else {
             None
         };
-        Ok(Self { cfg, secrets, listener, validator })
+        let ctl = crate::ctl::bind(&home.socket_path())?;
+        let gateway_unix = crate::gateway::bind_gateway_socket(&home.state_dir());
+        Ok(Self { cfg, secrets, listener, ctl, gateway_unix, validator })
     }
 
     pub fn port(&self) -> u16 {

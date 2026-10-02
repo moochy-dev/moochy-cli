@@ -73,7 +73,7 @@ pub fn native_error(d: Dialect, f: &Failure) -> Resp {
 }
 
 /// Accept loop. The listener is bound to loopback by the caller.
-pub async fn serve(node: Arc<Node>, listener: TcpListener) {
+pub async fn serve(node: Arc<Node>, listener: TcpListener, unix: Option<std::os::unix::net::UnixListener>) {
     if let Err(e) = crate::run::init_key(&node.home.state_dir()) {
         crate::util::log("error", "no run key: `moochy run` cannot get a sandboxed session", &json!({"error": e.msg}));
     }
@@ -82,7 +82,7 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
     let conns = Arc::new(Semaphore::new(MAX_CONNS));
     // Same door on a 0600 Unix socket: `moochy run` bridges it into the sandbox's empty netns,
     // where the agent reaches it as 127.0.0.1:<port> (same Host allowlist).
-    let unix = gateway_socket(&node);
+    let unix = unix.and_then(|l| tokio::net::UnixListener::from_std(l).ok());
     let mut shutdown = node.shutdown.subscribe();
     loop {
         tokio::select! {
@@ -110,12 +110,15 @@ pub fn gateway_socket_path(node: &Node) -> std::path::PathBuf {
     node.home.state_dir().join("gateway.sock")
 }
 
-fn gateway_socket(node: &Node) -> Option<tokio::net::UnixListener> {
+/// Bind `<state>/gateway.sock` (0600) before the lockdown (macOS Seatbelt refuses a
+/// Unix-socket bind afterwards). `None` when it cannot be made: `moochy run` then fails closed.
+pub fn bind_gateway_socket(state_dir: &std::path::Path) -> Option<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt as _;
-    let p = gateway_socket_path(node);
+    let p = state_dir.join("gateway.sock");
     let _ = std::fs::remove_file(&p);
-    let l = tokio::net::UnixListener::bind(&p).ok()?;
+    let l = std::os::unix::net::UnixListener::bind(&p).ok()?;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok()?;
+    l.set_nonblocking(true).ok()?;
     Some(l)
 }
 
