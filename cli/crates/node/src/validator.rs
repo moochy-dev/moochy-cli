@@ -73,7 +73,9 @@ fn zygote() -> std::io::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn lockdown(p: &moochy_sandbox::DonorPolicy) -> std::io::Result<()> {
-    moochy_sandbox::lockdown_self(p).map(drop).map_err(std::io::Error::other)
+    // The zygote cage, not the donor one: on macOS the donor profile denies fork, and a
+    // stricter profile cannot be stacked in each child (A219).
+    moochy_sandbox::lockdown_zygote(p).map(drop).map_err(std::io::Error::other)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
