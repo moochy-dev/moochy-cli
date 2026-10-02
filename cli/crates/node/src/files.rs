@@ -30,6 +30,26 @@ pub struct FileText {
     pub text: String,
 }
 
+/// A path (relative to the repo root, components already plain) that must never be shared:
+/// any component named `.git` (case-insensitively: APFS, A214), or matching the `moochy run`
+/// mask list (A207, CONTRACT §15.4: one list for the sandbox and file sharing), or the extra
+/// names below.
+fn denied_rel(rel: &Path) -> Option<&'static str> {
+    let mut prefix = PathBuf::new();
+    for c in rel.components() {
+        let Component::Normal(name) = c else { return Some("`..`/`.` components are not allowed") };
+        let name_s = name.to_string_lossy();
+        if name_s.eq_ignore_ascii_case(".git") {
+            return Some(".git is never readable");
+        }
+        prefix.push(name);
+        if denied_name(&name_s) || moochy_sandbox::mask::matches_secret(Path::new(""), &prefix) {
+            return Some("secret-shaped file name");
+        }
+    }
+    None
+}
+
 fn denied_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with(".env")
@@ -69,12 +89,9 @@ fn check_inline_path(p: &str) -> Result<(), String> {
         if matches!(name, "" | "." | "..") || name.contains('\\') {
             return Err("`..`/`.`/empty components are not allowed".into());
         }
-        if name == ".git" {
-            return Err(".git is never readable".into());
-        }
-        if denied_name(name) {
-            return Err("secret-shaped file name".into());
-        }
+    }
+    if let Some(why) = denied_rel(Path::new(p)) {
+        return Err(why.into());
     }
     Ok(())
 }
@@ -156,12 +173,9 @@ fn check(scope_root: &Path, client_roots: Option<&[PathBuf]>, p: &str) -> Result
     let mut cur = scope_root.to_path_buf();
     for c in rel.components() {
         let Component::Normal(name) = c else { return Err("`..`/`.` components are not allowed".into()) };
-        let name_s = name.to_str().ok_or("non-UTF-8 path")?;
-        if name_s == ".git" {
-            return Err(".git is never readable".into());
-        }
-        if denied_name(name_s) {
-            return Err("secret-shaped file name".into());
+        name.to_str().ok_or("non-UTF-8 path")?;
+        if let Some(why) = denied_rel(Path::new(name)) {
+            return Err(why.into());
         }
         cur.push(name);
         let md = std::fs::symlink_metadata(&cur).map_err(|_| "not found".to_owned())?;
@@ -177,6 +191,11 @@ fn check(scope_root: &Path, client_roots: Option<&[PathBuf]>, p: &str) -> Result
         return Err("outside the client's MCP roots".into());
     }
     let rel = real.strip_prefix(scope_root).map_err(|_| "outside the workspace root".to_owned())?;
+    // Checked as given (above, per component and as a whole) AND on the canonical path: a
+    // case-folding filesystem resolves `.GIT` or `Credentials.JSON` to the real entry (A214).
+    if let Some(why) = joined.strip_prefix(scope_root).ok().and_then(denied_rel).or_else(|| denied_rel(rel)) {
+        return Err(why.into());
+    }
     Ok((real.clone(), rel.to_str().ok_or("non-UTF-8 path")?.to_owned()))
 }
 
@@ -289,6 +308,9 @@ mod tests {
         assert!(read(&empty, &["src/a.rs".into()]).is_err(), "empty roots allow nothing");
         assert!(read(&narrow, &["src/a.rs".into()]).is_err(), "outside client roots");
         assert!(read(&Scope::default(), &["src/a.rs".into()]).is_err(), "no root");
+        for bad in ["credentials.json", "terraform.tfstate", "service-account-prod.json", ".vault-token", "x/.GIT/config", ".Git/HEAD", "d/.aws/config"] {
+            assert!(check_inline_path(bad).is_err(), "{bad} must be refused (A207/A214)");
+        }
         let inl = |p: &str| inline(&[serde_json::json!({"path": p, "text": "k AKIAABCDEFGHIJKLMNOP"})]);
         assert!(inl("src/a.rs").unwrap()[0].text.contains("[REDACTED:aws_key]"));
         for bad in [".env", "src/.git/config", "../x", "/etc/passwd", "a/./b", "id_rsa", ""] {
