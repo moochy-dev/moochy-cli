@@ -31,6 +31,10 @@ use std::path::PathBuf;
 mod cgroup;
 #[cfg(target_os = "linux")]
 mod donor;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod doctor;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use doctor::doctor;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -86,11 +90,14 @@ pub struct Spec {
     pub run_token: Option<String>,
     /// `--allow-host`: exact host names the agent may reach on :443 through the
     /// launcher's CONNECT proxy (`HTTPS_PROXY` inside). Empty (default) = no
-    /// proxy, no network but the gateway. Linux only for now.
+    /// proxy, no network but the gateway. Linux: `127.0.0.1:3128` inside the
+    /// netns; macOS: an ephemeral loopback port the profile allows.
     pub allow_hosts: Vec<String>,
     /// Directories no visible path may be or contain (A197): a worktree, `ro_paths`
     /// or `rw_paths` entry that is `/` or an ancestor of one of these is
-    /// refused. Default: the real `$HOME`. mo-node adds the Moochy home.
+    /// refused. Default: the real `$HOME` and the Moochy home wherever
+    /// `moochy` would put it (`$MOOCHY_HOME`, `$XDG_CONFIG_HOME/moochy`,
+    /// `~/.config/moochy`); a `--home` elsewhere must be pushed by the caller.
     pub protected: Vec<PathBuf>,
     /// Resource limits. Defaults are generous but finite (fork-bomb / OOM safe).
     pub limits: Limits,
@@ -191,7 +198,7 @@ impl Spec {
             run_token: None,
             git_writable: false,
             allow_hosts: Vec::new(),
-            protected: std::env::var_os("HOME").map(PathBuf::from).into_iter().collect(),
+            protected: default_protected(),
             limits: Limits::default(),
             unsafe_no_sandbox: false,
         }
@@ -210,10 +217,10 @@ impl Spec {
             self.check_exposure()?;
         }
         if !self.allow_hosts.is_empty() {
-            if cfg!(not(target_os = "linux")) {
-                return Err(Error::Unsupported("--allow-host is implemented only on Linux for now"));
+            if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+                return Err(Error::Unsupported("--allow-host is implemented only on Linux and macOS"));
             }
-            if self.gateway_loopback_port == Some(PROXY_LOOPBACK_PORT) {
+            if cfg!(target_os = "linux") && self.gateway_loopback_port == Some(PROXY_LOOPBACK_PORT) {
                 return Err(Error::Unsupported("gateway_loopback_port collides with the --allow-host proxy port"));
             }
         }
@@ -265,6 +272,22 @@ impl Spec {
 #[must_use]
 pub fn delegated_cgroup() -> Option<PathBuf> {
     cgroup::delegated_parent()
+}
+
+/// `$HOME` and every default location of the Moochy home (mirrors the node's
+/// `Home::resolve`). Nonexistent entries are harmless (skipped by the check).
+fn default_protected() -> Vec<PathBuf> {
+    let env = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = env("HOME");
+    [
+        home.clone(),
+        env("MOOCHY_HOME"),
+        env("XDG_CONFIG_HOME").map(|x| x.join("moochy")),
+        home.map(|h| h.join(".config/moochy")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Default read-only system roots. These exist on virtually every Unix host and

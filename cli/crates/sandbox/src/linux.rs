@@ -19,7 +19,10 @@ use rustix::thread::UnshareFlags;
 
 use crate::{Error, Spec, mask, seccomp, sys};
 
-const ABI_CEIL: ABI = ABI::V5;
+// V9 (Linux 7.1) adds `ResolveUnix`: connect() to pathname UNIX sockets only
+// beneath rules that grant it. Negotiated best-effort: on older kernels the
+// right is simply not handled (DESIGN.md "Landlock ABI").
+const ABI_CEIL: ABI = ABI::V9;
 
 fn setup(what: &'static str, err: std::io::Error) -> Error {
     Error::Setup { what, err }
@@ -80,7 +83,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
             None => None,
         },
         gateway_port: spec.gateway_loopback_port,
-        proxy_socket: proxy.as_ref().map(|p| p.sock().to_path_buf()),
+        proxy_socket: proxy.as_ref().and_then(|p| p.sock()).map(std::path::Path::to_path_buf),
         cgroup_procs: cgroup.as_ref().map(crate::cgroup::Cgroup::procs),
         cwd: spec.cwd.clone(),
         git,
@@ -780,7 +783,7 @@ fn ll(what: &'static str) -> impl Fn(landlock::RulesetError) -> Error {
 
 /// Preflight: the kernel features we require, with an actionable error when
 /// unprivileged user namespaces are blocked (Ubuntu AppArmor restriction).
-fn preflight() -> Result<(), Error> {
+pub(crate) fn preflight() -> Result<(), Error> {
     let restrict = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
         .is_ok_and(|s| s.trim() == "1");
     // Probe: can we create a user namespace at all?

@@ -187,3 +187,17 @@ pub fn winch_signalfd() -> io::Result<std::os::fd::OwnedFd> {
         Ok(std::os::fd::OwnedFd::from_raw_fd(fd))
     }
 }
+
+/// The kernel's Landlock ABI version (`landlock_create_ruleset(NULL, 0,
+/// LANDLOCK_CREATE_RULESET_VERSION)`); 0 when Landlock is unavailable. For
+/// `moochy doctor` only: the sandbox itself negotiates through the `landlock`
+/// crate.
+pub fn landlock_abi() -> i32 {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: with a NULL attr and size 0 the kernel reads no user memory and
+    // returns the ABI version (or -1).
+    let r = unsafe {
+        libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<libc::c_void>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION)
+    };
+    i32::try_from(r).unwrap_or(0).max(0)
+}

@@ -38,6 +38,15 @@ R deny /bin/sh -c "curl -s -m 3 https://example.com"
 R deny /bin/sh -c "cat ~/.zshrc"
 R deny /usr/bin/osascript -e "tell application \"System Events\" to get name of every process"
 R deny /usr/bin/pbpaste
+# --allow-host (CONNECT proxy on an ephemeral loopback port; only that port is reachable).
+RA() { exp=$1; shift; out=$("$B" run $J/wt --ro $BD --allow-host example.com -- "$@" 2>&1); rc=$?; if [ $rc -eq 125 ] || echo "$out" | grep -q "sandbox-exec:"; then v=SETUP; elif [ "$exp" = ok ]; then [ $rc -eq 0 ] && v=PASS || v=FAIL; else [ $rc -ne 0 ] && v=PASS || v=FAIL; fi; [ $v = PASS ] && pass=$((pass+1)) || fail=$((fail+1)); printf "%-5s %-4s rc=%-3s %-50s | %s\n" $v $exp $rc "allow-host: $(echo "$*" | sed "s|$BD/||g" | cut -c1-38)" "$(echo $out | cut -c1-90)"; }
+RA ok   $B env HTTPS_PROXY
+RA ok   /bin/sh -c "$B proxy env example.com:443 | grep -q ' 200 '"
+RA deny /bin/sh -c "$B proxy env example.org:443 | grep -q ' 200 '"
+RA deny /bin/sh -c "$B proxy env example.com:22 | grep -q ' 200 '"
+RA deny /bin/sh -c "curl -sS -m 5 --noproxy '*' -o /dev/null https://example.com"
+RA deny $B connect 1.1.1.1:443
+out=$("$B" run $J/wt --ro $BD --allow-host '*.example.com' -- /usr/bin/true 2>&1); if echo "$out" | grep -q "not an exact DNS host name"; then pass=$((pass+1)); echo "PASS  allow-host wildcard refused"; else fail=$((fail+1)); echo "FAIL  allow-host wildcard: $out"; fi
 kill $GW $GS 2>/dev/null; wait 2>/dev/null; rm -f $SHARED /tmp/moochy-check-$$-w.txt
 # Terminal injection (TIOCSTI) under a real pty: the control run outside must succeed (so the
 # check is meaningful), the same call inside `moochy run` must be refused (A192).
