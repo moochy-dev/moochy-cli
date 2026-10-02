@@ -131,7 +131,7 @@ pub struct PoolSync {
     #[prost(bool, tag = "9")]
     pub allow_unsandboxed_tools: bool,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolWorker {
     #[prost(string, tag = "1")]
     pub worker_device: ::prost::alloc::string::String,
@@ -156,6 +156,18 @@ pub struct PoolWorker {
     /// Ed25519 key of the worker device (verifies receipts, progress checkpoints)
     #[prost(bytes = "bytes", tag = "9")]
     pub sign_pub: ::prost::bytes::Bytes,
+    /// which provider serves each model on this worker (project provider exclusion, §15.4)
+    #[prost(message, repeated, tag = "10")]
+    pub served: ::prost::alloc::vec::Vec<ServedModel>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ServedModel {
+    /// public model id
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    /// anthropic | openai | openrouter | deepseek | xai | local
+    #[prost(string, tag = "2")]
+    pub provider: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkerOffer {
@@ -179,6 +191,9 @@ pub struct ModelOffer {
     /// 0-100
     #[prost(uint32, tag = "3")]
     pub rl_headroom: u32,
+    /// the donor's provider serving this model (anthropic | openai | openrouter | deepseek | xai | local)
+    #[prost(string, tag = "4")]
+    pub provider: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KnownTasks {
