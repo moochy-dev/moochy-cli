@@ -1,7 +1,7 @@
 //! Firewall allowlists as data (plan 06 §7). Anything not listed is rejected.
 //! Widening an allowlist needs two-person review (06 §7.3): keep diffs here small.
 
-use crate::{Flags, Provider};
+use crate::{Dialect, Flags, Provider};
 use crate::firewall::{F, Hook, R};
 
 // --- Anthropic Messages (06 §7.1) ------------------------------------------------------
@@ -442,10 +442,209 @@ pub(crate) static OPENAI: R = R::Obj(&[
     F("reasoning", R::Deny("use `reasoning_effort`"), false),
 ]);
 
+// --- OpenAI Responses (CONTRACT §18.6): OpenAI, xAI, OpenRouter -----------------------
+// Stateless only: nothing may keep or fetch conversation data at the provider (`store`,
+// `previous_response_id`, `conversation`, `background`, stored items, stored prompts).
+// Client-executed tools only: `function` and `custom` (freeform, e.g. Codex `apply_patch`).
+
+const STATELESS: &str = "stateless only: every request is self-contained (it would keep or read conversation data at the provider)";
+pub(crate) const STATELESS_WHY: &str = STATELESS;
+
+const R_TEXT: R = R::Obj(&[F("text", R::Str, true)]);
+
+const R_INPUT_PART: R = R::Tagged {
+    key: "type",
+    cases: &[
+        ("input_text", R_TEXT),
+        (
+            "input_image",
+            R::Hook(
+                Hook::Image,
+                &R::Obj(&[
+                    F("image_url", R::Hook(Hook::DataUrl, &R::Str), true),
+                    F("detail", R::Enum(&["auto", "low", "high"]), false),
+                    F("file_id", R::Deny("file ids read the donor's file store"), false),
+                ]),
+            ),
+        ),
+        ("input_file", R::Deny("file inputs read the donor's file store or make the provider fetch URLs")),
+        ("input_audio", R::Deny("audio input is not allowed")),
+    ],
+};
+
+const R_OUTPUT_PART: R = R::Tagged {
+    key: "type",
+    cases: &[
+        ("output_text", R::Obj(&[F("text", R::Str, true), F("annotations", R::Arr(&R::Any), false), F("logprobs", R::Any, false)])),
+        ("refusal", R::Obj(&[F("refusal", R::Str, true)])),
+    ],
+};
+
+const R_TYPE_MESSAGE: F = F("type", R::Enum(&["message"]), false);
+const R_ID: F = F("id", R::Str, false);
+const R_STATUS: F = F("status", R::Enum(&["in_progress", "completed", "incomplete"]), false);
+
+/// A message item (`type` absent or `message`), discriminated by `role`.
+const R_MESSAGE: R = R::Tagged {
+    key: "role",
+    cases: &[
+        ("user", R::Obj(&[R_TYPE_MESSAGE, R_ID, R_STATUS, F("content", R::OneOf(&[R::Str, R::Arr(&R_INPUT_PART)]), true)])),
+        ("system", R::Obj(&[R_TYPE_MESSAGE, R_ID, R_STATUS, F("content", R::OneOf(&[R::Str, R::Arr(&R_INPUT_PART)]), true)])),
+        ("developer", R::Obj(&[R_TYPE_MESSAGE, R_ID, R_STATUS, F("content", R::OneOf(&[R::Str, R::Arr(&R_INPUT_PART)]), true)])),
+        ("assistant", R::Obj(&[R_TYPE_MESSAGE, R_ID, R_STATUS, F("content", R::OneOf(&[R::Str, R::Arr(&R_OUTPUT_PART)]), true)])),
+    ],
+};
+
+const R_TOOL_OUTPUT: R = R::OneOf(&[R::Str, R::Arr(&R_INPUT_PART)]);
+const HOSTED_ITEM: R = R::Deny("hosted tool items run or bill on the donor's account");
+
+const R_INPUT_ITEM: R = R::Tagged {
+    key: "type",
+    cases: &[
+        ("", R_MESSAGE),
+        ("message", R_MESSAGE),
+        ("function_call", R::Obj(&[R_ID, R_STATUS, F("call_id", R::Str, true), F("name", R::Str, true), F("arguments", R::Str, true)])),
+        ("function_call_output", R::Obj(&[R_ID, R_STATUS, F("call_id", R::Str, true), F("output", R_TOOL_OUTPUT, true)])),
+        ("custom_tool_call", R::Obj(&[R_ID, R_STATUS, F("call_id", R::Str, true), F("name", R::Str, true), F("input", R::Str, true)])),
+        ("custom_tool_call_output", R::Obj(&[R_ID, R_STATUS, F("call_id", R::Str, true), F("output", R_TOOL_OUTPUT, true)])),
+        (
+            "reasoning",
+            R::Obj(&[
+                R_ID,
+                R_STATUS,
+                F("summary", R::Arr(&R::Tagged { key: "type", cases: &[("summary_text", R_TEXT)] }), true),
+                F("content", R::OneOf(&[R::Null, R::Arr(&R::Tagged { key: "type", cases: &[("reasoning_text", R_TEXT)] })]), false),
+                F("encrypted_content", R::OneOf(&[R::Null, R::Str]), false),
+            ]),
+        ),
+        ("item_reference", R::Deny(STATELESS)),
+        ("web_search_call", HOSTED_ITEM),
+        ("file_search_call", HOSTED_ITEM),
+        ("code_interpreter_call", HOSTED_ITEM),
+        ("image_generation_call", HOSTED_ITEM),
+        ("computer_call", R::Deny("computer use is not allowed")),
+        ("computer_call_output", R::Deny("computer use is not allowed")),
+        ("local_shell_call", R::Deny("`local_shell` is not supported: declare a function tool")),
+        ("local_shell_call_output", R::Deny("`local_shell` is not supported: declare a function tool")),
+        ("mcp_list_tools", R::Deny("remote MCP makes the provider call arbitrary servers")),
+        ("mcp_call", R::Deny("remote MCP makes the provider call arbitrary servers")),
+        ("mcp_approval_request", R::Deny("remote MCP makes the provider call arbitrary servers")),
+        ("mcp_approval_response", R::Deny("remote MCP makes the provider call arbitrary servers")),
+    ],
+};
+
+/// Client-executed tools only. Hosted tools act at the provider on the donor's account.
+const R_TOOL: R = R::Tagged {
+    key: "type",
+    cases: &[
+        (
+            "function",
+            R::Obj(&[F("name", R::Str, true), F("description", R::OneOf(&[R::Null, R::Str]), false), F("parameters", R::Any, false), F("strict", R::OneOf(&[R::Null, R::Bool]), false)]),
+        ),
+        (
+            "custom",
+            R::Obj(&[
+                F("name", R::Str, true),
+                F("description", R::Str, false),
+                F(
+                    "format",
+                    R::Tagged {
+                        key: "type",
+                        cases: &[("text", R::Obj(&[])), ("grammar", R::Obj(&[F("syntax", R::Enum(&["lark", "regex"]), true), F("definition", R::Str, true)]))],
+                    },
+                    false,
+                ),
+            ]),
+        ),
+        ("web_search", R::Deny("hosted web search runs and bills on the donor's account")),
+        ("web_search_preview", R::Deny("hosted web search runs and bills on the donor's account")),
+        ("file_search", R::Deny("hosted file search reads the donor's vector stores")),
+        ("code_interpreter", R::Deny("hosted code interpreter runs code on the donor's account")),
+        ("computer_use_preview", R::Deny("computer use is not allowed")),
+        ("computer_use", R::Deny("computer use is not allowed")),
+        ("image_generation", R::Deny("hosted image generation bills on the donor's account")),
+        ("mcp", R::Deny("remote MCP makes the provider call arbitrary servers")),
+        ("local_shell", R::Deny("`local_shell` is not supported: declare a function tool")),
+    ],
+};
+
+pub(crate) static RESPONSES: R = R::Obj(&[
+    F("model", R::Str, true),
+    F("input", R::OneOf(&[R::Str, R::Arr(&R_INPUT_ITEM)]), true),
+    F("instructions", R::OneOf(&[R::Null, R::Str]), false),
+    F("tools", R::Arr(&R_TOOL), false),
+    F(
+        "tool_choice",
+        R::OneOf(&[
+            R::Enum(&["none", "auto", "required"]),
+            R::Tagged { key: "type", cases: &[("function", R::Obj(&[F("name", R::Str, true)])), ("custom", R::Obj(&[F("name", R::Str, true)]))] },
+        ]),
+        false,
+    ),
+    F("parallel_tool_calls", R::Bool, false),
+    F("max_output_tokens", R::UInt, false),
+    F("max_tool_calls", R::UInt, false),
+    F("temperature", R::Num, false),
+    F("top_p", R::Num, false),
+    F("top_logprobs", R::UInt, false),
+    F("stream", R::Bool, false),
+    F("stream_options", R::Obj(&[F("include_obfuscation", R::Bool, false)]), false),
+    F("include", R::Arr(&R::Enum(&["reasoning.encrypted_content", "message.output_text.logprobs"])), false),
+    F(
+        "reasoning",
+        R::Obj(&[
+            F("effort", R::OneOf(&[R::Null, R::Enum(&["none", "minimal", "low", "medium", "high", "xhigh"])]), false),
+            F("summary", R::OneOf(&[R::Null, R::Enum(&["auto", "concise", "detailed"])]), false),
+            F("generate_summary", R::OneOf(&[R::Null, R::Enum(&["auto", "concise", "detailed"])]), false),
+        ]),
+        false,
+    ),
+    F(
+        "text",
+        R::Obj(&[
+            F(
+                "format",
+                R::Tagged {
+                    key: "type",
+                    cases: &[
+                        ("text", R::Obj(&[])),
+                        ("json_object", R::Obj(&[])),
+                        ("json_schema", R::Obj(&[F("name", R::Str, true), F("description", R::Str, false), F("schema", R::Any, true), F("strict", R::Bool, false)])),
+                    ],
+                },
+                false,
+            ),
+            F("verbosity", R::Enum(&["low", "medium", "high"]), false),
+        ]),
+        false,
+    ),
+    F("truncation", R::Enum(&["auto", "disabled"]), false),
+    F("user", R::Str, false),
+    F("safety_identifier", R::Str, false),
+    F("prompt_cache_key", R::Str, false),
+    F("store", R::Hook(Hook::False, &R::Bool), false),
+    F("background", R::Hook(Hook::False, &R::Bool), false),
+    F("previous_response_id", R::OneOf(&[R::Null, R::Deny(STATELESS)]), false),
+    F("conversation", R::OneOf(&[R::Null, R::Deny(STATELESS)]), false),
+    F("prompt", R::Deny("stored prompt templates live at the provider"), false),
+    F("metadata", R::Deny("stored-response metadata is not allowed"), false),
+    F("service_tier", R::Deny("the service tier is the donor's call"), false),
+    F("prompt_cache_retention", R::Deny("extended prompt caching keeps data at the provider"), false),
+    F("models", R::Deny("fallback model lists would bill models outside the pledge"), false),
+    F("route", R::Deny("fallback routing would bill models outside the pledge"), false),
+    F("plugins", R::Deny("plugins (web search, file parsing) bill extra on the donor's account"), false),
+    F("provider", R::Deny("upstream routing is set by the Worker"), false),
+    F("transforms", R::Deny("prompt transforms are not in the allowlist"), false),
+    F("usage", R::Deny("usage reporting is set by the Worker"), false),
+]);
+
 /// Per-provider top-level denies on top of the dialect table (fail closed on fields the
 /// provider does not document; its paid add-ons are already unknown to the table:
 /// `search_parameters`, `web_search_options`, `deferred`, server-side tools).
-pub(crate) fn provider_denies(p: Provider) -> &'static [(&'static str, &'static str)] {
+pub(crate) fn provider_denies(p: Provider, d: Dialect) -> &'static [(&'static str, &'static str)] {
+    if d == Dialect::OpenAiResponses {
+        return &[];
+    }
     match p {
         Provider::XAi => &[
             ("store", "not part of the xAI chat completions API"),

@@ -214,29 +214,31 @@ pub struct AdapterDef {
     pub messages: Option<&'static str>,
     /// OpenAI chat-completions endpoint path, if served.
     pub chat: Option<&'static str>,
+    /// OpenAI Responses endpoint path, if the provider speaks it natively (§18.6).
+    pub responses: Option<&'static str>,
 }
 
 impl AdapterDef {
     pub const fn of(p: Provider) -> Self {
         match p {
-            Provider::Anthropic => Self { host: "api.anthropic.com", messages: Some("/v1/messages"), chat: None },
-            Provider::OpenAi => Self { host: "api.openai.com", messages: None, chat: Some("/v1/chat/completions") },
+            Provider::Anthropic => Self { host: "api.anthropic.com", messages: Some("/v1/messages"), chat: None, responses: None },
+            Provider::OpenAi => Self { host: "api.openai.com", messages: None, chat: Some("/v1/chat/completions"), responses: Some("/v1/responses") },
             // OpenAI-compatible root `https://openrouter.ai/api/v1`; Anthropic-compatible root
             // `https://openrouter.ai/api` (+ `/v1/messages`).
             Provider::OpenRouter => {
-                Self { host: "openrouter.ai", messages: Some("/api/v1/messages"), chat: Some("/api/v1/chat/completions") }
+                Self { host: "openrouter.ai", messages: Some("/api/v1/messages"), chat: Some("/api/v1/chat/completions"), responses: Some("/api/v1/responses") }
             }
             // OpenAI-compatible root `https://api.deepseek.com`; Anthropic-compatible root
             // `https://api.deepseek.com/anthropic` (+ `/v1/messages`).
             Provider::DeepSeek => {
-                Self { host: "api.deepseek.com", messages: Some("/anthropic/v1/messages"), chat: Some("/chat/completions") }
+                Self { host: "api.deepseek.com", messages: Some("/anthropic/v1/messages"), chat: Some("/chat/completions"), responses: None }
             }
             // OpenAI-compatible root `https://api.x.ai/v1` (global endpoint; the US regional
             // host costs +10% and is not allowlisted). No Anthropic-compatible endpoint.
-            Provider::XAi => Self { host: "api.x.ai", messages: None, chat: Some("/v1/chat/completions") },
+            Provider::XAi => Self { host: "api.x.ai", messages: None, chat: Some("/v1/chat/completions"), responses: Some("/v1/responses") },
             // The donor's own server (Ollama :11434, LM Studio :1234, vLLM :8000, llama.cpp
             // :8080): no official host; the base URL comes from `check_local_base_url`.
-            Provider::Local => Self { host: "", messages: None, chat: Some("/v1/chat/completions") },
+            Provider::Local => Self { host: "", messages: None, chat: Some("/v1/chat/completions"), responses: None },
         }
     }
 
@@ -244,6 +246,7 @@ impl AdapterDef {
         match d {
             Dialect::AnthropicMessages => self.messages,
             Dialect::OpenAiChat => self.chat,
+            Dialect::OpenAiResponses => self.responses,
         }
     }
 }

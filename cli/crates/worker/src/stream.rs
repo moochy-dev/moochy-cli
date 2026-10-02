@@ -178,7 +178,16 @@ struct State {
     /// llama.cpp-style cumulative `timings` (prompt_n, cache_n, predicted_n): usage fallback
     /// for local servers when no `usage` object was sent.
     timings: Option<(u64, Option<u64>, u64)>,
+    /// Responses: open tool items (output_index, custom tool, decoded input so far).
+    rs_open: Vec<(u32, bool, Vec<u8>)>,
+    /// Responses: closed tool items (never reopened).
+    rs_closed: Vec<u32>,
 }
+
+/// Largest Responses tool-call input assembled for the done-event cross-check.
+const MAX_TOOL_INPUT: usize = 8 << 20;
+/// Most tool items in one Responses stream.
+const MAX_TOOL_ITEMS: usize = 4096;
 
 fn invalid(st: &mut State, span: Span, sink: &mut dyn FnMut(Span, Event<'_>)) {
     st.malformed = true;
@@ -321,6 +330,11 @@ impl StreamParser {
             sink(span, Event::Stop);
             return;
         }
+        // Responses streams end with `response.completed`; a stray `[DONE]` means nothing.
+        if self.dialect == Dialect::OpenAiResponses && self.data.as_slice() == b"[DONE]" {
+            sink(span, Event::Other);
+            return;
+        }
         let mut tape = std::mem::take(&mut self.tape);
         let data_len = len64(self.data.len());
         match json::parse(&self.data, &mut tape) {
@@ -328,6 +342,7 @@ impl StreamParser {
                 let ends = match self.dialect {
                     Dialect::AnthropicMessages => anthropic_event(&mut self.st, doc.root(), data_len, span, sink),
                     Dialect::OpenAiChat => openai_chunk(&mut self.st, doc.root(), data_len, span, sink),
+                    Dialect::OpenAiResponses => responses_event(&mut self.st, doc.root(), data_len, span, sink),
                 };
                 out.tool_ends = out.tool_ends.saturating_add(ends);
             }
@@ -366,7 +381,7 @@ impl StreamParser {
                     provider_cost_uusd: st.anth_cost,
                 }
             }
-            Dialect::OpenAiChat => {
+            Dialect::OpenAiChat | Dialect::OpenAiResponses => {
                 // Some providers (xAI) send cumulative usage in every chunk: only a stream
                 // that really ended (`[DONE]`, or a whole JSON body) has final usage.
                 let mut u = st.oa.or_else(|| st.timings.map(timings_usage)).unwrap_or(Usage { estimated: true, ..Usage::default() });
@@ -657,8 +672,217 @@ fn oa_usage(st: &mut State, u: Val<'_>) {
     });
 }
 
+/// One OpenAI Responses SSE event (§18.6). Tool items (`function_call`, `custom_tool_call`)
+/// are tracked by `output_index`: their input arrives in `added` and the deltas, and the
+/// `*.done` copies must repeat it exactly (what a client executes is what was inspected).
+/// Hosted-tool items are forbidden; unknown event types fail closed.
+#[allow(clippy::too_many_lines)] // one flat dispatcher over the event types
+fn responses_event(st: &mut State, v: Val<'_>, data_len: u64, span: Span, sink: &mut dyn FnMut(Span, Event<'_>)) -> u32 {
+    let Some(ty) = v.get("type").and_then(Val::as_str) else {
+        invalid(st, span, sink);
+        return 0;
+    };
+    let oi = u32_of(v.get("output_index"));
+    let open = oi.and_then(|i| st.rs_open.iter().position(|o| o.0 == i));
+    match ty.as_ref() {
+        "response.created" | "response.in_progress" => {
+            let r = v.get("response");
+            // Output must arrive as items; a pre-filled response could carry a tool call.
+            if r.and_then(|r| r.get("output")).is_some_and(|o| o.kind() != Kind::Arr || o.items().next().is_some()) {
+                invalid(st, span, sink);
+                return 0;
+            }
+            set_once(&mut st.id, r.and_then(|r| r.get("id")));
+            set_once(&mut st.model, r.and_then(|r| r.get("model")));
+            sink(span, Event::Other);
+        }
+        "response.output_item.added" => {
+            let item = v.get("item").filter(|i| i.kind() == Kind::Obj);
+            let it = item.and_then(|i| i.get("type"));
+            match (it, oi) {
+                (Some(t), Some(i)) if t.is_str("function_call") || t.is_str("custom_tool_call") => {
+                    let custom = t.is_str("custom_tool_call");
+                    let first = item.and_then(|x| x.get(if custom { "input" } else { "arguments" }));
+                    if open.is_some()
+                        || st.rs_closed.contains(&i)
+                        || st.rs_open.len() >= MAX_OPEN_TOOLS
+                        || st.rs_closed.len() >= MAX_TOOL_ITEMS
+                        || first.is_some_and(|f| f.kind() != Kind::Str)
+                    {
+                        invalid(st, span, sink);
+                        return 0;
+                    }
+                    let text = first.and_then(Val::as_str).unwrap_or_default();
+                    st.rs_open.push((i, custom, text.as_bytes().to_vec()));
+                    sink(span, Event::ToolStart { index: i, id: item.and_then(|x| x.get("call_id")), name: item.and_then(|x| x.get("name")) });
+                    if let Some(f) = first.filter(|_| !text.is_empty()) {
+                        sink(span, Event::ToolArgs { index: i, json: f });
+                    }
+                }
+                (Some(t), Some(_)) if (t.is_str("message") || t.is_str("reasoning")) && open.is_none() => sink(span, Event::Other),
+                (Some(t), Some(_)) if !t.is_str("message") && !t.is_str("reasoning") => {
+                    st.forbidden = true;
+                    sink(span, Event::Forbidden { block_type: t });
+                }
+                _ => invalid(st, span, sink),
+            }
+        }
+        "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+            let custom = ty.starts_with("response.custom");
+            let d = v.get("delta").filter(|d| d.kind() == Kind::Str);
+            match (open, d) {
+                (Some(p), Some(d)) if st.rs_open.get(p).is_some_and(|o| o.1 == custom) => {
+                    let text = d.as_str().unwrap_or_default();
+                    let Some(o) = st.rs_open.get_mut(p) else { return 0 };
+                    if o.2.len().saturating_add(text.len()) > MAX_TOOL_INPUT {
+                        invalid(st, span, sink);
+                        return 0;
+                    }
+                    o.2.extend_from_slice(text.as_bytes());
+                    let i = o.0;
+                    sink(span, Event::ToolArgs { index: i, json: d });
+                }
+                _ => invalid(st, span, sink),
+            }
+        }
+        "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
+            let custom = ty.starts_with("response.custom");
+            let full = v.get(if custom { "input" } else { "arguments" }).and_then(Val::as_str);
+            let same = open.and_then(|p| st.rs_open.get(p)).is_some_and(|o| o.1 == custom && full.as_deref().map(str::as_bytes) == Some(o.2.as_slice()));
+            if same { sink(span, Event::Other) } else { invalid(st, span, sink) }
+        }
+        "response.output_item.done" => {
+            let item = v.get("item").filter(|i| i.kind() == Kind::Obj);
+            let it = item.and_then(|i| i.get("type"));
+            match (it, open) {
+                (Some(t), Some(p)) if t.is_str("function_call") || t.is_str("custom_tool_call") => {
+                    let custom = t.is_str("custom_tool_call");
+                    let full = item.and_then(|x| x.get(if custom { "input" } else { "arguments" })).and_then(Val::as_str);
+                    let same = st.rs_open.get(p).is_some_and(|o| o.1 == custom && full.as_deref().map(str::as_bytes) == Some(o.2.as_slice()));
+                    if !same {
+                        invalid(st, span, sink);
+                        return 0;
+                    }
+                    let (i, ..) = st.rs_open.swap_remove(p);
+                    st.rs_closed.push(i);
+                    sink(span, Event::ToolEnd { index: i });
+                    return 1;
+                }
+                (Some(t), None) if t.is_str("message") || t.is_str("reasoning") => sink(span, Event::Other),
+                (Some(t), None) if !t.is_str("function_call") && !t.is_str("custom_tool_call") => {
+                    st.forbidden = true;
+                    sink(span, Event::Forbidden { block_type: t });
+                }
+                _ => invalid(st, span, sink),
+            }
+        }
+        "response.content_part.added"
+        | "response.content_part.done"
+        | "response.output_text.delta"
+        | "response.output_text.done"
+        | "response.refusal.delta"
+        | "response.refusal.done"
+        | "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_part.done"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_text.done" => {
+            if open.is_some() || oi.is_none() {
+                invalid(st, span, sink); // text on a tool item, or unattached
+                return 0;
+            }
+            if ty.ends_with(".delta") {
+                st.out_bytes = st.out_bytes.saturating_add(data_len);
+            }
+            sink(span, Event::Other);
+        }
+        "response.completed" | "response.incomplete" => {
+            if !st.rs_open.is_empty() {
+                invalid(st, span, sink); // ended with a tool call still open
+                return 0;
+            }
+            let r = v.get("response");
+            set_once(&mut st.id, r.and_then(|r| r.get("id")));
+            set_once(&mut st.model, r.and_then(|r| r.get("model")));
+            if let Some(u) = r.and_then(|r| r.get("usage")).filter(|u| u.kind() == Kind::Obj) {
+                rs_usage(st, u);
+            }
+            st.done = true;
+            sink(span, Event::Stop);
+        }
+        "response.failed" => {
+            if let Some(u) = v.get("response").and_then(|r| r.get("usage")).filter(|u| u.kind() == Kind::Obj) {
+                rs_usage(st, u);
+            }
+            st.error = true;
+            sink(span, Event::Error);
+        }
+        "error" => {
+            st.error = true;
+            sink(span, Event::Error);
+        }
+        _ => invalid(st, span, sink),
+    }
+    0
+}
+
+/// Responses `usage`: `input_tokens` includes the cached `input_tokens_details.cached_tokens`;
+/// `output_tokens` includes reasoning (`total − input` covers providers that do not).
+fn rs_usage(st: &mut State, u: Val<'_>) {
+    let g = |v: Option<Val<'_>>, k: &str| v.and_then(|v| v.get(k)).and_then(Val::as_u64);
+    let input = g(Some(u), "input_tokens");
+    let output = g(Some(u), "output_tokens");
+    let total = g(Some(u), "total_tokens");
+    let cached = g(u.get("input_tokens_details"), "cached_tokens").unwrap_or(0);
+    let mut est = input.is_none() || output.is_none();
+    let input = input.unwrap_or(0);
+    let uncached = input.checked_sub(cached).unwrap_or_else(|| {
+        est = true;
+        input
+    });
+    let mut cost = match u.get("cost").filter(|c| !c.is_null()) {
+        None => None,
+        Some(c) => {
+            let x = decimal_to_uusd_ceil(c.raw()).filter(|_| c.kind() == Kind::Num);
+            est |= x.is_none();
+            x
+        }
+    };
+    if let Some(t) = u.get("cost_in_usd_ticks").filter(|c| !c.is_null()) {
+        let x = t.as_u64().map(|t| t.div_ceil(10_000));
+        est |= x.is_none();
+        cost = cost.max(x);
+    }
+    let output = output.unwrap_or(0).max(total.map_or(0, |t| t.saturating_sub(input)));
+    st.oa = Some(Usage { input: uncached, output, cache_write_5m: 0, cache_write_1h: 0, cache_read: cached, estimated: est, provider_cost_uusd: cost });
+}
+
+const RS_ITEMS: [&str; 4] = ["message", "reasoning", "function_call", "custom_tool_call"];
+
 fn whole_body(st: &mut State, dialect: Dialect, v: Val<'_>) {
     match dialect {
+        Dialect::OpenAiResponses => {
+            if v.get("object").is_none() && v.get("error").is_some_and(|e| !e.is_null()) {
+                st.error = true;
+                return;
+            }
+            set_once(&mut st.id, v.get("id"));
+            set_once(&mut st.model, v.get("model"));
+            for it in v.get("output").map(Val::items).into_iter().flatten() {
+                if !it.get("type").is_some_and(|t| RS_ITEMS.iter().any(|k| t.is_str(k))) {
+                    st.forbidden = true;
+                }
+            }
+            if let Some(u) = v.get("usage").filter(|u| u.kind() == Kind::Obj) {
+                rs_usage(st, u);
+            }
+            match v.get("status") {
+                Some(s) if s.is_str("completed") || s.is_str("incomplete") => st.done = true,
+                Some(s) if s.is_str("failed") => st.error = true,
+                _ => {}
+            }
+        }
         Dialect::AnthropicMessages => {
             if v.get("type").is_some_and(|t| t.is_str("error")) {
                 st.error = true;

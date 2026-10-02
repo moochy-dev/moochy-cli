@@ -119,7 +119,7 @@ impl std::error::Error for ValidateError {}
 // Small enum <-> byte maps (fail closed on unknown values)
 
 const PROVIDERS: [Provider; 6] = [Provider::Anthropic, Provider::OpenRouter, Provider::DeepSeek, Provider::OpenAi, Provider::XAi, Provider::Local];
-const DIALECTS: [Dialect; 2] = [Dialect::AnthropicMessages, Dialect::OpenAiChat];
+const DIALECTS: [Dialect; 3] = [Dialect::AnthropicMessages, Dialect::OpenAiChat, Dialect::OpenAiResponses];
 const EFFORTS: [Effort; 7] = [Effort::None, Effort::Minimal, Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max];
 const TTLS: [CacheTtl; 3] = [CacheTtl::None, CacheTtl::M5, CacheTtl::H1];
 const LEVELS: [Level; 2] = [Level::Strict, Level::Paranoid];

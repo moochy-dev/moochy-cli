@@ -21,42 +21,59 @@ pub enum Verdict {
 /// The tools a request declared, kept with their schemas.
 pub struct ToolSet {
     doc: OwnedDoc,
-    /// (name, tape index of its schema)
-    tools: Vec<(String, Option<usize>)>,
+    /// (name, tape index of its schema, free-form text input)
+    tools: Vec<(String, Option<usize>, bool)>,
 }
 
 impl ToolSet {
     /// Read `tools[]` from the client's request body (Anthropic `name`/`input_schema`;
     /// OpenAI `function.name`/`function.parameters`). Client-executed Anthropic tools
-    /// (`bash_*`, `text_editor_*`, …) have no schema: name check + tripwire only.
+    /// (`bash_*`, `text_editor_*`, …) have no schema: name check + tripwire only. Responses:
+    /// `function` tools (`name`/`parameters`) and free-form `custom` tools (text input, e.g.
+    /// Codex `apply_patch`: name check + tripwire on the text).
     pub fn from_request(dialect: Dialect, body: &[u8]) -> Result<Self, json::Error> {
         let doc = OwnedDoc::parse(body)?;
         let mut tools = Vec::new();
         for t in doc.doc().root().get("tools").map(Val::items).into_iter().flatten() {
-            let (name, schema) = match dialect {
-                Dialect::AnthropicMessages => (t.get("name"), t.get("input_schema")),
+            let (name, schema, freeform) = match dialect {
+                Dialect::AnthropicMessages => (t.get("name"), t.get("input_schema"), false),
                 Dialect::OpenAiChat => {
                     let f = t.get("function");
-                    (f.and_then(|f| f.get("name")), f.and_then(|f| f.get("parameters")))
+                    (f.and_then(|f| f.get("name")), f.and_then(|f| f.get("parameters")), false)
                 }
+                Dialect::OpenAiResponses => match t.get("type") {
+                    Some(ty) if ty.is_str("function") => (t.get("name"), t.get("parameters"), false),
+                    Some(ty) if ty.is_str("custom") => (t.get("name"), None, true),
+                    _ => (None, None, false),
+                },
             };
             if let Some(n) = name.and_then(Val::as_str) {
-                tools.push((n.into_owned(), schema.map(Val::index)));
+                tools.push((n.into_owned(), schema.map(Val::index), freeform));
             }
         }
         Ok(Self { doc, tools })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.tools.iter().map(|(n, _)| n.as_str())
+        self.tools.iter().map(|(n, ..)| n.as_str())
     }
 
     /// Check one complete tool call. `input` is the assembled input JSON (Anthropic
-    /// `partial_json` fragments concatenated; OpenAI `arguments`); empty means `{}`.
+    /// `partial_json` fragments concatenated; OpenAI `arguments`); empty means `{}`. For a
+    /// free-form tool (Responses `custom`), `input` is the text itself.
     pub fn check_call(&self, name: &str, input: &[u8]) -> Verdict {
-        let Some((_, schema)) = self.tools.iter().find(|(n, _)| n == name) else {
+        let Some((_, schema, freeform)) = self.tools.iter().find(|(n, ..)| n == name) else {
             return Verdict::Block(format!("tool `{}` is not in the request's tools", clean(name)));
         };
+        if *freeform {
+            let Ok(text) = std::str::from_utf8(input) else {
+                return Verdict::Block("tool input is not valid UTF-8".into());
+            };
+            return match scan_text(text) {
+                Some(rule) => Verdict::Block(tripwire_reason(rule)),
+                None => Verdict::Allow,
+            };
+        }
         let input = if input.iter().all(u8::is_ascii_whitespace) { &b"{}"[..] } else { input };
         let mut tape = Vec::new();
         let Ok(doc) = json::parse(input, &mut tape) else {
@@ -111,6 +128,19 @@ pub fn response_tool_calls(dialect: Dialect, body: &[u8]) -> Result<Vec<(String,
                     let args = f.and_then(|f| f.get("arguments")).and_then(Val::as_str).unwrap_or_default().into_owned();
                     out.push((name, args.into_bytes()));
                 }
+            }
+        }
+        // Responses: `function_call` (JSON `arguments`) and `custom_tool_call` (text `input`).
+        Dialect::OpenAiResponses => {
+            for it in root.get("output").map(Val::items).into_iter().flatten() {
+                let field = match it.get("type") {
+                    Some(t) if t.is_str("function_call") => "arguments",
+                    Some(t) if t.is_str("custom_tool_call") => "input",
+                    _ => continue,
+                };
+                let name = it.get("name").and_then(Val::as_str).unwrap_or_default().into_owned();
+                let input = it.get(field).and_then(Val::as_str).unwrap_or_default().into_owned();
+                out.push((name, input.into_bytes()));
             }
         }
     }

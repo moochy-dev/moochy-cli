@@ -323,7 +323,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
     let mut tape = Vec::new();
     let (facts, headers, root) = check(req.dialect, req.body, req.headers, *req.policy, req.catalog, &mut tape)?;
     // Fields the shared dialect table allows but this provider's API does not have.
-    if let Some((field, why)) = tables::provider_denies(req.provider).iter().find(|(f, _)| root.get(f).is_some()) {
+    if let Some((field, why)) = tables::provider_denies(req.provider, req.dialect).iter().find(|(f, _)| root.get(f).is_some()) {
         return Err(Reject::new(RejectCode::Firewall, *field, format!("is not allowed: {why}")));
     }
 
@@ -334,6 +334,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
     };
     let model = enc(req.provider_model_id);
     let user = enc(req.user_pseudonym);
+    let max_out = facts.max_tokens.to_string();
     let (prompt, completion);
     let mut patches: Vec<Patch<'_>> = vec![Patch { path: &["model"], json: &model }];
     match req.dialect {
@@ -354,6 +355,16 @@ pub fn prepare(req: &Request<'_>) -> Result<Prepared, Reject> {
                 // xAI documents `safety_identifier` for end-user attribution.
                 Provider::XAi => patches.push(Patch { path: &["safety_identifier"], json: &user }),
                 // Local servers: no end-user id (nothing to attribute abuse to on the donor's own box).
+                Provider::DeepSeek | Provider::Anthropic | Provider::Local => {}
+            }
+        }
+        // §18.6: stateless (OpenAI and xAI store responses by default) and output-bounded.
+        Dialect::OpenAiResponses => {
+            patches.push(Patch { path: &["store"], json: b"false" });
+            patches.push(Patch { path: &["max_output_tokens"], json: max_out.as_bytes() });
+            match req.provider {
+                Provider::OpenAi | Provider::XAi => patches.push(Patch { path: &["safety_identifier"], json: &user }),
+                Provider::OpenRouter => patches.push(Patch { path: &["user"], json: &user }),
                 Provider::DeepSeek | Provider::Anthropic | Provider::Local => {}
             }
         }
@@ -394,6 +405,13 @@ fn dollars(uusd: u64) -> String {
 
 type Checked<'a> = (Facts, Vec<(&'static str, String)>, Val<'a>);
 
+fn ceiling_for(policy: Policy, catalog: &Catalog) -> u64 {
+    match policy.level {
+        Level::Strict => catalog.max_output,
+        Level::Paranoid => catalog.max_output.min(PARANOID_MAX_TOKENS),
+    }
+}
+
 fn check<'a>(
     dialect: Dialect,
     body: &'a [u8],
@@ -412,6 +430,7 @@ fn check<'a>(
     let top = match dialect {
         Dialect::AnthropicMessages => &tables::ANTHROPIC,
         Dialect::OpenAiChat => &tables::OPENAI,
+        Dialect::OpenAiResponses => &tables::RESPONSES,
     };
     w.check(top, root, None)?;
     let out_headers = w.headers(dialect, headers)?;
@@ -432,14 +451,17 @@ fn check<'a>(
             }
             (a.or(b).and_then(Val::as_u64), root.get("reasoning_effort"))
         }
+        // Codex sends no `max_output_tokens`: the catalog ceiling bounds it (and `prepare`
+        // writes it into the provider request, so cost stays bounded by the route).
+        Dialect::OpenAiResponses => (
+            Some(root.get("max_output_tokens").and_then(Val::as_u64).unwrap_or_else(|| ceiling_for(policy, catalog))),
+            root.get("reasoning").and_then(|r| r.get("effort")).filter(|e| !e.is_null()),
+        ),
     };
     let Some(max_tokens) = max_tokens else {
         return Err(fw("max_tokens", "is required".into()));
     };
-    let ceiling = match policy.level {
-        Level::Strict => catalog.max_output,
-        Level::Paranoid => catalog.max_output.min(PARANOID_MAX_TOKENS),
-    };
+    let ceiling = ceiling_for(policy, catalog);
     if max_tokens == 0 || max_tokens > ceiling {
         return Err(fw("max_tokens", format!("must be between 1 and {ceiling}").into()));
     }
@@ -526,6 +548,8 @@ pub(crate) enum Hook {
     One,
     /// Per-turn `output_config.effort` (Anthropic `per-turn-control`): tracked, max wins.
     TurnEffort,
+    /// Must be `false` (Responses `store`, `background`: stateless only).
+    False,
 }
 
 #[derive(Default)]
@@ -755,6 +779,11 @@ impl<'a> Walk<'a> {
             Hook::TurnEffort => {
                 let e = v.as_str().as_deref().and_then(Effort::parse);
                 self.acc.turn_effort = self.acc.turn_effort.max(e);
+            }
+            Hook::False => {
+                if v.as_bool() != Some(false) {
+                    return self.fail(format!("must be false: {}", tables::STATELESS_WHY));
+                }
             }
             Hook::One => {
                 if v.as_u64() != Some(1) {

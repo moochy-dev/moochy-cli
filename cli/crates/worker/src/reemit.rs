@@ -19,8 +19,9 @@ use crate::clean::clean_text;
 use crate::json::{self, Kind, Node, Val};
 use crate::Dialect;
 
-/// Largest SSE event (one `data:` payload) re-emitted.
-pub const MAX_EVENT: usize = 1 << 20;
+/// Largest SSE event (one `data:` payload) re-emitted (Responses `response.completed` events
+/// carry the whole response object).
+pub const MAX_EVENT: usize = 4 << 20;
 /// Largest non-streamed body re-emitted.
 pub const MAX_BODY: usize = 32 << 20;
 const ID: usize = 256;
@@ -546,6 +547,179 @@ pub(crate) const OPENAI_BODY: T = T::Obj(&[
     M("timings", O_TIMINGS, false),
 ]);
 
+// --- OpenAI Responses (§18.6: OpenAI, xAI, OpenRouter) ---
+
+const R_USAGE: T = T::Obj(&[
+    M("input_tokens", T::U64, true),
+    M("input_tokens_details", T::Or(&[T::Null, T::Obj(&[M("cached_tokens", T::U64, false)])]), false),
+    M("output_tokens", T::U64, true),
+    M("output_tokens_details", T::Or(&[T::Null, T::Obj(&[M("reasoning_tokens", T::U64, false)])]), false),
+    M("total_tokens", T::U64, false),
+    M("cost", T::Or(&[T::Null, T::Num]), false),
+    M("is_byok", T::Bool, false),
+    M("cost_in_usd_ticks", T::U64, false),
+]);
+const R_ERROR_OBJ: T = T::Obj(&[M("code", T::Or(&[T::Null, T::Ident(64)]), false), M("message", T::Text(64 << 10), true)]);
+const R_OUT_TEXT: T = T::Obj(&[M("type", T::Lit("output_text"), true), M("text", T::Text(TEXT), true), M("annotations", T::EmptyArr, false)]);
+const R_REFUSAL: T = T::Obj(&[M("type", T::Lit("refusal"), true), M("refusal", T::Text(TEXT), true)]);
+const R_PART: T = T::Tag("type", &[("output_text", R_OUT_TEXT), ("refusal", R_REFUSAL)]);
+const R_SUMMARY: T = T::Obj(&[M("type", T::Lit("summary_text"), true), M("text", T::Text(TEXT), true)]);
+const R_REASONING_TEXT: T = T::Obj(&[M("type", T::Lit("reasoning_text"), true), M("text", T::Text(TEXT), true)]);
+
+/// Output items. Hosted-tool items (`web_search_call`, `file_search_call`, `mcp_call`, …) are
+/// absent: they fail the attempt.
+const R_ITEM: T = T::Tag(
+    "type",
+    &[
+        (
+            "message",
+            T::Obj(&[
+                M("type", T::Lit("message"), true),
+                M("id", T::Ident(ID), true),
+                M("status", OPT_WORD, false),
+                M("role", T::Lit("assistant"), true),
+                M("content", T::Arr(&R_PART, 4096), true),
+            ]),
+        ),
+        (
+            "reasoning",
+            T::Obj(&[
+                M("type", T::Lit("reasoning"), true),
+                M("id", T::Ident(ID), true),
+                M("summary", T::Arr(&R_SUMMARY, 4096), true),
+                M("content", T::Or(&[T::Null, T::Arr(&R_REASONING_TEXT, 4096)]), false),
+                M("encrypted_content", T::Or(&[T::Null, T::Raw(RAW)]), false),
+                M("status", OPT_WORD, false),
+            ]),
+        ),
+        (
+            "function_call",
+            T::Obj(&[
+                M("type", T::Lit("function_call"), true),
+                M("id", T::Ident(ID), false),
+                M("call_id", T::Ident(ID), true),
+                M("name", T::Ident(128), true),
+                M("arguments", T::Raw(RAW), true),
+                M("status", OPT_WORD, false),
+            ]),
+        ),
+        (
+            "custom_tool_call",
+            T::Obj(&[
+                M("type", T::Lit("custom_tool_call"), true),
+                M("id", T::Ident(ID), false),
+                M("call_id", T::Ident(ID), true),
+                M("name", T::Ident(128), true),
+                M("input", T::Raw(RAW), true),
+                M("status", OPT_WORD, false),
+            ]),
+        ),
+    ],
+);
+
+/// The response object in streamed lifecycle events: no `output` (items reach the client only
+/// through the gated `output_item` events, never a second, uninspected copy).
+const R_RESPONSE_STREAM: T = T::Obj(&[
+    M("id", T::Ident(ID), true),
+    M("object", T::Lit("response"), true),
+    M("created_at", T::Num, false),
+    M("status", OPT_WORD, false),
+    M("model", T::Ident(ID), false),
+    M("usage", T::Or(&[T::Null, R_USAGE]), false),
+    M("error", T::Or(&[T::Null, R_ERROR_OBJ]), false),
+    M("incomplete_details", T::Or(&[T::Null, T::Obj(&[M("reason", T::Ident(64), false)])]), false),
+]);
+
+/// Non-streamed Responses body.
+pub(crate) const RESPONSES_BODY: T = T::Obj(&[
+    M("id", T::Ident(ID), true),
+    M("object", T::Lit("response"), true),
+    M("created_at", T::Num, false),
+    M("status", OPT_WORD, false),
+    M("model", T::Ident(ID), false),
+    M("output", T::Arr(&R_ITEM, 4096), true),
+    M("usage", T::Or(&[T::Null, R_USAGE]), false),
+    M("error", T::Or(&[T::Null, R_ERROR_OBJ]), false),
+    M("incomplete_details", T::Or(&[T::Null, T::Obj(&[M("reason", T::Ident(64), false)])]), false),
+]);
+
+const SEQ: M = M("sequence_number", T::U64, false);
+const IID: M = M("item_id", T::Ident(ID), true);
+const OIDX: M = M("output_index", T::U64, true);
+const CIDX: M = M("content_index", T::U64, true);
+const SIDX: M = M("summary_index", T::U64, true);
+
+/// One Responses SSE event (tag = `type` = the `event:` name). Anything else fails closed.
+pub(crate) const RESPONSES_EVENT: T = T::Tag(
+    "type",
+    &[
+        ("response.created", T::Obj(&[M("type", T::Lit("response.created"), true), SEQ, M("response", R_RESPONSE_STREAM, true)])),
+        ("response.in_progress", T::Obj(&[M("type", T::Lit("response.in_progress"), true), SEQ, M("response", R_RESPONSE_STREAM, true)])),
+        ("response.completed", T::Obj(&[M("type", T::Lit("response.completed"), true), SEQ, M("response", R_RESPONSE_STREAM, true)])),
+        ("response.incomplete", T::Obj(&[M("type", T::Lit("response.incomplete"), true), SEQ, M("response", R_RESPONSE_STREAM, true)])),
+        ("response.failed", T::Obj(&[M("type", T::Lit("response.failed"), true), SEQ, M("response", R_RESPONSE_STREAM, true)])),
+        ("response.output_item.added", T::Obj(&[M("type", T::Lit("response.output_item.added"), true), SEQ, OIDX, M("item", R_ITEM, true)])),
+        ("response.output_item.done", T::Obj(&[M("type", T::Lit("response.output_item.done"), true), SEQ, OIDX, M("item", R_ITEM, true)])),
+        ("response.content_part.added", T::Obj(&[M("type", T::Lit("response.content_part.added"), true), SEQ, IID, OIDX, CIDX, M("part", R_PART, true)])),
+        ("response.content_part.done", T::Obj(&[M("type", T::Lit("response.content_part.done"), true), SEQ, IID, OIDX, CIDX, M("part", R_PART, true)])),
+        ("response.output_text.delta", T::Obj(&[M("type", T::Lit("response.output_text.delta"), true), SEQ, IID, OIDX, CIDX, M("delta", T::Text(TEXT), true)])),
+        ("response.output_text.done", T::Obj(&[M("type", T::Lit("response.output_text.done"), true), SEQ, IID, OIDX, CIDX, M("text", T::Text(TEXT), true)])),
+        ("response.refusal.delta", T::Obj(&[M("type", T::Lit("response.refusal.delta"), true), SEQ, IID, OIDX, CIDX, M("delta", T::Text(TEXT), true)])),
+        ("response.refusal.done", T::Obj(&[M("type", T::Lit("response.refusal.done"), true), SEQ, IID, OIDX, CIDX, M("refusal", T::Text(TEXT), true)])),
+        (
+            "response.function_call_arguments.delta",
+            T::Obj(&[M("type", T::Lit("response.function_call_arguments.delta"), true), SEQ, IID, OIDX, M("delta", T::Raw(RAW), true)]),
+        ),
+        (
+            "response.function_call_arguments.done",
+            T::Obj(&[M("type", T::Lit("response.function_call_arguments.done"), true), SEQ, IID, OIDX, M("name", T::Ident(128), false), M("arguments", T::Raw(RAW), true)]),
+        ),
+        (
+            "response.custom_tool_call_input.delta",
+            T::Obj(&[M("type", T::Lit("response.custom_tool_call_input.delta"), true), SEQ, IID, OIDX, M("delta", T::Raw(RAW), true)]),
+        ),
+        (
+            "response.custom_tool_call_input.done",
+            T::Obj(&[M("type", T::Lit("response.custom_tool_call_input.done"), true), SEQ, IID, OIDX, M("input", T::Raw(RAW), true)]),
+        ),
+        (
+            "response.reasoning_summary_part.added",
+            T::Obj(&[M("type", T::Lit("response.reasoning_summary_part.added"), true), SEQ, IID, OIDX, SIDX, M("part", R_SUMMARY, true)]),
+        ),
+        (
+            "response.reasoning_summary_part.done",
+            T::Obj(&[M("type", T::Lit("response.reasoning_summary_part.done"), true), SEQ, IID, OIDX, SIDX, M("part", R_SUMMARY, true)]),
+        ),
+        (
+            "response.reasoning_summary_text.delta",
+            T::Obj(&[M("type", T::Lit("response.reasoning_summary_text.delta"), true), SEQ, IID, OIDX, SIDX, M("delta", T::Text(TEXT), true)]),
+        ),
+        (
+            "response.reasoning_summary_text.done",
+            T::Obj(&[M("type", T::Lit("response.reasoning_summary_text.done"), true), SEQ, IID, OIDX, SIDX, M("text", T::Text(TEXT), true)]),
+        ),
+        (
+            "response.reasoning_text.delta",
+            T::Obj(&[M("type", T::Lit("response.reasoning_text.delta"), true), SEQ, IID, OIDX, CIDX, M("delta", T::Text(TEXT), true)]),
+        ),
+        (
+            "response.reasoning_text.done",
+            T::Obj(&[M("type", T::Lit("response.reasoning_text.done"), true), SEQ, IID, OIDX, CIDX, M("text", T::Text(TEXT), true)]),
+        ),
+        (
+            "error",
+            T::Obj(&[
+                M("type", T::Lit("error"), true),
+                SEQ,
+                M("code", T::Or(&[T::Null, T::Ident(64)]), false),
+                M("message", T::Text(64 << 10), false),
+                M("param", T::Or(&[T::Null, T::Text(1024)]), false),
+                M("error", T::Or(&[T::Null, R_ERROR_OBJ]), false),
+            ]),
+        ),
+    ],
+);
+
 // ---------------------------------------------------------------------------------------
 // The re-emitter
 
@@ -655,6 +829,8 @@ impl Reemitter {
             Dialect::AnthropicMessages => &ANTHROPIC_BODY,
             Dialect::OpenAiChat if root.get("error").is_some() => &O_ERROR,
             Dialect::OpenAiChat => &OPENAI_BODY,
+            Dialect::OpenAiResponses if root.get("object").is_none() && root.get("error").is_some() => &O_ERROR,
+            Dialect::OpenAiResponses => &RESPONSES_BODY,
         };
         let mut w = W { out, dropped: 0 };
         let r = w.emit(schema, root);
@@ -697,7 +873,7 @@ impl Reemitter {
                 self.has_data = true;
             }
             b"event" => {
-                if self.has_event || self.dialect != Dialect::AnthropicMessages {
+                if self.has_event || self.dialect == Dialect::OpenAiChat {
                     return fail("unexpected event line");
                 }
                 if value.len() > 64 {
@@ -726,6 +902,11 @@ impl Reemitter {
             self.events = self.events.saturating_add(1);
             return Ok(());
         }
+        // Responses streams end with `response.completed`; a stray `[DONE]` is not forwarded.
+        if self.dialect == Dialect::OpenAiResponses && self.data.as_slice() == b"[DONE]" && !has_event {
+            self.dropped = self.dropped.saturating_add(1);
+            return Ok(());
+        }
         let mut tape = std::mem::take(&mut self.tape);
         let start = out.len();
         let r = (|| {
@@ -733,7 +914,7 @@ impl Reemitter {
             let root = doc.root();
             let mut w = W { out: &mut *out, dropped: 0 };
             match self.dialect {
-                Dialect::AnthropicMessages => {
+                Dialect::AnthropicMessages | Dialect::OpenAiResponses => {
                     let ty = root.get("type").and_then(Val::as_str).ok_or(ReemitError("event without a type"))?;
                     if has_event && self.event.as_slice() != ty.as_bytes() {
                         return fail("event name does not match the data type");
@@ -744,7 +925,7 @@ impl Reemitter {
                     w.out.extend_from_slice(b"event: ");
                     w.out.extend_from_slice(ty.as_bytes());
                     w.out.extend_from_slice(b"\ndata: ");
-                    w.emit(&ANTHROPIC_EVENT, root)?;
+                    w.emit(if self.dialect == Dialect::AnthropicMessages { &ANTHROPIC_EVENT } else { &RESPONSES_EVENT }, root)?;
                 }
                 Dialect::OpenAiChat => {
                     w.out.extend_from_slice(b"data: ");
@@ -783,6 +964,9 @@ pub fn visible_texts(dialect: Dialect, stream: bool, root: Val<'_>, f: &mut dyn 
         (Dialect::OpenAiChat, _) if root.get("error").is_some() => &O_ERROR,
         (Dialect::OpenAiChat, true) => &OPENAI_CHUNK,
         (Dialect::OpenAiChat, false) => &OPENAI_BODY,
+        (Dialect::OpenAiResponses, true) => &RESPONSES_EVENT,
+        (Dialect::OpenAiResponses, false) if root.get("object").is_none() && root.get("error").is_some() => &O_ERROR,
+        (Dialect::OpenAiResponses, false) => &RESPONSES_BODY,
     };
     visit(schema, root, f);
 }

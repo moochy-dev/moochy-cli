@@ -29,6 +29,8 @@ impl Dialect {
         match moochy_worker::Dialect::parse(s)? {
             moochy_worker::Dialect::AnthropicMessages => Some(Self::Anthropic),
             moochy_worker::Dialect::OpenAiChat => Some(Self::OpenAi),
+            // §18.6: not routed by the node yet (mo-node: gateway route, pool offer dialect).
+            moochy_worker::Dialect::OpenAiResponses => None,
         }
     }
     pub fn worker(self) -> moochy_worker::Dialect {

@@ -34,6 +34,9 @@ use std::fmt;
 pub enum Dialect {
     AnthropicMessages,
     OpenAiChat,
+    /// OpenAI Responses (`POST /v1/responses`, CONTRACT §18.6): passthrough to providers that
+    /// speak it natively (OpenAI, xAI, OpenRouter); stateless only.
+    OpenAiResponses,
 }
 
 impl Dialect {
@@ -41,6 +44,7 @@ impl Dialect {
         match s {
             "anthropic.messages" => Some(Self::AnthropicMessages),
             "openai.chat" => Some(Self::OpenAiChat),
+            "openai.responses" => Some(Self::OpenAiResponses),
             _ => None,
         }
     }
@@ -49,6 +53,7 @@ impl Dialect {
         match self {
             Self::AnthropicMessages => "anthropic.messages",
             Self::OpenAiChat => "openai.chat",
+            Self::OpenAiResponses => "openai.responses",
         }
     }
 }
@@ -60,7 +65,7 @@ pub enum Provider {
     OpenRouter,
     DeepSeek,
     OpenAi,
-    /// xAI (Grok): OpenAI-compatible chat completions only.
+    /// xAI (Grok): OpenAI-compatible chat completions and Responses.
     XAi,
     /// A donor's own OpenAI-compatible inference server (Ollama, LM Studio, vLLM, llama.cpp
     /// server) on loopback or the LAN: free, goals counted in tokens (see `API.md`).
