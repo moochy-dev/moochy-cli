@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# Moochy background process (gateway + donor), per-user systemd unit.
+# Platform half of CONTRACT §15.2 "bounded worst case"; the process also locks
+# itself down after boot (Landlock + seccomp, no exec). Install:
+#   install -D -m 0644 moochy.user.service ~/.config/systemd/user/moochy.service
+#   systemctl --user daemon-reload && systemctl --user enable --now moochy
+#   loginctl enable-linger "$USER"   # keep donating while logged out (optional)
+# Keystore: the OS keychain (Secret Service) on desktops. Headless with the
+# encrypted-file keystore: see "Passphrase" at the end of this file.
+[Unit]
+Description=Moochy background process (gateway and donor)
+Documentation=https://github.com/moochy-dev/moochy-cli/tree/main/docs/guides
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# $0 is the binary; the passphrase is exported only if a credential provides it.
+ExecStart=/bin/sh -c 'if [ -r "$${CREDENTIALS_DIRECTORY:-/nonexistent}/moochy-passphrase" ]; then MOOCHY_PASSPHRASE=$$(cat "$$CREDENTIALS_DIRECTORY/moochy-passphrase"); export MOOCHY_PASSPHRASE; fi; exec "$0" up --foreground' %h/.local/bin/moochy
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+# Never write keys to a core dump.
+LimitCORE=0
+TasksMax=256
+MemoryMax=1G
+
+# Filesystem: limited by moochy's own Landlock lockdown (state dir + CA roots,
+# CONTRACT §15.2), not by this unit. Mount-namespace options (ProtectSystem=,
+# ProtectHome=, PrivateTmp=, ProtectKernelTunables=, PrivateDevices=, …) are
+# deliberately absent: a user manager needs an unprivileged user namespace for
+# them, and on Ubuntu >= 23.10 (kernel.apparmor_restrict_unprivileged_userns=1)
+# that attempt silently skips every mount AND moves the process into AppArmor's
+# `unprivileged_userns` profile; exec'ing moochy from there under
+# deploy/client/apparmor/moochy then denies socket(AF_INET) (EACCES, verified on
+# Ubuntu 24.04 / systemd 255), so the donor cannot start. Options that imply
+# dropping capabilities fail outright in a user manager (218/CAPABILITIES).
+# On a distro without that restriction and without the AppArmor profile you may
+# add them in a drop-in (`systemctl --user edit moochy`):
+#   ProtectSystem=strict / ProtectHome=read-only / ReadWritePaths=%h/.config/moochy / PrivateTmp=yes
+# For the full set, run the always-on donor as moochy.system.service.
+
+# Process and kernel surface (seccomp-based: enforced in user units too). The self-lockdown needs prctl(no_new_privs),
+# seccomp() and the landlock_* syscalls, all inside @system-service plus the
+# explicit list below; it creates no namespaces (fork + Landlock + seccomp).
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @clock @module
+SystemCallErrorNumber=EPERM
+# Unix sockets (local control, D-Bus keychain), IPv4/IPv6 (relay, providers, loopback doors).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# No CapabilityBoundingSet=/ProtectHostname=: a user manager cannot drop
+# capabilities (it has none to give; the unit fails with 218/CAPABILITIES) nor
+# create UTS namespaces. The system unit has both.
+
+[Install]
+WantedBy=default.target
+
+# Passphrase (encrypted-file keystore, headless): keep it out of the
+# environment of your shell and out of unit files:
+#   install -m 0600 /dev/stdin ~/.config/moochy-passphrase   # type it, Ctrl-D
+#   systemctl --user edit moochy   →   [Service]
+#                                      LoadCredential=moochy-passphrase:%h/.config/moochy-passphrase
