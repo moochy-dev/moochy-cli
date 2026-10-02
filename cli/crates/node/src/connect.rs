@@ -103,11 +103,9 @@ fn section(id: &str) -> Option<&'static str> {
     GUIDE.get(start..at.checked_add(1)?.checked_add(len)?)
 }
 
-/// Why the guide's code block is held back: Codex's Responses provider needs `POST /v1/responses`
-/// in the gateway (CONTRACT §18.6), not served by this version.
-fn held_back(id: &str, block: &str) -> bool {
-    id == "codex" && block.contains("wire_api = \"responses\"")
-}
+/// Agents whose API door this version serves although their guide section still says "not yet"
+/// (Codex: `POST /v1/responses`, CONTRACT §18.6; the guide is updated by mo-docs): no MCP-only line.
+const API_DOOR_SERVED: &[&str] = &["codex"];
 
 /// The guide section of a §18 agent as a preset: prose as `# ` comments, code blocks verbatim
 /// (placeholders filled), and a plain line when the agent reaches donated tokens through MCP only.
@@ -118,11 +116,7 @@ fn guide_snippet(id: &str, url: &str, repo: &str, main: &str) -> Option<String> 
     for l in section(id)?.lines() {
         if let Some(b) = block.as_mut() {
             if l.starts_with("```") {
-                if held_back(id, b) {
-                    out.push_str("# (this provider block applies once moochy serves POST /v1/responses: not in this version)\n");
-                } else {
-                    out.push_str(b);
-                }
+                out.push_str(b);
                 block = None;
             } else {
                 b.push_str(&fill(l));
@@ -135,7 +129,7 @@ fn guide_snippet(id: &str, url: &str, repo: &str, main: &str) -> Option<String> 
         } else if let Some(row) = l.strip_prefix("| API") {
             // The "Tool" cell of the API row says when the agent is MCP only.
             let tool = row.split('|').nth(2).unwrap_or_default().trim().replace("**", "");
-            if tool.contains("MCP only") || tool.contains("not yet") {
+            if (tool.contains("MCP only") || tool.contains("not yet")) && !API_DOOR_SERVED.contains(&id) {
                 out.push_str("# API: ");
                 out.push_str(&tool);
                 out.push_str(". This agent uses donated tokens through MCP (moochy_delegate).\n");
@@ -165,7 +159,6 @@ mod tests {
             .skip(1)
             .step_by(2)
             .map(|b| b.split_once('\n').unwrap().1.replace("http://127.0.0.1:PORT", url).replace("owner/repo", repo).replace("anthropic/claude-sonnet-5", main))
-            .filter(|b| !super::held_back(id, b))
             .collect()
     }
 
@@ -187,12 +180,12 @@ mod tests {
             assert!(!s.contains("PORT") && !s.contains("owner/repo") && !s.contains("mooch_local_"), "{id}: {s}");
             assert!(s.contains("moochy mcp") || s.contains(r#""mcp", "--repo""#), "{id}: an MCP door");
         }
-        // MCP-only agents say so; Codex's Responses provider is held back for now.
-        for id in ["gemini-cli", "amp", "antigravity", "kiro-cli", "codex"] {
+        // MCP-only agents say so; Codex has both doors (its Responses provider, §18.6).
+        for id in ["gemini-cli", "amp", "antigravity", "kiro-cli"] {
             assert!(super::snippet(id, url, repo, main, main).unwrap().contains("# API: "), "{id}");
         }
         let codex = super::snippet("codex", url, repo, main, main).unwrap();
-        assert!(!codex.contains("wire_api") || !codex.lines().any(|l| l.starts_with("wire_api")), "{codex}");
+        assert!(codex.contains("wire_api = \"responses\"\n") && codex.contains(&format!("base_url = \"{url}/v1\"")) && !codex.contains("# API: not yet"), "{codex}");
         assert!(super::snippet("droid", url, repo, main, main).unwrap().lines().all(|l| !l.starts_with("# API: ")));
     }
 

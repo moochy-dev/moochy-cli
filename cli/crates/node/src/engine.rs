@@ -41,12 +41,11 @@ impl Dialect {
             Self::OpenAiResponses => moochy_worker::Dialect::OpenAiResponses,
         }
     }
-    /// The route-header dialect; `None` while moochy-proto cannot name it (fail closed).
-    pub fn proto(self) -> Option<msg::Dialect> {
+    pub fn proto(self) -> msg::Dialect {
         match self {
-            Self::Anthropic => Some(msg::Dialect::AnthropicMessages),
-            Self::OpenAi => Some(msg::Dialect::OpenAiChat),
-            Self::OpenAiResponses => None,
+            Self::Anthropic => msg::Dialect::AnthropicMessages,
+            Self::OpenAi => msg::Dialect::OpenAiChat,
+            Self::OpenAiResponses => msg::Dialect::OpenAiResponses,
         }
     }
     /// The OpenAI error and stream shapes (Chat Completions and Responses).
@@ -173,7 +172,7 @@ pub fn route_header(e: &CatalogEntry, d: Dialect, f: &Facts, repo_id: &str, affi
     let bad = |w: &str| Failure::new("invalid_request", false, format!("moochy: {w}"));
     Ok(RouteHeader {
         repo_id: repo_id.parse().map_err(|_| Failure::new("internal", true, "moochy: bad repo id from relay".to_owned()))?,
-        dialect: d.proto().ok_or_else(|| Failure::new("model_not_in_pool", false, "moochy: this version cannot route the Responses API yet (moochy-proto)".to_owned()))?,
+        dialect: d.proto(),
         model: e.model.clone(),
         effort: f.effort.as_str().into(),
         max_tokens: u32::try_from(f.max_tokens).map_err(|_| bad("max_tokens too large"))?,
@@ -331,7 +330,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending: moochy-proto Dialect::OpenAiResponses in the catalog (agent/mo-proto 475d6297, not on main yet)"]
     fn responses_stateful_fields_refused_before_sealing() {
         let raw = br#"{"version":3,"effective_at":"2026-01-01T00:00:00Z","entries":[{"model":"openai/gpt-5","provider":"openai","provider_model_id":"gpt-5","dialects":["openai.chat","openai.responses"],"in":1250000,"out":10000000,"cache_write_5m":0,"cache_write_1h":0,"cache_read":125000,"max_image_tokens":1600,"max_page_tokens":3000,"fast_multiplier":1,"default_effort":"medium","max_output":128000,"source":"curated"}]}"#;
         let c = Catalog::parse(raw).unwrap();
