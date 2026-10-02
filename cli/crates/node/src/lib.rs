@@ -10,6 +10,7 @@
 
 pub mod approve;
 pub mod audit;
+pub mod button;
 pub mod cli;
 pub mod config;
 pub mod ctl;
