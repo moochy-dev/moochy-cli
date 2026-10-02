@@ -50,6 +50,8 @@ pub struct PoolWorker {
     pub dialects: Vec<String>,
     pub models: Vec<String>,
     pub hint: u32,
+    /// `PoolWorker.served`: (model, provider) the worker serves it through (§15.4 exclusion).
+    pub served: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -316,6 +318,7 @@ impl Node {
                 dialects: Vec::new(),
                 models: Vec::new(),
                 hint: 100,
+                served: Vec::new(),
             };
             w.dialects = vec!["anthropic.messages".into(), "openai.chat".into()];
             w.models = vec![STUB_MODEL.into()];
@@ -401,6 +404,7 @@ impl Node {
                     dialects: w.dialects.iter().filter(|d| plain_id(d)).cloned().collect(),
                     models: w.models.iter().filter(|m| plain_id(m)).cloned().collect(),
                     hint: w.hint.min(100),
+                    served: w.served.iter().take(256).filter(|s| plain_id(&s.model) && plain_id(&s.provider)).map(|s| (s.model.clone(), s.provider.clone())).collect(),
                 };
                 // Kept as advertised; the key-log rule is applied when the pool is read
                 // (`pool_for`), so a worker refused before the first checkpoint is not lost.

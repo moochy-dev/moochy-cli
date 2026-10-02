@@ -191,29 +191,20 @@ fn run_local(node: &Arc<Node>, req: TaskReq) -> mpsc::Receiver<TaskEv> {
 
 /// Affinity worker first, then the best `hint`s, ≤ 8 wraps (04 §7).
 fn pick(pool: &RepoPool, dialect: Dialect, model: &str, sticky: Option<&str>) -> Vec<PoolWorker> {
-    let mut c: Vec<&PoolWorker> =
-        pool.workers.iter().filter(|w| w.models.iter().any(|m| m == model) && w.dialects.iter().any(|d| d == dialect.wire())).collect();
+    let mut c: Vec<&PoolWorker> = pool
+        .workers
+        .iter()
+        .filter(|w| w.models.iter().any(|m| m == model) && w.dialects.iter().any(|d| d == dialect.wire()) && provider_allowed(w, model, &pool.excluded_providers))
+        .collect();
     c.sort_by_key(|w| (Some(w.worker_device.as_str()) != sticky, std::cmp::Reverse(w.hint)));
     c.into_iter().take(MAX_WRAPS).cloned().collect()
 }
 
-/// §15.4 provider exclusion: never seal to a donor serving through an excluded provider.
-/// ponytail: pool workers do not say which provider serves each model yet, so a model that an
-/// excluded provider can also serve is refused outright (fail closed); filter per worker in
-/// `pick` once `PoolWorker` carries the provider.
-fn excluded_check(cat: &engine::Catalog, model: &str, excluded: &[String]) -> Result<(), Failure> {
-    if excluded.is_empty() {
-        return Ok(());
-    }
-    let hit: Vec<&str> = cat.entries.iter().filter(|e| e.model == model && excluded.iter().any(|x| x == &e.provider)).map(|e| e.provider.as_str()).collect();
-    if hit.is_empty() {
-        return Ok(());
-    }
-    Err(Failure::new(
-        "forbidden",
-        false,
-        format!("moochy: this project does not accept donations through {} for `{model}`, and donors of that model cannot be told apart by provider yet", hit.join(", ")),
-    ))
+/// §15.4 provider exclusion, per worker: never seal to a donor serving `model` through an
+/// excluded provider. Fail closed: when the project excludes anything, a worker that does not
+/// say which provider serves the model is left out too.
+fn provider_allowed(w: &PoolWorker, model: &str, excluded: &[String]) -> bool {
+    excluded.is_empty() || w.served.iter().find(|(m, _)| m == model).is_some_and(|(_, p)| !excluded.iter().any(|x| x.eq_ignore_ascii_case(p)))
 }
 
 fn wraps(ws: &[PoolWorker], task: &TaskId, route: &[u8], ck: &ContentKey) -> Vec<pb::Wrap> {
@@ -239,9 +230,15 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
     let header = engine::route_header(&req.entry, req.dialect, &req.facts, &pool.repo_id, aff)?;
     let route = header.to_bytes().map_err(internal)?;
     let sticky = node.session_worker(&aff);
-    excluded_check(&node.catalog(), &req.entry.model, &pool.excluded_providers)?;
     let chosen = pick(&pool, req.dialect, &req.entry.model, sticky.as_deref());
     if chosen.is_empty() {
+        if !pool.excluded_providers.is_empty() && !pick(&RepoPool { excluded_providers: Vec::new(), ..pool.clone() }, req.dialect, &req.entry.model, None).is_empty() {
+            return Err(Failure::new(
+                "forbidden",
+                false,
+                format!("moochy: no donor offers `{}` through a provider this project accepts (it excludes {})", req.entry.model, pool.excluded_providers.join(", ")),
+            ));
+        }
         return Err(Failure::new("model_not_in_pool", false, format!("moochy: no donor offers `{}` for {}", req.entry.model, req.slug)));
     }
     let task = TaskId::new(now_ms()).map_err(internal)?;
@@ -754,16 +751,28 @@ mod exclusion {
     use super::*;
 
     #[test]
-    fn excluded_providers_fail_closed() {
-        let stub = engine::Catalog::stub();
-        let mut cat = engine::Catalog { entries: stub.entries.clone(), ..engine::Catalog::default() };
-        let mut or = cat.entries[0].clone();
-        or.provider = "openrouter".into();
-        cat.entries.push(or);
-        let m = cat.entries[0].model.clone();
-        assert!(excluded_check(&cat, &m, &[]).is_ok());
-        assert!(excluded_check(&cat, &m, &["deepseek".into()]).is_ok());
-        assert!(excluded_check(&cat, &m, &["openrouter".into()]).is_err(), "an excluded provider can serve it");
+    fn excluded_providers_per_worker_fail_closed() {
+        let w = |dev: &str, served: &[(&str, &str)]| PoolWorker {
+            worker_device: dev.into(),
+            enc_pub: [0; 32],
+            sign_pub: None,
+            key_log_index: 0,
+            approval_log_index: 0,
+            donor: String::new(),
+            dialects: vec!["anthropic.messages".into()],
+            models: vec!["m".into()],
+            hint: 50,
+            served: served.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect(),
+        };
+        let pool = RepoPool {
+            workers: vec![w("a", &[("m", "anthropic")]), w("o", &[("m", "openrouter")]), w("silent", &[])],
+            excluded_providers: vec!["openrouter".into()],
+            ..RepoPool::default()
+        };
+        let got: Vec<String> = pick(&pool, Dialect::Anthropic, "m", None).into_iter().map(|w| w.worker_device).collect();
+        assert_eq!(got, vec!["a".to_owned()], "openrouter excluded, the silent worker fails closed");
+        let open = RepoPool { excluded_providers: Vec::new(), ..pool };
+        assert_eq!(pick(&open, Dialect::Anthropic, "m", None).len(), 3, "no exclusion: everyone");
     }
 }
 
