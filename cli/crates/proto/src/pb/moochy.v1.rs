@@ -711,12 +711,23 @@ pub struct DevicePollResponse {
     #[prost(int64, tag = "8")]
     pub cap_uusd_month: i64,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ListDonationsRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDonationsRequest {
+    /// `moochy decisions` (CONTRACT §16.6): the donations TO the projects this user owns (pending
+    /// requests and history, donor names per their visibility), instead of the user's own.
+    #[prost(bool, tag = "1")]
+    pub as_owner: bool,
+    /// as_owner only: one project ("" = all of them)
+    #[prost(string, tag = "2")]
+    pub repo_slug: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListDonationsResponse {
     #[prost(message, repeated, tag = "1")]
     pub donations: ::prost::alloc::vec::Vec<Donation>,
+    /// echoes the request: a relay without owner listing leaves it false and the CLI refuses the answer
+    #[prost(bool, tag = "2")]
+    pub as_owner: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonateRequest {
@@ -748,7 +759,7 @@ pub struct DonateRequest {
 pub struct DonationActionRequest {
     #[prost(string, tag = "1")]
     pub pledge_id: ::prost::alloc::string::String,
-    /// pause | resume | reclaim | update
+    /// pause | resume | reclaim | update; owner of the project: refuse (a pending request)
     #[prost(string, tag = "2")]
     pub action: ::prost::alloc::string::String,
     /// reclaim: > 0 lowers the monthly limit, 0 ends the donation
@@ -757,8 +768,11 @@ pub struct DonationActionRequest {
     /// action = update
     #[prost(message, optional, tag = "4")]
     pub update: ::core::option::Option<DonateRequest>,
+    /// action = refuse: optional, \<= 280 chars, shown to the donor
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Donation {
     #[prost(string, tag = "1")]
     pub pledge_id: ::prost::alloc::string::String,
@@ -787,6 +801,33 @@ pub struct Donation {
     pub schedule: ::prost::alloc::string::String,
     #[prost(int64, tag = "13")]
     pub created_at_ms: i64,
+    /// as_owner listings only:
+    ///
+    /// handle, pseudonym or "" (the donor's visibility)
+    #[prost(string, tag = "14")]
+    pub donor: ::prost::alloc::string::String,
+    /// the decisions trail, oldest first (CONTRACT §16.6)
+    #[prost(message, repeated, tag = "15")]
+    pub events: ::prost::alloc::vec::Vec<DonationEvent>,
+    /// pending: when the request expires unanswered
+    #[prost(int64, tag = "16")]
+    pub expires_at_ms: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DonationEvent {
+    /// requested | accepted | refused | expired | stopped | lowered | resumed | revoked
+    #[prost(string, tag = "1")]
+    pub event: ::prost::alloc::string::String,
+    /// cli | web | email | passkey | system
+    #[prost(string, tag = "2")]
+    pub via: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub at_ms: i64,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    /// key-log index of the signed entry, 0 = none
+    #[prost(int64, tag = "5")]
+    pub log_index: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetDeviceCapRequest {

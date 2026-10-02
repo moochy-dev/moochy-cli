@@ -105,6 +105,10 @@ COMMANDS:
                                   with its own passphrase, that signs approvals, memberships and
                                   claims; only used by these commands, never by the app
   pending                         Requests waiting for your signature (maintainers)
+  decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] [--yes]
+            | decisions accept <id>
+                                  Donors asking to donate to your projects, and what was decided
+                                  (who, when, how); accepting is signed with your passkey on the web
   accept <donor> --repo PROJECT [--revoke] [--yes]
                                   Accept a donor for your project (--revoke removes them);
                                   `approve` is the same command
@@ -264,7 +268,7 @@ fn run() -> Result<()> {
     let home = Home::resolve(o.home.clone())?;
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     // A cloud box (§17.1) has no owner powers and no donor role.
-    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "pending" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
+    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
         crate::boxes::refuse_on_box(&home.load()?, cmd)?;
     }
     match w.as_slice() {
@@ -330,6 +334,7 @@ fn run() -> Result<()> {
         // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
         ["donations", act, id] => crate::donations::action(&home, act, id),
+        ["decisions", rest @ ..] => decisions_cmd(&home, &o, rest),
         ["owner", "init"] => crate::owner::init(&home, false),
         ["owner", "trust", id] => crate::owner::trust(&home, id, o.has("yes")),
         ["owner", "rotate"] => crate::owner::init(&home, true),
@@ -413,6 +418,16 @@ fn logout(home: &Home, o: &Opts) -> Result<()> {
     home.save(&cfg)?;
     emit(&json!({"event": "logged_out", "revoked": told.is_some_and(|r| r.revoked)}));
     Ok(())
+}
+
+/// `moochy decisions …` (CONTRACT §16.6).
+fn decisions_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    match w {
+        [] => crate::decisions::list(home, repo_filter(o)?.as_deref(), o.has("json")),
+        ["refuse", id] => crate::decisions::refuse(home, id, o.reason.as_deref(), o.has("yes")),
+        ["accept", id] => crate::decisions::accept_link(home, id),
+        _ => Err(usage("decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] | decisions accept <id>")),
+    }
 }
 
 /// `moochy box …` (CONTRACT §17.1).

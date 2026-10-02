@@ -51,7 +51,7 @@ fn status(s: &Status) -> crate::util::Error {
     }
 }
 
-fn call(home: &crate::config::Home, op: &str, request: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn call(home: &crate::config::Home, op: &str, request: Vec<u8>) -> Result<Vec<u8>> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
@@ -74,7 +74,7 @@ fn dollars(uusd: i64) -> String {
 
 /// `moochy donations [--json]`: this account's donations.
 pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
-    let b = call(home, "list", ListDonationsRequest {}.encode_to_vec())?;
+    let b = call(home, "list", ListDonationsRequest::default().encode_to_vec())?;
     let r = ListDonationsResponse::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
     for d in &r.donations {
         if json_out {
@@ -136,7 +136,7 @@ pub fn action(home: &crate::config::Home, action: &str, pledge_id: &str) -> Resu
         "stop" => "reclaim",
         _ => return Err(usage("donations pause|resume|stop <id>")),
     };
-    let q = DonationActionRequest { pledge_id: pledge_id.into(), action: action.into(), amount_uusd: 0, update: None };
+    let q = DonationActionRequest { pledge_id: pledge_id.into(), action: action.into(), ..DonationActionRequest::default() };
     let b = call(home, "action", q.encode_to_vec())?;
     let d = Donation::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
     emit(&donation_json(&d));
