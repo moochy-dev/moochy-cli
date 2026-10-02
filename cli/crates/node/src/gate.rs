@@ -58,6 +58,9 @@ pub struct Gate {
     ended: bool,
     /// Tripwire over response text (prompt injection, §15.4): a flag, never a block.
     scanner: TextScanner,
+    /// Visible text of this chunk's events, fed to the tripwire once per chunk (and before a
+    /// `message_stop`): the scanner re-reads its whole window on every feed (CONTRACT §13).
+    pending_text: String,
     warning: Option<&'static str>,
     /// Highest Anthropic content-block index seen (the warning block goes after it).
     max_index: Option<u32>,
@@ -104,24 +107,31 @@ impl Gate {
             withheld_because: NOT_SANDBOXED,
             ended: false,
             scanner: TextScanner::new(),
+            pending_text: String::new(),
             warning: None,
             max_index: None,
             tape: Vec::new(),
         }
     }
 
-    /// Feed one streamed event's text to the tripwire and track block indices.
+    /// Queue one streamed event's text for the tripwire and track block indices.
     fn scan_event(&mut self, start: u64, end: u64) {
         let ev = self.buf.get(rel(start, self.base)..rel(end, self.base)).unwrap_or_default();
-        let (text, index) = event_text(self.dialect, ev, &mut self.tape);
-        if let Some(i) = index {
+        if let Some(i) = event_text(self.dialect, ev, &mut self.tape, &mut self.pending_text) {
             self.max_index = Some(self.max_index.map_or(i, |m| m.max(i)));
         }
-        if let Some(t) = text
-            && let Some(rule) = self.scanner.push(&t)
-        {
+    }
+
+    /// Feed the queued text to the tripwire (same result as one feed per event: the scanner
+    /// concatenates what it is fed).
+    fn scan_pending(&mut self) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        if let Some(rule) = self.scanner.push(&self.pending_text) {
             self.warning.get_or_insert(rule);
         }
+        self.pending_text.clear();
     }
 
     /// The visible warning, as a new text block (Anthropic) or content chunk (OpenAI).
@@ -224,6 +234,7 @@ impl Gate {
                     }
                 }
                 K::Stop => {
+                    self.scan_pending();
                     if self.hold.is_none() {
                         if let Some(rule) = self.warning.take() {
                             self.emit_until(start);
@@ -263,6 +274,7 @@ impl Gate {
             }
         }
         self.items = items;
+        self.scan_pending();
         if self.hold.as_ref().is_some_and(|h| h.closing.is_some()) {
             self.close_hold(seq);
         } else if self.hold.is_none() {
@@ -422,22 +434,31 @@ fn rel(abs: u64, base: u64) -> usize {
     usize::try_from(abs.saturating_sub(base)).unwrap_or(usize::MAX)
 }
 
-/// Text carried by one SSE event, and the content-block index it names (Anthropic). The text
-/// is every human-visible field the re-emitter writes (A216: `reemit::visible_texts` walks the
+/// Appends the text carried by one SSE event to `out`; returns the block index it names
+/// (Anthropic `index`, Responses `output_index`). The text is every human-visible field the re-emitter writes (A216: `reemit::visible_texts` walks the
 /// re-emission allowlists, so inline `content_block.text`, thinking, refusals, … are all
 /// scanned), from the parsed event: no raw-byte prefilter an escape could slip past.
-fn event_text(d: Dialect, ev: &[u8], tape: &mut Vec<moochy_worker::json::Node>) -> (Option<String>, Option<u32>) {
-    let Some(data) = ev.split(|b| *b == b'\n').find_map(|l| l.strip_prefix(b"data:")) else { return (None, None) };
+fn event_text(d: Dialect, ev: &[u8], tape: &mut Vec<moochy_worker::json::Node>, out: &mut String) -> Option<u32> {
+    let data = ev.split(|b| *b == b'\n').find_map(|l| l.strip_prefix(b"data:"))?;
     let data = data.trim_ascii();
     tape.clear();
-    let Ok(doc) = moochy_worker::json::parse(data, tape) else { return (None, None) };
+    let doc = moochy_worker::json::parse(data, tape).ok()?;
     let v = doc.root();
     let index = match d {
         Dialect::Anthropic => v.get("index").and_then(|i| i.raw().parse().ok()),
         Dialect::OpenAiResponses => v.get("output_index").and_then(|i| i.raw().parse().ok()),
         Dialect::OpenAi => None,
     };
-    (visible_text(d, true, v), index)
+    // This event's fields newline-separated; consecutive events concatenated as before.
+    let mut first = true;
+    moochy_worker::reemit::visible_texts(d.worker(), true, v, &mut |t| {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(t);
+    });
+    index
 }
 
 /// All visible text fields of one event or body, newline-separated; `None` when there is none.
@@ -755,6 +776,24 @@ mod tests {
             sse("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
         ];
         let n = 20_000u32;
+        // E22's bursts carry several events per sealed chunk: the tripwire is fed once per chunk.
+        let five = ev.repeat(5);
+        let mut g = Gate::new(Dialect::Anthropic, true, REQ, false);
+        let mut c = Canon::new(Dialect::Anthropic, true);
+        for (i, h) in head.iter().enumerate() {
+            g.push(u32::try_from(i).unwrap(), h.as_bytes()).unwrap();
+            while let Some(b) = g.pop(None, false) {
+                let _ = c.push(&b).unwrap();
+            }
+        }
+        let t = std::time::Instant::now();
+        for i in 0..n / 5 {
+            g.push(i + 2, five.as_bytes()).unwrap();
+            while let Some(b) = g.pop(None, false) {
+                let _ = c.push(&b).unwrap();
+            }
+        }
+        println!("gate+scan+reemit, 5 events per chunk: {} ns/event", t.elapsed().as_nanos() / u128::from(n));
         for canon in [false, true] {
             let mut g = Gate::new(Dialect::Anthropic, true, REQ, false);
             let mut c = Canon::new(Dialect::Anthropic, true);
