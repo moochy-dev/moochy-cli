@@ -1,7 +1,7 @@
 //! Command line (CONTRACT §6): tiny `lexopt` parser, JSON event lines on stdout, exit codes
 //! 0 ok, 2 usage, 3 auth/approval refused, 4 network, 10 internal.
 
-use crate::config::{Home, RepoEntry, valid_slug};
+use crate::config::{Home, RepoEntry};
 use crate::keystore::{self, ProviderKey};
 use crate::node::{Keys, Node, WorkerParts};
 use crate::pb::local::{EnvRequest, JournalRequest, McpOpen, McpUp, PauseRequest, ShutdownRequest, StatusRequest, mcp_up};
@@ -410,10 +410,14 @@ fn box_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
 
 /// `--repo` as a filter (optional, checked).
 fn repo_filter(o: &Opts) -> Result<Option<String>> {
-    match &o.repo {
-        Some(r) if !valid_slug(r) => Err(usage("--repo must be owner/name")),
-        r => Ok(r.clone()),
-    }
+    o.repo.as_deref().map(canonical_repo).transpose()
+}
+
+const REPO_FORMS: &str = "owner/name, github/owner/name or gitlab/group[/subgroup…]/name";
+
+/// A `--repo` value in the link's canonical form (`owner/name` = GitHub, `gitlab/…`).
+fn canonical_repo(r: &str) -> Result<String> {
+    crate::config::canonical_slug(r).ok_or_else(|| usage(format!("--repo is {REPO_FORMS}")))
 }
 
 /// `moochy up` on a cloud box (§17.1): enroll with `MOOCHY_ENROLL` when this machine has no device
@@ -450,27 +454,17 @@ fn checked_relay(o: &Opts, saved: Option<&str>) -> Result<String> {
 }
 
 fn slug_or_detect(o: &Opts) -> Result<String> {
-    let slug = match &o.repo {
-        Some(r) => r.clone(),
-        None => detect_repo().ok_or_else(|| usage("--repo owner/name is required (no git remote found)"))?,
-    };
-    if !valid_slug(&slug) {
-        return Err(usage("--repo must be owner/name"));
+    match &o.repo {
+        Some(r) => canonical_repo(r),
+        None => detect_repo().ok_or_else(|| usage(format!("--repo is required (no github.com or gitlab.com `origin` remote here): {REPO_FORMS}"))),
     }
-    Ok(slug)
 }
 
-/// `owner/name` from the `origin` remote of the current git repository.
+/// The project of the `origin` remote of the current git repository (github.com, gitlab.com).
 fn detect_repo() -> Option<String> {
     let out = crate::util::command("git").args(["config", "--get", "remote.origin.url"]).stderr(std::process::Stdio::null()).output().ok()?;
-    let url = String::from_utf8(out.stdout).ok()?;
-    let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
-    let path = url.rsplit_once(':').map_or(url, |(_, p)| p);
-    let mut parts = path.rsplit('/');
-    let name = parts.next()?;
-    let owner = parts.next()?;
-    let slug = format!("{owner}/{name}");
-    valid_slug(&slug).then_some(slug)
+    let p = crate::button::parse_remote(&String::from_utf8(out.stdout).ok()?).ok()?;
+    crate::config::canonical_slug(&if p.provider == "gitlab" { format!("gitlab/{}", p.path) } else { p.path })
 }
 
 /// `moochy run -- <cmd…>` (CONTRACT §15.1). Fails closed until `moochy-sandbox` is in the build.
@@ -584,10 +578,8 @@ fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     // Plan 07 and the web claim page: `moochy claim <owner/repo>` (positional, E84).
     if let ["claim", repo] = w {
-        if !valid_slug(repo) {
-            return Err(usage("claim <owner/name>"));
-        }
-        return crate::owner::sign(home, &repo.to_ascii_lowercase(), &["claim"], o.has("yes"), false, false, 0);
+        let slug = crate::config::canonical_slug(repo).ok_or_else(|| usage(format!("claim <project>: {REPO_FORMS}")))?;
+        return crate::owner::sign(home, &slug.to_ascii_lowercase(), &["claim"], o.has("yes"), false, false, 0);
     }
     let slug = slug_or_detect(o)?;
     crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))?;
@@ -851,10 +843,20 @@ fn button(o: &Opts, rest: &[&str]) -> Result<()> {
         (true, ["github"]) => Some("github"),
         (true, ["gitlab"]) => Some("gitlab"),
         (false, []) => None,
-        _ => return Err(usage("button [--repo owner/name] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
+        _ => return Err(usage("button [--repo PROJECT] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
     };
     let project = if let Some(r) = &o.repo {
-        crate::button::project(provider.unwrap_or("github"), r)?
+        // `--provider gitlab --repo group/name`, or a provider-qualified `--repo`.
+        match provider {
+            Some(p) if !r.starts_with("github/") && !r.starts_with("gitlab/") => crate::button::project(p, r)?,
+            _ => {
+                let pr = crate::button::from_slug(r)?;
+                if provider.is_some_and(|x| x != pr.provider) {
+                    return Err(usage(format!("--repo names a {} project, not {}", pr.provider, provider.unwrap_or_default())));
+                }
+                pr
+            }
+        }
     } else {
         {
             let out = crate::util::command("git").args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().map_err(|e| usage(format!("git: {e}")))?;

@@ -277,16 +277,31 @@ fn parse_bool(key: &str, v: &str) -> Result<bool> {
     }
 }
 
-/// `owner/name` with conservative characters.
+/// One project path segment as the providers allow it (relay `project.validSegment`).
+fn valid_segment(p: &str) -> bool {
+    (1..=100).contains(&p.len())
+        && !p.starts_with(['.', '-'])
+        && !p.ends_with(".git")
+        && !p.ends_with(".atom")
+        && p.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+/// A project as `--repo` and the link name it (CONTRACT §9): `owner/name` or
+/// `github/owner/name` (GitHub; two segments always mean GitHub), `gitlab/group[/subgroup…]/name`
+/// (up to 20 group levels). Canonical form: `owner/name` for GitHub, `gitlab/…` for GitLab.
+pub fn canonical_slug(s: &str) -> Option<String> {
+    let segs: Vec<&str> = s.split('/').collect();
+    let ok = s.len() <= 300 && segs.iter().all(|p| valid_segment(p));
+    match segs.as_slice() {
+        [_, _] if ok => Some(s.to_owned()),
+        ["github", o, n] if ok => Some(format!("{o}/{n}")),
+        ["gitlab", rest @ ..] if ok && (2..=21).contains(&rest.len()) => Some(s.to_owned()),
+        _ => None,
+    }
+}
+
 pub fn valid_slug(s: &str) -> bool {
-    let ok = |p: &str| {
-        !p.is_empty()
-            && p.len() <= 100
-            && p != "."
-            && p != ".."
-            && p.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-    };
-    matches!(s.split_once('/'), Some((o, n)) if ok(o) && ok(n))
+    canonical_slug(s).is_some()
 }
 
 #[cfg(test)]
@@ -298,5 +313,14 @@ mod tests {
         assert!(!super::valid_slug("acme/../x"));
         assert!(!super::valid_slug("acme/.."));
         assert!(!super::valid_slug("a/b c"));
+        // Provider-qualified paths (CONTRACT §9).
+        use super::canonical_slug as c;
+        assert_eq!(c("github/acme/widget").as_deref(), Some("acme/widget"));
+        assert_eq!(c("github/docs").as_deref(), Some("github/docs"), "two segments: owner github, repo docs");
+        assert_eq!(c("gitlab/group/sub/project").as_deref(), Some("gitlab/group/sub/project"));
+        assert_eq!(c("gitlab/g/p").as_deref(), Some("gitlab/g/p"));
+        assert!(c("bitbucket/a/b").is_none() && c("acme/x/y").is_none() && c("gitlab/a/-/b").is_none() && c("a/b.git").is_none());
+        let deep = format!("gitlab/{}p", "g/".repeat(20));
+        assert!(c(&deep).is_some() && c(&format!("gitlab/g/{}", &deep[7..])).is_none(), "20 group levels at most");
     }
 }

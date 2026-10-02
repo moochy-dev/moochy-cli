@@ -62,6 +62,15 @@ pub fn parse_remote(url: &str) -> Result<Project> {
     project(provider, path)
 }
 
+/// A project from a `--repo` slug (`owner/name`, `github/owner/name`, `gitlab/group[/…]/name`).
+pub fn from_slug(slug: &str) -> Result<Project> {
+    let c = crate::config::canonical_slug(slug).ok_or_else(|| usage("--repo is owner/name, github/owner/name or gitlab/group[/subgroup]/name"))?;
+    match c.strip_prefix("gitlab/") {
+        Some(path) => project("gitlab", path),
+        None => project("github", &c),
+    }
+}
+
 /// Check an `owner/name` (GitHub) or `group[/subgroup…]/name` (GitLab) path.
 pub fn project(provider: &'static str, path: &str) -> Result<Project> {
     let segs: Vec<&str> = path.split('/').collect();
@@ -125,11 +134,13 @@ pub fn snippet(p: &Project, o: &Options) -> Result<String> {
         }
         if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
     };
-    let base = match p.provider {
-        "github" => format!("{ORIGIN}/p/{}", p.path),
-        _ => format!("{ORIGIN}/p/{}/{}", p.provider, p.path),
+    // GitHub: the legacy short form (README buttons in the wild); GitLab: the canonical form, with
+    // actions after `/-/` so nested group paths stay unambiguous (A229).
+    let (base, act) = match p.provider {
+        "github" => (format!("{ORIGIN}/p/{}", p.path), "/"),
+        _ => (format!("{ORIGIN}/p/{}/{}", p.provider, p.path), "/-/"),
     };
-    let (img, donate) = (format!("{base}/button.svg{}", query(None)), format!("{base}/donate"));
+    let (img, donate) = (format!("{base}{act}button.svg{}", query(None)), format!("{base}{act}donate"));
     let height = match size.as_deref() {
         Some("s") => 28,
         Some("l") => 44,
@@ -140,7 +151,7 @@ pub fn snippet(p: &Project, o: &Options) -> Result<String> {
         // No explicit theme: the snippet that follows the reader's light or dark theme.
         "html" if theme.is_none() => format!(
             "<a href=\"{donate}\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"{}\">\n    <img alt=\"{label}\" height=\"{height}\" src=\"{img}\">\n  </picture>\n</a>",
-            format_args!("{base}/button.svg{}", query(Some("dark")))
+            format_args!("{base}{act}button.svg{}", query(Some("dark")))
         ),
         "html" => format!("<a href=\"{donate}\"><img alt=\"{label}\" height=\"{height}\" src=\"{img}\"></a>"),
         "rst" => format!(".. image:: {img}\n   :target: {donate}\n   :alt: {label}"),
@@ -192,9 +203,12 @@ mod tests {
         let o = Options { label: Some("Fuel this project".into()), style: Some("compact".into()), size: Some("l".into()), ..Options::default() };
         assert_eq!(
             snippet(&p, &o).unwrap(),
-            "[![Fuel this project](https://moochy.dev/p/gitlab/g/s/p/button.svg?label=Fuel+this+project&size=l&style=compact)](https://moochy.dev/p/gitlab/g/s/p/donate)"
+            "[![Fuel this project](https://moochy.dev/p/gitlab/g/s/p/-/button.svg?label=Fuel+this+project&size=l&style=compact)](https://moochy.dev/p/gitlab/g/s/p/-/donate)"
         );
         assert!(snippet(&p, &Options { style: Some("neon".into()), ..Options::default() }).is_err());
+        assert_eq!(from_slug("gitlab/g/s/p").unwrap(), p);
+        assert_eq!(from_slug("github/acme/widget").unwrap(), Project { provider: "github", path: "acme/widget".into() });
+        assert_eq!(from_slug("github/docs").unwrap(), Project { provider: "github", path: "github/docs".into() });
         assert!(snippet(&p, &Options { label: Some("<script>".into()), ..Options::default() }).is_err());
     }
 }
