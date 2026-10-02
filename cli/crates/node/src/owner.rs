@@ -13,7 +13,7 @@ use crate::pb::link::{LookupRequest, LookupResponse};
 use crate::pb::local::{ApproveRequest, ClaimRequest, MembersRequest, SignResponse, SubmitEntryRequest, members_request::Op};
 use crate::util::{Ctx as _, Result, auth, b64e, clean, internal, now_ms, usage};
 use moochy_keylog::Kind;
-use moochy_keylog::entry::{Body, claim_body, grant_body, owner_key_body, owner_key_id, parse_body, sig_message};
+use moochy_keylog::entry::{Body, authorized_owner_key_body, claim_body, grant_body, owner_key_body, owner_key_id, parse_body, sig_message};
 use moochy_proto::crypto::SignKey;
 use serde_json::json;
 use std::io::{BufRead as _, Write as _};
@@ -124,7 +124,21 @@ fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -
     let msg = sig_message(Kind::OwnerKeyAdded, &body);
     let mut sigs = vec![new.sign(&msg).to_vec()];
     sigs.extend(prev.map(|p| p.sign(&msg).to_vec()));
-    let r = rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs }))?;
+    let r = match rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs })) {
+        // The account has a passkey (KEYLOG §4b): a first CLI key needs it to co-sign on the web.
+        Err(e) if prev.is_none() && e.msg.contains("owner_key_exists") => {
+            let authorizer = match crate::keylog::KeyLog::passkey_authorizer(home, &cfg, &pseudonym) {
+                Some(Some(a)) => a,
+                Some(None) => return Err(usage("this account already has an owner key: if it is a passkey you added on the web, trust it here first (`moochy owner trust ok_…`, from the key-log alert) and run this again; if it is a key of this CLI, use `moochy owner rotate`")),
+                None => return Err(usage("this account already has an owner key (the public key log, needed to check its passkeys, is not configured here)")),
+            };
+            let body = authorized_owner_key_body(&pseudonym, &new.public(), now_ms(), &authorizer);
+            let sig = new.sign(&sig_message(Kind::OwnerKeyAdded, &body));
+            eprintln!("Your account has a passkey ({authorizer}): approve this new owner key {} with it on the web.", owner_key_id(&new.public()));
+            rt.block_on(submit(home, SubmitEntryRequest { request_id: String::new(), kind: "OWNER_KEY_ADDED".into(), body, sigs: vec![sig.to_vec()] }))?
+        }
+        r => r?,
+    };
     store(home, cfg.relay.as_deref(), &new, &pass)?;
     crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": owner_key_id(&new.public()), "log_index": r.log_index}));
     Ok(new)

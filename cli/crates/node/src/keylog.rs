@@ -84,6 +84,26 @@ fn add_key(path: &std::path::Path, k: &[u8; 32]) {
     let _ = crate::config::write_private(path, all.as_bytes());
 }
 
+/// The `ok_…` id of a passkey owner key from its digest (`owner_key_id(cose)` = the first 16
+/// bytes of `passkey_digest(cose)`, hex).
+fn passkey_id(digest: &[u8; 32]) -> String {
+    std::iter::once("ok_".to_owned()).chain(digest.iter().take(16).map(|b| format!("{b:02x}"))).collect()
+}
+
+/// One box device of this account, from the key log (`KeyLog::boxes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxRow {
+    pub device_id: String,
+    /// Its enrollment token (`bt_…`).
+    pub box_id: String,
+    /// The one repo it may use.
+    pub repo_id: String,
+    pub expires_at_ms: u64,
+    pub revoked: bool,
+    /// `now ≥ expires_at_ms`.
+    pub expired: bool,
+}
+
 impl KeyLog {
     /// `None` when no log key is configured (or it is unusable): nothing is trusted then.
     pub fn open(home: &Home, cfg: &Config, sign_pub: Option<[u8; 32]>) -> Option<Arc<Self>> {
@@ -98,8 +118,10 @@ impl KeyLog {
         let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
         let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
         let state = home.state_dir();
+        // A box (§17.1) runs the monitor for the gate only: its owner's other boxes and keys are
+        // not its business (WIRING §9b).
         let me = match (cfg.pseudonym.clone(), sign_pub) {
-            (Some(pseudonym), Some(pk)) => {
+            (Some(pseudonym), Some(pk)) if cfg.box_device.is_none() => {
                 let mut known_keys = read_keys(&state.join("device_keys"));
                 known_keys.push(pk);
                 Some(Me { pseudonym, known_keys })
@@ -129,11 +151,10 @@ impl KeyLog {
         }
     }
 
-    /// Foreground CLI (owner commands): the pseudonym that owns `device` in this node's persisted
-    /// mirror, read from disk — independent of `node.sock`, and trustworthy: the records must
-    /// reproduce a checkpoint signed by the pinned log key (`Monitor::open`). Outer `None`: no
-    /// key log on this node; inner `None`: the device is not in the log.
-    pub fn device_owner(home: &Home, cfg: &Config, device: &str) -> Option<Option<String>> {
+    /// Foreground CLI: this node's persisted mirror, read from disk — independent of `node.sock`,
+    /// and trustworthy: the records must reproduce a checkpoint signed by the pinned log key
+    /// (`Monitor::open`). `None`: no key log on this node.
+    fn mirror(home: &Home, cfg: &Config) -> Option<View> {
         let key = NoteKey::parse(&effective_log_key(cfg)?).ok()?;
         let origin = cfg.log_origin.clone().unwrap_or_else(|| key.name().to_owned());
         let tag = crate::config::origin_tag(cfg.relay.as_deref().unwrap_or(""));
@@ -146,8 +167,53 @@ impl KeyLog {
             witnesses: Vec::new(),
             min_cosignatures: 0,
         };
-        let m = Monitor::open(mc).ok()?;
-        Some(m.view().state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
+        Monitor::open(mc).ok().map(|m| m.view())
+    }
+
+    /// Owner commands: the pseudonym that owns `device` in the mirror. Outer `None`: no key log
+    /// on this node; inner `None`: the device is not in the log.
+    pub fn device_owner(home: &Home, cfg: &Config, device: &str) -> Option<Option<String>> {
+        Some(Self::mirror(home, cfg)?.state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
+    }
+
+    /// `moochy box list` (§17.1, WIRING §9b): this account's boxes in the mirror, in log order,
+    /// revoked and expired ones included. `None`: no key log on this node (or not logged in).
+    pub fn boxes(home: &Home, cfg: &Config) -> Option<Vec<BoxRow>> {
+        let ps = cfg.pseudonym.as_deref()?;
+        let now = crate::util::now_ms();
+        Self::mirror(home, cfg)?
+            .state(|s| {
+                s.boxes(ps)
+                    .into_iter()
+                    .map(|(id, d)| BoxRow {
+                        device_id: id.to_owned(),
+                        box_id: d.box_id.clone().unwrap_or_default(),
+                        repo_id: d.repo_scope.clone().unwrap_or_default(),
+                        expires_at_ms: d.expires_at_ms,
+                        revoked: d.revoked,
+                        expired: d.expires_at_ms != 0 && now >= d.expires_at_ms,
+                    })
+                    .collect()
+            })
+            .ok()
+    }
+
+    /// `moochy owner init` on an account with passkeys (KEYLOG §4b): an active passkey owner key
+    /// of `pseudonym` that the human already trusted on this device (`moochy owner trust`, which
+    /// records its digest; a passkey's id is the first half of that digest). Never one the relay
+    /// names. Outer `None`: no key log.
+    pub fn passkey_authorizer(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Option<String>> {
+        let trusted = read_keys(&home.state_dir().join("owner_keys"));
+        Some(
+            Self::mirror(home, cfg)?
+                .state(|s| {
+                    trusted.iter().find_map(|d| {
+                        s.owner_key(&passkey_id(d)).filter(|k| k.passkey.is_some() && !k.revoked && k.pseudonym == pseudonym && k.owner_pub == *d).map(|k| k.id.clone())
+                    })
+                })
+                .ok()
+                .flatten(),
+        )
     }
 
     /// Run the monitor for the node's lifetime (once).
@@ -279,6 +345,10 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
                         )),
                     );
                 }
+            }
+            // §17.1: a box of this account is news, not a threat (BoxOutsideRepo is the threat).
+            if matches!(a, Alert::BoxEnrolled { .. }) {
+                return ("info", "key log: box enrolled".into(), f);
             }
             ("error", "key log alert".into(), f)
         }
@@ -456,4 +526,13 @@ pub fn check_receipt_ack(node: &Node, receipt: &[u8], ack: &crate::pb::link::Rec
         let _ = std::fs::create_dir_all(&dir);
         let _ = crate::config::write_private(&dir.join(name), rec.to_string().as_bytes());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn passkey_ids_from_digests() {
+        let cose = b"\xa5\x01\x02\x03\x26";
+        assert_eq!(super::passkey_id(&moochy_keylog::state::passkey_digest(cose)), moochy_keylog::entry::owner_key_id(cose));
+    }
 }
