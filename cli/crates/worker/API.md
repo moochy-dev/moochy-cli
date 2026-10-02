@@ -219,3 +219,46 @@ Facts relied on (docs.x.ai, fetched 2026-10-01; sources in the agent report):
 - Usage: `prompt_tokens` includes `prompt_tokens_details.cached_tokens`; `completion_tokens` is visible output only and `completion_tokens_details.reasoning_tokens` is extra (`total_tokens = prompt + completion + reasoning`); `cost_in_usd_ticks` is the authoritative charge (`provider_cost_uusd`). Every stream chunk carries cumulative `usage`.
 - Rate limits: per model RPS/TPM; no rate-limit response headers are documented. `x-ratelimit-*` headers are parsed if present; otherwise `headroom_pct()` is `None`.
 - **Cost-bound caveat (for the catalog/reservation):** xAI's `max_completion_tokens` bounds *visible* output only; reasoning tokens (on by default, effort `high`, cannot be disabled on grok-4.5+) are not bounded by it. See the agent report for the reservation recommendation.
+
+## Local inference servers (provider kind `local`)
+
+A donor's own OpenAI-compatible server (Ollama `:11434`, LM Studio `:1234`, vLLM `:8000`, llama.cpp server `:8080`). It is free (price 0), goals are counted in tokens, and it goes through the same firewall, limits, re-emission and tool-call gating as hosted providers. Dialect: `openai.chat` only, at `<base>/v1/chat/completions`.
+
+### For mo-donor (key and host configuration)
+
+- **`moochy keys add local --base-url http://127.0.0.1:11434 [--key-stdin] [--allow-unvetted-host]`:**
+  - Validate with `provider::check_local_base_url(url, allow_unvetted) -> Result<LocalHost, ConfigError>`; the URL is an origin only (`http(s)://host[:port]`).
+  - `LocalHost::Loopback`: no warning. `LocalHost::Lan` (RFC 1918, IPv6 ULA, CGNAT/Tailscale `100.64/10`): warn that prompts cross the LAN, in clear text with `http://`.
+  - Always refused: link-local (`169.254/16` incl. cloud metadata, `fe80::/10`), unspecified, multicast, broadcast.
+  - Public IPs and host names (DNS can rebind them) are refused unless `--allow-unvetted-host` (dev). With it the result is `LocalHost::Unvetted`; print a loud warning at every start.
+- **API key:** optional. Empty means no `Authorization` header; Ollama and LM Studio ignore keys, and vLLM uses one only with `--api-key`.
+- **Adapter:** `Adapter::new(&AdapterConfig { provider: Provider::Local, base_url: Some(url), api_key, insecure_dev: false, dev_root: None, limits: Limits::local() })`. Use `Adapter::new_local(&cfg, true)` only with `--allow-unvetted-host`.
+  - `Limits::local()` = headers 300 s and idle 300 s: a local server may load the model and process the whole prompt before the first byte.
+  - `warm()` pre-opens a keep-alive connection. `https://` requires HTTP/2 (most local servers speak HTTP/1.1, so use `http://` on loopback/LAN).
+- **Model mapping:** the donor maps public catalog slugs to server model ids in config, for example `"local/qwen2.5-0.5b-instruct-q4" = "qwen2.5:0.5b"`. Discover the server's ids with `GET <base>/v1/models` (Ollama, LM Studio, vLLM and llama.cpp all serve it). Pass the server id as `provider_model_id`.
+  - The firewall refuses **cloud-routed ids** (`firewall::is_cloud_routed`: Ollama `*:cloud` / `*-cloud` tags). Those requests would leave the machine for ollama.com, billed to the donor's account. The refusal is `model_unavailable`, retryable elsewhere.
+- **Firewall:** same OpenAI table. Also refused: `store`, `modalities`, `verbosity` and every server-specific extension (`top_k`, `min_p`, `repeat_penalty`, `chat_template_kwargs`, `options`, …).
+  - Mutations: model id mapping and `stream_options.include_usage` only. No end-user id: there is no account to attribute abuse to on the donor's own box.
+- **Offer:** `rl_headroom` 100 (local servers send no rate-limit headers). `slots_max` should match the server's parallel slots (llama.cpp `-np`, Ollama `OLLAMA_NUM_PARALLEL`).
+- **Usage:** from the server's `usage` (forced via `include_usage`; exact).
+  - Without it, llama.cpp's cumulative `timings` give exact counts (`prompt_n` + `cache_n` = prompt tokens).
+  - Otherwise usage is `estimated` (output from streamed bytes; Ollama-style `timings` without `cache_n` count all prompt tokens as input).
+  - Reasoning is inside `completion_tokens`, bounded by `max_tokens`. `provider_cost_uusd` is `None`; cost = catalog price 0.
+
+### For mo-relay (catalog and trust tier)
+
+- **Catalog entries:** `provider: "local"`, `dialects: ["openai.chat"]`, every price field 0, `max_output` per model, `default_effort: "none"` (or the model's).
+- **Own public slugs**, for example `local/<model>-<quant>`: a quantised local model is not the hosted model, so requesters opt in to it explicitly. Never reuse a hosted slug.
+- **Trust tier:** add a field such as `trust: "self_reported"` for local entries. Usage comes from the donor's own server (a lying donor can inflate token counts), and nothing is billed. So:
+  - local tokens count toward token-denominated goals and a separate "local compute" leaderboard, labelled self-reported;
+  - they never count toward money totals;
+  - receipts settle at 0 (`r = 0`, so no reservation is needed);
+  - disputes still apply: visible output ±25% (03 §12.2).
+- **Scheduling:** a local pledge serves only the `local/*` slugs it offers. Treat it like any donor for approvals (owner-signed `DONOR_APPROVED`).
+
+### Verified
+
+- **Recorded fixtures:** 16 byte-exact responses from Ollama 0.35.0 and llama.cpp server b11312 (Qwen2.5-0.5B, Qwen3-0.6B thinking), with provenance in `tests/fixtures/local/README.md`.
+- **Tests:** `tests/local.rs` covers per-server usage, tool calls, lossless re-emission, the host-vetting table, adapter rules and the firewall.
+- **Live test:** `MOOCHY_LOCAL_SERVERS=… cargo test --test local -- --ignored` passes end to end against both servers (text and tool call).
+- **Fuzz:** `local_url` (7 M executions), plus `stream`, `reemit` and `firewall` with local seeds and `Provider::Local`; no crash.

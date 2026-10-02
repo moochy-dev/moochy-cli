@@ -430,6 +430,19 @@ const O_USAGE: T = T::Obj(&[
     M("num_sources_used", T::U64, false),
 ]);
 
+/// llama.cpp / Ollama `timings` (local servers): numbers only; the usage fallback reads it.
+const O_TIMINGS: T = T::Obj(&[
+    M("cache_n", T::U64, false),
+    M("prompt_n", T::U64, false),
+    M("prompt_ms", T::Num, false),
+    M("prompt_per_token_ms", T::Num, false),
+    M("prompt_per_second", T::Num, false),
+    M("predicted_n", T::U64, false),
+    M("predicted_ms", T::Num, false),
+    M("predicted_per_token_ms", T::Num, false),
+    M("predicted_per_second", T::Num, false),
+]);
+
 const O_TOOL_CALL_DELTA: T = T::Obj(&[
     M("index", T::U64, true),
     M("id", T::Ident(ID), false),
@@ -469,6 +482,7 @@ pub(crate) const OPENAI_CHUNK: T = T::Obj(&[
         true,
     ),
     M("usage", T::Or(&[T::Null, O_USAGE]), false),
+    M("timings", O_TIMINGS, false),
 ]);
 
 pub(crate) const O_ERROR: T = T::Obj(&[M(
@@ -529,6 +543,7 @@ pub(crate) const OPENAI_BODY: T = T::Obj(&[
         true,
     ),
     M("usage", T::Or(&[T::Null, O_USAGE]), false),
+    M("timings", O_TIMINGS, false),
 ]);
 
 // ---------------------------------------------------------------------------------------

@@ -1,0 +1,18 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1790893850,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"Hello"}}],"created":1790893850,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":","}}],"created":1790893850,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" how"}}],"created":1790893850,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" are"}}],"created":1790893850,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" you"}}],"created":1790893851,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"?"}}],"created":1790893851,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":1790893851,"id":"chatcmpl-uB47MZgFmWhiL5LolFgn5yF7IumoKhaH","model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","system_fingerprint":"b11312-0c1e57098","object":"chat.completion.chunk","timings":{"cache_n":34,"prompt_n":1,"prompt_ms":99.244,"prompt_per_token_ms":99.244,"prompt_per_second":10.076175889726331,"predicted_n":7,"predicted_ms":610.878,"predicted_per_token_ms":101.813,"predicted_per_second":9.821928437429404}}
+
+data: [DONE]
+
