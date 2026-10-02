@@ -59,18 +59,19 @@ fn slots_max(node: &Node) -> u32 {
     node.cfg.slots_max.unwrap_or(crate::config::DEFAULT_SLOTS)
 }
 
-/// `(dialect, public model)` this node can serve: adapters × catalog entries of their provider.
-/// (dialect, model, provider) for every catalog model an adapter of this device can serve.
-fn served_models(node: &Node) -> Vec<(Dialect, String, String)> {
+/// `(dialect, public model, provider)` this node can serve: adapters × catalog entries of their
+/// provider (the relay steers on the provider too, e.g. a project's excluded providers).
+fn served_models(node: &Node) -> Vec<(Dialect, String, &'static str)> {
     let cat = node.catalog();
     let only = node.cfg.models_override();
     let mut out = Vec::new();
     for a in &node.adapters {
-        for e in cat.entries.iter().filter(|e| e.provider == a.provider().as_str() && only.as_ref().is_none_or(|o| o.contains(&e.model.as_str()))) {
+        for e in cat.entries.iter().filter(|e| e.provider == a.provider().as_str() && only.as_ref().is_none_or(|o| o.contains(&e.model.as_str())) && node.provider_model_id(e).is_some()) {
             for d in &e.dialects {
                 let Some(d) = Dialect::from_wire(d.as_str()) else { continue };
-                if a.provider().serves(d.worker()) && !out.iter().any(|(od, om, op)| *od == d && *om == e.model && *op == e.provider) {
-                    out.push((d, e.model.clone(), e.provider.clone()));
+                let item = (d, e.model.clone(), a.provider().as_str());
+                if a.provider().serves(d.worker()) && !out.contains(&item) {
+                    out.push(item);
                 }
             }
         }
@@ -99,7 +100,7 @@ pub fn offer(node: &Node) -> pb::NodeMsg {
     let now = now_ms();
     let rl = lock(&node.rl_headroom);
     let headroom = |m: &str| rl.get(m).filter(|(_, exp)| *exp > now).map_or(100, |(p, _)| u32::from(*p));
-    let models = served_models(node).into_iter().map(|(d, m, provider)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m, provider }).collect();
+    let models = served_models(node).into_iter().map(|(d, m, p)| pb::ModelOffer { dialect: d.wire().into(), rl_headroom: headroom(&m), model: m, provider: p.into() }).collect();
     drop(rl);
     let free = if paused || !can_serve(node) { 0 } else { slots_max(node).saturating_sub(node.worker_busy.load(Ordering::Relaxed)) };
     let cap = device_cap(node).unwrap_or(0);
@@ -423,20 +424,26 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     };
     let fwc = engine::fw_catalog(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
     let policy = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
-    let mut aliases: Vec<&str> = vec![entry.model.as_str(), entry.provider_model_id.as_str()];
+    let pmid = node.provider_model_id(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
+    let mut aliases: Vec<&str> = vec![entry.model.as_str(), pmid.as_str()];
     aliases.extend(entry.aliases.iter().map(String::as_str));
     let effort = Effort::parse(&route.effort).ok_or_else(|| with_ck("route_mismatch", false, Some("effort".into())))?;
     let flags = engine::route_flags(&route).ok_or_else(|| with_ck("route_mismatch", false, Some("flags".into())))?;
-    // ponytail: the gateway device is only known inside the payload, which the parent must not
-    // parse; until Assign carries it (verified against the child's answer), the provider-facing
-    // pseudonym is per (repo, donation) rather than per (repo, member device).
-    let pseudo = user_pseudonym(&assign.repo_id, &assign.pledge_id);
+    // Per-member provider pseudonym H(repo ‖ gateway device), never the raw id. The device comes
+    // from `Assign.gateway_device` (relay-asserted, ids only): it is checked below against the
+    // device the child decoded from the signed payload, and that device against the key log,
+    // before anything reaches the provider. An older relay without it: per (repo, donation).
+    let claimed_gw = Some(assign.gateway_device.as_str()).filter(|d| !d.is_empty());
+    if claimed_gw.is_some_and(|d| d.parse::<moochy_proto::DeviceId>().is_err()) {
+        return Err(with_ck("bad_envelope", false, None));
+    }
+    let pseudo = user_pseudonym(&assign.repo_id, claimed_gw.unwrap_or(&assign.pledge_id));
     let req = ValidateRequest {
         provider: adapter.provider(),
         dialect: dialect.worker(),
         policy,
         catalog: fwc,
-        provider_model_id: &entry.provider_model_id,
+        provider_model_id: &pmid,
         user_pseudonym: &pseudo,
         max_price: Some(MaxPrice { prompt_uusd_per_mtok: entry.input, completion_uusd_per_mtok: entry.out }),
         route: Route {
@@ -473,6 +480,9 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         task_sig: moochy_proto::B(v.task_sig),
     };
     let prepared = v.prepared;
+    if claimed_gw.is_some_and(|d| d != inner.gateway_device.text()) {
+        return Err(with_ck("bad_envelope", false, Some("the relay named another requesting device than the signed request".into())));
+    }
     let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
     match gateway_key(node, &inner.gateway_device.text(), &assign.repo_id) {
         Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
@@ -675,14 +685,19 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         cache_write_1h: out.usage.cache_write_1h,
         cache_read: out.usage.cache_read,
         estimated: out.usage.estimated || (openrouter && or_cost.is_none()),
-        provider_cost_uusd: if openrouter { Some(or_cost.unwrap_or(reserved)) } else { None },
+        // xAI's reported charge (`cost_in_usd_ticks`) is authoritative too, but optional; the
+        // relay refuses a provider cost above the reservation, so it is capped there.
+        provider_cost_uusd: match a.entry.provider.as_str() {
+            "openrouter" => Some(or_cost.unwrap_or(reserved)),
+            "xai" => or_cost.map(|c| c.min(reserved)),
+            _ => None,
+        },
     };
     let fast = a.route.flags.iter().any(|f| f == "fast");
     // Fallback when a cost cannot be computed (e.g. OpenRouter without a reported cost): the reservation.
     let cost = money::cost_uusd(&a.entry, &usage, fast).unwrap_or(reserved);
-    // xAI bills reasoning beyond `max_tokens` and reports the charge (`cost_in_usd_ticks`). The
-    // receipt stays catalog-priced (only OpenRouter may carry a provider cost today), but the
-    // donor's own cap settles at what xAI actually charged when that is higher.
+    // The donor's own cap settles at what xAI actually charged when that is above the receipt
+    // (reasoning beyond the reservation).
     let local = if a.entry.provider == "xai" { out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok()).map_or(cost, |c| c.max(cost)) } else { cost };
     let model = clean(out.model.as_deref().unwrap_or("")).into_owned();
     let req_id = request_id.or(out.id).unwrap_or_default();
@@ -723,6 +738,10 @@ async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer
     let (key, payload) = (a.key.clone(), signed.encode_to_vec());
     if with_store(node, move |s| s.put_receipt(&key, &payload, ucost, now_ms())).await.is_none_or(|r| r.is_err()) {
         log("error", "outbox write failed", &json!({"task": refuse.task}));
+    } else {
+        // The receipt is in the outbox: the in-flight record has served its purpose.
+        let path = inflight_path(node, refuse.task, refuse.attempt);
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }
     let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
     let acked = sent
@@ -898,10 +917,21 @@ async fn recover_inflight(node: &Arc<Node>, keys: &Keys) {
             .and_then(|(m, reserved, rc)| Some((sign_receipt(keys, rc, m)?, *reserved, rc)));
         if let Some((signed, cost, rc)) = signed {
             let (key, payload) = (attempt_key(&rc.task_id.text(), rc.attempt.into()), signed.encode_to_vec());
-            if with_store(node, move |s| s.put_receipt(&key, &payload, cost, now_ms())).await.is_none_or(|r| r.is_err()) {
-                continue; // keep the record: retried at the next start
+            // Never a second receipt for an attempt the outbox already holds one for (the real
+            // receipt is fsynced before `End`): the relay treats different bytes for a settled
+            // attempt as a conflict.
+            let put = with_store(node, move |s| {
+                if s.since(0).any(|(k, _)| k == key.as_slice()) {
+                    return Ok(false);
+                }
+                s.put_receipt(&key, &payload, cost, now_ms()).map(|()| true)
+            })
+            .await;
+            match put {
+                Some(Ok(true)) => log("warn", "recovered an attempt interrupted by a crash: estimated receipt queued", &json!({"task": rc.task_id.text(), "attempt": rc.attempt})),
+                Some(Ok(false)) => {}
+                _ => continue, // keep the record: retried at the next start
             }
-            log("warn", "recovered an attempt interrupted by a crash: estimated receipt queued", &json!({"task": rc.task_id.text(), "attempt": rc.attempt}));
         }
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }

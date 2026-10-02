@@ -170,8 +170,9 @@ pub async fn revoke_self(node: &Node, reason: &str) -> Result<LogEntryAck, Statu
         return Err(Status::failed_precondition("not logged in"));
     };
     let pseudonym = node.cfg.pseudonym.as_deref().unwrap_or_default();
-    let body = moochy_keylog::entry::lp(&[me.as_bytes(), pseudonym.as_bytes(), reason.as_bytes()]);
-    let sig = keys.sign.sign(&moochy_keylog::entry::sig_message(moochy_keylog::Kind::KeyRevoked, &body));
+    let body = moochy_keylog::entry::revoke_body(me, pseudonym, reason);
+    // A device's revocation request (KEYLOG §2a): not a log signature.
+    let sig = keys.sign.sign(&moochy_keylog::entry::revoke_request_message(&body));
     submit_entry(node, &format!("revoke-{me}"), "KEY_REVOKED", Bytes::from(body), vec![Bytes::copy_from_slice(&sig)], Duration::from_secs(5)).await
 }
 

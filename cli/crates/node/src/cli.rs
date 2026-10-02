@@ -22,7 +22,7 @@ Open-source client (Apache-2.0) · 100% free
 USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
 
 COMMANDS:
-  login [--relay URL] [--ca-file PEM] [--roles gateway,worker] [--name NAME] [--headless]
+  login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless]
                                   Add this device to your account. Roles: gateway uses donated
                                   tokens, worker donates yours. Only the default server unless
                                   MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
@@ -46,6 +46,9 @@ COMMANDS:
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
+  keys add local --base-url http://127.0.0.1:11434 --model local/<slug>=<server id> [--key-stdin]
+                                  Donate your own GPU: an OpenAI-compatible server on this
+                                  machine or your LAN (Ollama, LM Studio, vLLM, llama.cpp)
   keys list | keys remove <provider> | keys rotate
                                   rotate = new device keys for this machine (the old ones stop
                                   working 24 h later)
@@ -134,6 +137,8 @@ struct Opts {
     out: Option<PathBuf>,
     reason: Option<String>,
     from_file: Option<PathBuf>,
+    log_key: Option<String>,
+    models: Vec<String>,
     worktree: Option<PathBuf>,
     allow_hosts: Vec<String>,
     config: Option<PathBuf>,
@@ -165,13 +170,15 @@ fn parse() -> Result<Opts> {
             Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("model") => o.models.push(s(p.value().map_err(err)?)?),
+            Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -201,23 +208,7 @@ fn run() -> Result<()> {
     let home = Home::resolve(o.home.clone())?;
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     match w.as_slice() {
-        ["login"] => {
-            // A175: a pinned CA replaces the public roots: development and tests only.
-            if o.ca_file.is_some() && !dev_mode() {
-                return Err(usage("--ca-file is only accepted with MOOCHY_INSECURE_DEV=1 (development and tests)"));
-            }
-            let relay = o.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
-            if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
-                // A135: a lookalike relay could harvest a login; only for development and tests.
-                if !dev_mode() {
-                    return Err(usage("another server than the default needs MOOCHY_INSECURE_DEV=1 (development and tests only)"));
-                }
-                eprintln!("Warning: signing in to a server that is not the default ({}). This device gets a separate keystore for it.", clean(relay));
-            }
-            let roles: Vec<String> = o.roles.as_deref().unwrap_or("gateway").split(',').map(|r| r.trim().to_owned()).collect();
-            let name = o.name.clone().unwrap_or_else(crate::login::default_name);
-            rt_small()?.block_on(crate::login::login(&home, relay, o.ca_file.clone(), roles, name))
-        }
+        ["login"] => login_cmd(&home, &o),
         ["logout"] => logout(&home, &o),
         ["report", task] => report(&home, &o, task),
         ["doctor"] => doctor(&home),
@@ -245,7 +236,6 @@ fn run() -> Result<()> {
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
-        ["verify", r] => verify(&home, r),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
         ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
@@ -262,6 +252,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["approve", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
+        ["verify", r] => rt_small()?.block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            let v = c.verify(crate::pb::local::VerifyRequest { receipt_ref: (*r).into() }).await.map_err(|s| auth(format!("not verified: {}", clean(s.message()))))?;
+            println!("{}", v.into_inner().result_json);
+            Ok(())
+        }),
         ["donate"] => crate::donations::donate(&home, &slug_or_detect(&o)?, o.cap.unwrap_or(0), o.has("yes")),
         // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
@@ -391,22 +387,6 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
     let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
     let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
     std::process::exit(code);
-}
-
-/// `moochy verify <receipt_ref>` (07 §2): a public receipt of a request this device made.
-fn verify(home: &Home, receipt_ref: &str) -> Result<()> {
-    if receipt_ref.is_empty() || receipt_ref.len() > 64 || !receipt_ref.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
-        return Err(usage("verify <receipt_ref> (e.g. r_… from the receipt page)"));
-    }
-    let ready: serde_json::Value = std::fs::read(home.node_json()).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| usage("the Moochy app is not running (start it with `moochy up`)"))?;
-    let url = ready.get("gateway_url").and_then(serde_json::Value::as_str).unwrap_or_default();
-    let (status, body) = crate::run::local_get(&home.state_dir(), url, &format!("/moochy/verify/{receipt_ref}"))?;
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-    emit(&v);
-    match status {
-        200 => Ok(()),
-        _ => Err(auth(format!("not verified: {}", clean(v.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error"))))),
-    }
 }
 
 fn env(home: &Home, o: &Opts) -> Result<()> {
@@ -662,7 +642,37 @@ fn git_tracked(path: &std::path::Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn login_cmd(home: &Home, o: &Opts) -> Result<()> {
+    // A175: a pinned CA replaces the public roots: development and tests only.
+    if o.ca_file.is_some() && !dev_mode() {
+        return Err(usage("--ca-file is only accepted with MOOCHY_INSECURE_DEV=1 (development and tests)"));
+    }
+    let relay = o.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
+    if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
+        // A135: a lookalike relay could harvest a login; only for development and tests.
+        if !dev_mode() {
+            return Err(usage("another server than the default needs MOOCHY_INSECURE_DEV=1 (development and tests only)"));
+        }
+        eprintln!("Warning: signing in to a server that is not the default ({}). This device gets a separate keystore for it.", clean(relay));
+    }
+    let roles: Vec<String> = o.roles.as_deref().unwrap_or("gateway").split(',').map(|r| r.trim().to_owned()).collect();
+    let name = o.name.clone().unwrap_or_else(crate::login::default_name);
+    if let Some(k) = &o.log_key {
+        moochy_keylog::NoteKey::parse(k).map_err(|e| usage(format!("--log-key: {e}")))?;
+    }
+    rt_small()?.block_on(crate::login::login(home, relay, o.ca_file.clone(), roles, name))?;
+    if let Some(k) = &o.log_key {
+        let mut cfg = home.load()?;
+        cfg.log_key = Some(k.clone());
+        home.save(&cfg)?;
+    }
+    Ok(())
+}
+
 fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
+    if provider == "local" {
+        return crate::keycheck::add_local(home, o.base_url.as_deref(), o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
+    }
     if !crate::keycheck::PROVIDERS.contains(&provider) {
         return Err(usage(format!("provider must be one of: {}", crate::keycheck::PROVIDERS.join(", "))));
     }
@@ -688,7 +698,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     let mut cfg = home.load()?;
     let mut sec = keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != provider);
-    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone() });
+    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new() });
     keystore::save(home, &cfg, &sec)?;
     // CONTRACT §15.2 "bounded worst case": a dedicated key with a spend limit at the provider.
     eprintln!("Tip: use a key made only for Moochy, with a monthly spend limit set at {provider}: the most it can ever cost you is that limit.");
@@ -753,6 +763,7 @@ fn up_foreground(home: Home, offline: bool, unsafe_no_lockdown: bool) -> Result<
 fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts> {
     use moochy_worker::provider::{Adapter, AdapterConfig, Limits};
     let mut adapters = Vec::new();
+    let mut local_models = std::collections::HashMap::new();
     for p in &secrets.providers {
         let Some(provider) = moochy_worker::Provider::parse(&p.provider) else {
             log("warn", "this version cannot donate with this provider yet; update moochy", &json!({"provider": p.provider}));
@@ -760,21 +771,30 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         };
         // `--base-url` replaces the provider origin only; moochy-worker owns the per-dialect paths.
         let base_url = p.base_url.clone();
+        let local = provider == moochy_worker::Provider::Local;
         let cfg = AdapterConfig {
             provider,
             api_key: zeroize::Zeroizing::new(p.key.clone()),
             base_url,
-            insecure_dev: dev_mode(),
+            // A local server is the donor's own: vetted by host (worker API.md), not dev mode.
+            insecure_dev: dev_mode() && !local,
             dev_root: None,
-            limits: Limits::default(),
+            limits: if local { Limits::local() } else { Limits::default() },
         };
-        match Adapter::new(&cfg) {
+        if local {
+            local_models.extend(p.models.iter().map(|(k, v)| (k.clone(), v.clone())));
+            if p.allow_unvetted_host {
+                eprintln!("moochy: WARNING the local model server {} is not a loopback or private address (--allow-unvetted-host, development only)", clean(p.base_url.as_deref().unwrap_or("")));
+            }
+        }
+        let built = if local { Adapter::new_local(&cfg, p.allow_unvetted_host) } else { Adapter::new(&cfg) };
+        match built {
             Ok(a) => adapters.push(Arc::new(a)),
             Err(e) => log("error", "provider key not usable", &json!({"provider": p.provider, "error": e.to_string()})),
         }
     }
     let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
-    Ok(WorkerParts { adapters, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
+    Ok(WorkerParts { adapters, local_models, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
 }
 
 async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
