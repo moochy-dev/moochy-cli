@@ -45,6 +45,10 @@ pub struct Config {
     /// it the node trusts relay-asserted membership and approvals (D14, dev only).
     pub log_key: Option<String>,
     pub log_origin: Option<String>,
+    /// Receipt transparency log note key (KEYLOG §8, origin `moochy.dev/receipts`): inclusion
+    /// proofs in `ReceiptAck` are verified against it (compiled in for the default relay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts_log_key: Option<String>,
     /// Public Git anchor of the key log (hourly fork check), e.g. a raw-file base URL.
     pub log_anchor_url: Option<String>,
     /// Worker: serve only these public models (comma-separated), below what the keys allow.
@@ -52,6 +56,12 @@ pub struct Config {
     /// Projects (`owner/name`, comma-separated) whose clients receive tool calls from donated
     /// tokens outside `moochy run` (CONTRACT §15.4 opt-in; warned at every start).
     pub allow_unsandboxed_tools: Option<String>,
+    /// Donor safety step (07 §8.1 step 4) accepted at this Unix ms: a monthly cap for this
+    /// machine and the provider-side spend limit advice. No serving without it (outside dev).
+    pub donor_safety_ack_ms: Option<u64>,
+    /// Pinned donors per project (06 §8 "pinned donors"): `owner/name` → donor names; tasks for
+    /// that project are sealed only to these donors.
+    pub pinned_donors: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -180,7 +190,7 @@ impl Config {
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "monthly_limit" => {
-                self.device_monthly_cap_uusd = Some(crate::util::parse_dollars(value.trim_start_matches('$')).ok_or_else(|| usage("monthly_limit is a dollar amount, e.g. 20 or 12.50"))?);
+                self.device_monthly_cap_uusd = Some(crate::util::parse_amount(value).map_err(|e| usage(format!("monthly_limit is a dollar amount, e.g. 20 or 12.50: {e}")))?);
             }
             // Machine form of `monthly_limit` (millionths of a dollar), kept for scripts.
             "device_monthly_cap_uusd" => {
@@ -212,6 +222,10 @@ impl Config {
                 moochy_keylog::NoteKey::parse(value).map_err(|e| usage(format!("log_key: {e}")))?;
                 self.log_key = Some(value.into());
             }
+            "receipts_log_key" => {
+                moochy_keylog::NoteKey::parse(value).map_err(|e| usage(format!("receipts_log_key: {e}")))?;
+                self.receipts_log_key = Some(value.into());
+            }
             "log_anchor_url" => {
                 if !value.starts_with("https://") {
                     return Err(usage("log_anchor_url must be https://"));
@@ -219,6 +233,22 @@ impl Config {
                 self.log_anchor_url = Some(value.into());
             }
             "models_override" => self.models_override = Some(value.into()).filter(|v: &String| !v.is_empty()),
+            "pinned_donors" => {
+                // `owner/name=alice,bob` (empty list clears the project's pins).
+                let (slug, names) = value.split_once('=').ok_or_else(|| usage("pinned_donors is owner/name=donor1,donor2"))?;
+                if !valid_slug(slug) {
+                    return Err(usage("pinned_donors is owner/name=donor1,donor2"));
+                }
+                let names: Vec<String> = names.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect();
+                if names.len() > 64 || !names.iter().all(|n| n.len() <= 64 && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))) {
+                    return Err(usage("pinned_donors: at most 64 names of letters, digits, _ - ."));
+                }
+                if names.is_empty() {
+                    self.pinned_donors.remove(&slug.to_ascii_lowercase());
+                } else {
+                    self.pinned_donors.insert(slug.to_ascii_lowercase(), names);
+                }
+            }
             "allow_unsandboxed_tools" => {
                 if !value.is_empty() && !value.split(',').all(|s| valid_slug(s.trim())) {
                     return Err(usage("allow_unsandboxed_tools is a comma-separated list of owner/name projects (empty to clear)"));
@@ -227,7 +257,7 @@ impl Config {
             }
             _ => {
                 return Err(usage(format!(
-                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, log_key, log_anchor_url)"
+                    "unknown config key {key:?} (monthly_limit, slots_max, gateway_addr, journal_full_text, auto_cache, firewall_level, models_override, allow_unsandboxed_tools, pinned_donors, log_key, receipts_log_key, log_anchor_url)"
                 )));
             }
         }

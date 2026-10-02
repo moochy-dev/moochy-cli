@@ -53,21 +53,77 @@ fn zygote() -> std::io::Result<()> {
     let mut p = moochy_sandbox::DonorPolicy::new(PathBuf::from("/dev/null"), 0);
     p.ro_paths.clear();
     lockdown(&p)?;
+    // Live children (bounded: the node keeps at most a few warm plus those in use).
+    let mut children: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut cmd = [0u8; 1];
     loop {
         // Reap finished children (single-use: each exits after its one request).
-        while let Ok(Some(_)) = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG) {}
-        match (&ctl).read(&mut cmd) {
-            Ok(1) => {}
-            _ => return Ok(()), // node gone
+        while let Ok(Some((pid, _))) = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG) {
+            children.remove(&pid.as_raw_nonzero().get());
         }
-        let v = moochy_sandbox::spawn_validator_with(|ch| moochy_worker::validate::child_main(&ch, &ch)).map_err(std::io::Error::other)?;
-        let fds = [v.sock.as_fd()];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-        let mut anc = rustix::net::SendAncillaryBuffer::new(&mut space);
-        anc.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
-        rustix::net::sendmsg(&ctl, &[IoSlice::new(b"V")], &mut anc, rustix::net::SendFlags::empty())?;
-        // Our copy of the parent end closes here; the child is reaped later.
+        if (&ctl).read(&mut cmd).ok() != Some(1) {
+            return Ok(()); // node gone
+        }
+        match cmd {
+            // `K` + pid: kill a stuck child (A221). Only our own children.
+            [b'K'] => {
+                let mut b = [0u8; 4];
+                (&ctl).read_exact(&mut b)?;
+                let pid = i32::from_be_bytes(b);
+                if children.contains(&pid) {
+                    kill(pid);
+                }
+            }
+            // `F`: fork one; reply `V` + pid with the child's socket.
+            [b'F'] => {
+                if children.len() >= MAX_CHILDREN {
+                    return Err(std::io::Error::other("too many live validators"));
+                }
+                let v = moochy_sandbox::spawn_validator_with(|ch| moochy_worker::validate::child_main(&ch, &ch)).map_err(std::io::Error::other)?;
+                let pid = v.pid();
+                children.insert(pid);
+                limit_cpu(pid);
+                let mut msg = [b'V', 0, 0, 0, 0];
+                if let Some(t) = msg.get_mut(1..) {
+                    t.copy_from_slice(&pid.to_be_bytes());
+                }
+                let fds = [v.sock.as_fd()];
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut anc = rustix::net::SendAncillaryBuffer::new(&mut space);
+                anc.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
+                rustix::net::sendmsg(&ctl, &[IoSlice::new(&msg)], &mut anc, rustix::net::SendFlags::empty())?;
+                // Our copy of the parent end closes here; the child is reaped later.
+            }
+            _ => return Err(std::io::Error::other("unknown zygote command")),
+        }
+    }
+}
+
+/// At most this many children alive at once (warm + in use + not yet reaped).
+const MAX_CHILDREN: usize = 256;
+
+/// A221: a validator gets at most a few seconds of CPU (one request: warm-up + one parse);
+/// beyond it the kernel kills it (SIGXCPU, then SIGKILL at the hard limit).
+#[cfg(target_os = "linux")]
+fn limit_cpu(pid: i32) {
+    use rustix::process::{Pid, Resource, Rlimit, prlimit};
+    if let Some(p) = Pid::from_raw(pid) {
+        let _ = prlimit(Some(p), Resource::Cpu, Rlimit { current: Some(CPU_SECS), maximum: Some(CPU_SECS.saturating_add(1)) });
+    }
+}
+
+// macOS: no prlimit on another process; moochy-sandbox gives each validator child RLIMIT_CPU 5 s
+// itself (limit_validator_child), and the node's deadline + `K` kill bound a stuck child.
+#[cfg(not(target_os = "linux"))]
+fn limit_cpu(_: i32) {}
+
+/// CPU seconds per validator child.
+#[cfg(target_os = "linux")]
+const CPU_SECS: u64 = 5;
+
+fn kill(pid: i32) {
+    if let Some(p) = rustix::process::Pid::from_raw(pid) {
+        let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
     }
 }
 
@@ -91,7 +147,7 @@ pub struct Pool {
     /// after the lockdown), so the worker stops offering until the app restarts.
     dead: std::sync::atomic::AtomicBool,
     ctl: Mutex<UnixStream>,
-    idle: Mutex<Vec<UnixStream>>,
+    idle: Mutex<Vec<(UnixStream, i32)>>,
     _zygote: Mutex<std::process::Child>,
 }
 
@@ -116,7 +172,7 @@ impl Pool {
     }
 
     /// One fresh child from the zygote (blocking: a fork + one round trip).
-    fn fetch(&self) -> std::io::Result<UnixStream> {
+    fn fetch(&self) -> std::io::Result<(UnixStream, i32)> {
         let r = self.fetch_inner();
         if r.is_err() {
             self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -124,10 +180,10 @@ impl Pool {
         r
     }
 
-    fn fetch_inner(&self) -> std::io::Result<UnixStream> {
+    fn fetch_inner(&self) -> std::io::Result<(UnixStream, i32)> {
         let ctl = lock(&self.ctl);
         (&*ctl).write_all(b"F")?;
-        let mut byte = [0u8; 1];
+        let mut msg = [0u8; 5];
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut anc = rustix::net::RecvAncillaryBuffer::new(&mut space);
         // MSG_CMSG_CLOEXEC is Linux-only; elsewhere the flag is set right after the receive (the
@@ -136,14 +192,18 @@ impl Pool {
         let flags = rustix::net::RecvFlags::CMSG_CLOEXEC;
         #[cfg(not(target_os = "linux"))]
         let flags = rustix::net::RecvFlags::empty();
-        rustix::net::recvmsg(&*ctl, &mut [IoSliceMut::new(&mut byte)], &mut anc, flags)?;
+        let got = rustix::net::recvmsg(&*ctl, &mut [IoSliceMut::new(&mut msg)], &mut anc, flags)?;
+        let pid = match (got.bytes, msg) {
+            (5, [b'V', a, b, c, d]) => i32::from_be_bytes([a, b, c, d]),
+            _ => return Err(std::io::Error::other("bad zygote answer")),
+        };
         for m in anc.drain() {
             if let rustix::net::RecvAncillaryMessage::ScmRights(mut fds) = m
                 && let Some(fd) = fds.next()
             {
                 #[cfg(not(target_os = "linux"))]
                 rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
-                return Ok(UnixStream::from(fd));
+                return Ok((UnixStream::from(fd), pid));
             }
         }
         Err(std::io::Error::other("zygote sent no validator"))
@@ -170,8 +230,8 @@ impl Pool {
     /// Validate one request in a fresh jailed child. Child failures are `busy` (retryable).
     pub async fn validate(self: &Arc<Self>, req: &ValidateRequest<'_>) -> Result<Validated, ValidateError> {
         let warm = lock(&self.idle).pop();
-        let s = if let Some(s) = warm {
-            s
+        let (s, pid) = if let Some(w) = warm {
+            w
         } else {
             let me = self.clone();
             tokio::task::spawn_blocking(move || me.fetch()).await.map_err(|_| ValidateError::Child("spawn"))?.map_err(|_| ValidateError::Child("spawn"))?
@@ -180,6 +240,20 @@ impl Pool {
         tokio::task::spawn_blocking(move || me.fill());
         s.set_nonblocking(true).map_err(|_| ValidateError::Child("socket"))?;
         let s = tokio::net::UnixStream::from_std(s).map_err(|_| ValidateError::Child("socket"))?;
-        moochy_worker::validate::validate_on(s, req, DEADLINE).await
+        let r = moochy_worker::validate::validate_on(s, req, DEADLINE).await;
+        if matches!(r, Err(ValidateError::Child(_))) {
+            // Stuck past the deadline or misbehaving: the zygote (its parent) kills it (A221).
+            let me = self.clone();
+            tokio::task::spawn_blocking(move || me.kill(pid));
+        }
+        r
+    }
+
+    fn kill(&self, pid: i32) {
+        let mut m = [b'K', 0, 0, 0, 0];
+        if let Some(t) = m.get_mut(1..) {
+            t.copy_from_slice(&pid.to_be_bytes());
+        }
+        let _ = (&*lock(&self.ctl)).write_all(&m);
     }
 }
