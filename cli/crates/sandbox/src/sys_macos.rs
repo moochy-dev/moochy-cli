@@ -123,3 +123,94 @@ pub fn channel_stream() -> std::os::unix::net::UnixStream {
     // SAFETY: after `isolate_fds`, CHANNEL_FD is open and owned by nobody else.
     unsafe { std::os::unix::net::UnixStream::from_raw_fd(CHANNEL_FD) }
 }
+
+/// Between fork and exec of `moochy run`'s `sandbox-exec`: `setsid` (own
+/// session, no controlling terminal: A192) and the rlimits macOS enforces per
+/// process (open files, core, CPU). `RLIMIT_NPROC` is per *user* on macOS
+/// (it would cap the user's whole desktop) and `RLIMIT_AS` is not enforced, so
+/// neither is set here (DESIGN.md).
+pub fn session_and_limits(cmd: &mut std::process::Command, l: &crate::Limits) {
+    use std::os::unix::process::CommandExt as _;
+    let mut lims: Vec<(libc::c_int, u64)> = vec![(libc::RLIMIT_NOFILE, l.open_files), (libc::RLIMIT_CORE, l.core_bytes)];
+    if l.cpu_seconds > 0 {
+        lims.push((libc::RLIMIT_CPU, l.cpu_seconds));
+    }
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe setsid/setrlimit on data captured (allocated) before
+    // the fork; it allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for &(res, v) in &lims {
+                let r = libc::rlimit { rlim_cur: v, rlim_max: v };
+                if libc::setrlimit(res, &raw const r) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+/// `killpg(pgid, SIGKILL)`; a no-op for pgid ≤ 1.
+pub fn killpg(pgid: i32) {
+    if pgid > 1 {
+        // SAFETY: killpg only sends a signal; it touches no memory.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+const FORWARDED: [libc::c_int; 5] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGWINCH];
+
+extern "C" fn forward(sig: libc::c_int) {
+    let pg = FORWARD_TO.load(std::sync::atomic::Ordering::Relaxed);
+    if pg > 1 {
+        // SAFETY: killpg is async-signal-safe and touches no memory.
+        unsafe {
+            libc::killpg(pg, sig);
+        }
+    }
+}
+
+/// While alive, the launcher passes Ctrl-C, Ctrl-\, SIGTERM, SIGHUP and window
+/// resizes on to the run's process group (it has no controlling terminal, so
+/// the tty no longer signals it) instead of dying and orphaning it. The
+/// previous handlers come back on drop.
+pub struct Forwarding(Vec<(libc::c_int, libc::sigaction)>);
+
+pub fn forward_signals(pgid: i32) -> Forwarding {
+    FORWARD_TO.store(pgid, std::sync::atomic::Ordering::Relaxed);
+    let mut old = Vec::with_capacity(FORWARDED.len());
+    for sig in FORWARDED {
+        // SAFETY: sigaction structs are plain data, fully initialised here;
+        // `forward` is an async-signal-safe extern "C" handler.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = forward as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            let mut prev: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, &raw const sa, &raw mut prev) == 0 {
+                old.push((sig, prev));
+            }
+        }
+    }
+    Forwarding(old)
+}
+
+impl Drop for Forwarding {
+    fn drop(&mut self) {
+        for (sig, prev) in &self.0 {
+            // SAFETY: restores the handler sigaction returned earlier.
+            unsafe {
+                libc::sigaction(*sig, prev, std::ptr::null_mut());
+            }
+        }
+        FORWARD_TO.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}

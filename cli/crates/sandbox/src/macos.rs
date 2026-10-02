@@ -34,28 +34,73 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         eprintln!("moochy: WARNING --unsafe-no-sandbox: running WITHOUT a sandbox (debugging only).");
         let mut cmd = Command::new(program);
         cmd.args(args).current_dir(&spec.worktree);
-        apply_env(&mut cmd, spec, Path::new("/tmp"));
+        apply_env(&mut cmd, spec, Path::new("/tmp"), &spec.worktree);
         return Ok(code(cmd.status().map_err(Error::Exec)?));
     }
     let worktree = spec
         .worktree
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
-    let masks = mask::collect(&worktree)?;
+    let scan = mask::scan(&worktree)?;
+    let git_before = crate::git::snapshot(&scan.dotgits);
     // A private scratch dir per run: the shared /tmp and the per-user
     // /var/folders stay out of reach (other apps' files live there).
     let scratch = make_scratch()?;
-    let profile = maintainer_profile(spec, &worktree, &masks, &scratch);
+    let home = scratch.join("home");
+    std::fs::create_dir(&home).map_err(|e| setup("create scratch home", e))?;
+    let profile = maintainer_profile(spec, &worktree, &scan.masks, &scratch);
+    let profile = match profile {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(e);
+        }
+    };
 
     let mut cmd = Command::new("sandbox-exec");
     cmd.arg("-p").arg(&profile).arg("--").arg(program).args(args);
     cmd.current_dir(&worktree);
     cmd.env_clear();
-    apply_env(&mut cmd, spec, &scratch);
-    let status = cmd.status().map_err(Error::Exec);
+    apply_env(&mut cmd, spec, &scratch, &home);
+    // Own session (no controlling terminal: no TIOCSTI into the user's shell,
+    // A192) + rlimits, set between fork and exec.
+    crate::sys_macos::session_and_limits(&mut cmd, &spec.limits);
+    let status = supervise(&mut cmd, spec.limits.wall_seconds);
     let _ = std::fs::remove_dir_all(&scratch);
-    Ok(code(status?))
+    crate::git::notice_if_changed(&worktree, &git_before);
+    status
 }
+
+/// Run `cmd` (a session leader), forwarding terminal signals to its process
+/// group, enforcing the wall deadline (exit 124), and killing whatever is left
+/// in the group when it exits (A198). A descendant that starts its own session
+/// escapes the group: macOS has no PID namespace (residual, DESIGN.md).
+fn supervise(cmd: &mut Command, wall_seconds: u64) -> Result<i32, Error> {
+    use std::time::{Duration, Instant};
+    let mut child = cmd.spawn().map_err(Error::Exec)?;
+    let pgid = i32::try_from(child.id()).unwrap_or(0);
+    let fwd = crate::sys_macos::forward_signals(pgid);
+    let deadline = Instant::now().checked_add(Duration::from_secs(wall_seconds)).filter(|_| wall_seconds > 0);
+    let result = loop {
+        let Some(d) = deadline else { break child.wait().map(code).map_err(Error::Exec) };
+        match child.try_wait() {
+            Ok(Some(s)) => break Ok(code(s)),
+            Ok(None) if Instant::now() >= d => {
+                crate::sys_macos::killpg(pgid);
+                let _ = child.wait();
+                break Ok(WALL_TIMEOUT_EXIT);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => break Err(Error::Exec(e)),
+        }
+    };
+    drop(fwd);
+    crate::sys_macos::killpg(pgid);
+    result
+}
+
+/// Exit code when the wall-clock deadline kills the run (as `timeout(1)`).
+const WALL_TIMEOUT_EXIT: i32 = 124;
 
 fn make_scratch() -> Result<std::path::PathBuf, Error> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -76,9 +121,11 @@ fn real(p: &Path) -> String {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
 }
 
-fn apply_env(cmd: &mut Command, spec: &Spec, scratch: &Path) {
+fn apply_env(cmd: &mut Command, spec: &Spec, scratch: &Path, home: &Path) {
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
-    cmd.env("HOME", &spec.worktree); // no access to the real home
+    // A private home in the scratch dir: tools' creds/history never land in
+    // the repo (A198), and the real home stays out of reach.
+    cmd.env("HOME", home);
     cmd.env("TMPDIR", scratch);
     for (k, v) in &spec.env {
         cmd.env(k, v);
@@ -97,8 +144,10 @@ fn code(s: std::process::ExitStatus) -> i32 {
 /// Deny-by-default maintainer profile: read system paths, read-write the
 /// worktree + scratch, deny the masked secret files explicitly, network only to
 /// the gateway loopback port, no exec of setuid helpers, no mach services.
-pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::PathBuf], scratch: &Path) -> String {
+pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::PathBuf], scratch: &Path) -> Result<String, Error> {
     let wt = sbpl_quote(&worktree.to_string_lossy());
+    let wt_re = regex_escape(&worktree.to_string_lossy())
+        .ok_or(Error::Unsupported("worktree path has characters the macOS profile cannot express"))?;
     let mut p = String::new();
     // Rules are matched last-wins: `deny default` first, allows after, the
     // secret masks last so they beat the worktree allow.
@@ -141,7 +190,37 @@ pub fn maintainer_profile(spec: &Spec, worktree: &Path, masks: &[std::path::Path
     for m in masks {
         let _ = writeln!(p, "(deny file-read* file-write* process-exec* (subpath {}))", sbpl_quote(&m.to_string_lossy()));
     }
-    p
+    // Git metadata the host's git later trusts (A191): no write to any `.git`
+    // at any depth — which also blocks creating one (`git init`, a nested repo).
+    // `git_writable` reopens the top-level one except the files that make the
+    // host run code or redirect.
+    let git_re = "\\.[gG][iI][tT]";
+    if spec.git_writable {
+        let _ = writeln!(p, "(deny file-write* (regex #\"^{wt_re}/.+/{git_re}(/|$)\"))");
+        let _ = writeln!(
+            p,
+            "(deny file-write* (regex #\"^{wt_re}/{git_re}/(hooks|config|config\\.worktree|modules|commondir)(/|$)\"))"
+        );
+    } else {
+        let _ = writeln!(p, "(deny file-write* (regex #\"^{wt_re}/(.+/)?{git_re}(/|$)\"))");
+    }
+    Ok(p)
+}
+
+/// A path as a literal inside an SBPL `#"…"` regex; `None` for characters we
+/// can't express safely there (quote, backslash, control).
+fn regex_escape(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len().saturating_mul(2));
+    for c in s.chars() {
+        if c == '"' || c == '\\' || c.is_control() {
+            return None;
+        }
+        if ".^$*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 /// Donor self-lockdown profile (§15.2a): deny process-exec/process-fork, limit

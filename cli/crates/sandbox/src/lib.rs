@@ -28,6 +28,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 mod donor;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -35,6 +37,11 @@ mod linux;
 pub mod git;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod mask;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod proxy;
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzzing;
 #[cfg(target_os = "linux")]
 mod seccomp;
 #[cfg(target_os = "linux")]
@@ -77,6 +84,14 @@ pub struct Spec {
     /// ends. The agent inside cannot forge it for an unsandboxed process outside
     /// because it never leaves the sandbox env. `None` = inject nothing.
     pub run_token: Option<String>,
+    /// `--allow-host`: exact host names the agent may reach on :443 through the
+    /// launcher's CONNECT proxy (`HTTPS_PROXY` inside). Empty (default) = no
+    /// proxy, no network but the gateway. Linux only for now.
+    pub allow_hosts: Vec<String>,
+    /// Directories no visible path may be or contain (A197): a worktree, `ro_paths`
+    /// or `rw_paths` entry that is `/` or an ancestor of one of these is
+    /// refused. Default: the real `$HOME`. mo-node adds the Moochy home.
+    pub protected: Vec<PathBuf>,
     /// Resource limits. Defaults are generous but finite (fork-bomb / OOM safe).
     pub limits: Limits,
     /// Let the agent write `.git` (commit inside). `hooks/`, `config` and
@@ -98,8 +113,15 @@ pub struct Limits {
     pub cpu_seconds: u64,
     /// Max open files (`RLIMIT_NOFILE`).
     pub open_files: u64,
-    /// Max processes/threads for this user inside the userns (`RLIMIT_NPROC`).
+    /// Max processes/threads for this user inside the userns (`RLIMIT_NPROC`;
+    /// also the sandbox-wide cgroup `pids.max`).
     pub processes: u64,
+    /// Memory for the whole sandbox, bytes (cgroup `memory.max`, swap 0). 0 =
+    /// no cgroup memory limit (`memory_bytes` still caps each process).
+    pub memory_total_bytes: u64,
+    /// CPU for the whole sandbox in percent of one CPU (cgroup `cpu.max`; 250 =
+    /// 2.5 CPUs). 0 = unlimited.
+    pub cpu_percent: u32,
     /// Max core dump size (`RLIMIT_CORE`); 0 disables cores.
     pub core_bytes: u64,
     /// Wall-clock deadline for the whole run, seconds. 0 = no deadline. On
@@ -114,6 +136,8 @@ impl Default for Limits {
             cpu_seconds: 0,
             open_files: 1024,
             processes: 512,
+            memory_total_bytes: 0,
+            cpu_percent: 0,
             core_bytes: 0,
             wall_seconds: 0,
         }
@@ -122,6 +146,12 @@ impl Default for Limits {
 
 /// Path at which [`Spec::gateway_socket`] is exposed inside the sandbox.
 pub const GATEWAY_SOCK_PATH: &str = "/run/moochy/gateway.sock";
+
+/// Loopback port of the `--allow-host` proxy inside the sandbox.
+pub const PROXY_LOOPBACK_PORT: u16 = 3128;
+
+/// Path of the `--allow-host` proxy socket inside the sandbox.
+pub const PROXY_SOCK_PATH: &str = "/run/moochy/proxy.sock";
 
 /// Environment variable carrying [`Spec::run_token`] inside the sandbox.
 pub const RUN_TOKEN_ENV: &str = "MOOCHY_RUN_TOKEN";
@@ -160,6 +190,8 @@ impl Spec {
             cwd: None,
             run_token: None,
             git_writable: false,
+            allow_hosts: Vec::new(),
+            protected: std::env::var_os("HOME").map(PathBuf::from).into_iter().collect(),
             limits: Limits::default(),
             unsafe_no_sandbox: false,
         }
@@ -173,6 +205,17 @@ impl Spec {
     pub fn run(&self, program: &std::ffi::OsStr, args: &[OsString]) -> Result<i32, Error> {
         if self.gateway_loopback_port.is_some() && self.gateway_socket.is_none() {
             return Err(Error::Unsupported("gateway_loopback_port requires gateway_socket"));
+        }
+        if !self.unsafe_no_sandbox {
+            self.check_exposure()?;
+        }
+        if !self.allow_hosts.is_empty() {
+            if cfg!(not(target_os = "linux")) {
+                return Err(Error::Unsupported("--allow-host is implemented only on Linux for now"));
+            }
+            if self.gateway_loopback_port == Some(PROXY_LOOPBACK_PORT) {
+                return Err(Error::Unsupported("gateway_loopback_port collides with the --allow-host proxy port"));
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -190,6 +233,38 @@ impl Spec {
             ))
         }
     }
+}
+
+impl Spec {
+    /// A197: refuse a view that would expose `/`, the real home or the Moochy
+    /// home (keystore, run key, other repos) inside the sandbox.
+    fn check_exposure(&self) -> Result<(), Error> {
+        let protected: Vec<PathBuf> = self.protected.iter().filter_map(|p| p.canonicalize().ok()).collect();
+        let visible = std::iter::once(&self.worktree).chain(&self.rw_paths).chain(&self.ro_paths);
+        for p in visible.filter_map(|p| p.canonicalize().ok()) {
+            let hit = if p.parent().is_none() { Some(p.clone()) } else { protected.iter().find(|q| q.starts_with(&p)).cloned() };
+            if let Some(q) = hit {
+                return Err(Error::Setup {
+                    what: "sandbox view check",
+                    err: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{} would expose {} inside the sandbox; use a project directory", p.display(), q.display()),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The cgroup v2 directory `Spec::run` would create its per-run cgroup in
+/// (`memory.max`, `pids.max`, `cpu.max`, `cgroup.kill` at the end), or `None`
+/// when no delegated cgroup is available and rlimits are the only limits. For
+/// `moochy doctor`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn delegated_cgroup() -> Option<PathBuf> {
+    cgroup::delegated_parent()
 }
 
 /// Default read-only system roots. These exist on virtually every Unix host and
