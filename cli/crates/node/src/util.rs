@@ -97,11 +97,31 @@ pub fn lp(fields: &[&[u8]]) -> Vec<u8> {
 
 /// `--cap`: `$20` / `$12.50` is dollars (what people type); a bare integer is already µ$
 /// (machine callers). Never guessed from the digit count.
-pub fn parse_limit(s: &str) -> Option<u64> {
-    match s.trim().strip_prefix('$') {
-        Some(d) => parse_dollars(d),
-        None => s.trim().parse().ok(),
+/// Sanity ceiling for a dollar amount typed on the command line ($100,000).
+pub const MAX_AMOUNT_UUSD: u64 = 100_000 * 1_000_000;
+
+/// A dollar amount from the command line (CONTRACT §6: amounts on the command line are dollars;
+/// µ$ only in `*_uusd` keys and on the wire): `$20`, `20`, `20.50` → µ$. At most 2 decimals, no
+/// sign, at most [`MAX_AMOUNT_UUSD`]. The error says what was wrong.
+pub fn parse_amount(s: &str) -> std::result::Result<u64, String> {
+    let t = s.trim();
+    let d = t.strip_prefix('$').unwrap_or(t);
+    if d.starts_with('-') {
+        return Err(format!("{t}: amounts cannot be negative"));
     }
+    if d.split_once('.').is_some_and(|(_, f)| f.len() > 2) {
+        return Err(format!("{t}: dollars and cents only (at most 2 decimals, e.g. 20.50)"));
+    }
+    let v = parse_dollars(d).ok_or_else(|| format!("{t}: not a dollar amount (e.g. 20 or $20.50)"))?;
+    if v > MAX_AMOUNT_UUSD {
+        return Err(format!("{t}: more than ${} is refused as a likely mistake", MAX_AMOUNT_UUSD / 1_000_000));
+    }
+    Ok(v)
+}
+
+/// [`parse_amount`] for callers that only need yes/no.
+pub fn parse_limit(s: &str) -> Option<u64> {
+    parse_amount(s).ok()
 }
 
 /// `12.5` → 12_500_000 µ$ (at most 6 decimals; checked math).
@@ -264,6 +284,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn amounts_are_dollars() {
+        // CONTRACT §6: `--cap 20` is $20.00, never 20 µ$.
+        assert_eq!(parse_amount("20"), Ok(20_000_000));
+        assert_eq!(parse_amount("$20"), Ok(20_000_000));
+        assert_eq!(parse_amount("20.50"), Ok(20_500_000));
+        assert_eq!(parse_amount(" $0.05 "), Ok(50_000));
+        assert_eq!(parse_amount("100000"), Ok(MAX_AMOUNT_UUSD));
+        for bad in ["20.505", "-5", "$-5", "abc", "", "$", "1e3", "100000.01", "99999999999999999999"] {
+            assert!(parse_amount(bad).is_err(), "{bad} accepted");
+        }
+        assert_eq!(parse_limit("20"), Some(20_000_000));
+    }
+
+    #[test]
     fn ulid_roundtrip() {
         let u = ulid().unwrap();
         assert_eq!(u.len(), 26);
@@ -296,8 +330,9 @@ mod tests {
     fn dollars() {
         assert_eq!(parse_limit("$20"), Some(20_000_000));
         assert_eq!(parse_limit("$12.50"), Some(12_500_000));
-        assert_eq!(parse_limit("1000"), Some(1000), "bare integer = µ$");
-        assert_eq!(parse_limit("$0.000001"), Some(1));
+        // CONTRACT §6: command-line amounts are dollars (a bare integer is NOT µ$).
+        assert_eq!(parse_limit("1000"), Some(1_000_000_000));
+        assert_eq!(parse_limit("$0.000001"), None, "at most 2 decimals");
         assert_eq!(parse_limit("$1.0000001"), None);
         assert_eq!(parse_limit("$-3"), None);
         assert_eq!(parse_dollars("20"), Some(20_000_000));

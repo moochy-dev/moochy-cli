@@ -184,12 +184,12 @@ pub fn add_local(home: &crate::config::Home, base_url: Option<&str>, key_stdin: 
         map.insert(slug.to_owned(), id.to_owned());
     }
     if map.is_empty() {
-        eprintln!("The server lists: {}. Map public slugs to them with --model local/<slug>=<id>.", served.join(", "));
+        eprintln!("The server lists: {}. Catalog models with one of these ids are served as is; map others with --model local/<slug>=<id>.", served.join(", "));
     }
     let mut cfg = home.load()?;
     let mut sec = crate::keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != "local");
-    sec.providers.push(crate::keystore::ProviderKey { provider: "local".into(), key: key.to_string(), base_url: Some(url.to_owned()), allow_unvetted_host: allow_unvetted, models: map.clone() });
+    sec.providers.push(crate::keystore::ProviderKey { provider: "local".into(), key: key.to_string(), base_url: Some(url.to_owned()), allow_unvetted_host: allow_unvetted, models: map.clone(), served_ids: served.iter().filter(|id| !moochy_worker::firewall::is_cloud_routed(id)).cloned().collect() });
     crate::keystore::save(home, &cfg, &sec)?;
     crate::util::emit(&serde_json::json!({"event": "key_added", "provider": "local", "models": map}));
     Ok(())

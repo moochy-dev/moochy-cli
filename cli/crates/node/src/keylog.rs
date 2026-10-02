@@ -36,9 +36,24 @@ pub const DEFAULT_LOG_VKEY: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_VKEY"
 /// anything the relay says.
 pub fn effective_log_key(cfg: &Config) -> Option<String> {
     cfg.log_key.clone().or_else(|| {
-        let default = cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY));
-        DEFAULT_LOG_VKEY.filter(|k| default && !k.is_empty()).map(str::to_owned)
+        DEFAULT_LOG_VKEY.filter(|k| default_relay(cfg) && !k.is_empty()).map(str::to_owned)
     })
+}
+
+/// The default relay's public Git anchor of the key log (raw-file base URL), compiled into
+/// release builds (`MOOCHY_DEFAULT_LOG_ANCHOR`, T-C06-015).
+pub const DEFAULT_LOG_ANCHOR: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_ANCHOR");
+
+fn default_relay(cfg: &Config) -> bool {
+    cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY))
+}
+
+/// The anchor this node checks hourly: `log_anchor_url`, else the compiled-in default for the
+/// default relay (https only).
+pub fn effective_anchor(cfg: &Config) -> Option<String> {
+    cfg.log_anchor_url
+        .clone()
+        .or_else(|| DEFAULT_LOG_ANCHOR.filter(|u| default_relay(cfg) && u.starts_with("https://")).map(str::to_owned))
 }
 
 pub struct KeyLog {
@@ -175,6 +190,12 @@ impl KeyLog {
         self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()
     }
 
+    /// Worker side (T-03-088): this donor device holds an owner-signed DONOR_APPROVED for
+    /// `repo_id` in a fresh verified log.
+    pub fn donor_approved(&self, device: &str, repo_id: &str) -> bool {
+        self.verified() && self.view().sealable(device, repo_id).is_ok()
+    }
+
     /// Worker side (03 §7.2 1–2): the logged signing key of a Gateway device allowed to use
     /// `repo_id`. Only from a fresh verified log.
     pub fn gateway_key(&self, device: &str, repo_id: &str) -> Option<[u8; 32]> {
@@ -248,7 +269,7 @@ struct Link {
 
 impl moochy_keylog::LogLink for Link {
     fn anchor_configured(&self) -> bool {
-        self.node.cfg.log_anchor_url.is_some()
+        effective_anchor(&self.node.cfg).is_some()
     }
 
     async fn get_tile(&mut self, path: &str) -> Result<Vec<u8>, moochy_keylog::Error> {
@@ -286,7 +307,7 @@ impl moochy_keylog::LogLink for Link {
     }
 
     async fn anchor(&mut self) -> Option<Vec<u8>> {
-        let url = self.node.cfg.log_anchor_url.clone()?;
+        let url = effective_anchor(&self.node.cfg)?;
         if Instant::now() < self.anchor_due {
             return None;
         }
@@ -338,4 +359,53 @@ pub async fn verify_ref(node: &Arc<Node>, receipt_ref: &str) -> Result<serde_jso
     };
     Ok(serde_json::json!({"verified": true, "receipt_ref": receipt_ref, "donor": clean(&donor), "revoked": revoked, "repo_id": p.repo_id.text(),
         "model": clean(&p.model), "cost_uusd": p.cost_uusd, "day": clean(&p.day), "trust": trust}))
+}
+
+/// The default relay's receipt-log verifier key, compiled into release builds
+/// (`MOOCHY_DEFAULT_RECEIPTS_VKEY`, KEYLOG §8).
+pub const DEFAULT_RECEIPTS_VKEY: Option<&str> = option_env!("MOOCHY_DEFAULT_RECEIPTS_VKEY");
+
+fn receipts_key(cfg: &Config) -> Option<NoteKey> {
+    let vkey = cfg.receipts_log_key.clone().or_else(|| {
+        DEFAULT_RECEIPTS_VKEY.filter(|k| default_relay(cfg) && !k.is_empty()).map(str::to_owned)
+    })?;
+    NoteKey::parse(&vkey).ok()
+}
+
+/// T-KL-007 (KEYLOG §8): a `ReceiptAck` proves our settled receipt is in the public receipt log:
+/// `(index, inclusion proof)` against a signed receipt-log checkpoint. Verified against the pinned
+/// receipt-log key; kept next to the receipt (`<state>/receipt-proofs/`); any failure is a
+/// security alert (the relay could be hiding settled receipts). Without a key: not checked.
+pub fn check_receipt_ack(node: &Node, receipt: &[u8], ack: &crate::pb::link::ReceiptAck) {
+    let Some(key) = receipts_key(&node.cfg) else { return };
+    let ids = json!({"task": clean(&ack.task), "attempt": ack.attempt});
+    if ack.receipt_log_checkpoint.is_empty() {
+        log("warn", "receipt log: the server acknowledged a receipt without its inclusion proof", &ids);
+        return;
+    }
+    let alert = |why: &str| {
+        let mut f = ids.clone();
+        if let Some(o) = f.as_object_mut() {
+            o.insert("alert".into(), json!("receipt_log"));
+            o.insert("why".into(), json!(why));
+        }
+        log("error", "key log alert", &f);
+    };
+    let Ok(cp) = moochy_keylog::note::open_checkpoint(&ack.receipt_log_checkpoint, key.name(), &key) else {
+        return alert("receipt-log checkpoint does not verify");
+    };
+    let proof: Option<Vec<moochy_keylog::Hash>> =
+        (ack.receipt_log_proof.len() <= 64).then(|| ack.receipt_log_proof.iter().map(|h| <[u8; 32]>::try_from(h.as_ref()).ok()).collect()).flatten();
+    let Some(proof) = proof else { return alert("malformed inclusion proof") };
+    if !moochy_keylog::receipts::verify(receipt, ack.receipt_log_index, &cp, &proof) {
+        return alert("our receipt is not at the claimed place in the receipt log");
+    }
+    let rec = json!({"index": ack.receipt_log_index, "proof": proof.iter().map(|h| crate::util::b64e(h)).collect::<Vec<_>>(),
+        "checkpoint": crate::util::b64e(&ack.receipt_log_checkpoint), "tree_size": cp.size});
+    let dir = node.home.state_dir().join("receipt-proofs");
+    let name = format!("{}-{}.json", ack.task.chars().filter(char::is_ascii_alphanumeric).collect::<String>(), ack.attempt);
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = crate::config::write_private(&dir.join(name), rec.to_string().as_bytes());
+    });
 }

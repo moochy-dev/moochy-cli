@@ -23,6 +23,8 @@ pub struct Boot {
     pub gateway_unix: Option<std::os::unix::net::UnixListener>,
     /// Worker role: the key-less validator zygote, exec'd before the lockdown (§15.2).
     pub validator: Option<std::sync::Arc<crate::validator::Pool>>,
+    /// Set by [`apply`]: the process is locked down.
+    pub locked: bool,
 }
 
 impl Boot {
@@ -61,7 +63,7 @@ impl Boot {
         };
         let ctl = crate::ctl::bind(&home.socket_path())?;
         let gateway_unix = crate::gateway::bind_gateway_socket(&home.state_dir());
-        Ok(Self { cfg, secrets, listener, ctl, gateway_unix, validator })
+        Ok(Self { cfg, secrets, listener, ctl, gateway_unix, validator, locked: false })
     }
 
     pub fn port(&self) -> u16 {
@@ -85,19 +87,33 @@ fn ro_paths(home: &Home, cfg: &Config) -> Vec<PathBuf> {
     v
 }
 
-/// TCP ports a dev provider override (`keys add --base-url`, insecure dev only) needs.
-fn dev_ports(secrets: &Secrets) -> Vec<u16> {
-    secrets
-        .providers
-        .iter()
-        .filter_map(|p| p.base_url.as_deref())
-        .filter_map(|u| u.rsplit_once(':').and_then(|(_, port)| port.trim_end_matches('/').parse::<u16>().ok()))
-        .filter(|p| *p != 443)
-        .collect()
+/// TCP ports the provider origins need besides 443 (a local model server, a dev override):
+/// the explicit port, else the scheme's default (80 for `http://`). A222: `http://host` without
+/// a port is port 80, not "no port".
+fn provider_ports(secrets: &Secrets) -> Vec<u16> {
+    secrets.providers.iter().filter_map(|p| p.base_url.as_deref()).filter_map(origin_port).filter(|p| *p != 443).collect()
 }
 
-/// Lock this process down. Must run before the async runtime starts (single-threaded).
-pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
+fn origin_port(url: &str) -> Option<u16> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // `[v6]:port`, `host:port`, or no port.
+    let port = match host_port.rsplit_once(']') {
+        Some((_, tail)) => tail.strip_prefix(':'),
+        None => host_port.rsplit_once(':').map(|(_, p)| p),
+    };
+    match port {
+        Some(p) => p.parse().ok(),
+        None => match scheme {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        },
+    }
+}
+
+pub fn apply(home: &Home, boot: &mut Boot, unsafe_no_lockdown: bool) -> Result<()> {
     let relay_port = match boot.cfg.relay.as_deref() {
         Some(r) => crate::tls::Origin::parse(r)?.port,
         None => 0,
@@ -108,20 +124,30 @@ pub fn apply(home: &Home, boot: &Boot, unsafe_no_lockdown: bool) -> Result<()> {
     p.unsafe_no_lockdown = unsafe_no_lockdown;
     // Provider origins on other ports than 443: a local model server (`keys add local`) and
     // development overrides (`keys add --base-url`, MOOCHY_INSECURE_DEV only).
-    p.connect_ports = dev_ports(&boot.secrets);
+    p.connect_ports = provider_ports(&boot.secrets);
     let r = lockdown_self(&p).map_err(|e| internal(format!("cannot lock the background process down ({e}); run `moochy doctor`, or `moochy up --unsafe-no-lockdown` for debugging only")))?;
+    boot.locked = !unsafe_no_lockdown;
+    // A223: Landlock network rules exist from ABI 4, socket/signal scoping from ABI 6; read the
+    // ABI rather than "fully enforced" (never true below the newest ABI, which made every
+    // current kernel look unprotected and hid real losses).
+    let landlock_net = r.landlock_fs && r.abi >= 4;
+    let landlock_scope = r.landlock_fs && r.abi >= 6;
     let rep = json!({
         "locked": !unsafe_no_lockdown,
+        "landlock_scope": landlock_scope,
         "no_new_privs": r.no_new_privs,
         "seccomp": r.seccomp,
         "landlock_fs": r.landlock_fs,
-        "landlock_net": r.landlock_net,
+        "landlock_net": landlock_net,
         "landlock_abi": r.abi,
         "all_threads": r.all_threads,
     });
     log(if unsafe_no_lockdown { "error" } else { "info" }, if unsafe_no_lockdown { "UNSAFE: background process NOT locked down (--unsafe-no-lockdown)" } else { "background process locked down" }, &rep);
-    if r.landlock_net == Some(false) || (r.landlock_fs && r.landlock_net.is_none()) {
-        log("warn", "kernel without Landlock network rules: outbound connections are not limited by moochy; use the systemd unit's RestrictAddressFamilies", &json!({"landlock_abi": r.abi}));
+    if !unsafe_no_lockdown && !landlock_net {
+        log("warn", "kernel without Landlock network rules (ABI < 4): outbound connections are not limited by moochy; use the systemd unit's RestrictAddressFamilies", &json!({"landlock_abi": r.abi}));
+    }
+    if !unsafe_no_lockdown && !landlock_scope {
+        log("warn", "kernel without Landlock scoping (ABI < 6): abstract Unix sockets and signals are not confined by moochy", &json!({"landlock_abi": r.abi}));
     }
     record(home, &rep);
     Ok(())
@@ -191,4 +217,19 @@ fn host_support(out: &mut Vec<(bool, &'static str, String)>) {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn host_support(out: &mut Vec<(bool, &'static str, String)>) {
     out.push((false, "sandbox", "no process lockdown on this OS yet".into()));
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn origin_ports() {
+        use super::origin_port;
+        assert_eq!(origin_port("http://127.0.0.1:11434"), Some(11434));
+        assert_eq!(origin_port("http://192.168.1.5"), Some(80));
+        assert_eq!(origin_port("http://192.168.1.5/"), Some(80));
+        assert_eq!(origin_port("https://gpu.lan"), Some(443));
+        assert_eq!(origin_port("http://[::1]:8080"), Some(8080));
+        assert_eq!(origin_port("http://[fd00::1]"), Some(80));
+        assert_eq!(origin_port("ftp://x"), None);
+    }
 }

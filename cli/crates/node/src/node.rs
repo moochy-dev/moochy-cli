@@ -112,8 +112,17 @@ pub struct Node {
     pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
-    /// Worker: local model server mapping, public slug → server model id.
+    /// Worker: this donor's own donations (pledge id → status), from `ListDonations` on our own
+    /// session, and when they were fetched (ms). The relay's pledge assignment is never trusted
+    /// alone (T-03-088).
+    pub own_pledges: Mutex<HashMap<String, String>>,
+    /// Worker: local model server mapping, public slug → server model id, and the ids it lists.
     pub local_models: HashMap<String, String>,
+    pub local_served: std::collections::HashSet<String>,
+    /// Worker: serializes `ListDonations` refreshes (T-03-088); value = last fetch (ms).
+    pub pledge_refresh: tokio::sync::Mutex<u64>,
+    /// The process locked itself down (§15.2): required to donate (A222).
+    pub locked: bool,
     /// Worker: single-use jailed request validators (CONTRACT §15.2).
     pub validator: Option<Arc<crate::validator::Pool>>,
     /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
@@ -177,7 +186,11 @@ impl Node {
             adapters: w.adapters,
             store: w.store,
             validator: w.validator,
+            locked: w.locked,
             local_models: w.local_models,
+            local_served: w.local_served,
+            pledge_refresh: tokio::sync::Mutex::new(0),
+            own_pledges: Mutex::new(HashMap::new()),
             approvals: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
@@ -207,7 +220,8 @@ impl Node {
     /// mapping), else the catalog's. `None` = this node does not serve that local slug.
     pub fn provider_model_id(&self, e: &moochy_proto::money::CatalogEntry) -> Option<String> {
         if e.provider == "local" {
-            return self.local_models.get(&e.model).cloned();
+            // The donor's explicit mapping, else the catalog's id when the server lists it.
+            return self.local_models.get(&e.model).cloned().or_else(|| self.local_served.contains(&e.provider_model_id).then(|| e.provider_model_id.clone()));
         }
         Some(e.provider_model_id.clone())
     }
@@ -488,8 +502,12 @@ pub struct WorkerParts {
     pub adapters: Vec<Arc<Adapter>>,
     /// Local model server: public `local/*` slug → the server's model id.
     pub local_models: HashMap<String, String>,
+    /// Local model server: the ids it listed at `keys add`.
+    pub local_served: std::collections::HashSet<String>,
     pub store: Option<Arc<Mutex<Store>>>,
     pub validator: Option<Arc<crate::validator::Pool>>,
+    /// The process is locked down (CONTRACT §15.2); an unlocked node never donates (A222).
+    pub locked: bool,
 }
 
 /// RAII counter for in-flight work (`gateway_tasks`, `worker_busy`).

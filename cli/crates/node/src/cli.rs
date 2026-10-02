@@ -61,6 +61,8 @@ COMMANDS:
   keys list | keys remove <provider> | keys rotate
                                   rotate = new device keys for this machine (the old ones stop
                                   working 24 h later)
+  keys revoke <device id>         Remove another device from your account (e.g. one you did
+                                  not add); this one: `moochy logout`
   config set <KEY> <VALUE> | config show
                                   monthly_limit (dollars, e.g. 20), slots_max (1-64),
                                   gateway_addr, journal_full_text, auto_cache,
@@ -188,7 +190,10 @@ fn parse() -> Result<Opts> {
                 o.monthly_limit = Some(crate::util::parse_dollars(s(p.value().map_err(err)?)?.trim_start_matches('$')).ok_or_else(|| usage("--monthly-limit is a dollar amount, e.g. 25"))?);
             }
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
-            Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
+            Long("cap") => {
+                let v = crate::util::parse_amount(&s(p.value().map_err(err)?)?).map_err(|e| usage(format!("--cap (a monthly amount in dollars): {e}")))?;
+                o.cap = Some(i64::try_from(v).map_err(|_| usage("--cap is too large"))?);
+            }
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
@@ -228,6 +233,7 @@ fn run() -> Result<()> {
         ["doctor"] => doctor(&home),
         ["update"] => update(&o),
         ["keys", "rotate"] => crate::owner::rotate_device(&home),
+        ["keys", "revoke", id] => crate::owner::revoke_device(&home, id),
         ["up"] => {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
@@ -723,7 +729,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     let mut cfg = home.load()?;
     let mut sec = keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != provider);
-    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new() });
+    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new(), served_ids: Vec::new() });
     keystore::save(home, &cfg, &sec)?;
     emit(&json!({"event": "key_added", "provider": provider}));
     safety(home, o, Some(provider))
@@ -855,8 +861,12 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
 fn up_foreground(home: Home, offline: bool, unsafe_no_lockdown: bool) -> Result<()> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
     // CONTRACT §15.2: load, bind, lock down while single-threaded, then start the runtime.
-    let boot = crate::lockdown::Boot::load(&home, offline)?;
-    crate::lockdown::apply(&home, &boot, unsafe_no_lockdown)?;
+    // A222: the debug escape hatch exists only in insecure dev mode.
+    if unsafe_no_lockdown && !dev_mode() {
+        return Err(usage("--unsafe-no-lockdown is only accepted with MOOCHY_INSECURE_DEV=1 (debugging)"));
+    }
+    let mut boot = crate::lockdown::Boot::load(&home, offline)?;
+    crate::lockdown::apply(&home, &mut boot, unsafe_no_lockdown)?;
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().ctx("runtime")?;
     rt.block_on(up(home, offline, boot))
 }
@@ -866,6 +876,7 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
     use moochy_worker::provider::{Adapter, AdapterConfig, Limits};
     let mut adapters = Vec::new();
     let mut local_models = std::collections::HashMap::new();
+    let mut local_served = std::collections::HashSet::new();
     for p in &secrets.providers {
         let Some(provider) = moochy_worker::Provider::parse(&p.provider) else {
             log("warn", "this version cannot donate with this provider yet; update moochy", &json!({"provider": p.provider}));
@@ -885,9 +896,15 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         };
         if local {
             local_models.extend(p.models.iter().map(|(k, v)| (k.clone(), v.clone())));
+            local_served.extend(p.served_ids.iter().cloned());
             if p.allow_unvetted_host {
                 eprintln!("moochy: WARNING the local model server {} is not a loopback or private address (--allow-unvetted-host, development only)", clean(p.base_url.as_deref().unwrap_or("")));
             }
+        }
+        // A222: an unvetted local host is a development setting; outside dev mode it is refused.
+        if p.allow_unvetted_host && !dev_mode() {
+            log("error", "local model server refused: --allow-unvetted-host is development only (MOOCHY_INSECURE_DEV=1)", &json!({}));
+            continue;
         }
         let built = if local { Adapter::new_local(&cfg, p.allow_unvetted_host) } else { Adapter::new(&cfg) };
         match built {
@@ -896,12 +913,12 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         }
     }
     let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
-    Ok(WorkerParts { adapters, local_models, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
+    Ok(WorkerParts { adapters, local_models, local_served, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None, locked: false })
 }
 
 async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {
     let port = boot.port();
-    let crate::lockdown::Boot { cfg, secrets, listener, ctl, gateway_unix, validator } = boot;
+    let crate::lockdown::Boot { cfg, secrets, listener, ctl, gateway_unix, validator, locked } = boot;
     let listener = tokio::net::TcpListener::from_std(listener).ctx("gateway listener")?;
     let sock_path = home.socket_path();
     let sock = tokio::net::UnixListener::from_std(ctl).ctx("control socket")?;
@@ -911,6 +928,7 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
     };
     let mut parts = if cfg.has_role("worker") && keys.is_some() && !offline { worker_parts(&home, &secrets)? } else { WorkerParts::default() };
     parts.validator = validator;
+    parts.locked = locked;
     let node = Node::new(home.clone(), cfg, secrets, keys, parts, offline);
     // Durable journal (E62): the writer thread, and the recent entries back in memory.
     crate::journal::start(&home.state_dir());

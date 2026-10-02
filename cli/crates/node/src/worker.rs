@@ -55,6 +55,7 @@ fn can_serve(node: &Node) -> bool {
     node.cfg.has_role("worker")
         && node.keys.is_some()
         && node.store.is_some()
+        && node.locked
         && node.validator.as_ref().is_some_and(|v| v.alive())
         && device_cap(node).is_some()
         && !node.adapters.is_empty()
@@ -144,6 +145,8 @@ pub fn on_welcome(node: &Arc<Node>) {
         if let Some(keys) = &node.keys {
             recover_inflight(&node, keys).await;
         }
+        // Own donations up front, so the first tasks do not wait for ListDonations (T-03-088).
+        let _ = refresh_own_pledges(&node, "").await;
         let unacked = with_store(&node, |s| s.unacked().map(|(_, p)| p.to_vec()).collect::<Vec<_>>()).await.unwrap_or_default();
         let receipts: Vec<pb::SignedReceipt> = unacked.iter().filter_map(|p| pb::SignedReceipt::decode(p.as_slice()).ok()).collect();
         let tasks = receipts.iter().map(|r| pb::KnownTask { task: r.task.clone(), attempt: r.attempt, state: "outbox".into() }).collect();
@@ -157,10 +160,15 @@ pub fn on_welcome(node: &Arc<Node>) {
 }
 
 /// `ReceiptAck` on the session: mark the outbox entry acknowledged.
-pub fn on_receipt_ack(node: &Arc<Node>, task: &str, attempt: u32) {
+pub fn on_receipt_ack(node: &Arc<Node>, ack: pb::ReceiptAck) {
     let node = node.clone();
-    let key = attempt_key(task, attempt);
+    let key = attempt_key(&ack.task, ack.attempt);
     tokio::spawn(async move {
+        let k2 = key.clone();
+        let receipt = with_store(&node, move |s| s.since(0).find(|(k, _)| *k == k2.as_slice()).map(|(_, p)| p.to_vec())).await.flatten();
+        if let Some(r) = receipt.and_then(|p| pb::SignedReceipt::decode(p.as_slice()).ok()) {
+            crate::keylog::check_receipt_ack(&node, &r.receipt, &ack);
+        }
         let _ = with_store(&node, move |s| s.ack(&key, now_ms())).await;
     });
 }
@@ -340,6 +348,57 @@ fn gateway_key(node: &Node, device: &str, repo_id: &str) -> Option<[u8; 32]> {
     node.keylog.as_ref().and_then(|l| l.gateway_key(device, repo_id))
 }
 
+/// A donation turns active when its owner approves it: re-list soon, but never more than 4×/s.
+const OWN_PLEDGES_REFRESH_MS: u64 = 250;
+
+/// T-03-088: the relay's pledge/repo assignment is never trusted alone. The pledge must be one of
+/// this donor's own active donations (listed on our own authenticated session), and with a
+/// verified key log this device must hold an owner-signed DONOR_APPROVED for the repo.
+async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<(), &'static str> {
+    if let Some(l) = &node.keylog
+        && l.verified()
+        && !l.donor_approved(node.device_id().unwrap_or_default(), repo_id)
+    {
+        return Err("this project has not approved this donor (key log)");
+    }
+    let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|s| s == "active");
+    if known(node) != Some(true) {
+        refresh_own_pledges(node, pledge).await?;
+    }
+    match known(node) {
+        Some(true) => Ok(()),
+        Some(false) => Err("this donation is not active"),
+        None => Err("not one of this donor's donations"),
+    }
+}
+
+/// Refresh this donor's own donations (`ListDonations` on our own session), at most every 250 ms.
+/// Concurrent tasks wait for the refresh in flight and re-check, so a burst never refuses a
+/// donation that is being fetched. `Err` only for "relay-asserted, dev": a relay without the
+/// donation RPCs under `MOOCHY_INSECURE_DEV` (the caller then accepts).
+async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'static str> {
+    let mut last = node.pledge_refresh.lock().await;
+    if !want.is_empty() && lock(&node.own_pledges).get(want).is_some_and(|s| s == "active") {
+        return Ok(());
+    }
+    if *last != 0 && now_ms().saturating_sub(*last) < OWN_PLEDGES_REFRESH_MS {
+        return Ok(());
+    }
+    let Some(l) = node.link() else { return Ok(()) };
+    let mut c = l.client.clone();
+    match timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest {}))).await {
+        Ok(Ok(r)) => {
+            *last = now_ms();
+            *lock(&node.own_pledges) = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, d.status)).collect();
+        }
+        Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => {
+            lock(&node.own_pledges).insert(want.to_owned(), "active".into());
+        }
+        _ => *last = 0, // failed: retry at the next task
+    }
+    Ok(())
+}
+
 /// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
 /// whatever the relay decided; the firewall level is the donor's own setting (06 §7.3).
 fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<Policy, String> {
@@ -420,6 +479,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("unauthorized_task", false, Some("task id outside the freshness window".into())));
     }
     let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
+    own_donation(node, &assign.pledge_id, &assign.repo_id).await.map_err(|d| with_ck("unauthorized_task", false, Some(d.into())))?;
     // 2. Adapter + catalog entry, pledge policy, route expectations for the validator.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
     let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
@@ -751,20 +811,23 @@ async fn finish(node: &Arc<Node>, keys: &Keys, a: &Admitted, attempt: u8, sealer
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
     }
     let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
-    let acked = sent
-        && matches!(
-            timeout(Duration::from_secs(5), async {
-                while let Some(m) = next(down).await {
-                    if matches!(m, serve_down::Msg::ReceiptAck(_)) {
-                        return true;
-                    }
+    let ack = if sent {
+        timeout(Duration::from_secs(5), async {
+            while let Some(m) = next(down).await {
+                if let serve_down::Msg::ReceiptAck(a) = m {
+                    return Some(a);
                 }
-                false
-            })
-            .await,
-            Ok(true)
-        );
-    if acked {
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    if let Some(ack) = ack {
+        crate::keylog::check_receipt_ack(node, &signed.receipt, &ack);
         let key = a.key.clone();
         let _ = with_store(node, move |s| s.ack(&key, now_ms())).await;
     } else if let Some(l) = node.link() {
