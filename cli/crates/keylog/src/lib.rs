@@ -11,6 +11,7 @@
 //!   shared fail-closed [`View`] for Gateways and Workers, persistence (see `WIRING.md`)
 //! - [`cosig`]: witness cosignatures (C2SP tlog-cosignature v1)
 //! - [`receipts`]: receipt transparency log inclusion
+//! - [`projection`]: verify a donor-signed projection fetched by reference (`moochy verify`)
 //! - `fetch` (feature `http`): blocking tile fetcher with size limits and timeouts
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -33,6 +34,7 @@ pub mod merkle;
 pub mod mirror;
 pub mod monitor;
 pub mod note;
+pub mod projection;
 pub mod receipts;
 pub mod state;
 pub mod tiles;

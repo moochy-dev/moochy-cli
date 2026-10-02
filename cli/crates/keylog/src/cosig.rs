@@ -65,6 +65,8 @@ impl CosignerKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cosignature {
     pub witness: String,
+    /// The witness key id (a witness is identified by name AND key id, A205).
+    pub key_id: u32,
     /// POSIX seconds at which the witness cosigned.
     pub timestamp: u64,
 }
@@ -95,9 +97,12 @@ pub fn cosignatures(note: &[u8], witnesses: &[CosignerKey]) -> Result<Vec<Cosign
         w.key
             .verify(&Signature::from(sig), msg.as_bytes())
             .map_err(|_| Error::BadSig)?;
-        if !out.iter().any(|c| c.witness == w.name) {
+        // One credit per distinct pinned witness, identified by (name, key id) (A205):
+        // two pins sharing a name but holding different keys are two witnesses.
+        if !out.iter().any(|c| c.witness == w.name && c.key_id == w.id) {
             out.push(Cosignature {
                 witness: w.name.clone(),
+                key_id: w.id,
                 timestamp: ts,
             });
         }
