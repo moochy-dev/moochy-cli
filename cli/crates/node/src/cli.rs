@@ -27,10 +27,11 @@ COMMANDS:
                                   tokens, worker donates yours. Only the default server unless
                                   MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
   logout                          Remove this device: revoke its keys, then delete them here
-  up [--foreground] [--unsafe-no-lockdown]
+  up [--foreground] [--headless] [--unsafe-no-lockdown]
                                   Start the Moochy app on this machine. It locks itself down
                                   (no commands, files limited to its state); the flag disables
-                                  that for debugging only
+                                  that for debugging only. In a cloud box, MOOCHY_ENROLL=<token>
+                                  enrolls the box first (its own keys, one project, expiring)
   down                            Stop it
   status [--json]                 Connection, slots in use, donations available to your projects
   pause | resume                  Stop or restart donating from this device (works offline)
@@ -39,10 +40,20 @@ COMMANDS:
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
   run [--repo OWNER/NAME] [--worktree DIR] [--allow-host HOST]... [--git-writable]
-      [--unsafe-no-sandbox] -- <cmd>
+      [--unsafe-no-sandbox | --box-is-sandbox] -- <cmd>
                                   Run your coding agent in a sandbox wired to Moochy: it sees only
                                   this repository (secrets hidden) and reaches only Moochy. Tool
-                                  calls from donated tokens reach only sandboxed agents
+                                  calls from donated tokens reach only sandboxed agents.
+                                  --box-is-sandbox: in a single-purpose cloud box without user
+                                  namespaces or Landlock, the box itself is the sandbox
+  box token create [--repo OWNER/NAME] [--ttl 24h] [--cap $20] [--max-boxes 1]
+                                  A token that lets cloud boxes (boat.dev, E2B, Daytona, Modal,
+                                  Codespaces) use this project's donations: each box gets its own
+                                  keys, its own monthly limit and expires with the token. Shown once
+  box token list [--repo P] | box token revoke <bt_…>
+  box list [--repo P] | box revoke <d_…>
+                                  Boxes enrolled for your projects; revoke one, or a token and all
+                                  its boxes
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
                                   Add a provider API key (xai = Grok). It is checked with the
                                   provider's free models call and never leaves this machine
@@ -99,7 +110,8 @@ COMMANDS:
   claim <OWNER/NAME> [--yes]      Confirm you maintain a project, signed by your owner key
                                   (also: claim --repo OWNER/NAME)
 
-ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_INSECURE_DEV=1 (development only)
+ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_ENROLL (cloud box enrollment token),
+     MOOCHY_INSECURE_DEV=1 (development only)
 ";
 
 pub fn main() -> ExitCode {
@@ -159,6 +171,9 @@ struct Opts {
     models: Vec<String>,
     worktree: Option<PathBuf>,
     allow_hosts: Vec<String>,
+    /// `moochy box token create`: `--ttl`, `--max-boxes`.
+    ttl: Option<String>,
+    max_boxes: Option<u32>,
     config: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
@@ -193,6 +208,8 @@ fn parse() -> Result<Opts> {
             Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("ttl") => o.ttl = Some(s(p.value().map_err(err)?)?),
+            Long("max-boxes") => o.max_boxes = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--max-boxes is a whole number"))?),
             Long("model") => o.models.push(s(p.value().map_err(err)?)?),
             Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
@@ -207,7 +224,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -236,6 +253,10 @@ fn run() -> Result<()> {
     }
     let home = Home::resolve(o.home.clone())?;
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
+    // A cloud box (§17.1) has no owner powers and no donor role.
+    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "pending" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
+        crate::boxes::refuse_on_box(&home.load()?, cmd)?;
+    }
     match w.as_slice() {
         ["login"] => login_cmd(&home, &o),
         ["logout"] => logout(&home, &o),
@@ -248,6 +269,7 @@ fn run() -> Result<()> {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
             }
+            box_enroll(&home, &o)?;
             if o.has("foreground") { up_foreground(home, o.has("offline"), o.has("unsafe-no-lockdown")) } else { up_background(&home, &o) }
         }
         ["down"] => rt_small()?.block_on(async {
@@ -271,6 +293,7 @@ fn run() -> Result<()> {
         ["service", "install"] => crate::service::install(&home, o.has("system"), o.has("print")),
         ["service", "uninstall"] => crate::service::uninstall(o.has("system")),
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
+        ["box", rest @ ..] => box_cmd(&home, &o, rest),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
         ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
@@ -373,6 +396,59 @@ fn logout(home: &Home, o: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// `moochy box …` (CONTRACT §17.1).
+fn box_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    match w {
+        ["token", "create"] => crate::boxes::token_create(home, &slug_or_detect(o)?, o.ttl.as_deref(), o.cap, o.max_boxes),
+        ["token", "list"] => crate::boxes::list(home, repo_filter(o)?.as_deref(), true),
+        ["token", "revoke", id] => crate::boxes::revoke(home, id, "bt_"),
+        ["list"] => crate::boxes::list(home, repo_filter(o)?.as_deref(), false),
+        ["revoke", id] => crate::boxes::revoke(home, id, "d_"),
+        _ => Err(usage("box token create|list|revoke, box list|revoke (see --help)")),
+    }
+}
+
+/// `--repo` as a filter (optional, checked).
+fn repo_filter(o: &Opts) -> Result<Option<String>> {
+    match &o.repo {
+        Some(r) if !valid_slug(r) => Err(usage("--repo must be owner/name")),
+        r => Ok(r.clone()),
+    }
+}
+
+/// `moochy up` on a cloud box (§17.1): enroll with `MOOCHY_ENROLL` when this machine has no device
+/// yet (or its box binding is stale), then refuse to start a box that is expired, copied or forked.
+fn box_enroll(home: &Home, o: &Opts) -> Result<()> {
+    let token = crate::boxes::enroll_token()?;
+    let cfg = home.load()?;
+    if token.is_none() && cfg.box_device.is_none() {
+        return Ok(());
+    }
+    let fp = crate::boxes::fingerprint()?;
+    if crate::boxes::plan(&cfg, token.is_some(), crate::util::now_ms(), Some(&fp))? == crate::boxes::Start::Run {
+        return Ok(());
+    }
+    let Some(token) = token else { return Err(internal("enrollment without a token")) };
+    let relay = checked_relay(o, cfg.relay.as_deref())?;
+    let name = o.name.clone().unwrap_or_else(crate::login::default_name);
+    rt_small()?.block_on(crate::login::login(home, &relay, o.ca_file.clone(), vec!["gateway".into()], name, Some(token.as_str())))
+}
+
+/// The relay for `login`/enrollment: the default one, others only in development (A135, A175).
+fn checked_relay(o: &Opts, saved: Option<&str>) -> Result<String> {
+    if o.ca_file.is_some() && !dev_mode() {
+        return Err(usage("--ca-file is only accepted with MOOCHY_INSECURE_DEV=1 (development and tests)"));
+    }
+    let relay = o.relay.as_deref().or(saved).unwrap_or(crate::config::DEFAULT_RELAY);
+    if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
+        if !dev_mode() {
+            return Err(usage("another server than the default needs MOOCHY_INSECURE_DEV=1 (development and tests only)"));
+        }
+        eprintln!("Warning: signing in to a server that is not the default ({}). This device gets a separate keystore for it.", clean(relay));
+    }
+    Ok(relay.to_owned())
+}
+
 fn slug_or_detect(o: &Opts) -> Result<String> {
     let slug = match &o.repo {
         Some(r) => r.clone(),
@@ -407,6 +483,9 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
         })?
         .into_inner();
     let cmd: Vec<String> = cmd.iter().map(|s| (*s).to_owned()).collect();
+    if o.has("box-is-sandbox") && (o.has("unsafe-no-sandbox") || !o.allow_hosts.is_empty() || o.has("git-writable")) {
+        return Err(usage("--box-is-sandbox runs without moochy's sandbox: --allow-host, --git-writable and --unsafe-no-sandbox do not apply"));
+    }
     if o.has("unsafe-no-sandbox") {
         let env = crate::run::gateway_env(&r.anthropic_base_url, &r.openai_base_url, &r.mcp_url, &r.token);
         let st = crate::run::run_unsandboxed(&env, &cmd)?;
@@ -422,7 +501,7 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
         git_writable: o.has("git-writable"),
     };
     let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
-    let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
+    let code = if o.has("box-is-sandbox") { crate::run::run_platform(&gw, &cmd, worktree)? } else { crate::run::run_sandboxed(&gw, &cmd, worktree)? };
     std::process::exit(code);
 }
 
@@ -511,7 +590,12 @@ fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
         return crate::owner::sign(home, &repo.to_ascii_lowercase(), &["claim"], o.has("yes"), false, false, 0);
     }
     let slug = slug_or_detect(o)?;
-    crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))
+    crate::owner::sign(home, &slug, w, o.has("yes"), o.has("revoke"), o.has("device"), o.cap.unwrap_or(0))?;
+    // A member device's own monthly cap is a project setting, not signed (E32).
+    if let (["members", "add", device], true, Some(cap)) = (w, o.has("device"), o.cap) {
+        crate::boxes::set_device_cap(home, &slug, device, cap)?;
+    }
+    Ok(())
 }
 
 /// `moochy report <task> [--out file] [--reason text]`: evidence bundle (06 §9).
@@ -565,23 +649,28 @@ fn doctor(home: &Home) -> Result<()> {
     for (ok, what, detail) in crate::lockdown::doctor(home, st.is_some()) {
         line(ok, what, detail);
     }
-    // `moochy run` (§15.1): host support, and what the agent will not see (A163). Informational.
-    let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_ok_and(|v| v.trim() == "1");
-    if restricted {
-        println!("note sandbox   user namespaces are restricted (AppArmor): `moochy run` prints the one-line fix for this binary");
-    } else {
-        println!("ok   sandbox   `moochy run` can build its sandbox here");
-    }
+    // `moochy run` (§15.1): moochy-sandbox's own checks (user namespaces, Landlock ABI, cgroup)
+    // and what the agent will not see in this repo (A163). Informational.
+    let root = std::env::current_dir().ok().and_then(|d| crate::files::git_root(&d));
+    let sb = moochy_sandbox::doctor(root.as_deref());
+    let sandbox_ok = !sb.iter().any(|l| l.level == moochy_sandbox::doctor::Level::Fail && matches!(l.topic, "sandbox" | "landlock"));
     println!("     hidden    {}", moochy_sandbox::mask::SECRET_PATTERNS.join(" "));
-    if let Some(root) = std::env::current_dir().ok().and_then(|d| crate::files::git_root(&d)) {
-        match moochy_sandbox::mask::collect(&root) {
-            Ok(v) => {
-                println!("     in this repo, hidden from the agent: {} path(s)", v.len());
-                for p in v.iter().take(50) {
-                    println!("       {}", clean(&p.to_string_lossy()));
-                }
-            }
-            Err(e) => println!("note masks     {}", clean(&e.to_string())),
+    for l in &sb {
+        let level = match l.level {
+            moochy_sandbox::doctor::Level::Ok => "ok  ",
+            moochy_sandbox::doctor::Level::Note => "note",
+            moochy_sandbox::doctor::Level::Fail => "FAIL",
+        };
+        for (i, text) in l.text.lines().enumerate() {
+            if i == 0 { println!("{level} {:<9} {}", l.topic, clean(text)) } else { println!("               {}", clean(text)) }
+        }
+    }
+    // Cloud boxes (§17): the box binding, and what this runtime lacks.
+    for (level, what, detail) in crate::boxes::doctor_lines(&cfg, sandbox_ok) {
+        if level == "FAIL" {
+            line(false, what, detail);
+        } else {
+            println!("{level} {what:<9} {}", clean(&detail));
         }
     }
     let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
@@ -687,24 +776,15 @@ fn git_tracked(path: &std::path::Path) -> bool {
 }
 
 fn login_cmd(home: &Home, o: &Opts) -> Result<()> {
-    // A175: a pinned CA replaces the public roots: development and tests only.
-    if o.ca_file.is_some() && !dev_mode() {
-        return Err(usage("--ca-file is only accepted with MOOCHY_INSECURE_DEV=1 (development and tests)"));
-    }
-    let relay = o.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY);
-    if crate::tls::Origin::parse(relay)?.url() != crate::config::DEFAULT_RELAY {
-        // A135: a lookalike relay could harvest a login; only for development and tests.
-        if !dev_mode() {
-            return Err(usage("another server than the default needs MOOCHY_INSECURE_DEV=1 (development and tests only)"));
-        }
-        eprintln!("Warning: signing in to a server that is not the default ({}). This device gets a separate keystore for it.", clean(relay));
-    }
+    // A175 (pinned CA) and A135 (lookalike relay): development and tests only.
+    let relay = checked_relay(o, None)?;
+    let relay = relay.as_str();
     let roles: Vec<String> = o.roles.as_deref().unwrap_or("gateway").split(',').map(|r| r.trim().to_owned()).collect();
     let name = o.name.clone().unwrap_or_else(crate::login::default_name);
     if let Some(k) = &o.log_key {
         moochy_keylog::NoteKey::parse(k).map_err(|e| usage(format!("--log-key: {e}")))?;
     }
-    rt_small()?.block_on(crate::login::login(home, relay, o.ca_file.clone(), roles, name))?;
+    rt_small()?.block_on(crate::login::login(home, relay, o.ca_file.clone(), roles, name, None))?;
     if let Some(k) = &o.log_key {
         let mut cfg = home.load()?;
         cfg.log_key = Some(k.clone());
@@ -873,7 +953,7 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
     // The background process never sees the owner passphrase (CONTRACT §15.4, A190).
-    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE");
+    cmd.arg("--home").arg(&home.dir).args(["up", "--foreground"]).env_remove("MOOCHY_OWNER_PASSPHRASE").env_remove(crate::boxes::ENROLL_ENV);
     if offline {
         cmd.arg("--offline");
     }

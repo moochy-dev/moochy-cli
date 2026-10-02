@@ -41,6 +41,8 @@ pub struct TaskReq {
     pub t_client_rx: u64,
     /// §15.4: tool calls may reach this client (sandboxed run token or project opt-in).
     pub release_tools: bool,
+    /// §17.2: from a `moochy run --box-is-sandbox` session (reported to the relay).
+    pub platform_sandboxed: bool,
     /// What `firewall::pool_compatible` removed (shown to the client as a `[moochy]` note).
     pub stripped: Vec<String>,
     /// Pinned donors for this task (project config, narrowed by `x-moochy-donors`); empty = any.
@@ -283,6 +285,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         wraps: first_wraps,
         body_len: sealed.body_len,
         body_chunks: u32::try_from(n).unwrap_or(u32::MAX),
+        platform_sandboxed: req.platform_sandboxed,
     };
     let route = open.route.clone();
     // Kept (refcounted Bytes) until the provider starts, to resubmit the same task on a new

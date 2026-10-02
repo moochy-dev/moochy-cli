@@ -62,6 +62,10 @@ pub struct Config {
     /// Pinned donors per project (06 §8 "pinned donors"): `owner/name` → donor names; tasks for
     /// that project are sealed only to these donors.
     pub pinned_donors: BTreeMap<String, Vec<String>>,
+    /// Set when this device is an enrolled cloud box (CONTRACT §17.1): repo-scoped, expiring,
+    /// bound to this machine.
+    #[serde(default, rename = "box", skip_serializing_if = "Option::is_none")]
+    pub box_device: Option<crate::boxes::BoxState>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]

@@ -299,6 +299,10 @@ impl LocalControl for Ctl {
         }))
     }
 
+    async fn link_call(&self, r: Request<crate::pb::local::LinkCallRequest>) -> std::result::Result<Response<crate::pb::local::LinkCallResponse>, Status> {
+        crate::boxes::link_call(&self.node, r.into_inner()).await.map(Response::new)
+    }
+
     async fn report(&self, r: Request<ReportRequest>) -> std::result::Result<Response<ReportResponse>, Status> {
         let r = r.into_inner();
         let ev = lock(&self.node.evidence);

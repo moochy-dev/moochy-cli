@@ -23,16 +23,25 @@ use tokio::sync::mpsc;
 
 pub const RUN_KEY_FILE: &str = "run.key";
 pub const RUN_KEY_HEADER: &str = "x-moochy-run-key";
+/// `moochy run --box-is-sandbox` (§17.2): the session's sandbox is the box, not moochy-sandbox.
+pub const PLATFORM_HEADER: &str = "x-moochy-platform-sandbox";
 const TOKEN_PREFIX: &str = "mrun_";
 const MAX_RUNS: usize = 256;
 const HEARTBEAT: Duration = Duration::from_secs(5);
 
-/// SHA-256(run token) → project slug. Looked up by digest so timing reveals nothing of the token.
-static RUNS: LazyLock<Mutex<HashMap<[u8; 32], String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A live run token: its project, and whether the box is the sandbox (§17.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub slug: String,
+    pub platform: bool,
+}
+
+/// SHA-256(run token) → run. Looked up by digest so timing reveals nothing of the token.
+static RUNS: LazyLock<Mutex<HashMap<[u8; 32], Run>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The run key of this process (set at gateway start).
 static RUN_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
-fn runs() -> std::sync::MutexGuard<'static, HashMap<[u8; 32], String>> {
+fn runs() -> std::sync::MutexGuard<'static, HashMap<[u8; 32], Run>> {
     RUNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -44,8 +53,8 @@ pub fn init_key(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The slug a live run token belongs to.
-pub fn check(token: &str) -> Option<String> {
+/// The run a live run token belongs to.
+pub fn check(token: &str) -> Option<Run> {
     if !token.starts_with(TOKEN_PREFIX) {
         return None;
     }
@@ -114,8 +123,9 @@ impl Drop for Live {
     }
 }
 
-/// `POST /moochy/run` for `slug` (already authenticated by its repo token).
-pub fn open(slug: String, presented_key: Option<&str>, peer: Option<Peer>, state_dir: &Path) -> Resp {
+/// `POST /moochy/run` for `slug` (already authenticated by its repo token). `platform`:
+/// `--box-is-sandbox`, the session is marked platform-sandboxed.
+pub fn open(slug: String, platform: bool, presented_key: Option<&str>, peer: Option<Peer>, state_dir: &Path) -> Resp {
     if !key_ok(presented_key) {
         return json_resp(403, &serde_json::json!({"error": "run_key_required"}));
     }
@@ -131,11 +141,11 @@ pub fn open(slug: String, presented_key: Option<&str>, peer: Option<Peer>, state
         if r.len() >= MAX_RUNS {
             return json_resp(429, &serde_json::json!({"error": "too_many_runs"}));
         }
-        r.insert(digest, slug);
+        r.insert(digest, Run { slug, platform });
     }
     let live = Live(digest);
     let (tx, rx) = mpsc::channel::<Bytes>(2);
-    let first = Bytes::from(format!("{}\n", serde_json::json!({"token": token, "sandboxed": true})));
+    let first = Bytes::from(format!("{}\n", serde_json::json!({"token": token, "sandboxed": true, "platform": platform})));
     tokio::spawn(async move {
         let _live = live;
         if tx.send(first).await.is_err() {
@@ -204,7 +214,7 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     rt.block_on(async {
         // The minting response stays open for the whole run: the token dies with it.
-        let (token, hold) = mint(&gw.state_dir.join("gateway.sock"), port, &gw.repo_token, key.trim()).await?;
+        let (token, hold) = mint(&gw.state_dir.join("gateway.sock"), port, &gw.repo_token, key.trim(), false).await?;
         let mut spec = moochy_sandbox::Spec::new(worktree.clone());
         spec.cwd = cwd.starts_with(&worktree).then_some(cwd);
         spec.gateway_socket = Some(gw.state_dir.join("gateway.sock"));
@@ -255,7 +265,7 @@ pub fn local_get(state_dir: &Path, gateway_url: &str, path: &str) -> Result<(u16
 }
 
 /// POST /moochy/run → the run token, plus what keeps it alive (connection + body drain).
-async fn mint(sock: &Path, port: u16, repo_token: &str, key: &str) -> Result<(String, tokio::task::JoinHandle<()>)> {
+async fn mint(sock: &Path, port: u16, repo_token: &str, key: &str, platform: bool) -> Result<(String, tokio::task::JoinHandle<()>)> {
     use http_body_util::BodyExt as _;
     // Over the 0600 Unix socket: the gateway checks this process's credentials (A201).
     let tcp = tokio::time::timeout(Duration::from_secs(5), tokio::net::UnixStream::connect(sock))
@@ -270,6 +280,7 @@ async fn mint(sock: &Path, port: u16, repo_token: &str, key: &str) -> Result<(St
         .header(hyper::header::HOST, format!("127.0.0.1:{port}"))
         .header(hyper::header::AUTHORIZATION, format!("Bearer {repo_token}"))
         .header(RUN_KEY_HEADER, key)
+        .header(PLATFORM_HEADER, if platform { "1" } else { "0" })
         .body(http_body_util::Empty::<Bytes>::new())
         .map_err(|e| internal(format!("request: {e}")))?;
     let resp = tokio::time::timeout(Duration::from_secs(10), send.send_request(req)).await.map_err(|_| internal("gateway timeout"))?.map_err(|e| internal(format!("gateway: {e}")))?;
@@ -300,6 +311,89 @@ async fn mint(sock: &Path, port: u16, repo_token: &str, key: &str) -> Result<(St
         drop(send);
     });
     Ok((token, hold))
+}
+
+/// Variables a platform-sandboxed run keeps from the caller (§17.2 clean environment): no
+/// credentials, no platform tokens; the gateway variables are added on top.
+const PLATFORM_KEEP_ENV: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "NO_COLOR"];
+
+/// `moochy run --box-is-sandbox -- <cmd…>` (CONTRACT §17.2): the maintainer declares this
+/// single-purpose VM or container the sandbox. No kernel isolation here, so: a loud warning; a
+/// clean environment with only the gateway variables; the secret masks enforced by refusing to run
+/// while the worktree holds files the sandbox would hide (nothing can hide them here); a run token
+/// marked platform-sandboxed (tool calls only if the project allows platform sandboxes).
+/// Run tokens are honoured only on the gateway's Unix socket (A215), so this process bridges a
+/// loopback port to it for the agent.
+pub fn run_platform(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::path::PathBuf>) -> Result<i32> {
+    let (prog, args) = cmd.split_first().ok_or_else(|| usage("moochy run --box-is-sandbox -- <command> [args…]"))?;
+    let port: u16 = gw.anthropic.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).ok_or_else(|| internal("gateway URL without a port"))?;
+    let key = std::fs::read_to_string(gw.state_dir.join(RUN_KEY_FILE)).map_err(|_| internal("no run key: restart the Moochy app (`moochy down`, `moochy up`)"))?;
+    let cwd = std::env::current_dir().map_err(|e| internal(format!("cwd: {e}")))?;
+    let worktree = worktree.or_else(|| crate::files::git_root(&cwd)).unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or(cwd.clone()));
+    guard_worktree(&worktree, gw.state_dir.parent().unwrap_or(&gw.state_dir))?;
+    let exposed = moochy_sandbox::mask::collect(&worktree).map_err(|e| usage(format!("cannot check the worktree for secrets: {e}")))?;
+    if !exposed.is_empty() {
+        let list: Vec<String> = exposed.iter().take(10).map(|p| crate::util::clean(&p.strip_prefix(&worktree).unwrap_or(p).to_string_lossy()).into_owned()).collect();
+        return Err(usage(format!(
+            "refusing --box-is-sandbox: without a kernel sandbox nothing hides these {} file(s) from the agent: {}{}. Move them out of the box (use the platform's secret store), then run again",
+            exposed.len(),
+            list.join(", "),
+            if exposed.len() > 10 { ", …" } else { "" }
+        )));
+    }
+    eprintln!(
+        "\n!!! WARNING: --box-is-sandbox: `{}` runs WITHOUT moochy's sandbox.\n!!! This box is the only boundary: the agent can read and change everything this user can on it,\n!!! reach any network the box reaches, and read the Moochy keys stored here (this box's own, scoped to one project, capped and expiring).\n!!! Use it only in a single-purpose VM or container that holds nothing else. Tool calls from donated tokens reach it only if the project allows platform sandboxes.\n",
+        crate::util::clean(prog)
+    );
+    let sock = gw.state_dir.join("gateway.sock");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
+    rt.block_on(async {
+        let (token, hold) = mint(&sock, port, &gw.repo_token, key.trim(), true).await?;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| internal(format!("bridge: {e}")))?;
+        let local = listener.local_addr().map_err(|e| internal(format!("bridge: {e}")))?.port();
+        let bridge = tokio::spawn(bridge(listener, sock, format!("127.0.0.1:{port}")));
+        let at = |url: &str| url.replacen(&format!(":{port}"), &format!(":{local}"), 1);
+        let mut c = std::process::Command::new(prog);
+        c.args(args).env_clear().current_dir(if cwd.starts_with(&worktree) { &cwd } else { &worktree });
+        for k in PLATFORM_KEEP_ENV {
+            if let Some(v) = std::env::var_os(k) {
+                c.env(k, v);
+            }
+        }
+        for (k, v) in gateway_env(&at(&gw.anthropic), &at(&gw.openai), &at(&gw.mcp), &token) {
+            c.env(k, v);
+        }
+        c.env(moochy_sandbox::RUN_TOKEN_ENV, &token);
+        let name = crate::util::clean(prog).into_owned();
+        let st = tokio::task::spawn_blocking(move || c.status()).await.map_err(|_| internal("launcher failed"))?.map_err(|e| internal(format!("run {name}: {e}")))?;
+        bridge.abort();
+        drop(hold);
+        Ok(st.code().unwrap_or(1))
+    })
+}
+
+/// Loopback → gateway socket, request by request, with the gateway's own Host (DNS-rebinding
+/// allowlist). Only reachable from this box; every request still needs the run token.
+async fn bridge(listener: tokio::net::TcpListener, sock: std::path::PathBuf, authority: String) {
+    let Ok(host) = hyper::header::HeaderValue::from_str(&authority) else { return };
+    loop {
+        let Ok((tcp, _)) = listener.accept().await else { continue };
+        let _ = tcp.set_nodelay(true);
+        let (sock, host) = (sock.clone(), host.clone());
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                let (sock, host) = (sock.clone(), host.clone());
+                async move {
+                    let unix = tokio::time::timeout(Duration::from_secs(5), tokio::net::UnixStream::connect(&sock)).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+                    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(unix)).await.map_err(std::io::Error::other)?;
+                    tokio::spawn(conn);
+                    req.headers_mut().insert(hyper::header::HOST, host);
+                    send.send_request(req).await.map_err(std::io::Error::other)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
+        });
+    }
 }
 
 /// A197: the worktree becomes read-write inside the sandbox, so it must not be `/`, contain the
@@ -410,22 +504,22 @@ mod tests {
         let key = std::fs::read_to_string(dir.join(RUN_KEY_FILE)).unwrap();
         let mine = Peer { uid: std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&dir).unwrap()), pid: Some(i32::try_from(std::process::id()).unwrap()) };
         let me = Some(mine);
-        assert_eq!(open("acme/widget".into(), None, me, &dir).status(), 403);
-        assert_eq!(open("acme/widget".into(), Some("AAAA"), me, &dir).status(), 403);
-        assert_eq!(open("acme/widget".into(), Some(key.trim()), None, &dir).status(), 403, "TCP (no peer) cannot mint");
+        assert_eq!(open("acme/widget".into(), false, None, me, &dir).status(), 403);
+        assert_eq!(open("acme/widget".into(), false, Some("AAAA"), me, &dir).status(), 403);
+        assert_eq!(open("acme/widget".into(), false, Some(key.trim()), None, &dir).status(), 403, "TCP (no peer) cannot mint");
         if cfg!(target_os = "linux") {
             let other = Some(Peer { pid: Some(1), ..mine });
-            assert_eq!(open("acme/widget".into(), Some(key.trim()), other, &dir).status(), 403, "another program cannot mint");
+            assert_eq!(open("acme/widget".into(), false, Some(key.trim()), other, &dir).status(), 403, "another program cannot mint");
         }
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let r = open("acme/widget".into(), Some(key.trim()), me, &dir);
+            let r = open("acme/widget".into(), false, Some(key.trim()), me, &dir);
             assert_eq!(r.status(), 200);
             let Body::Chan(mut rx) = r.into_body() else { panic!("streamed") };
             let line = rx.recv().await.unwrap();
             let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
             let tok = v["token"].as_str().unwrap().to_owned();
-            assert_eq!(check(&tok).as_deref(), Some("acme/widget"));
+            assert_eq!(check(&tok), Some(Run { slug: "acme/widget".into(), platform: false }));
             assert_eq!(check("mrun_forged"), None);
             drop(rx);
             for _ in 0..50 {
