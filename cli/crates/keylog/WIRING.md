@@ -293,3 +293,62 @@ spec's (`webauthn_*`, `counter`, `high_s`, `owner_key_exists`, `dup_key`, `skew`
 - **`moochy owner init` with passkeys** (§4b, 9a): when `Code::OwnerKeyExists` comes back from a
   first-key submission and the account has passkeys (`view.state(|s| s.owner_key(..))`), switch
   to the authorized form. Then `acknowledge_owner_key(pub)` as today, before submitting.
+
+## 10. A224: a first CLI owner key needs a proof (spec/KEYLOG.md §4c)
+
+From the cutover (2026-10-05T00:00:00Z, on the running max of the log's `logged_at`), the log
+refuses a first CLI (Ed25519) owner key that carries no proof, with `owner_key_proof`. Before the
+cutover the relay may still append the old proofless form, but it should stop now: wire the
+proof, then a dev log can set `Config.OwnerKeyProofFromMs = 1` so tests exercise the rule today.
+
+### 10a. mo-relay (append path) with mo-oauth (the confirmed link)
+
+- **What the CLI sends is unchanged.** `moochy owner init` submits
+  `SignedLogEntry{kind: "OWNER_KEY_ADDED", body: 4 fields (no prev), sigs: [new_sig]}`.
+  `AppendSigned` would log it proofless. Instead, in `edge/keylog.go` `logEntry` route it like
+  `holdOwnerKey` (`edge/pendingkey.go`) when all three hold:
+  1. it is a first key (`prev` empty, no `Authorizer`);
+  2. the user has no active owner key (`len(KeyLog.OwnerKeys(ps)) == 0`; with passkeys only:
+     answer `owner_key_exists` and let the CLI use §4b);
+  3. the session's pseudonym matches the body.
+
+  Then check `new_sig` (`proto.Verify`, ZIP-215) and keep it pending, 10 min TTL, bound to the
+  user, device and request id.
+- **The confirmed link (mo-oauth + mo-notify).**
+  1. Mail the account's **confirmed** address a single-use link naming the key:
+     "bind CLI owner key `ok_…` from device X?". Store only `sha256(token)`.
+  2. Refuse to mail when the confirmed address changed less than 72 h ago (`prefs.ChangedAt`, the
+     same rule as the first passkey); answer the CLI `email_changed_recently`.
+  3. Opening the link needs the user's web session (same user). Confirming with a POST, CSRF and
+     same Origin, as for `/decide`, computes
+     `proof := tlog.EmailProof(tokenHash, tlog.OwnerKeyID(pub), ps)` and calls
+     `KeyLog.Append(ctx, tlog.OwnerKeyAdded, body, tlog.ProvenOwnerKeySig(newSig, proof))`.
+  4. Answer the CLI's pending request with the index or the code.
+- **Codes to surface:**
+  - `owner_key_proof`: the old path was used after the cutover.
+  - `owner_key_exists`: the account already has an owner key. Rotate a CLI key with `prev`; with
+    passkeys only, use §4b.
+  - `skew`: `issued_at` older than 10 min. The CLI signs at submit; if the click comes later,
+    answer `skew` and let the CLI resubmit, or keep the pending TTL ≤ 10 min.
+- **Tests.** In relay tests that bind owner keys through the Node path (`relay/test/keylog_test.go`,
+  `decide_test.go`, e2e), set `Config.OwnerKeyProofFromMs = 1` once the flow exists, and confirm
+  through the link. Until then they pass only before the cutover date.
+
+### 10b. mo-donor (Node / CLI)
+
+- **Required patch.** `crates/node/src/keylog.rs`, `alert_fields`: checked, `cargo build -p moochy` and its tests build with it.
+
+  ```rust
+  Alert::UnprovenOwnerKey { idx, owner_key, known } => json!({"alert": "unproven_owner_key", "idx": idx, "kind": "OWNER_KEY_ADDED", "owner_key": clean(owner_key), "known": known}),
+  ```
+
+  `known: true` is a reminder (log at info); `known: false` is a security event.
+- **`moochy owner init` shows the proof state.** After submitting, print "waiting for you to
+  confirm the email sent to your confirmed address (link names ok_…); expires in 10 min". On
+  success, read `view.state(|s| s.owner_key(&id).map(|k| k.proof))` and show `OwnerKeyProof::Email`
+  as "bound with your confirmed email" (or `Authorizer` as "authorized by your passkey").
+  `moochy owner status` shows the same, and for `OwnerKeyProof::None` "bound before the email
+  proof rule (on the relay's word); rotating keeps it trusted only if it was yours". Map the codes
+  `owner_key_proof`, `owner_key_exists` and `email_changed_recently` to plain sentences.
+- **Nothing else changes for verification.** The mirror applies the rule itself, with the
+  compiled-in cutover. Legacy keys and their approvals stay valid.
