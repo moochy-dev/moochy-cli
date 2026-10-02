@@ -38,6 +38,7 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 - Read `docs/plan/06-security-and-trust.md`. Every mitigation listed there for your component is in scope.
 - `docs/security/attack-catalog.md` (owned by `mo-sec`) is the running list of attacks with their counter-measure and the E2E scenario that proves it. When it exists, check your component against it.
+- `security@moochy.dev` (in SECURITY.md) is confirmed by the product owner but NOT live yet: never send to it, test it, look it up, or configure anything for it; leave the text as it is.
 - Fail closed: on any doubt (bad signature, unknown field, oversize, wrong state) refuse with a specific code, never "best effort".
 
 ## 6. Web palette (fixed)
