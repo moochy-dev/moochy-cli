@@ -35,8 +35,8 @@ pub fn default_name() -> String {
 /// without a browser and the device is saved as a box bound to this machine.
 pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Vec<String>, name: String, enroll: Option<&str>) -> Result<()> {
     let origin = Origin::parse(relay)?;
-    // Box: gateway only, and the machine binding read before a token use is spent.
-    let box_fp = enroll.map(|_| crate::boxes::fingerprint()).transpose()?;
+    // Box: gateway only; the machine-id hint is recorded with it.
+    let box_fp = enroll.map(|_| crate::boxes::fingerprint());
     if enroll.is_some() && roles != ["gateway"] {
         return Err(usage("a box enrolls as a gateway device only"));
     }

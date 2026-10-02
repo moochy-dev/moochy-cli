@@ -15,6 +15,7 @@ pub mod button;
 pub mod cli;
 pub mod config;
 pub mod ctl;
+pub mod decisions;
 pub mod connect;
 pub mod donations;
 pub mod engine;
