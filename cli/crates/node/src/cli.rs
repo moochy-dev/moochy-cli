@@ -52,6 +52,9 @@ COMMANDS:
   service install [--system] [--print] | service uninstall [--system]
                                   Start Moochy at login (systemd user unit, launchd agent);
                                   --print shows the unit only
+  audit --provider [--from-file usage.csv]
+                                  What this device served (90 days), checked against the
+                                  provider's usage export (date,model,cost_usd)
   safety [--monthly-limit $N] [--accept-safety]
                                   The safety step before donating: a monthly limit for this
                                   machine, and a provider-side spend limit (required once)
@@ -189,7 +192,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -247,6 +250,7 @@ fn run() -> Result<()> {
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
         ["safety"] => safety(&home, &o, None),
+        ["audit"] if o.has("provider") => audit(&home, &o),
         ["service", "install"] => crate::service::install(&home, o.has("system"), o.has("print")),
         ["service", "uninstall"] => crate::service::uninstall(o.has("system")),
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
@@ -741,6 +745,28 @@ fn spend_limit_page(provider: &str) -> &'static str {
 /// advice to use a dedicated key with a provider-side spend limit, acknowledged with a checkbox.
 /// Interactive on the terminal; headless with `--monthly-limit $N --accept-safety`. Until it is
 /// done this device does not donate (outside `MOOCHY_INSECURE_DEV`).
+/// `moochy audit --provider [--from-file usage.csv]` (07 §2): the last 90 days of served work.
+fn audit(home: &Home, o: &Opts) -> Result<()> {
+    let since = crate::util::now_ms().saturating_sub(crate::journal::RETENTION_DAYS.saturating_mul(86_400_000));
+    let entries = crate::journal::since(&home.state_dir(), since);
+    let provider = match &o.from_file {
+        Some(f) => {
+            let md = std::fs::metadata(f).map_err(|e| usage(format!("{}: {e}", f.display())))?;
+            if md.len() > 64 << 20 {
+                return Err(usage("usage file larger than 64 MiB"));
+            }
+            Some(crate::audit::provider_csv(&std::fs::read_to_string(f).map_err(|e| usage(format!("{}: {e}", f.display())))?)?)
+        }
+        None => None,
+    };
+    let r = crate::audit::report(&entries, provider.as_ref());
+    emit(&r);
+    if r.get("flagged").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty()) {
+        return Err(Error { exit: crate::util::Exit::Internal, msg: "some days show provider spend the journal does not account for".into() });
+    }
+    Ok(())
+}
+
 fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<()> {
     use std::io::{BufRead as _, Write as _};
     let mut cfg = home.load()?;

@@ -33,7 +33,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-{user}ExecStart={exe} --home {home} up --foreground
+{user}# Optional, 0600: MOOCHY_PASSPHRASE=… for the file keystore (the OS keychain needs none).
+EnvironmentFile=-{home}/service.env
+ExecStart={exe} --home {home} up --foreground
 Restart=on-failure
 RestartSec=5
 # CONTRACT §15.2: platform hardening on top of the node's own lockdown (seccomp, Landlock).
