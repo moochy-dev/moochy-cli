@@ -1151,6 +1151,11 @@ impl Drop for H1Lease {
 
 /// Largest run of already-received body frames merged into one chunk.
 const COALESCE_MAX: usize = 16 << 10;
+/// Most frames merged into one chunk. Unbounded, the merge loop chases a burst (each extra
+/// frame may cost a socket read) and holds the first frame back; one frame per chunk costs a
+/// link message per event downstream. Measured on E22-style bursts (interleaved A/B, dev box):
+/// 4 gives the lowest per-chunk p50 end to end (cap 1 / 2 / unbounded were all slower).
+const MERGE_MAX_FRAMES: u32 = 4;
 
 /// How a body ended, kept while a merged chunk in front of it is handed out first.
 #[derive(Debug, Clone, Copy)]
@@ -1192,7 +1197,7 @@ impl std::fmt::Debug for Response {
 
 impl Response {
     /// Next body bytes, `None` at the end. Never waits to batch: it returns as soon as one
-    /// frame is there, merged with every further frame already received (up to 16 KiB), so
+    /// frame is there, merged with the frames already received (at most 4 frames, 16 KiB), so
     /// a burst costs one chunk downstream instead of one per frame. Enforces the idle
     /// timeout, the total deadline and the size cap.
     pub async fn next(&mut self) -> Result<Option<Bytes>, Failure> {
@@ -1207,6 +1212,7 @@ impl Response {
             let mut conn = lease.as_mut().and_then(|l| l.conn.as_mut());
             let mut first: Option<Bytes> = None;
             let mut merged: Option<BytesMut> = None;
+            let mut frames = 0u32;
             let polled = poll_fn(|cx| {
                 loop {
                     let have = first.is_some();
@@ -1240,7 +1246,8 @@ impl Response {
                                     m.len()
                                 }
                             };
-                            if total >= COALESCE_MAX {
+                            frames = frames.saturating_add(1);
+                            if total >= COALESCE_MAX || frames >= MERGE_MAX_FRAMES {
                                 return Poll::Ready(Ok(()));
                             }
                         }
