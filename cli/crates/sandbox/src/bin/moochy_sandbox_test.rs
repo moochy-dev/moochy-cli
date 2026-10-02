@@ -585,10 +585,12 @@ fn probe_http(a: &[String]) -> ExitCode {
     }
 }
 
-/// `proxy <addr> <host:port>`: send a CONNECT through the proxy at `addr` and
-/// print its status line.
+/// `proxy <addr|env> <host:port>`: send a CONNECT through the proxy at `addr`
+/// (`env`: the one `HTTPS_PROXY` names) and print its status line.
 fn probe_proxy(a: &[String]) -> ExitCode {
     let (Some(addr), Some(target)) = (a.first(), a.get(1)) else { return ExitCode::from(2) };
+    let from_env = std::env::var("HTTPS_PROXY").unwrap_or_default();
+    let addr = if addr == "env" { from_env.trim_start_matches("http://").trim_end_matches('/') } else { addr.as_str() };
     let res = (|| -> std::io::Result<String> {
         let sa = addr.parse().map_err(|_| std::io::Error::other("bad addr"))?;
         let mut s = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2))?;

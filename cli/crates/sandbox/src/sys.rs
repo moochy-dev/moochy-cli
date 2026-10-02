@@ -81,19 +81,23 @@ pub fn loopback_up() -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("loopback socket: {e}")))?;
     // SAFETY: `ifr` is a zeroed, properly sized `ifreq`; the kernel reads the
     // name and reads/writes `ifru_flags` only. The fd is valid for both calls.
+    // glibc takes the ioctl request as c_ulong, musl as c_int (the musl
+    // release builds): both values fit.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+    let (get, set) = (libc::SIOCGIFFLAGS as libc::Ioctl, libc::SIOCSIFFLAGS as libc::Ioctl);
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         for (dst, src) in ifr.ifr_name.iter_mut().zip(b"lo\0") {
             *dst = libc::c_char::from_ne_bytes([*src]);
         }
-        if libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) == -1 {
+        if libc::ioctl(sock.as_raw_fd(), get, &mut ifr) == -1 {
             return Err(io::Error::last_os_error());
         }
         // IFF_UP | IFF_RUNNING = 0x41: fits in c_short.
         #[allow(clippy::cast_possible_truncation)]
         let up = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         ifr.ifr_ifru.ifru_flags |= up;
-        if libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) == -1 {
+        if libc::ioctl(sock.as_raw_fd(), set, &ifr) == -1 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -186,4 +190,18 @@ pub fn winch_signalfd() -> io::Result<std::os::fd::OwnedFd> {
         }
         Ok(std::os::fd::OwnedFd::from_raw_fd(fd))
     }
+}
+
+/// The kernel's Landlock ABI version (`landlock_create_ruleset(NULL, 0,
+/// LANDLOCK_CREATE_RULESET_VERSION)`); 0 when Landlock is unavailable. For
+/// `moochy doctor` only: the sandbox itself negotiates through the `landlock`
+/// crate.
+pub fn landlock_abi() -> i32 {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: with a NULL attr and size 0 the kernel reads no user memory and
+    // returns the ABI version (or -1).
+    let r = unsafe {
+        libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<libc::c_void>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION)
+    };
+    i32::try_from(r).unwrap_or(0).max(0)
 }

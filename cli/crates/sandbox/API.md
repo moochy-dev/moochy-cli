@@ -38,8 +38,8 @@ let code = spec.run(program, &args)?;                // blocks; returns the agen
 | `cwd` | worktree | Working directory inside. |
 | `run_token` | `None` | Exported as `MOOCHY_RUN_TOKEN` inside the sandbox only. |
 | `limits` | 4 GiB AS, 1024 fds, 512 procs, no core, no CPU/wall cap | rlimits (every one applied or the run fails); `wall_seconds` kills the whole sandbox (exit 124). cgroup v2 (§1.8): `processes` → `pids.max`, `memory_total_bytes` → `memory.max` + swap 0, `cpu_percent` → `cpu.max` (0 = unset). |
-| `allow_hosts` | empty | `--allow-host`: exact host names reachable on :443 through the CONNECT proxy (§1.2b). Linux only (macOS: `Unsupported`). |
-| `protected` | `[$HOME]` | No visible path (worktree, `ro_paths`, `rw_paths`) may be `/` or contain one of these. **mo-node: push the Moochy home dir.** |
+| `allow_hosts` | empty | `--allow-host`: exact host names reachable on :443 through the CONNECT proxy (§1.2b). Linux and macOS. |
+| `protected` | `$HOME`, `$MOOCHY_HOME`, `$XDG_CONFIG_HOME/moochy`, `~/.config/moochy` | No visible path (worktree, `ro_paths`, `rw_paths`) may be `/` or contain one of these. The defaults mirror the node's `Home::resolve`; **mo-node: also push `home.dir`** (covers `--home`). |
 | `git_writable` | `false` | Top-level `.git` writable except `hooks/ config config.worktree modules/ commondir` (§1.6). |
 | `unsafe_no_sandbox` | `false` | `--unsafe-no-sandbox`: runs **without** a sandbox after a loud stderr warning. Debug only. |
 
@@ -87,10 +87,11 @@ single-threaded (`poll`), capped at 64 concurrent connections, and dies with the
 ### 1.2b `--allow-host` (off by default)
 
 `spec.allow_hosts = vec!["registry.npmjs.org".into()]`. The launcher serves an HTTP CONNECT
-proxy on a Unix socket in its 0700 scratch dir, bind-mounted at `/run/moochy/proxy.sock`; the
+proxy. **Linux:** on a Unix socket in its 0700 scratch dir, bind-mounted at `/run/moochy/proxy.sock`; the
 reaper bridges `127.0.0.1:3128` (`PROXY_LOOPBACK_PORT`) to it, Landlock allows connect to that
 port, and `HTTPS_PROXY`/`https_proxy` point there (`NO_PROXY=127.0.0.1,localhost`; `spec.env`
-can override). Policy, fail closed: `CONNECT <host>:443` only; `host` must equal an entry
+can override). **macOS:** on an ephemeral `127.0.0.1` port, the only port besides the gateway
+the Seatbelt profile allows (`HTTPS_PROXY` names it). Policy, fail closed: `CONNECT <host>:443` only; `host` must equal an entry
 (case-insensitive exact DNS name: no wildcards, no IP literals, invalid entries make `run` fail);
 every resolved address must be public (no loopback/private/link-local/CGNAT/ULA/NAT64…, so DNS
 rebinding onto the gateway or cloud metadata is refused) and the tunnel connects to the checked
@@ -194,6 +195,17 @@ it before `unshare`, so every descendant is inside. At the end `cgroup.kill` and
 SIGKILLed launcher's empty cgroup is swept by the next run. Graceful by contract: no
 delegated cgroup → no error. Test: `e95_cgroup_limits_when_delegated`.
 
+### 1.8b `moochy doctor`
+
+`moochy_sandbox::doctor(worktree: Option<&Path>) -> Vec<doctor::Line { level: Ok|Note|Fail, topic, text }>`:
+ready-to-print lines (every path escaped: repo file names are untrusted). Linux: `sandbox`
+(the real userns preflight; on a restricted host the exact AppArmor fix, which first moves a
+user-writable binary to `/usr/local/bin`), `landlock` (kernel ABI and the layers it lacks),
+`cgroup` (`delegated_cgroup()` or the rlimits-only note); macOS: `sandbox` (`sandbox-exec`).
+With a worktree: `masks` (count, then up to 50 relative paths, then `… and N more`).
+**mo-node:** replace the doctor block in `cli.rs` with
+`for l in moochy_sandbox::doctor(root.as_deref()) { line(l.level != Level::Fail, l.topic, l.text) }`.
+
 ### 1.9 macOS
 
 `sandbox-exec` with a generated profile, plus: own session (`setsid`, no controlling
@@ -201,7 +213,7 @@ terminal) with `SIGINT SIGTERM SIGHUP SIGQUIT SIGWINCH` forwarded to the run's p
 while it runs, `RLIMIT_NOFILE/CORE/CPU` (`RLIMIT_NPROC` is per user on macOS and `RLIMIT_AS`
 is not enforced: not set), the wall deadline (exit 124), `killpg(SIGKILL)` of whatever is left
 in the group at the end, `HOME` = a private dir in the scratch dir. Residual: a descendant
-that starts its own session survives the run (no PID namespace). `allow_hosts` → `Unsupported`.
+that starts its own session survives the run (no PID namespace). `allow_hosts`: §1.2b.
 
 The test suite on this box used the same shape, scoped to the test binary only
 (`/etc/apparmor.d/moochy-sandbox-test`), and the profile was removed afterwards.
@@ -285,8 +297,17 @@ fails, because std only forwards an errno.
 
 ## 4. Test driver
 
+Targets: clippy-clean on `aarch64`/`x86_64` Linux (gnu and musl, the release targets) and
+`aarch64-apple-darwin`. Unit tests + oracles also run on `x86_64-unknown-linux-musl` under
+`qemu-x86_64` (x86_64 seccomp tables incl. the x32 filter); the e2e suite passes with the
+static `aarch64-unknown-linux-musl` driver.
+
 Fuzzing (dev-only, `fuzz/`, not a workspace member): `cargo +nightly fuzz run mask_glob` /
-`seccomp_tables` (from `cli/crates/sandbox`). The oracles live in `src/fuzzing.rs`
+`seccomp_tables` (from `cli/crates/sandbox`). On stable, coverage-guided too (no ASan; all code
+here is safe Rust, so the oracles' asserts are the detector):
+`RUSTFLAGS="--cfg fuzzing -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table -Cllvm-args=-sanitizer-coverage-trace-compares -Cdebug-assertions -Coverflow-checks" cargo build --release --target <host triple>`
+in `fuzz/` (the explicit `--target` keeps the flags off build scripts). Last run (2026-10-02,
+arm64, 621 s each): `mask_glob` 64.0 M execs, `seccomp_tables` 176.4 M execs, no finding. The oracles live in `src/fuzzing.rs`
 (`cfg(test)`/`cfg(fuzzing)` only) and run deterministically in `cargo test`: the seccomp one
 executes the compiled BPF of all three profiles with a cBPF interpreter against the policy
 restated independently.

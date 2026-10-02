@@ -14,7 +14,7 @@
 //!   the tunnel connects to the checked address itself (no second lookup);
 //! - head ≤ 8 KiB read within 10 s, upstream connect ≤ 10 s, ≤ 64 tunnels.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -159,25 +159,84 @@ pub fn judge(head: &[u8], allow: &Allowlist) -> Verdict {
     }
 }
 
-/// The proxy of one run: bound and served on its own thread before the sandbox
-/// is spawned (the socket must exist to be bind-mounted), stopped when dropped.
+/// The proxy of one run, served on its own thread from before the sandbox is
+/// spawned, stopped when dropped. Linux: a Unix socket (bind-mounted into the
+/// view, reached through the reaper's bridge). macOS: a loopback TCP port (the
+/// Seatbelt profile allows exactly that port; no netns there).
 pub(crate) struct Proxy {
-    sock: PathBuf,
+    wake: Wake,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+enum Wake {
+    Unix(PathBuf),
+    Tcp(SocketAddr),
+}
+
+/// A connection the proxy can serve (Unix or loopback TCP).
+trait Stream: std::io::Read + std::io::Write + Send + Sized + 'static {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()>;
+    fn try_clone(&self) -> std::io::Result<Self>;
+    fn shutdown_write(&self) -> std::io::Result<()>;
+}
+
+macro_rules! impl_stream {
+    ($t:ty) => {
+        impl Stream for $t {
+            fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+                <$t>::set_read_timeout(self, d)
+            }
+            fn try_clone(&self) -> std::io::Result<Self> {
+                <$t>::try_clone(self)
+            }
+            fn shutdown_write(&self) -> std::io::Result<()> {
+                <$t>::shutdown(self, std::net::Shutdown::Write)
+            }
+        }
+    };
+}
+impl_stream!(UnixStream);
+impl_stream!(TcpStream);
+
 impl Proxy {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn bind(sock: PathBuf, allow: Allowlist) -> Result<Self, crate::Error> {
         let l = UnixListener::bind(&sock).map_err(|err| crate::Error::Setup { what: "bind --allow-host proxy", err })?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let s2 = Arc::clone(&stop);
-        let thread = std::thread::spawn(move || serve(&l, &allow, &s2));
-        Ok(Self { sock, stop, thread: Some(thread) })
+        Ok(Self::spawn(Wake::Unix(sock), move |stop| serve(l.incoming(), &allow, &stop)))
     }
 
-    pub(crate) fn sock(&self) -> &std::path::Path {
-        &self.sock
+    /// `127.0.0.1:<ephemeral>`; the port is [`Proxy::port`].
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn bind_loopback(allow: Allowlist) -> Result<Self, crate::Error> {
+        let err = |err| crate::Error::Setup { what: "bind --allow-host proxy", err };
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(err)?;
+        let addr = l.local_addr().map_err(err)?;
+        Ok(Self::spawn(Wake::Tcp(addr), move |stop| {
+            serve(l.incoming().map(|c| c.and_then(|c| c.set_nodelay(true).map(|()| c))), &allow, &stop);
+        }))
+    }
+
+    fn spawn(wake: Wake, f: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        Self { wake, stop, thread: Some(std::thread::spawn(move || f(s2))) }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn sock(&self) -> Option<&std::path::Path> {
+        match &self.wake {
+            Wake::Unix(p) => Some(p),
+            Wake::Tcp(_) => None,
+        }
+    }
+
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn port(&self) -> Option<u16> {
+        match &self.wake {
+            Wake::Tcp(a) => Some(a.port()),
+            Wake::Unix(_) => None,
+        }
     }
 }
 
@@ -185,18 +244,21 @@ impl Drop for Proxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = UnixStream::connect(&self.sock); // wake the accept loop
+            // Wake the accept loop.
+            match &self.wake {
+                Wake::Unix(p) => drop(UnixStream::connect(p)),
+                Wake::Tcp(a) => drop(TcpStream::connect_timeout(a, Duration::from_secs(1))),
+            }
             let _ = t.join();
         }
     }
 }
 
-/// Serve the proxy on `listener` until `stop` is set (then one more connection
-/// wakes the accept loop). Blocking. Live tunnels end when the sandbox (the
-/// bridge's far end) dies.
-fn serve(listener: &UnixListener, allow: &Allowlist, stop: &AtomicBool) {
+/// Serve accepted connections until `stop` is set (then one more connection
+/// wakes the accept loop). Blocking. Live tunnels end when their client does.
+fn serve<S: Stream>(incoming: impl Iterator<Item = std::io::Result<S>>, allow: &Allowlist, stop: &AtomicBool) {
     let live = Arc::new(AtomicUsize::new(0));
-    for conn in listener.incoming() {
+    for conn in incoming {
         if stop.load(Ordering::Relaxed) {
             return;
         }
@@ -213,7 +275,7 @@ fn serve(listener: &UnixListener, allow: &Allowlist, stop: &AtomicBool) {
     }
 }
 
-fn handle(mut c: UnixStream, allow: &Allowlist) -> std::io::Result<()> {
+fn handle<S: Stream>(mut c: S, allow: &Allowlist) -> std::io::Result<()> {
     c.set_read_timeout(Some(HEAD_TIMEOUT))?;
     let mut head = Vec::with_capacity(512);
     let mut buf = [0u8; 1024];
@@ -261,13 +323,14 @@ fn handle(mut c: UnixStream, allow: &Allowlist) -> std::io::Result<()> {
     });
     let mut up_r = up;
     let _ = std::io::copy(&mut up_r, &mut c);
-    let _ = c.shutdown(std::net::Shutdown::Write);
+    let _ = c.shutdown_write();
     let _ = t.join();
     Ok(())
 }
 
-fn refuse(c: &mut UnixStream, status: &str) -> std::io::Result<()> {
-    write!(c, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+fn refuse(c: &mut impl std::io::Write, status: &str) -> std::io::Result<()> {
+    // One write: the client sees the whole status line in its first read.
+    c.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
 }
 
 #[cfg(test)]

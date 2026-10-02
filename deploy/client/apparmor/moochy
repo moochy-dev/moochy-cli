@@ -5,9 +5,11 @@
 # to the moochy binary at root-owned install paths; it confines nothing else.
 # Never set the sysctl to 0 instead: that hands the permission to every program.
 #
-# Install:  sudo install -m 0644 moochy /etc/apparmor.d/moochy && sudo apparmor_parser -r /etc/apparmor.d/moochy
-# Installed elsewhere? Edit the path below to the real (root-owned) location;
-# a user-writable path would let any program of that user obtain userns.
+# Install (packaging details: deploy/client/README.md, "Ubuntu 23.10+"):
+#   sudo install -m 0644 moochy /etc/apparmor.d/moochy && sudo apparmor_parser -r /etc/apparmor.d/moochy
+# Needs AppArmor >= 4.0 (Ubuntu 24.04+). Installed elsewhere? Move the binary
+# to /usr/local/bin rather than editing the path: a user-writable path would
+# let any program of that user obtain userns.
 abi <abi/4.0>,
 include <tunables/global>
 
