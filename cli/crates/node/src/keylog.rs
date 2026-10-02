@@ -36,9 +36,24 @@ pub const DEFAULT_LOG_VKEY: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_VKEY"
 /// anything the relay says.
 pub fn effective_log_key(cfg: &Config) -> Option<String> {
     cfg.log_key.clone().or_else(|| {
-        let default = cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY));
-        DEFAULT_LOG_VKEY.filter(|k| default && !k.is_empty()).map(str::to_owned)
+        DEFAULT_LOG_VKEY.filter(|k| default_relay(cfg) && !k.is_empty()).map(str::to_owned)
     })
+}
+
+/// The default relay's public Git anchor of the key log (raw-file base URL), compiled into
+/// release builds (`MOOCHY_DEFAULT_LOG_ANCHOR`, T-C06-015).
+pub const DEFAULT_LOG_ANCHOR: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_ANCHOR");
+
+fn default_relay(cfg: &Config) -> bool {
+    cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY))
+}
+
+/// The anchor this node checks hourly: `log_anchor_url`, else the compiled-in default for the
+/// default relay (https only).
+pub fn effective_anchor(cfg: &Config) -> Option<String> {
+    cfg.log_anchor_url
+        .clone()
+        .or_else(|| DEFAULT_LOG_ANCHOR.filter(|u| default_relay(cfg) && u.starts_with("https://")).map(str::to_owned))
 }
 
 pub struct KeyLog {
@@ -254,7 +269,7 @@ struct Link {
 
 impl moochy_keylog::LogLink for Link {
     fn anchor_configured(&self) -> bool {
-        self.node.cfg.log_anchor_url.is_some()
+        effective_anchor(&self.node.cfg).is_some()
     }
 
     async fn get_tile(&mut self, path: &str) -> Result<Vec<u8>, moochy_keylog::Error> {
@@ -292,7 +307,7 @@ impl moochy_keylog::LogLink for Link {
     }
 
     async fn anchor(&mut self) -> Option<Vec<u8>> {
-        let url = self.node.cfg.log_anchor_url.clone()?;
+        let url = effective_anchor(&self.node.cfg)?;
         if Instant::now() < self.anchor_due {
             return None;
         }
@@ -352,8 +367,7 @@ pub const DEFAULT_RECEIPTS_VKEY: Option<&str> = option_env!("MOOCHY_DEFAULT_RECE
 
 fn receipts_key(cfg: &Config) -> Option<NoteKey> {
     let vkey = cfg.receipts_log_key.clone().or_else(|| {
-        let default = cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY));
-        DEFAULT_RECEIPTS_VKEY.filter(|k| default && !k.is_empty()).map(str::to_owned)
+        DEFAULT_RECEIPTS_VKEY.filter(|k| default_relay(cfg) && !k.is_empty()).map(str::to_owned)
     })?;
     NoteKey::parse(&vkey).ok()
 }
