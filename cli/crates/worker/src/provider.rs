@@ -43,6 +43,9 @@ pub struct Limits {
     pub max_response: u64,
     /// Error body bytes kept for the Gateway.
     pub max_error_body: usize,
+    /// An idle pooled HTTP/1.1 connection older than this is not reused: proxies in front of
+    /// GPU hosts (RunPod, Cloudflare: ~100 s) drop idle keep-alive connections silently.
+    pub pool_idle: Duration,
 }
 
 impl Limits {
@@ -62,6 +65,7 @@ impl Default for Limits {
             total: Duration::from_secs(3600),
             max_response: 128 << 20,
             max_error_body: 64 << 10,
+            pool_idle: Duration::from_secs(60),
         }
     }
 }
@@ -764,7 +768,7 @@ impl Adapter {
         };
         let (sender, conn) =
             http1::handshake(TokioIo::new(io)).await.map_err(|_| Failure::new(FailKind::Network, "HTTP/1 handshake failed"))?;
-        Ok(H1Conn { sender, conn: Some(conn) })
+        Ok(H1Conn { sender, conn: Some(conn), idle_since: None })
     }
 
     /// An idle keep-alive connection that is still usable, else a fresh one.
@@ -772,12 +776,15 @@ impl Adapter {
         loop {
             let idle = self.h1_idle.lock().ok().and_then(|mut g| g.pop());
             let Some(mut c) = idle else { break };
+            if c.idle_since.is_some_and(|t| t.elapsed() > self.limits.pool_idle) {
+                continue; // likely cut by a proxy in between: dropping it closes our end
+            }
             // An idle connection is not driven: one poll lets it notice a server close.
             c.drive(&mut Context::from_waker(Waker::noop()));
             if c.is_dead() {
                 continue;
             }
-            let H1Conn { sender, conn } = &mut c;
+            let H1Conn { sender, conn, .. } = &mut c;
             if drive(conn, sender.ready()).await.is_ok() {
                 return Ok((c, true));
             }
@@ -928,9 +935,12 @@ impl Adapter {
     async fn error(&self, status: u16, headers: &HeaderMap, mut body: Incoming, mut conn: Option<&mut H1Conn>) -> Failure {
         let kind = match status {
             429 => FailKind::RateLimited,
-            503 | 529 => FailKind::Overloaded,
+            // 520/521/523: a Cloudflare-fronted GPU proxy (RunPod) cannot reach the origin.
+            503 | 529 | 520 | 521 | 523 => FailKind::Overloaded,
             401 | 403 => FailKind::Auth,
             404 => FailKind::ModelUnavailable,
+            // 522/524: the proxy timed out waiting for the origin.
+            522 | 524 => FailKind::Timeout,
             400..=499 if status != 408 => FailKind::InvalidRequest,
             _ => FailKind::ProviderError,
         };
@@ -956,7 +966,11 @@ impl Adapter {
             retry_after_ms,
             rate_limit: Some(Box::new(RateLimit::from_headers(headers))),
             body: Bytes::from(buf),
-            detail: "provider returned an error status",
+            detail: if matches!(status, 522 | 524) {
+                "the server's proxy timed out before the first byte (RunPod-style proxies cut at ~100 s): use streaming requests"
+            } else {
+                "provider returned an error status"
+            },
         }
     }
 }
@@ -1060,6 +1074,8 @@ struct H1Conn {
     sender: http1::SendRequest<Full<Bytes>>,
     /// `None` once the connection has finished.
     conn: Option<H1Driver>,
+    /// When it was returned to the pool.
+    idle_since: Option<Instant>,
 }
 
 impl H1Conn {
@@ -1103,10 +1119,11 @@ fn poll_body(body: &mut Incoming, conn: Option<&mut H1Conn>, cx: &mut Context<'_
     Pin::new(body).poll_frame(cx)
 }
 
-fn return_h1(pool: &StdMutex<Vec<H1Conn>>, c: H1Conn) {
+fn return_h1(pool: &StdMutex<Vec<H1Conn>>, mut c: H1Conn) {
     if c.is_dead() {
         return;
     }
+    c.idle_since = Some(Instant::now());
     if let Ok(mut g) = pool.lock() {
         g.retain(|c| !c.is_dead());
         if g.len() < H1_MAX_IDLE {
@@ -1495,6 +1512,72 @@ mod tests {
         }
     }
 
+    /// Keep-alive HTTP/1.1 fake on loopback: answers every request on the same connection and
+    /// counts connections.
+    async fn keepalive_fake() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 4096];
+                    loop {
+                        while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                            let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                            if buf.len() < end + 4 + len {
+                                break;
+                            }
+                            buf.drain(..end + 4 + len);
+                            let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{SSE_OK}", SSE_OK.len());
+                            if s.write_all(resp.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                        match s.read(&mut b).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&b[..n]),
+                        }
+                    }
+                });
+            }
+        });
+        (port, conns)
+    }
+
+    /// RunPod-style proxies drop idle keep-alive connections: an idle pooled connection older
+    /// than `pool_idle` is never reused; a fresh one is dialled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_connections_expire_after_pool_idle() {
+        let (port, conns) = keepalive_fake().await;
+        let mut cfg = local_cfg(format!("http://127.0.0.1:{port}"));
+        cfg.limits.pool_idle = Duration::from_millis(150);
+        let a = Adapter::new(&cfg).unwrap();
+        assert_eq!(call(&a).await.unwrap(), SSE_OK.as_bytes());
+        assert_eq!(call(&a).await.unwrap(), SSE_OK.as_bytes());
+        assert_eq!(conns.load(std::sync::atomic::Ordering::SeqCst), 1, "reused while fresh");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(call(&a).await.unwrap(), SSE_OK.as_bytes());
+        assert_eq!(conns.load(std::sync::atomic::Ordering::SeqCst), 2, "an idle-expired connection is not reused");
+    }
+
+    /// A proxy's "origin timed out" (Cloudflare 524) is a retryable timeout with a clear hint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_timeout_status_is_a_retryable_timeout() {
+        let name = "gpu3.moochy.test";
+        test_dns::set(name, vec![IpAddr::from([127, 0, 0, 1])], true);
+        let f = tls_fake(&[name], "HTTP/1.1 524 A Timeout Occurred\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+        let a = Adapter::new_local_with(&local_cfg(format!("https://{name}:{}", f.port)), &remote_opts(f.port, name, RemoteTrust::Ca(f.ca.clone()))).unwrap();
+        let e = call(&a).await.unwrap_err();
+        assert_eq!((e.kind, e.status), (FailKind::Timeout, Some(524)));
+        assert!(e.detail.contains("streaming"), "{}", e.detail);
+    }
+
     #[test]
     fn remote_auth_header_rules() {
         let url = "https://gpu.example.com".to_owned();
@@ -1610,6 +1693,7 @@ mod tests {
         let full = |p: Provider, d: Dialect| AdapterDef::of(p).path(d).map(|path| format!("https://{}{path}", AdapterDef::of(p).host));
         let a = Dialect::AnthropicMessages;
         let o = Dialect::OpenAiChat;
+        let r = Dialect::OpenAiResponses;
         let want = [
             (Provider::Anthropic, a, Some("https://api.anthropic.com/v1/messages")),
             (Provider::Anthropic, o, None),
@@ -1621,6 +1705,13 @@ mod tests {
             (Provider::DeepSeek, o, Some("https://api.deepseek.com/chat/completions")),
             (Provider::XAi, a, None),
             (Provider::XAi, o, Some("https://api.x.ai/v1/chat/completions")),
+            // §18.6: Responses only where the provider speaks it natively.
+            (Provider::OpenAi, r, Some("https://api.openai.com/v1/responses")),
+            (Provider::XAi, r, Some("https://api.x.ai/v1/responses")),
+            (Provider::OpenRouter, r, Some("https://openrouter.ai/api/v1/responses")),
+            (Provider::Anthropic, r, None),
+            (Provider::DeepSeek, r, None),
+            (Provider::Local, r, None),
         ];
         for (p, d, url) in want {
             assert_eq!(full(p, d).as_deref(), url, "{p:?} {d:?}");
