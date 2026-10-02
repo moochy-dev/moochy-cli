@@ -19,6 +19,29 @@ fn pct(mut v: Vec<Duration>, p: usize) -> Duration {
     v[(v.len() * p / 100).min(v.len() - 1)]
 }
 
+/// Realistic Anthropic request body: long text blocks with escapes, tool results, numbers.
+fn provider_body(n: usize) -> Vec<u8> {
+    let words: Vec<&str> = "the of and to in is that for it as with was on be by this are from code fn let mut impl struct return if else match self error result ok some none use pub crate test assert vec string".split(' ').collect();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut b = Vec::from(&br#"{"model":"claude-sonnet-5-5","max_tokens":8192,"stream":true,"temperature":0.7,"messages":["#[..]);
+    let mut turn = 0u32;
+    while b.len() < n {
+        b.extend_from_slice(br#"{"role":"user","content":[{"type":"text","text":""#);
+        for _ in 0..120 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b.extend_from_slice(words[(x % words.len() as u64) as usize].as_bytes());
+            // JSON escapes inside the string: backslash-n, backslash-quote, backslash-u00e9.
+            b.extend_from_slice(match x % 23 { 0 => &b"\\n"[..], 1 => &b"\\\""[..], 2 => &b"\\u00e9"[..], _ => &b" "[..] });
+        }
+        b.extend_from_slice(format!(r#""}},{{"type":"tool_result","tool_use_id":"toolu_{turn}","content":"exit 0, {turn} lines"}}]}},"#).as_bytes());
+        turn += 1;
+    }
+    b.extend_from_slice(br#"{"role":"user","content":"end"}]}"#);
+    b
+}
+
 #[test]
 fn perf() {
     let ck = ContentKey::from_bytes([0x11; 32]);
@@ -49,6 +72,34 @@ fn perf() {
     let (p50, p99) = (pct(times.clone(), 50), pct(times, 99));
     let z = crypto::seal_request(&ck, &task, &body).unwrap().body_len;
     println!("seal_request 100 KB (→ {z} B sealed): p50 {p50:?} p99 {p99:?} (budget 1 ms / 3 ms)");
+
+    // 1a) Worker micro-benchmarks on a 100 KB provider body (mo-worker r12 / mo-donor r6):
+    //     strict JSON check, req_commit, body SHA-256, headers hash.
+    let pbody = provider_body(100_000);
+    let s_req = crypto::salt(&[7; 32], crypto::SaltName::Req).unwrap();
+    let mut hdrs = std::collections::BTreeMap::new();
+    hdrs.insert("anthropic-beta".to_owned(), "context-1m-2025-08-07".to_owned());
+    hdrs.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
+    let micro = |name: &str, f: &mut dyn FnMut()| {
+        let mut t = Vec::with_capacity(500);
+        for _ in 0..500 {
+            let s = Instant::now();
+            f();
+            t.push(s.elapsed());
+        }
+        println!("micro 100 KB {name}: p50 {:?} p99 {:?}", pct(t.clone(), 50), pct(t, 99));
+    };
+    micro("json::check", &mut || assert!(moochy_proto::json::check(&pbody).is_ok()));
+    micro("req_commit", &mut || assert_ne!(crypto::req_commit(&s_req, &pbody).unwrap(), [0; 32]));
+    micro("sha256(body)", &mut || assert_ne!(crypto::sha256(&pbody), [0; 32]));
+    micro("headers_sha256 (2 headers)", &mut || assert_ne!(crypto::headers_sha256(&hdrs).unwrap(), [0; 32]));
+    micro("HKDF k_req + rk + 3 salts (per task)", &mut || {
+        assert_ne!(crypto::k_req(&ck, &task).unwrap().expose(), &[0; 32]);
+        assert_ne!(crypto::rk(&ck, &r, &task, &w, 1).unwrap().expose(), &[0; 32]);
+        for n in [crypto::SaltName::Req, crypto::SaltName::Resp, crypto::SaltName::Pid] {
+            assert_ne!(crypto::salt(&[7; 32], n).unwrap().expose(), &[0; 32]);
+        }
+    });
 
     // 1b) Worker: open that 100 KB request (AEAD + pure-Rust zstd decode).
     let sealed100 = crypto::seal_request(&ck, &task, &body).unwrap();

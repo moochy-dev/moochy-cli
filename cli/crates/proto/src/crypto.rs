@@ -8,10 +8,8 @@ use crate::enc::{label, lp, u64be};
 use crate::msg::{InnerPayload, Projection, Receipt};
 use crate::{B, Blob, DeviceId, Error, RepoId, TaskId, json, pb};
 use bytes::{Bytes, BytesMut};
-use hkdf::Hkdf;
 use hpke::{Deserializable, Kem as _, OpModeR, OpModeS, Serializable};
 use rand_core::{CryptoRng, RngCore, TryRngCore};
-use sha2::Sha256;
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -66,9 +64,20 @@ impl std::fmt::Debug for Secret32 {
     }
 }
 
+/// HKDF-SHA256 (RFC 5869), output 32 bytes, through ring (ARMv8 SHA2 instructions; the portable
+/// sha2 backend took ~8 µs for the five derivations of a task, measured). An empty salt is the
+/// RFC's HashLen zero bytes, exactly as before.
 fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Result<Secret32, Error> {
+    struct Len32;
+    impl ring::hkdf::KeyType for Len32 {
+        fn len(&self) -> usize {
+            32
+        }
+    }
     let mut okm = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(salt), ikm).expand(info, &mut okm).map_err(|_| Error::Malformed)?;
+    let prk = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt).extract(ikm);
+    let info = [info];
+    prk.expand(&info, Len32).and_then(|o| o.fill(&mut okm)).map_err(|_| Error::Malformed)?;
     Ok(Secret32(okm))
 }
 
@@ -77,6 +86,17 @@ fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Result<Secret32, Error> {
 /// sha2 0.10 backend, which needs its `asm` feature on aarch64). Used for body hashes.
 pub fn sha256(b: &[u8]) -> [u8; 32] {
     ring::digest::digest(&ring::digest::SHA256, b).as_ref().try_into().unwrap_or([0; 32])
+}
+
+/// `SHA-256(lp(fields…))` streamed into one ring digest: same bytes hashed as `sha256(&lp(..))`,
+/// without first copying every field (e.g. the whole request body) into an `lp` buffer.
+fn sha256_lp<'a>(fields: impl IntoIterator<Item = &'a [u8]>) -> Result<[u8; 32], Error> {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for f in fields {
+        ctx.update(&u32::try_from(f.len()).map_err(|_| Error::TooLarge)?.to_be_bytes());
+        ctx.update(f);
+    }
+    ctx.finish().as_ref().try_into().map_err(|_| Error::Malformed)
 }
 
 /// `K_req = HKDF(salt="", ikm=CK, info=lp("moochy/v1/req", task_id))`.
@@ -112,25 +132,24 @@ pub fn salt(s: &[u8; 32], name: SaltName) -> Result<Secret32, Error> {
 
 /// `SHA-256(lp("moochy/v1/req-commit", S_req, body))`, body as sent by the Gateway (pre-mutation).
 pub fn req_commit(s_req: &Secret32, body: &[u8]) -> Result<[u8; 32], Error> {
-    Ok(sha256(&lp(&[label::REQ_COMMIT, &s_req.0, body])?))
+    sha256_lp([label::REQ_COMMIT, &s_req.0[..], body])
 }
 
 /// `SHA-256(lp("moochy/v1/resp-commit", S_resp, SHA-256(plaintext response)))`.
 /// The inner hash makes it streamable (lp needs the length up front) and lifts the 4 GiB lp limit.
 pub fn resp_commit(s_resp: &Secret32, resp_sha256: &[u8; 32]) -> Result<[u8; 32], Error> {
-    Ok(sha256(&lp(&[label::RESP_COMMIT, &s_resp.0, resp_sha256])?))
+    sha256_lp([label::RESP_COMMIT, &s_resp.0[..], &resp_sha256[..]])
 }
 
 /// `SHA-256(lp("moochy/v1/provider-req", S_pid, provider_request_id))`.
 pub fn provider_req_hash(s_pid: &Secret32, request_id: &str) -> Result<[u8; 32], Error> {
-    Ok(sha256(&lp(&[label::PROVIDER_REQ, &s_pid.0, request_id.as_bytes()])?))
+    sha256_lp([label::PROVIDER_REQ, &s_pid.0[..], request_id.as_bytes()])
 }
 
 /// `headers_sha256 = SHA-256(lp(name_1, value_1, …))` over the inner-payload headers in
 /// ascending byte order of names (BTreeMap order). No headers → SHA-256 of the empty string.
 pub fn headers_sha256(h: &BTreeMap<String, String>) -> Result<[u8; 32], Error> {
-    let fields: Vec<&[u8]> = h.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_bytes()]).collect();
-    Ok(sha256(&lp(&fields)?))
+    sha256_lp(h.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_bytes()]))
 }
 
 // ---------- chunk AEAD streams ----------
