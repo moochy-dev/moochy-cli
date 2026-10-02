@@ -52,6 +52,8 @@ COMMANDS:
   keys list | keys remove <provider> | keys rotate
                                   rotate = new device keys for this machine (the old ones stop
                                   working 24 h later)
+  keys revoke <device id>         Remove another device from your account (e.g. one you did
+                                  not add); this one: `moochy logout`
   config set <KEY> <VALUE> | config show
                                   monthly_limit (dollars, e.g. 20), slots_max (1-64),
                                   gateway_addr, journal_full_text, auto_cache,
@@ -214,6 +216,7 @@ fn run() -> Result<()> {
         ["doctor"] => doctor(&home),
         ["update"] => update(&o),
         ["keys", "rotate"] => crate::owner::rotate_device(&home),
+        ["keys", "revoke", id] => crate::owner::revoke_device(&home, id),
         ["up"] => {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));

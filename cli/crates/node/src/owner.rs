@@ -259,3 +259,24 @@ pub fn rotate_device(home: &Home) -> Result<()> {
     crate::util::emit(&json!({"event": "key_rotated", "device_id": id, "log_index": r.log_index, "note": "restart the app (`moochy down && moochy up`) within 24 h to use the new key"}));
     Ok(())
 }
+
+/// `moochy keys revoke <device_id>` (the own-key alert's advice, T-06-083): revoke ANOTHER device
+/// of this account, e.g. one the key log shows but you never added. Signed by this device
+/// (KEYLOG §2a revoke request), relayed by the running app; this device: `moochy logout`.
+pub fn revoke_device(home: &Home, device_id: &str) -> Result<()> {
+    let cfg = home.load()?;
+    if Some(device_id) == cfg.device_id.as_deref() {
+        return Err(usage("that is this device: use `moochy logout`"));
+    }
+    if !moochy_keylog::entry::is_id(device_id, "d_") {
+        return Err(usage("keys revoke <device id> (d_…, as shown in the alert or on the Devices page)"));
+    }
+    let pseudonym = cfg.pseudonym.clone().ok_or_else(|| auth("not logged in: run `moochy login` first"))?;
+    let sec = crate::keystore::load(home, &cfg)?.ok_or_else(|| auth("no keystore: run `moochy login` first"))?;
+    let me = sec.device.as_ref().ok_or_else(|| auth("not logged in: run `moochy login` first"))?.sign_key();
+    let body = moochy_keylog::entry::revoke_body(device_id, &pseudonym, "user");
+    let sig = me.sign(&moochy_keylog::entry::revoke_request_message(&body));
+    let r = rt()?.block_on(submit(home, SubmitEntryRequest { request_id: format!("revoke-{device_id}"), kind: "KEY_REVOKED".into(), body, sigs: vec![sig.to_vec()] }))?;
+    crate::util::emit(&json!({"event": "device_revoked", "device_id": device_id, "log_index": r.log_index}));
+    Ok(())
+}

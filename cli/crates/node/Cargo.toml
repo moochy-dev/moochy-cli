@@ -16,8 +16,9 @@ name = "moochy"
 path = "src/main.rs"
 
 [features]
-default = []
-# OS keychain keystore backend (macOS Keychain, Secret Service, Credential Manager).
+# T-02-010: the OS keychain is the default keystore (encrypted file as fallback).
+default = ["keychain"]
+# OS keychain keystore backend (macOS Keychain, Linux Secret Service).
 keychain = ["dep:keyring"]
 
 [dependencies]
@@ -60,7 +61,14 @@ subtle = { version = "2", default-features = false }
 # unsafe code. Already in the tree (moochy-sandbox). `net` + `process`: CONTRACT §15.2 validator
 # (SCM_RIGHTS from the key-less zygote, reaping its single-use children), same safe API.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "net", "process"] }
-keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+# OS keychain (T-02-010). macOS: the native Keychain. Linux: Secret Service over a pure-Rust D-Bus
+# client (no libdbus/C at build or run time); a host without a Secret Service daemon falls back
+# to the encrypted file.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", optional = true, default-features = false, features = ["apple-native"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", optional = true, default-features = false, features = ["async-secret-service", "tokio", "crypto-rust"] }
 
 [lints.rust]
 unsafe_code = "forbid"

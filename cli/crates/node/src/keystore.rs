@@ -200,6 +200,9 @@ pub(crate) fn open(file: &[u8], pass: &str, aad: &[u8]) -> Result<Zeroizing<Vec<
         .map_err(|_| auth("wrong passphrase or tampered keystore"))
 }
 
+/// This build has an OS keychain backend.
+pub const KEYCHAIN_BUILT: bool = cfg!(all(feature = "keychain", any(target_os = "linux", target_os = "macos")));
+
 fn use_keychain(cfg: &Config) -> bool {
     cfg.keystore.as_deref() == Some("keychain")
 }
@@ -226,12 +229,30 @@ pub fn load_or_init(home: &Home, cfg: &mut Config) -> Result<Secrets> {
     if let Some(s) = load(home, cfg)? {
         return Ok(s);
     }
-    if cfg.keystore.is_none() {
-        let kc = cfg!(feature = "keychain") && std::env::var_os("MOOCHY_PASSPHRASE").is_none();
-        cfg.keystore = Some(if kc { "keychain" } else { "file" }.into());
-        home.save(cfg)?;
-    }
     let s = Secrets::new()?;
+    if cfg.keystore.is_none() {
+        // T-02-010: the OS keychain by default; the encrypted file when MOOCHY_PASSPHRASE is set
+        // (headless, CI) or when this machine has no keychain service.
+        let mut chosen = "file";
+        if KEYCHAIN_BUILT && std::env::var_os("MOOCHY_PASSPHRASE").is_none() {
+            let mut probe = cfg.clone();
+            probe.keystore = Some("keychain".into());
+            match save(home, &probe, &s) {
+                Ok(()) => chosen = "keychain",
+                Err(e) => {
+                    return Err(auth(format!(
+                        "no OS keychain available here ({}); set MOOCHY_PASSPHRASE to keep the keys in the encrypted file instead",
+                        e.msg
+                    )));
+                }
+            }
+        }
+        cfg.keystore = Some(chosen.into());
+        home.save(cfg)?;
+        if chosen == "keychain" {
+            return Ok(s);
+        }
+    }
     save(home, cfg, &s)?;
     Ok(s)
 }
@@ -245,7 +266,7 @@ pub fn save(home: &Home, cfg: &Config, s: &Secrets) -> Result<()> {
     write_private(&home.keystore_path(cfg.relay.as_deref()), &seal(&plain, &passphrase()?, AAD)?)
 }
 
-#[cfg(feature = "keychain")]
+#[cfg(all(feature = "keychain", any(target_os = "linux", target_os = "macos")))]
 mod keychain {
     use super::{Config, Home, Result, Zeroizing, b64d, b64e};
     use crate::util::{auth, internal};
@@ -257,8 +278,15 @@ mod keychain {
         };
         keyring::Entry::new("moochy", &user).map_err(|e| internal(format!("keychain: {e}")))
     }
+    /// Keyring calls may block on D-Bus (Linux Secret Service): run them on their own short-lived
+    /// OS thread, never on an async runtime's thread, whoever the caller is.
+    fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T> {
+        std::thread::scope(|s| s.spawn(f).join()).map_err(|_| internal("keychain thread failed"))
+    }
+
     pub fn get(home: &Home, cfg: &Config) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        match entry(home, cfg)?.get_password() {
+        let e = entry(home, cfg)?;
+        match off_runtime(move || e.get_password())? {
             Ok(p) => {
                 let p = Zeroizing::new(p);
                 b64d(&p).map(|v| Some(Zeroizing::new(v))).ok_or_else(|| auth("keychain entry is corrupt"))
@@ -269,11 +297,12 @@ mod keychain {
     }
     pub fn set(home: &Home, cfg: &Config, plain: &[u8]) -> Result<()> {
         let s = Zeroizing::new(b64e(plain));
-        entry(home, cfg)?.set_password(&s).map_err(|e| internal(format!("keychain: {e}")))
+        let e = entry(home, cfg)?;
+        off_runtime(move || e.set_password(&s))?.map_err(|e| internal(format!("keychain: {e}")))
     }
 }
 
-#[cfg(not(feature = "keychain"))]
+#[cfg(not(all(feature = "keychain", any(target_os = "linux", target_os = "macos"))))]
 mod keychain {
     use super::{Config, Home, Result, Zeroizing};
     use crate::util::usage;
