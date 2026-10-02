@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+# Moochy on a cloud box (CONTRACT §17): a persistent Ubuntu VM such as
+# boat.dev, Daytona, Codespaces, RunPod/Vast/Lambda GPU hosts. Runs either a
+# headless donor or a maintainer box gateway (MOOCHY_ENROLL, §17.1).
+# Same hardening as moochy.system.service (the system manager applies every
+# namespace option, unlike user units on Ubuntu >= 23.10). Not for containers:
+# inside Docker/E2B/Modal there is usually no systemd; run the image from
+# deploy/client/container instead and let `moochy doctor` report what the
+# runtime blocks (§17.2).
+#
+# Secrets, from whichever the platform offers (both optional, never in the unit):
+#  - a credential: /etc/credstore.encrypted/moochy-passphrase (systemd-creds
+#    encrypt), /etc/credstore/… (0600 root), or one passed to the system manager
+#    (cloud-init, SMBIOS/qemu fw_cfg: `systemd.set_credential=moochy-enroll:…`);
+#    names moochy-passphrase and moochy-enroll;
+#  - /etc/moochy/box.env (0600 root) with MOOCHY_PASSPHRASE= / MOOCHY_ENROLL=,
+#    written by the platform's secret store.
+# Install:
+#   sudo useradd --system --home /var/lib/moochy --shell /usr/sbin/nologin moochy
+#   sudo install -m 0755 moochy /usr/local/bin/moochy
+#   sudo install -m 0644 moochy-box.service /etc/systemd/system/moochy.service
+#   sudo systemctl enable --now moochy
+[Unit]
+Description=Moochy on a cloud box (headless donor or box gateway)
+Documentation=https://github.com/moochy-dev/moochy-cli/tree/main/docs/guides
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=moochy
+Group=moochy
+Environment=MOOCHY_HOME=/var/lib/moochy
+EnvironmentFile=-/etc/moochy/box.env
+ImportCredential=moochy-passphrase
+ImportCredential=moochy-enroll
+# A credential wins over the env file; both are exported to moochy only.
+ExecStart=/bin/sh -c 'd="$${CREDENTIALS_DIRECTORY:-/nonexistent}"; if [ -r "$$d/moochy-passphrase" ]; then MOOCHY_PASSPHRASE=$$(cat "$$d/moochy-passphrase"); export MOOCHY_PASSPHRASE; fi; if [ -r "$$d/moochy-enroll" ]; then MOOCHY_ENROLL=$$(cat "$$d/moochy-enroll"); export MOOCHY_ENROLL; fi; exec "$0" up --foreground' /usr/local/bin/moochy
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+LimitCORE=0
+TasksMax=256
+MemoryMax=1G
+
+StateDirectory=moochy
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @clock @module
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
