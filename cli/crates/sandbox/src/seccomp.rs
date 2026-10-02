@@ -113,6 +113,11 @@ fn deny_common() -> Result<BTreeMap<i64, Vec<SeccompRule>>, Error> {
         libc::SYS_quotactl,
         libc::SYS_settimeofday,
         libc::SYS_clock_settime,
+        // io_uring: large kernel attack surface, and its ops bypass the
+        // per-syscall filter (A195).
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ];
     for nr in unconditional {
         m.insert(nr, Vec::new());
@@ -147,14 +152,38 @@ pub fn clone3_filter() -> Result<BpfProgram, Error> {
     compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::ENOSYS as u32))
 }
 
+/// x86_64 only: x32-ABI syscalls (`nr | 0x4000_0000`) carry the same
+/// `AUDIT_ARCH_X86_64`, so a deny-list keyed on x86_64 numbers (seccompiler
+/// has no x32 handling) would miss e.g. an x32 `execve`. Refuse the whole x32
+/// range; wrong-arch calls are killed by the stacked seccompiler program.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // tested on every arch (fuzzing.rs)
+pub(crate) fn x32_filter() -> BpfProgram {
+    use seccompiler::sock_filter;
+    const LD_W_ABS: u16 = 0x20;
+    const JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    let ins = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+    vec![
+        ins(LD_W_ABS, 0, 0, 0), // seccomp_data.nr
+        ins(JGE_K, 0, 1, 0x4000_0000),
+        ins(RET_K, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs()),
+        ins(RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ]
+}
+
+/// The deny-list programs, stacked: clone3 → ENOSYS, x32 → EPERM (x86_64), `m`.
+fn deny_stack(m: BTreeMap<i64, Vec<SeccompRule>>) -> Result<Vec<BpfProgram>, Error> {
+    let mut v = vec![clone3_filter()?];
+    #[cfg(target_arch = "x86_64")]
+    v.push(x32_filter());
+    v.push(compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM.unsigned_abs()))?);
+    Ok(v)
+}
+
 /// Maintainer-side agent deny-list. Denied calls fail with `EPERM` so the agent
 /// stays alive and sees a normal error (robustness).
 pub fn agent_filter() -> Result<Vec<BpfProgram>, Error> {
-    let m = deny_common()?;
-    Ok(vec![
-        clone3_filter()?,
-        compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32))?,
-    ])
+    deny_stack(deny_common()?)
 }
 
 /// Donor self-lockdown deny-list: everything [`agent_filter`] denies, **plus**
@@ -163,10 +192,7 @@ pub fn donor_filter() -> Result<Vec<BpfProgram>, Error> {
     let mut m = deny_common()?;
     m.insert(libc::SYS_execve, Vec::new());
     m.insert(libc::SYS_execveat, Vec::new());
-    Ok(vec![
-        clone3_filter()?,
-        compile(m, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32))?,
-    ])
+    deny_stack(m)
 }
 
 /// Validator-child allowlist (§15.2b): read/write/memory/exit only. `mmap`/
@@ -188,6 +214,9 @@ pub fn validator_filter() -> Result<BpfProgram, Error> {
         libc::SYS_writev,
         libc::SYS_close,
         libc::SYS_munmap,
+        // Vec growth past the mmap threshold reallocs via mremap (A200); it
+        // cannot change protections.
+        libc::SYS_mremap,
         libc::SYS_brk,
         libc::SYS_futex,
         libc::SYS_exit,

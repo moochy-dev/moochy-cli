@@ -1,0 +1,34 @@
+# Dev-only fuzz harnesses (AGENTS.md §3: not a workspace member, never ships).
+# Run: cargo +nightly fuzz run mask_glob   (from cli/crates/sandbox)
+#      cargo +nightly fuzz run seccomp_tables
+# cargo-fuzz builds with `--cfg fuzzing`, which exposes moochy_sandbox::fuzzing.
+[package]
+name = "moochy-sandbox-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+moochy-sandbox = { path = ".." }
+
+# Own (empty) workspace: keeps this crate out of cli/'s.
+[workspace]
+
+[[bin]]
+name = "mask_glob"
+path = "fuzz_targets/mask_glob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seccomp_tables"
+path = "fuzz_targets/seccomp_tables.rs"
+test = false
+doc = false
+bench = false

@@ -57,6 +57,10 @@ deploy/client/scripts/repro-check.sh --target x86_64-unknown-linux-musl --agains
 
 Every script takes `--dry-run`. After `cli/Cargo.lock` changes: `cargo vet regenerate imports` and `cargo vet regenerate exemptions` with `--manifest-path cli/Cargo.toml --store-path deploy/client/supply-chain`, then audit (`cargo vet certify`) any trust-base crate the regeneration exempted.
 
+## Ubuntu 23.10+ (AppArmor user-namespace restriction)
+
+`moochy run` needs unprivileged user namespaces: install `apparmor/moochy` with `sudo install -m 0644 deploy/client/apparmor/moochy /etc/apparmor.d/moochy && sudo apparmor_parser -r /etc/apparmor.d/moochy` (grants `userns` to `/usr/{,local/}bin/moochy` only; `moochy doctor` prints the same fix for the actual binary path).
+
 ## Headless donor container
 
 `container/Containerfile`: a static musl binary on an empty base, uid 65532, state in the `/data` volume (encrypted-file keystore, plan 07 §8.3). The donor's provider key stays on infrastructure the donor controls.
