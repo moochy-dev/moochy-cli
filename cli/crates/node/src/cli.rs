@@ -286,11 +286,7 @@ fn run() -> Result<()> {
             box_enroll(&home, &o)?;
             if o.has("foreground") { up_foreground(home, o.has("offline"), o.has("unsafe-no-lockdown")) } else { up_background(&home, &o) }
         }
-        ["down"] => rt_small()?.block_on(async {
-            crate::ctl::connect(&home.socket_path()).await?.shutdown(ShutdownRequest {}).await.map_err(|s| internal(s.message().to_owned()))?;
-            emit(&json!({"event": "stopped"}));
-            Ok(())
-        }),
+        ["down"] => down(&home),
         ["status"] => status(&home, o.has("json")),
         ["pause" | "resume"] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
@@ -428,6 +424,28 @@ fn decisions_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
         ["accept", id] => crate::decisions::accept_link(home, id),
         _ => Err(usage("decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] | decisions accept <id>")),
     }
+}
+
+/// `moochy down`: ask the app to stop.
+fn down(home: &Home) -> Result<()> {
+    rt_small()?.block_on(async {
+        if let Err(s) = crate::ctl::connect(&home.socket_path()).await?.shutdown(ShutdownRequest {}).await {
+            // The app may exit before its answer is flushed: stopped means the socket is gone.
+            let mut gone = false;
+            for _ in 0..40 {
+                if crate::ctl::connect(&home.socket_path()).await.is_err() {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !gone {
+                return Err(internal(s.message().to_owned()));
+            }
+        }
+        emit(&json!({"event": "stopped"}));
+        Ok(())
+    })
 }
 
 /// `moochy box …` (CONTRACT §17.1).
