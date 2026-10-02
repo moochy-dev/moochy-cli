@@ -49,6 +49,9 @@ COMMANDS:
   keys add local --base-url http://127.0.0.1:11434 --model local/<slug>=<server id> [--key-stdin]
                                   Donate your own GPU: an OpenAI-compatible server on this
                                   machine or your LAN (Ollama, LM Studio, vLLM, llama.cpp)
+  safety [--monthly-limit $N] [--accept-safety]
+                                  The safety step before donating: a monthly limit for this
+                                  machine, and a provider-side spend limit (required once)
   keys list | keys remove <provider> | keys rotate
                                   rotate = new device keys for this machine (the old ones stop
                                   working 24 h later)
@@ -127,6 +130,7 @@ fn dev_mode() -> bool {
 #[derive(Default)]
 struct Opts {
     home: Option<PathBuf>,
+    monthly_limit: Option<u64>,
     words: Vec<String>,
     relay: Option<String>,
     ca_file: Option<PathBuf>,
@@ -174,12 +178,15 @@ fn parse() -> Result<Opts> {
             Long("model") => o.models.push(s(p.value().map_err(err)?)?),
             Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
+            Long("monthly-limit") => {
+                o.monthly_limit = Some(crate::util::parse_dollars(s(p.value().map_err(err)?)?.trim_start_matches('$')).ok_or_else(|| usage("--monthly-limit is a dollar amount, e.g. 25"))?);
+            }
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => o.cap = Some(crate::util::parse_limit(&s(p.value().map_err(err)?)?).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| usage("--cap is a monthly amount in dollars, e.g. $20"))?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -236,6 +243,7 @@ fn run() -> Result<()> {
         }),
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
+        ["safety"] => safety(&home, &o, None),
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
         ["mcp"] => mcp(&home, &o),
         ["keys", "add", provider] => keys_add(&home, provider, &o),
@@ -708,9 +716,64 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     sec.providers.retain(|p| p.provider != provider);
     sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new() });
     keystore::save(home, &cfg, &sec)?;
-    // CONTRACT §15.2 "bounded worst case": a dedicated key with a spend limit at the provider.
-    eprintln!("Tip: use a key made only for Moochy, with a monthly spend limit set at {provider}: the most it can ever cost you is that limit.");
     emit(&json!({"event": "key_added", "provider": provider}));
+    safety(home, o, Some(provider))
+}
+
+/// Where each provider sets a spend limit (07 §8.1 step 4 deep links).
+fn spend_limit_page(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "https://console.anthropic.com/settings/limits",
+        "openai" => "https://platform.openai.com/settings/organization/limits",
+        "openrouter" => "https://openrouter.ai/settings/keys",
+        "deepseek" => "https://platform.deepseek.com/usage",
+        "xai" => "https://console.x.ai",
+        _ => "your provider's console",
+    }
+}
+
+/// The donor safety step (07 §8.1 step 4, required): a monthly cap for this machine, and the
+/// advice to use a dedicated key with a provider-side spend limit, acknowledged with a checkbox.
+/// Interactive on the terminal; headless with `--monthly-limit $N --accept-safety`. Until it is
+/// done this device does not donate (outside `MOOCHY_INSECURE_DEV`).
+fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<()> {
+    use std::io::{BufRead as _, Write as _};
+    let mut cfg = home.load()?;
+    if cfg.donor_safety_ack_ms.is_some() && cfg.device_monthly_cap_uusd.is_some() && o.monthly_limit.is_none() {
+        return Ok(());
+    }
+    let page = provider.map_or("your provider's console", spend_limit_page);
+    eprintln!(
+        "Safety step before donating:\n  1. A monthly limit for this machine: Moochy never spends more than this per month here.\n  2. Strongly recommended: a key made only for Moochy, with a monthly spend limit set at the provider ({page}).\n     Then the most it can ever cost you is that limit."
+    );
+    let (cap, accepted) = if o.has("accept-safety") {
+        (o.monthly_limit.or(cfg.device_monthly_cap_uusd), true)
+    } else if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        let mut out = tty.try_clone().ctx("tty")?;
+        let mut lines = std::io::BufReader::new(tty).lines();
+        let mut ask = |q: &str| -> Option<String> {
+            let _ = write!(out, "{q}");
+            let _ = out.flush();
+            lines.next()?.ok().map(|l| l.trim().to_owned())
+        };
+        let cap = o.monthly_limit.or_else(|| {
+            let a = ask("Monthly limit for this machine in dollars [25]: ")?;
+            crate::util::parse_dollars(if a.is_empty() { "25" } else { a.trim_start_matches('$') })
+        });
+        let ok = ask("[ ] I set a spend limit at my provider, or I accept the risk. Type yes to check this box: ").is_some_and(|a| a.eq_ignore_ascii_case("yes") || a.eq_ignore_ascii_case("y"));
+        (cap, ok)
+    } else {
+        (None, false)
+    };
+    let Some(cap) = cap.filter(|_| accepted) else {
+        eprintln!("Not donating yet. To finish: moochy safety --monthly-limit 25 --accept-safety");
+        emit(&json!({"event": "safety_step_pending"}));
+        return Ok(());
+    };
+    cfg.device_monthly_cap_uusd = Some(cap);
+    cfg.donor_safety_ack_ms = Some(crate::util::now_ms());
+    home.save(&cfg)?;
+    emit(&json!({"event": "safety_step_done", "monthly_limit": crate::util::fmt_dollars(cap)}));
     Ok(())
 }
 

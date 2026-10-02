@@ -52,6 +52,9 @@ pub struct Config {
     /// Projects (`owner/name`, comma-separated) whose clients receive tool calls from donated
     /// tokens outside `moochy run` (CONTRACT §15.4 opt-in; warned at every start).
     pub allow_unsandboxed_tools: Option<String>,
+    /// Donor safety step (07 §8.1 step 4) accepted at this Unix ms: a monthly cap for this
+    /// machine and the provider-side spend limit advice. No serving without it (outside dev).
+    pub donor_safety_ack_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
