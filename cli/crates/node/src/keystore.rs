@@ -49,6 +49,14 @@ pub struct ProviderKey {
     pub key: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// `local`: the server may be a public IP or host name (`--allow-unvetted-host`, dev only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[zeroize(skip)]
+    pub allow_unvetted_host: bool,
+    /// `local`: public catalog slug → the server's model id (`--model local/x=server-id`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[zeroize(skip)]
+    pub models: std::collections::BTreeMap<String, String>,
 }
 
 impl DeviceKeys {

@@ -107,6 +107,8 @@ pub struct Node {
     pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
+    /// Worker: local model server mapping, public slug → server model id.
+    pub local_models: HashMap<String, String>,
     /// Worker: single-use jailed request validators (CONTRACT §15.2).
     pub validator: Option<Arc<crate::validator::Pool>>,
     /// Worker: outbox + served-task set + reservations (blocking I/O: use on a blocking thread).
@@ -170,6 +172,7 @@ impl Node {
             adapters: w.adapters,
             store: w.store,
             validator: w.validator,
+            local_models: w.local_models,
             approvals: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
@@ -193,6 +196,15 @@ impl Node {
             seal_refused: Mutex::new(std::collections::HashSet::new()),
             keylog,
         })
+    }
+
+    /// The id to send to the provider for a catalog entry: a local server's own id (donor
+    /// mapping), else the catalog's. `None` = this node does not serve that local slug.
+    pub fn provider_model_id(&self, e: &moochy_proto::money::CatalogEntry) -> Option<String> {
+        if e.provider == "local" {
+            return self.local_models.get(&e.model).cloned();
+        }
+        Some(e.provider_model_id.clone())
     }
 
     pub fn catalog(&self) -> Arc<Catalog> {
@@ -248,7 +260,8 @@ impl Node {
 
     /// The relay's catalog key = the pinned key-log key (`log_key`, `<name>+<hash>+<b64(0x01‖pub)>`).
     pub fn catalog_key(&self) -> Option<[u8; 32]> {
-        let vkey = self.cfg.log_key.as_deref()?;
+        let vkey = crate::keylog::effective_log_key(&self.cfg)?;
+        let vkey = vkey.as_str();
         moochy_keylog::NoteKey::parse(vkey).ok()?;
         let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, vkey.splitn(3, '+').nth(2)?).ok()?;
         match raw.split_first() {
@@ -455,6 +468,8 @@ pub fn plain_id(s: &str) -> bool {
 #[derive(Default)]
 pub struct WorkerParts {
     pub adapters: Vec<Arc<Adapter>>,
+    /// Local model server: public `local/*` slug → the server's model id.
+    pub local_models: HashMap<String, String>,
     pub store: Option<Arc<Mutex<Store>>>,
     pub validator: Option<Arc<crate::validator::Pool>>,
 }

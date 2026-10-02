@@ -27,6 +27,20 @@ use tokio::time::Instant;
 const TILE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANCHOR_EVERY: Duration = Duration::from_secs(3600);
 
+/// The default relay's key-log verifier key, compiled into release builds
+/// (`MOOCHY_DEFAULT_LOG_VKEY` at build time, CONTRACT §6).
+pub const DEFAULT_LOG_VKEY: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_VKEY");
+
+/// The key this node verifies the log with: the configured `log_key` (`login --log-key`,
+/// `config set log_key`), else the compiled-in key when talking to the default relay. Never
+/// anything the relay says.
+pub fn effective_log_key(cfg: &Config) -> Option<String> {
+    cfg.log_key.clone().or_else(|| {
+        let default = cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY));
+        DEFAULT_LOG_VKEY.filter(|k| default && !k.is_empty()).map(str::to_owned)
+    })
+}
+
 pub struct KeyLog {
     view: Mutex<View>,
     /// Taken by [`KeyLog::start`].
@@ -61,7 +75,8 @@ fn add_key(path: &std::path::Path, k: &[u8; 32]) {
 impl KeyLog {
     /// `None` when no log key is configured (or it is unusable): nothing is trusted then.
     pub fn open(home: &Home, cfg: &Config, sign_pub: Option<[u8; 32]>) -> Option<Arc<Self>> {
-        let key = match NoteKey::parse(cfg.log_key.as_deref()?) {
+        let vkey = effective_log_key(cfg)?;
+        let key = match NoteKey::parse(&vkey) {
             Ok(k) => k,
             Err(e) => {
                 log("error", "key log disabled: bad log_key", &json!({"error": e.to_string()}));
