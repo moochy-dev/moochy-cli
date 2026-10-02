@@ -367,6 +367,10 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
             if matches!(a, Alert::BoxEnrolled { .. }) {
                 return ("info", "key log: box enrolled".into(), f);
             }
+            // A224: a first CLI owner key without proof is a reminder when it is this device's own.
+            if matches!(a, Alert::UnprovenOwnerKey { known: true, .. }) {
+                return ("info", "key log: your first owner key was registered without an email proof".into(), f);
+            }
             ("error", "key log alert".into(), f)
         }
         Event::Fork { size, .. } => ("error", format!("KEY LOG FORK: {}", e.message()), json!({"event": "fork", "size": size})),
@@ -392,6 +396,7 @@ fn alert_fields(a: &Alert) -> serde_json::Value {
         Alert::PasskeyCounter { idx, owner_key } => json!({"alert": "passkey_counter", "idx": idx, "code": "counter", "owner_key": clean(owner_key)}),
         Alert::BoxEnrolled { idx, device_id, repo_id, box_id, expires_at_ms } => json!({"alert": "box_enrolled", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id), "repo_id": clean(repo_id), "box_id": clean(box_id), "expires_at_ms": expires_at_ms}),
         Alert::BoxOutsideRepo { idx, device_id, repo_id } => json!({"alert": "box_outside_repo", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id), "repo_id": clean(repo_id)}),
+        Alert::UnprovenOwnerKey { idx, owner_key, known } => json!({"alert": "unproven_owner_key", "idx": idx, "kind": "OWNER_KEY_ADDED", "owner_key": clean(owner_key), "known": known}),
     }
 }
 
