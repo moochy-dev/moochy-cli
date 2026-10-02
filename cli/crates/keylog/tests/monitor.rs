@@ -471,11 +471,16 @@ fn acknowledge_keys_at_runtime() {
     let ev = block_on(m.on_checkpoint(&mut f.link, &f.n23));
     let msgs: Vec<String> = ev.iter().map(Event::message).collect();
     assert!(
-        !msgs.iter().any(|x| x.contains("unknown_owner_key: an owner key")),
+        !msgs
+            .iter()
+            .any(|x| x.contains("unknown_owner_key: an owner key")),
         "{msgs:?}"
     );
     // The device-key alert still fires for the rogue device until acknowledged.
-    assert!(msgs.iter().any(|x| x.contains("unknown_key: a new device")), "{msgs:?}");
+    assert!(
+        msgs.iter().any(|x| x.contains("unknown_key: a new device")),
+        "{msgs:?}"
+    );
 }
 
 #[test]

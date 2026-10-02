@@ -1,14 +1,21 @@
 //! Exact key-log record formats (spec/KEYLOG.md §2–3). Same grammar as Go's
 //! `relay/internal/tlog/entry.go`. Parsing is zero-copy: fields borrow the record.
 
-use crate::Error;
+use crate::{
+    Error,
+    webauthn::{self, Assertion},
+};
 
 pub const LABEL_RECORD: &[u8] = b"moochy/v1/keylog";
 pub const LABEL_SIG: &[u8] = b"moochy/v1/keylog-sig";
 pub const LABEL_POP: &[u8] = b"moochy/v1/key-pop";
-/// Bound on every record (and every entry of an entry bundle).
-/// 256 × (2 + 480) = 123,392 bytes: a full entry bundle fits one 128 KiB gRPC message.
-pub const MAX_RECORD: usize = 480;
+/// Bound on records without a WebAuthn assertion. The relay keeps every entry bundle
+/// within 256 × (2 + 480) = 123,392 bytes (PAD entries before large records,
+/// spec/KEYLOG.md §4a): a full bundle fits one 128 KiB gRPC message.
+pub const MAX_PLAIN_RECORD: usize = 480;
+/// Bound on every record (and every entry of an entry bundle): assertion-carrying
+/// records (passkey owner keys) only.
+pub const MAX_RECORD: usize = 2048;
 /// Label of receipt-log leaves: `lp("moochy/v1/receipt-log", sha256(receipt))`.
 pub const LABEL_RECEIPT_LOG: &[u8] = b"moochy/v1/receipt-log";
 /// Device-signed requests (spec/KEYLOG.md §2a): authenticate a request, never a log entry.
@@ -32,6 +39,8 @@ pub enum Kind {
     OwnerKeyAdded = 10,
     /// Retires a user's owner key (relay-asserted; removes trust only).
     OwnerKeyRevoked = 11,
+    /// Relay filler keeping entry bundles within their byte budget; no effect.
+    Pad = 12,
 }
 
 impl Kind {
@@ -49,6 +58,7 @@ impl Kind {
             9 => Self::Moderation,
             10 => Self::OwnerKeyAdded,
             11 => Self::OwnerKeyRevoked,
+            12 => Self::Pad,
             _ => return None,
         })
     }
@@ -56,7 +66,7 @@ impl Kind {
     /// Parses a kind name as used in `SignedLogEntry.kind` / `ApprovalRequest.kind`.
     #[must_use]
     pub fn from_name(s: &str) -> Option<Self> {
-        (1..=11).filter_map(Self::from_u32).find(|k| k.name() == s)
+        (1..=12).filter_map(Self::from_u32).find(|k| k.name() == s)
     }
 
     #[must_use]
@@ -73,6 +83,7 @@ impl Kind {
             Self::Moderation => "MODERATION",
             Self::OwnerKeyAdded => "OWNER_KEY_ADDED",
             Self::OwnerKeyRevoked => "OWNER_KEY_REVOKED",
+            Self::Pad => "PAD",
         }
     }
 
@@ -163,6 +174,27 @@ pub enum Body<'a> {
         owner_pub: &'a [u8; 32],
         reason: &'a str,
     },
+    /// OWNER_KEY_ADDED of a passkey (`webauthn-es256`, 9 fields, spec/KEYLOG.md §4a).
+    /// `authorizer` None = first owner key of the account, registered with the
+    /// relay-attested `email_proof` (A224); otherwise an active owner key of the same
+    /// user co-signs. `sig = lp(PoP assertion, authorizer signature)`.
+    OwnerPasskey {
+        pseudonym: &'a str,
+        cose: &'a [u8; webauthn::COSE_LEN],
+        authorizer: Option<&'a str>,
+        issued_at_ms: u64,
+        credential_id: &'a [u8],
+        rp_id: &'a str,
+        origins: &'a str,
+        email_proof: Option<&'a [u8; 32]>,
+    },
+    /// OWNER_KEY_REVOKED of a passkey (the key field is its COSE key).
+    OwnerPasskeyRevoke {
+        pseudonym: &'a str,
+        cose: &'a [u8; webauthn::COSE_LEN],
+        reason: &'a str,
+    },
+    Pad,
 }
 
 /// A parsed record.
@@ -173,7 +205,9 @@ pub struct Entry<'a> {
     pub body: Body<'a>,
     /// The exact body bytes (what owner signatures cover).
     pub raw_body: &'a [u8],
-    /// 64 bytes for KEY_ADDED (proof of possession) and kinds 3–7; empty otherwise.
+    /// 64 bytes for KEY_ADDED (proof of possession); kinds 3–7: 64 bytes (Ed25519
+    /// owner key) or an encoded [`Assertion`] (passkey); OWNER_KEY_ADDED: see [`Body`];
+    /// empty otherwise.
     pub sig: &'a [u8],
 }
 
@@ -191,7 +225,7 @@ pub fn lp(fields: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-fn unlp<const N: usize>(mut b: &[u8]) -> Result<[&[u8]; N], Error> {
+pub(crate) fn unlp<const N: usize>(mut b: &[u8]) -> Result<[&[u8]; N], Error> {
     let mut out: [&[u8]; N] = [&[]; N];
     for slot in &mut out {
         let (len, rest) = b
@@ -339,12 +373,20 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
     let kind = Kind::from_u32(u32::from_be_bytes(kind)).ok_or(Error::Format("unknown kind"))?;
     let logged_at_ms = u64_of(at)?;
     let want_sig = kind == Kind::KeyAdded || kind.owner_signed();
+    let passkey_add = kind == Kind::OwnerKeyAdded && unlp::<9>(body).is_ok();
     let sig_ok = match kind {
+        Kind::OwnerKeyAdded if passkey_add => unlp::<2>(sig).is_ok_and(|[pop, auth]| {
+            Assertion::parse(pop).is_ok() && (auth.is_empty() || owner_sig_form(auth))
+        }),
         Kind::OwnerKeyAdded => sig.len() == 64 || sig.len() == 128,
+        k if k.owner_signed() => owner_sig_form(sig),
         _ => sig.len() == if want_sig { 64 } else { 0 },
     };
     if !sig_ok {
         return Err(Error::Format("sig length"));
+    }
+    if rec.len() > MAX_PLAIN_RECORD && !(passkey_add || kind.owner_signed() && sig.len() != 64) {
+        return Err(Error::TooLarge);
     }
     let body_p = parse_body(kind, body)?;
     if let Body::OwnerKey { prev, .. } = body_p
@@ -359,6 +401,11 @@ pub fn parse_record(rec: &[u8]) -> Result<Entry<'_>, Error> {
         raw_body: body,
         sig,
     })
+}
+
+/// Kinds 3–7: 64 bytes (Ed25519 owner key) or an encoded assertion (passkey).
+fn owner_sig_form(sig: &[u8]) -> bool {
+    sig.len() == 64 || Assertion::parse(sig).is_ok()
 }
 
 #[allow(clippy::too_many_lines)] // one flat arm per entry kind
@@ -471,6 +518,39 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 reason: r,
             }
         }
+        Kind::OwnerKeyAdded if unlp::<9>(b).is_ok() => {
+            let [p, k, auth, t, alg, cred, rp, orig, proof] = unlp::<9>(b)?;
+            let (p, auth, t, alg, rp, orig) =
+                (s(p)?, s(auth)?, u64_of(t)?, s(alg)?, s(rp)?, s(orig)?);
+            let cose = <&[u8; webauthn::COSE_LEN]>::try_from(k).map_err(|_| bad.clone())?;
+            let email_proof = match proof.len() {
+                0 => None,
+                _ => Some(<&[u8; 32]>::try_from(proof).map_err(|_| bad.clone())?),
+            };
+            let authorizer = (!auth.is_empty()).then_some(auth);
+            if !is_pseudonym(p)
+                || webauthn::parse_cose(cose).is_err()
+                || alg != webauthn::ALG
+                || t == 0
+                || !(1..=255).contains(&cred.len())
+                || !is_rp_id(rp)
+                || !origins_ok(orig, rp)
+                || authorizer.is_some_and(|a| !is_owner_key_id(a))
+                || authorizer.is_none() != email_proof.is_some()
+            {
+                return Err(bad);
+            }
+            Body::OwnerPasskey {
+                pseudonym: p,
+                cose,
+                authorizer,
+                issued_at_ms: t,
+                credential_id: cred,
+                rp_id: rp,
+                origins: orig,
+                email_proof,
+            }
+        }
         Kind::OwnerKeyAdded => {
             let [p, k, prev, t] = unlp::<4>(b)?;
             let (p, t) = (s(p)?, u64_of(t)?);
@@ -494,24 +574,38 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
         Kind::OwnerKeyRevoked => {
             let [p, k, r] = unlp::<3>(b)?;
             let (p, r) = (s(p)?, s(r)?);
-            let Ok(owner_pub) = <&[u8; 32]>::try_from(k) else {
-                return Err(bad);
-            };
             if !is_pseudonym(p) || !is_token(r, 32) {
                 return Err(bad);
             }
-            Body::OwnerRevoke {
-                pseudonym: p,
-                owner_pub,
-                reason: r,
+            if let Ok(owner_pub) = <&[u8; 32]>::try_from(k) {
+                Body::OwnerRevoke {
+                    pseudonym: p,
+                    owner_pub,
+                    reason: r,
+                }
+            } else {
+                let cose = <&[u8; webauthn::COSE_LEN]>::try_from(k).map_err(|_| bad.clone())?;
+                webauthn::parse_cose(cose).map_err(|_| bad)?;
+                Body::OwnerPasskeyRevoke {
+                    pseudonym: p,
+                    cose,
+                    reason: r,
+                }
             }
+        }
+        Kind::Pad => {
+            if !b.is_empty() {
+                return Err(bad);
+            }
+            Body::Pad
         }
     })
 }
 
-/// Owner key id used as `signer` in kinds 3–7: `ok_` + hex(SHA-256(pub)[..16]).
+/// Owner key id used as `signer` in kinds 3–7: `ok_` + hex(SHA-256(key)[..16]), over
+/// the 32-byte Ed25519 key or the 77-byte COSE key of a passkey.
 #[must_use]
-pub fn owner_key_id(owner_pub: &[u8; 32]) -> String {
+pub fn owner_key_id(owner_pub: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(owner_pub);
     let mut out = String::with_capacity(35);
@@ -578,6 +672,42 @@ fn is_token(s: &str, max: usize) -> bool {
         && s.len() <= max
         && s.bytes().all(|c| {
             c.is_ascii_digit() || c.is_ascii_lowercase() || matches!(c, b'.' | b'_' | b'-')
+        })
+}
+
+/// A lowercase DNS name or IPv4 literal (dev), ≤ 253 chars.
+fn is_rp_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && !s.contains("..")
+        && s.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'-')
+}
+
+/// 1–4 comma-separated origins `https://host[:port]` (or `http://localhost|127.0.0.1[:port]`
+/// for dev), each host equal to `rp_id` or a subdomain of it; ≤ 256 bytes.
+fn origins_ok(s: &str, rp_id: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.split(',').count() <= 4
+        && s.split(',').all(|o| {
+            let rest = match (o.strip_prefix("https://"), o.strip_prefix("http://")) {
+                (Some(r), _) => r,
+                (None, Some(r))
+                    if matches!(r.split(':').next(), Some("localhost" | "127.0.0.1")) =>
+                {
+                    r
+                }
+                _ => return false,
+            };
+            let (host, port) = rest
+                .split_once(':')
+                .map_or((rest, None), |(h, p)| (h, Some(p)));
+            is_rp_id(host)
+                && (host == rp_id || host.strip_suffix(rp_id).is_some_and(|h| h.ends_with('.')))
+                && port.is_none_or(|p| is_decimal(p) && p.len() <= 5)
         })
 }
 
