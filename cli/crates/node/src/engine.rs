@@ -19,6 +19,8 @@ use std::sync::Arc;
 pub enum Dialect {
     Anthropic,
     OpenAi,
+    /// OpenAI Responses (`POST /v1/responses`, Codex; CONTRACT §18.6, worker RESPONSES.md).
+    OpenAiResponses,
 }
 
 impl Dialect {
@@ -29,21 +31,27 @@ impl Dialect {
         match moochy_worker::Dialect::parse(s)? {
             moochy_worker::Dialect::AnthropicMessages => Some(Self::Anthropic),
             moochy_worker::Dialect::OpenAiChat => Some(Self::OpenAi),
-            // §18.6: not routed by the node yet (mo-node: gateway route, pool offer dialect).
-            moochy_worker::Dialect::OpenAiResponses => None,
+            moochy_worker::Dialect::OpenAiResponses => Some(Self::OpenAiResponses),
         }
     }
     pub fn worker(self) -> moochy_worker::Dialect {
         match self {
             Self::Anthropic => moochy_worker::Dialect::AnthropicMessages,
             Self::OpenAi => moochy_worker::Dialect::OpenAiChat,
+            Self::OpenAiResponses => moochy_worker::Dialect::OpenAiResponses,
         }
     }
-    pub fn proto(self) -> msg::Dialect {
+    /// The route-header dialect; `None` while moochy-proto cannot name it (fail closed).
+    pub fn proto(self) -> Option<msg::Dialect> {
         match self {
-            Self::Anthropic => msg::Dialect::AnthropicMessages,
-            Self::OpenAi => msg::Dialect::OpenAiChat,
+            Self::Anthropic => Some(msg::Dialect::AnthropicMessages),
+            Self::OpenAi => Some(msg::Dialect::OpenAiChat),
+            Self::OpenAiResponses => None,
         }
+    }
+    /// The OpenAI error and stream shapes (Chat Completions and Responses).
+    pub fn is_openai(self) -> bool {
+        matches!(self, Self::OpenAi | Self::OpenAiResponses)
     }
 }
 
@@ -55,11 +63,15 @@ pub struct Failure {
     pub retry_after_ms: Option<u64>,
     /// Human detail (already unsealed). Never logged: it may name fields of the request.
     pub detail: Option<String>,
+    /// The request field a firewall refusal names (OpenAI's `error.param`). Boxed: `Failure`
+    /// travels in `Result::Err` on hot paths (clippy::result_large_err).
+    #[allow(clippy::box_collection)]
+    pub param: Option<Box<String>>,
 }
 
 impl Failure {
     pub fn new(code: &str, retryable: bool, detail: impl Into<Option<String>>) -> Self {
-        Self { code: code.into(), retryable, retry_after_ms: None, detail: detail.into() }
+        Self { code: code.into(), retryable, retry_after_ms: None, detail: detail.into(), param: None }
     }
 }
 
@@ -150,8 +162,10 @@ pub fn cache_ttl_w(t: msg::CacheTtl) -> firewall::CacheTtl {
 pub fn analyze(e: &CatalogEntry, d: Dialect, body: &[u8], headers: &[(String, String)]) -> Result<Facts, Failure> {
     let cat = fw_catalog(e).ok_or_else(|| Failure::new("model_not_in_pool", false, format!("moochy: catalog entry for `{}` is unusable", e.model)))?;
     let h: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    firewall::analyze(d.worker(), body, &h, &Policy::PERMISSIVE, &cat)
-        .map_err(|r| Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)")))
+    firewall::analyze(d.worker(), body, &h, &Policy::PERMISSIVE, &cat).map_err(|r| Failure {
+        param: (!r.path.is_empty()).then(|| Box::new(r.path.clone())),
+        ..Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)"))
+    })
 }
 
 /// Route header (03 §7.1) for a body analysed against catalog entry `e`.
@@ -159,7 +173,7 @@ pub fn route_header(e: &CatalogEntry, d: Dialect, f: &Facts, repo_id: &str, affi
     let bad = |w: &str| Failure::new("invalid_request", false, format!("moochy: {w}"));
     Ok(RouteHeader {
         repo_id: repo_id.parse().map_err(|_| Failure::new("internal", true, "moochy: bad repo id from relay".to_owned()))?,
-        dialect: d.proto(),
+        dialect: d.proto().ok_or_else(|| Failure::new("model_not_in_pool", false, "moochy: this version cannot route the Responses API yet (moochy-proto)".to_owned()))?,
         model: e.model.clone(),
         effort: f.effort.as_str().into(),
         max_tokens: u32::try_from(f.max_tokens).map_err(|_| bad("max_tokens too large"))?,
@@ -260,8 +274,43 @@ pub fn stub_body(d: Dialect, stream: bool, model: &str, text: &str) -> Bytes {
             [c(&json!({"role":"assistant","content":""}), &Value::Null), c(&json!({"content":text}), &Value::Null), c(&json!({}), &json!("stop")), "data: [DONE]\n\n".into()]
                 .concat()
         }
+        (Dialect::OpenAiResponses, false) => json!({"id":"resp_stub","object":"response","status":"completed","model":model,
+            "output":[{"type":"message","id":"msg_stub","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}],
+            "usage":{"input_tokens":1,"output_tokens":4,"total_tokens":5}})
+        .to_string(),
+        (Dialect::OpenAiResponses, true) => {
+            let life = |ty: &str, status: &str, usage: &Value| {
+                format!("event: {ty}\ndata: {}\n\n", json!({"type":ty,"response":{"id":"resp_stub","object":"response","status":status,"model":model,"usage":usage}}))
+            };
+            [life("response.created", "in_progress", &Value::Null), responses_message(0, "msg_stub", text), life("response.completed", "completed", &json!({"input_tokens":1,"output_tokens":4,"total_tokens":5}))].concat()
+        }
     };
     Bytes::from(s)
+}
+
+/// A whole Responses message item carrying `text`, as streamed events at `output_index`
+/// (`output_item.added` → `content_part.added` → `output_text.delta` → `output_text.done` →
+/// `content_part.done` → `output_item.done`, worker RESPONSES.md): the `[moochy]` notice that
+/// replaces a blocked tool call, the tripwire warning, and the offline stub.
+pub fn responses_message(output_index: u32, id: &str, text: &str) -> String {
+    let ev = |v: Value| format!("event: {}\ndata: {v}\n\n", v.get("type").and_then(Value::as_str).unwrap_or_default());
+    let part = |t: &str| json!({"type":"output_text","text":t,"annotations":[]});
+    let at = |ty: &str| json!({"type":ty,"item_id":id,"output_index":output_index,"content_index":0});
+    let with = |mut v: Value, k: &str, x: Value| {
+        if let Some(o) = v.as_object_mut() {
+            o.insert(k.into(), x);
+        }
+        v
+    };
+    [
+        ev(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":"message","id":id,"status":"in_progress","role":"assistant","content":[]}})),
+        ev(with(at("response.content_part.added"), "part", part(""))),
+        ev(with(at("response.output_text.delta"), "delta", json!(text))),
+        ev(with(at("response.output_text.done"), "text", json!(text))),
+        ev(with(at("response.content_part.done"), "part", part(text))),
+        ev(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"message","id":id,"status":"completed","role":"assistant","content":[part(text)]}})),
+    ]
+    .concat()
 }
 
 #[cfg(test)]
@@ -279,6 +328,27 @@ mod tests {
         assert!(open_detail(&c2, "firewall", &s).is_none(), "attempt bound in key");
         let long = "é".repeat(800);
         assert!(open_detail(&c, "x", &seal_detail(&c, "x", &long)).unwrap().len() <= MAX_DETAIL);
+    }
+
+    #[test]
+    #[ignore = "pending: moochy-proto Dialect::OpenAiResponses in the catalog (agent/mo-proto 475d6297, not on main yet)"]
+    fn responses_stateful_fields_refused_before_sealing() {
+        let raw = br#"{"version":3,"effective_at":"2026-01-01T00:00:00Z","entries":[{"model":"openai/gpt-5","provider":"openai","provider_model_id":"gpt-5","dialects":["openai.chat","openai.responses"],"in":1250000,"out":10000000,"cache_write_5m":0,"cache_write_1h":0,"cache_read":125000,"max_image_tokens":1600,"max_page_tokens":3000,"fast_multiplier":1,"default_effort":"medium","max_output":128000,"source":"curated"}]}"#;
+        let c = Catalog::parse(raw).unwrap();
+        let e = c.entries.first().unwrap();
+        let ok = br#"{"model":"openai/gpt-5","input":"hi","stream":true}"#;
+        assert!(analyze(e, Dialect::OpenAiResponses, ok, &[]).is_ok());
+        for (body, field) in [
+            (r#"{"model":"openai/gpt-5","input":"hi","store":true}"#, "store"),
+            (r#"{"model":"openai/gpt-5","input":"hi","previous_response_id":"resp_1"}"#, "previous_response_id"),
+        ] {
+            let f = analyze(e, Dialect::OpenAiResponses, body.as_bytes(), &[]).unwrap_err();
+            let (status, v) = crate::native::error_body(Dialect::OpenAiResponses, &f);
+            assert_eq!((status, v["error"]["type"].as_str(), v["error"]["code"].as_str()), (400, Some("invalid_request_error"), Some("firewall")), "{v}");
+            assert_eq!(v["error"]["param"], field, "{v}");
+        }
+        // Codex's identifying headers never reach a donor: any header is refused for this dialect.
+        assert!(analyze(e, Dialect::OpenAiResponses, ok, &[("session_id".into(), "s".into())]).is_err());
     }
 
     #[test]

@@ -42,13 +42,13 @@ pub fn error_body(d: Dialect, f: &Failure) -> (u16, Value) {
     let msg = message(f);
     let body = match d {
         Dialect::Anthropic => json!({"type":"error","error":{"type":ty,"message":msg}}),
-        Dialect::OpenAi => {
+        Dialect::OpenAi | Dialect::OpenAiResponses => {
             let oty = if status >= 500 { "server_error" } else { ty };
             // OpenAI has no 529.
-            json!({"error":{"message":msg,"type":oty,"param":null,"code":f.code}})
+            json!({"error":{"message":msg,"type":oty,"param":f.param,"code":f.code}})
         }
     };
-    let status = if d == Dialect::OpenAi && status == 529 { 503 } else { status };
+    let status = if d.is_openai() && status == 529 { 503 } else { status };
     (status, body)
 }
 
@@ -58,6 +58,11 @@ pub fn sse_error(d: Dialect, f: &Failure) -> Bytes {
     Bytes::from(match d {
         Dialect::Anthropic => format!("event: error\ndata: {body}\n\n"),
         Dialect::OpenAi => format!("data: {body}\n\n"),
+        // Responses streams: an `error` event (Codex reads `code` and `message`).
+        Dialect::OpenAiResponses => {
+            let e = body.get("error").cloned().unwrap_or_default();
+            format!("event: error\ndata: {}\n\n", json!({"type":"error","code":e.get("code"),"message":e.get("message"),"param":e.get("param")}))
+        }
     })
 }
 

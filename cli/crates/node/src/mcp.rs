@@ -271,7 +271,7 @@ impl Session {
         }
         let mut body = match dialect {
             Dialect::Anthropic => json!({"model": model, "max_tokens": max_tokens, "stream": true, "messages": [{"role":"user","content": user}]}),
-            Dialect::OpenAi => json!({"model": model, "max_tokens": max_tokens, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role":"user","content": user}]}),
+            Dialect::OpenAi | Dialect::OpenAiResponses => json!({"model": model, "max_tokens": max_tokens, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role":"user","content": user}]}),
         };
         if let Some(o) = body.as_object_mut() {
             if let Some(sys) = s("system") {
@@ -279,7 +279,7 @@ impl Session {
                     Dialect::Anthropic => {
                         o.insert("system".into(), json!(sys));
                     }
-                    Dialect::OpenAi => {
+                    Dialect::OpenAi | Dialect::OpenAiResponses => {
                         if let Some(ms) = o.get_mut("messages").and_then(Value::as_array_mut) {
                             ms.insert(0, json!({"role":"system","content":sys}));
                         }
@@ -289,7 +289,7 @@ impl Session {
             if let Some(e) = effort {
                 match dialect {
                     Dialect::Anthropic => o.insert("output_config".into(), json!({"effort": e})),
-                    Dialect::OpenAi => o.insert("reasoning_effort".into(), json!(e)),
+                    Dialect::OpenAi | Dialect::OpenAiResponses => o.insert("reasoning_effort".into(), json!(e)),
                 };
             }
         }
@@ -417,7 +417,7 @@ impl SseText {
                         && v.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta");
                     if delta { v.pointer("/delta/text").and_then(Value::as_str) } else { None }
                 }
-                Dialect::OpenAi => {
+                Dialect::OpenAi | Dialect::OpenAiResponses => {
                     if let Some(e) = v.get("error") {
                         self.error = Some(e.get("message").and_then(Value::as_str).unwrap_or("error").to_owned());
                     }

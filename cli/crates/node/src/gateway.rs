@@ -177,7 +177,9 @@ fn token(h: &HeaderMap) -> Option<&str> {
 
 async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, peer: Option<crate::run::Peer>) -> Resp {
     let path = req.uri().path().to_owned();
-    let dialect = if path.ends_with("/chat/completions") || (path.ends_with("/models") && req.headers().get("anthropic-version").is_none()) {
+    let dialect = if path.ends_with("/responses") {
+        Dialect::OpenAiResponses
+    } else if path.ends_with("/chat/completions") || (path.ends_with("/models") && req.headers().get("anthropic-version").is_none()) {
         Dialect::OpenAi
     } else {
         Dialect::Anthropic
@@ -254,6 +256,8 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
         (&Method::POST, "/v1/messages") => api(node, slug, Dialect::Anthropic, req, false, (release, platform)).await,
         (&Method::POST, "/v1/messages/count_tokens") => api(node, slug, Dialect::Anthropic, req, true, (release, platform)).await,
         (&Method::POST, "/v1/chat/completions") => api(node, slug, Dialect::OpenAi, req, false, (release, platform)).await,
+        // §18.6 Codex: OpenAI Responses, sealed only to offers that list it.
+        (&Method::POST, "/v1/responses") => api(node, slug, Dialect::OpenAiResponses, req, false, (release, platform)).await,
         _ => native_error(dialect, &Failure::new("not_found", false, format!("moochy: no route for {path}"))),
     }
 }
@@ -330,7 +334,9 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         }
         let model = root.get("model").and_then(Val::as_str).ok_or_else(|| bad("moochy: `model` is required".into()))?;
         let entry = catalog_entry(node, &model)?;
-        let missing = root.get("max_tokens").is_none() && root.get("max_completion_tokens").is_none();
+        // Responses: no injection (`max_tokens` is not a member there; the route takes the
+        // catalog's max_output and the worker writes `max_output_tokens`).
+        let missing = dialect != Dialect::OpenAiResponses && root.get("max_tokens").is_none() && root.get("max_completion_tokens").is_none();
         // 07 §4.2 step 4: multi-turn Anthropic conversation with no cache_control anywhere →
         // top-level automatic caching (5 m): cache reads cost donors a fraction of input.
         let turns = root.get("messages").map_or(0, |m| m.items().count());
@@ -339,12 +345,15 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         // Affinity key over system, tools and the first user message (04 §5), each re-serialized
         // canonically (`Val::raw` is empty for objects and arrays, which made every key equal).
         // The members injected below are top-level and change none of them.
-        let first = |role: &str| root.get("messages").and_then(|m| m.items().find(|x| x.get("role").is_some_and(|r| r.is_str(role))));
-        let system = match dialect {
-            Dialect::Anthropic => root.get("system"),
-            Dialect::OpenAi => first("system").or_else(|| first("developer")),
+        let turns_key = if dialect == Dialect::OpenAiResponses { "input" } else { "messages" };
+        let first = |role: &str| root.get(turns_key).and_then(|m| m.items().find(|x| x.get("role").is_some_and(|r| r.is_str(role))));
+        let (system, user) = match dialect {
+            Dialect::Anthropic => (root.get("system"), first("user")),
+            Dialect::OpenAi => (first("system").or_else(|| first("developer")), first("user")),
+            // Responses: `instructions`; `input` is a string or a list of items.
+            Dialect::OpenAiResponses => (root.get("instructions"), root.get("input").filter(|i| i.kind() == Kind::Str).or_else(|| first("user"))),
         };
-        let affinity = affinity_key(&node.secrets, system, root.get("tools"), first("user"), body.len());
+        let affinity = affinity_key(&node.secrets, system, root.get("tools"), user, body.len());
         let inject = missing.then(|| u64::from(entry.max_output).min(DEFAULT_MAX_TOKENS));
         (entry, affinity, inject, cache)
     };

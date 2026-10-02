@@ -142,6 +142,8 @@ impl Gate {
                 "data: {}\n\n",
                 json!({"id":"moochy","object":"chat.completion.chunk","created":0,"model":"moochy","choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]})
             ),
+            // A message item after the last output item (before `response.completed`).
+            Dialect::OpenAiResponses => write!(out, "{}", crate::engine::responses_message(index, "msg_moochy_warning", &text)),
         };
         Bytes::from(out)
     }
@@ -307,6 +309,9 @@ impl Gate {
                     "data: {}\n\n",
                     json!({"id":"moochy","object":"chat.completion.chunk","created":0,"model":"moochy","choices":[{"index":0,"delta":{"content":format!("{text}\n")},"finish_reason":null}]})
                 ),
+                // RESPONSES.md: the held `output_item.added … output_item.done` span becomes a
+                // message item with the notice, at the call's own `output_index`.
+                Dialect::OpenAiResponses => write!(out, "{}", crate::engine::responses_message(*index, &format!("msg_moochy_{index}"), &text)),
             };
         }
         Bytes::from(out)
@@ -329,6 +334,11 @@ impl Gate {
                 if let Some(m) = v.pointer_mut("/choices/0/message").and_then(Value::as_object_mut) {
                     let prev = m.get("content").and_then(Value::as_str).unwrap_or("").to_owned();
                     m.insert("content".into(), json!(format!("{prev}\n{note}")));
+                }
+            }
+            Dialect::OpenAiResponses => {
+                if let Some(o) = v.get_mut("output").and_then(Value::as_array_mut) {
+                    o.push(notice_item("msg_moochy_warning", &note));
                 }
             }
         }
@@ -424,6 +434,7 @@ fn event_text(d: Dialect, ev: &[u8], tape: &mut Vec<moochy_worker::json::Node>) 
     let v = doc.root();
     let index = match d {
         Dialect::Anthropic => v.get("index").and_then(|i| i.raw().parse().ok()),
+        Dialect::OpenAiResponses => v.get("output_index").and_then(|i| i.raw().parse().ok()),
         Dialect::OpenAi => None,
     };
     (visible_text(d, true, v), index)
@@ -503,8 +514,23 @@ fn rewrite_body(d: Dialect, body: &[u8], blocked: &[Option<String>]) -> Option<B
             let prev = msg.get("content").and_then(Value::as_str).unwrap_or("").to_owned();
             msg.insert("content".into(), json!(format!("{prev}{}", notes.join("\n"))));
         }
+        Dialect::OpenAiResponses => {
+            for (n, item) in v.get_mut("output")?.as_array_mut()?.iter_mut().enumerate() {
+                if matches!(item.get("type").and_then(Value::as_str), Some("function_call" | "custom_tool_call")) {
+                    if let Some(Some(r)) = blocked.get(i) {
+                        *item = notice_item(&format!("msg_moochy_{n}"), &note(r));
+                    }
+                    i = i.saturating_add(1);
+                }
+            }
+        }
     }
     Some(Bytes::from(v.to_string()))
+}
+
+/// A Responses output message item carrying a `[moochy]` text.
+fn notice_item(id: &str, text: &str) -> Value {
+    json!({"type":"message","id":id,"status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]})
 }
 
 #[cfg(test)]
@@ -549,6 +575,40 @@ mod tests {
             out.extend_from_slice(&b);
         }
         String::from_utf8(out).unwrap()
+    }
+
+    /// §18.6 (worker RESPONSES.md): a blocked Responses call becomes a `[moochy]` message item at
+    /// its own output_index, and the result passes the canonical re-emitter (no tool item, no
+    /// `output` copy in lifecycle events).
+    #[test]
+    fn responses_blocked_call_becomes_a_notice_item() {
+        const REQ: &str = include_str!("../../worker/tests/fixtures/responses/codex_request.json");
+        for (name, fixture) in [
+            ("text_tool", include_str!("../../worker/tests/fixtures/responses/stream_text_tool.sse")),
+            ("custom_tool", include_str!("../../worker/tests/fixtures/responses/stream_custom_tool.sse")),
+        ] {
+            let mut g = Gate::new(Dialect::OpenAiResponses, true, REQ.as_bytes(), false);
+            let mut gated = Vec::new();
+            // One event per chunk: what the client sees never depends on chunking.
+            for (i, ev) in fixture.split_inclusive("\n\n").enumerate() {
+                g.push(u32::try_from(i).unwrap(), ev.as_bytes()).unwrap();
+                while let Some(b) = g.pop(None, false) {
+                    gated.extend_from_slice(&b);
+                }
+            }
+            g.finish(true).unwrap();
+            while let Some(b) = g.pop(Some(u32::MAX), true) {
+                gated.extend_from_slice(&b);
+            }
+            let mut c = Canon::new(Dialect::OpenAiResponses, true);
+            let mut out = c.push(&gated).unwrap_or_else(|(_, e)| panic!("{name}: canonical re-emission refused the gated stream: {e}")).to_vec();
+            out.extend_from_slice(&c.finish().unwrap());
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("[moochy] tool call `"), "{name}: {out}");
+            assert!(!out.contains("\"type\":\"function_call\"") && !out.contains("\"type\":\"custom_tool_call\""), "{name}: a withheld call reached the client: {out}");
+            assert!(out.contains("\"msg_moochy_") && out.contains("event: response.completed"), "{name}: {out}");
+            assert!(!out.contains("\"output\":["), "{name}: lifecycle events carry no output copy");
+        }
     }
 
     #[test]
