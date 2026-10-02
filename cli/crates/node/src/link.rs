@@ -176,7 +176,7 @@ async fn session_inner(node: &Arc<Node>, relay: &str) -> std::result::Result<End
     }
     let origin_s = origin.url();
     let sig = keys.sign(&lp(&[b"moochy/v1/auth", &hello.nonce, origin_s.as_bytes(), &exporter, device_id.as_bytes()]));
-    let auth_msg = Auth { device_id: device_id.to_owned(), roles: roles(&node.cfg.roles), sig: bytes::Bytes::copy_from_slice(&sig), client_version: env!("CARGO_PKG_VERSION").into() };
+    let auth_msg = Auth { device_id: device_id.to_owned(), roles: roles(&node.cfg.roles), sig: bytes::Bytes::copy_from_slice(&sig), client_version: env!("CARGO_PKG_VERSION").into(), instance: bytes::Bytes::copy_from_slice(instance()) };
     up.send(NodeMsg { msg: Some(node_msg::Msg::Auth(auth_msg)) }).await.map_err(|_| End::Net("session closed".into()))?;
     let welcome = match next(&mut down).await? {
         relay_msg::Msg::Welcome(w) => w,
@@ -288,6 +288,20 @@ pub fn with_session<T>(h: &LinkHandle, msg: T) -> tonic::Request<T> {
     let mut r = tonic::Request::new(msg);
     r.metadata_mut().insert("x-moochy-session", h.session.clone());
     r
+}
+
+/// CONTRACT §17.1 clone detection: 16 random bytes drawn once per process start and sent with
+/// every Auth of this run; a cloned VM or memory snapshot starts with a different value, so the
+/// relay sees two instances of one device key and refuses the newer session.
+fn instance() -> &'static [u8] {
+    static INSTANCE: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let mut out = [0u8; 16];
+        if let Ok(r) = moochy_proto::crypto::random32() {
+            out.copy_from_slice(r.get(..16).unwrap_or(&[0u8; 16]));
+        }
+        out
+    })
 }
 
 #[cfg(test)]
