@@ -52,6 +52,9 @@ COMMANDS:
   service install [--system] [--print] | service uninstall [--system]
                                   Start Moochy at login (systemd user unit, launchd agent);
                                   --print shows the unit only
+  button [--repo P] [--provider github|gitlab] [--style mascot|text|compact] [--theme light|dark|auto]
+         [--size s|m|l] [--label TEXT] [--format markdown|html|rst]
+                                  The README Donate tokens button for this repository
   audit --provider [--from-file usage.csv]
                                   What this device served (90 days), checked against the
                                   provider's usage export (date,model,cost_usd)
@@ -138,6 +141,8 @@ fn dev_mode() -> bool {
 #[derive(Default)]
 struct Opts {
     home: Option<PathBuf>,
+    /// `moochy button`: label, style, theme, size, format.
+    button: crate::button::Options,
     monthly_limit: Option<u64>,
     words: Vec<String>,
     relay: Option<String>,
@@ -179,6 +184,11 @@ fn parse() -> Result<Opts> {
             Long("base-url") => o.base_url = Some(s(p.value().map_err(err)?)?),
             Long("out") => o.out = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("reason") => o.reason = Some(s(p.value().map_err(err)?)?),
+            Long("label") => o.button.label = Some(s(p.value().map_err(err)?)?),
+            Long("style") => o.button.style = Some(s(p.value().map_err(err)?)?),
+            Long("theme") => o.button.theme = Some(s(p.value().map_err(err)?)?),
+            Long("size") => o.button.size = Some(s(p.value().map_err(err)?)?),
+            Long("format") => o.button.format = Some(s(p.value().map_err(err)?)?),
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
@@ -256,6 +266,7 @@ fn run() -> Result<()> {
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
         ["safety"] => safety(&home, &o, None),
+        ["button", rest @ ..] => button(&o, rest),
         ["audit"] if o.has("provider") => audit(&home, &o),
         ["service", "install"] => crate::service::install(&home, o.has("system"), o.has("print")),
         ["service", "uninstall"] => crate::service::uninstall(o.has("system")),
@@ -751,6 +762,34 @@ fn spend_limit_page(provider: &str) -> &'static str {
 /// advice to use a dedicated key with a provider-side spend limit, acknowledged with a checkbox.
 /// Interactive on the terminal; headless with `--monthly-limit $N --accept-safety`. Until it is
 /// done this device does not donate (outside `MOOCHY_INSECURE_DEV`).
+/// `moochy button [--repo P] [--provider github|gitlab] [--style …] [--theme …] [--size …]
+/// [--label …] [--format markdown|html|rst]` (docs/guides/donate-button.md steps 1–3, offline).
+fn button(o: &Opts, rest: &[&str]) -> Result<()> {
+    let provider = match (o.has("provider"), rest) {
+        (true, ["github"]) => Some("github"),
+        (true, ["gitlab"]) => Some("gitlab"),
+        (false, []) => None,
+        _ => return Err(usage("button [--repo owner/name] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
+    };
+    let project = if let Some(r) = &o.repo {
+        crate::button::project(provider.unwrap_or("github"), r)?
+    } else {
+        {
+            let out = crate::util::command("git").args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().map_err(|e| usage(format!("git: {e}")))?;
+            if !out.status.success() {
+                return Err(usage("no `origin` remote here: pass --repo owner/name (and --provider gitlab for GitLab)"));
+            }
+            let p = crate::button::parse_remote(&String::from_utf8_lossy(&out.stdout))?;
+            if provider.is_some_and(|x| x != p.provider) {
+                return Err(usage(format!("the origin remote is on {}, not {}", p.provider, provider.unwrap_or_default())));
+            }
+            p
+        }
+    };
+    println!("{}", crate::button::snippet(&project, &o.button)?);
+    Ok(())
+}
+
 /// `moochy audit --provider [--from-file usage.csv]` (07 §2): the last 90 days of served work.
 fn audit(home: &Home, o: &Opts) -> Result<()> {
     let since = crate::util::now_ms().saturating_sub(crate::journal::RETENTION_DAYS.saturating_mul(86_400_000));
