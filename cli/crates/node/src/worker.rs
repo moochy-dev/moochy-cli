@@ -376,15 +376,30 @@ async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<(
 
 /// Refresh this donor's own donations (`ListDonations` on our own session), at most every 250 ms.
 /// Concurrent tasks wait for the refresh in flight and re-check, so a burst never refuses a
-/// donation that is being fetched. `Err` only for "relay-asserted, dev": a relay without the
-/// donation RPCs under `MOOCHY_INSECURE_DEV` (the caller then accepts).
+/// donation that is being fetched. A wanted donation that the last listing (< 250 ms ago) did not
+/// show active may have been approved since (E41): wait out the rest of the window (refresh lock
+/// released while waiting) and list once more before the caller refuses. `Err` only for
+/// "relay-asserted, dev": a relay without the donation RPCs under `MOOCHY_INSECURE_DEV` (the
+/// caller then accepts).
 async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'static str> {
+    let active = |n: &Node| !want.is_empty() && lock(&n.own_pledges).get(want).is_some_and(|s| s == "active");
     let mut last = node.pledge_refresh.lock().await;
-    if !want.is_empty() && lock(&node.own_pledges).get(want).is_some_and(|s| s == "active") {
+    if active(node) {
         return Ok(());
     }
-    if *last != 0 && now_ms().saturating_sub(*last) < OWN_PLEDGES_REFRESH_MS {
-        return Ok(());
+    let age = now_ms().saturating_sub(*last);
+    if *last != 0 && age < OWN_PLEDGES_REFRESH_MS {
+        if want.is_empty() {
+            return Ok(());
+        }
+        let seen = *last;
+        drop(last);
+        tokio::time::sleep(Duration::from_millis(OWN_PLEDGES_REFRESH_MS.saturating_sub(age))).await;
+        last = node.pledge_refresh.lock().await;
+        // Another task listed after our window opened: that answer is fresh enough.
+        if active(node) || *last != seen {
+            return Ok(());
+        }
     }
     let Some(l) = node.link() else { return Ok(()) };
     let mut c = l.client.clone();
