@@ -57,6 +57,11 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[zeroize(skip)]
     pub models: std::collections::BTreeMap<String, String>,
+    /// `local`: the model ids the server listed at `keys add` (`GET /v1/models`); a `local/*`
+    /// catalog entry whose `provider_model_id` is among them is served without a mapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[zeroize(skip)]
+    pub served_ids: Vec<String>,
 }
 
 impl DeviceKeys {

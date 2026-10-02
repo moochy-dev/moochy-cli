@@ -712,7 +712,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     let mut cfg = home.load()?;
     let mut sec = keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != provider);
-    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new() });
+    sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new(), served_ids: Vec::new() });
     keystore::save(home, &cfg, &sec)?;
     // CONTRACT §15.2 "bounded worst case": a dedicated key with a spend limit at the provider.
     eprintln!("Tip: use a key made only for Moochy, with a monthly spend limit set at {provider}: the most it can ever cost you is that limit.");
@@ -778,6 +778,7 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
     use moochy_worker::provider::{Adapter, AdapterConfig, Limits};
     let mut adapters = Vec::new();
     let mut local_models = std::collections::HashMap::new();
+    let mut local_served = std::collections::HashSet::new();
     for p in &secrets.providers {
         let Some(provider) = moochy_worker::Provider::parse(&p.provider) else {
             log("warn", "this version cannot donate with this provider yet; update moochy", &json!({"provider": p.provider}));
@@ -797,6 +798,7 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         };
         if local {
             local_models.extend(p.models.iter().map(|(k, v)| (k.clone(), v.clone())));
+            local_served.extend(p.served_ids.iter().cloned());
             if p.allow_unvetted_host {
                 eprintln!("moochy: WARNING the local model server {} is not a loopback or private address (--allow-unvetted-host, development only)", clean(p.base_url.as_deref().unwrap_or("")));
             }
@@ -808,7 +810,7 @@ fn worker_parts(home: &Home, secrets: &keystore::Secrets) -> Result<WorkerParts>
         }
     }
     let store = moochy_worker::store::Store::open(&home.state_dir().join("worker.log"), crate::util::now_ms()).ctx("open worker store")?;
-    Ok(WorkerParts { adapters, local_models, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
+    Ok(WorkerParts { adapters, local_models, local_served, store: Some(Arc::new(std::sync::Mutex::new(store))), validator: None })
 }
 
 async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()> {

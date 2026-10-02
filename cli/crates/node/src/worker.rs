@@ -137,6 +137,8 @@ pub fn on_welcome(node: &Arc<Node>) {
         if let Some(keys) = &node.keys {
             recover_inflight(&node, keys).await;
         }
+        // Own donations up front, so the first tasks do not wait for ListDonations (T-03-088).
+        let _ = refresh_own_pledges(&node, "").await;
         let unacked = with_store(&node, |s| s.unacked().map(|(_, p)| p.to_vec()).collect::<Vec<_>>()).await.unwrap_or_default();
         let receipts: Vec<pb::SignedReceipt> = unacked.iter().filter_map(|p| pb::SignedReceipt::decode(p.as_slice()).ok()).collect();
         let tasks = receipts.iter().map(|r| pb::KnownTask { task: r.task.clone(), attempt: r.attempt, state: "outbox".into() }).collect();
@@ -338,7 +340,8 @@ fn gateway_key(node: &Node, device: &str, repo_id: &str) -> Option<[u8; 32]> {
     node.keylog.as_ref().and_then(|l| l.gateway_key(device, repo_id))
 }
 
-const OWN_PLEDGES_REFRESH_MS: u64 = 5_000;
+/// A donation turns active when its owner approves it: re-list soon, but never more than 4×/s.
+const OWN_PLEDGES_REFRESH_MS: u64 = 250;
 
 /// T-03-088: the relay's pledge/repo assignment is never trusted alone. The pledge must be one of
 /// this donor's own active donations (listed on our own authenticated session), and with a
@@ -350,31 +353,42 @@ async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<(
     {
         return Err("this project has not approved this donor (key log)");
     }
-    let known = |n: &Node| lock(&n.own_pledges).1.get(pledge).map(|s| s == "active");
-    if known(node) == Some(true) {
-        return Ok(());
-    }
-    // Unknown (new donation) or stale: refresh, at most every 5 s.
-    let due = now_ms().saturating_sub(lock(&node.own_pledges).0) >= OWN_PLEDGES_REFRESH_MS;
-    if due && let Some(l) = node.link() {
-        lock(&node.own_pledges).0 = now_ms();
-        let mut c = l.client.clone();
-        let r = timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest {}))).await;
-        match r {
-            Ok(Ok(r)) => {
-                let map = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, d.status)).collect();
-                lock(&node.own_pledges).1 = map;
-            }
-            // A relay without the donation RPCs: relay-asserted only in insecure dev mode.
-            Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => return Ok(()),
-            _ => {}
-        }
+    let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|s| s == "active");
+    if known(node) != Some(true) {
+        refresh_own_pledges(node, pledge).await?;
     }
     match known(node) {
         Some(true) => Ok(()),
         Some(false) => Err("this donation is not active"),
         None => Err("not one of this donor's donations"),
     }
+}
+
+/// Refresh this donor's own donations (`ListDonations` on our own session), at most every 250 ms.
+/// Concurrent tasks wait for the refresh in flight and re-check, so a burst never refuses a
+/// donation that is being fetched. `Err` only for "relay-asserted, dev": a relay without the
+/// donation RPCs under `MOOCHY_INSECURE_DEV` (the caller then accepts).
+async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'static str> {
+    let mut last = node.pledge_refresh.lock().await;
+    if !want.is_empty() && lock(&node.own_pledges).get(want).is_some_and(|s| s == "active") {
+        return Ok(());
+    }
+    if *last != 0 && now_ms().saturating_sub(*last) < OWN_PLEDGES_REFRESH_MS {
+        return Ok(());
+    }
+    let Some(l) = node.link() else { return Ok(()) };
+    let mut c = l.client.clone();
+    match timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest {}))).await {
+        Ok(Ok(r)) => {
+            *last = now_ms();
+            *lock(&node.own_pledges) = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, d.status)).collect();
+        }
+        Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => {
+            lock(&node.own_pledges).insert(want.to_owned(), "active".into());
+        }
+        _ => *last = 0, // failed: retry at the next task
+    }
+    Ok(())
 }
 
 /// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
