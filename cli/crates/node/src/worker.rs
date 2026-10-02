@@ -442,7 +442,8 @@ fn user_pseudonym(repo: &str, gw: &str) -> String {
 struct Admitted {
     ck: ContentKey,
     task: TaskId,
-    inner: InnerPayload,
+    /// Shared with the off-path crash-record builder (no copy of the body).
+    inner: Arc<InnerPayload>,
     route: RouteHeader,
     entry: CatalogEntry,
     adapter: Arc<Adapter>,
@@ -597,7 +598,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         Some(Err(StoreError::Cap(w))) => return Err(with_ck("local_cap", true, Some(w.into()))),
         _ => return Err(with_ck("busy", true, None)),
     }
-    Ok(Admitted { ck, task, inner, route, entry, adapter, prepared, pledge, key, catalog_version: cat.version })
+    Ok(Admitted { ck, task, inner: Arc::new(inner), route, entry, adapter, prepared, pledge, key, catalog_version: cat.version })
 }
 
 /// Returns `(journal status, model, cost)`.
@@ -636,7 +637,15 @@ async fn serve(
     drop(body);
     let _ = tx.send(up(serve_up::Msg::Ack(pb::Ack { r: Bytes::copy_from_slice(&r) }))).await;
     let reserved = money::reserve_for_route(&a.entry, &a.route).unwrap_or(0);
-    let record = provisional(keys, &a, u8::try_from(attempt).unwrap_or(0), t_start).and_then(|rc| write_inflight(node, &rc, &a.route.model, reserved));
+    // The crash record hashes the whole body (req_commit): built on a blocking thread, so the
+    // provider call (and `Started`) never waits for it.
+    let (prov, path, model) = (a.prov(keys), inflight_path(node, task_s, attempt), a.route.model.clone());
+    let attempt8 = u8::try_from(attempt).unwrap_or(0);
+    let record = Some(tokio::task::spawn_blocking(move || {
+        if let Some(rc) = provisional_of(&prov, attempt8, t_start) {
+            write_inflight_now(&path, &rc, &model, reserved);
+        }
+    }));
     log("info", "timing", &json!({"task": task_s, "attempt": attempt, "t_assign_rx": t_assign_rx, "t_ack_tx": now_us()}));
     let out = run_provider(node, keys, a, attempt, r, t_start, down, &refuse).await;
     // The attempt is settled (receipt in the outbox): the record has served its purpose.
@@ -874,7 +883,28 @@ fn build_receipt(
 
 /// The receipt as known at the Ack: what a crash mid-stream settles at (05 §5.2): usage
 /// unknown (estimated), cost = the reservation, status `partial`.
+/// What the provisional (crash) receipt needs, owned, so it can be built off the async path.
+struct Prov {
+    worker: moochy_proto::DeviceId,
+    task: TaskId,
+    pledge: PledgeId,
+    catalog_version: u64,
+    inner: Arc<InnerPayload>,
+    route: RouteHeader,
+    entry: CatalogEntry,
+}
+
+impl Admitted {
+    fn prov(&self, keys: &Keys) -> Prov {
+        Prov { worker: keys.device_id, task: self.task, pledge: self.pledge, catalog_version: self.catalog_version, inner: self.inner.clone(), route: self.route.clone(), entry: self.entry.clone() }
+    }
+}
+
 fn provisional(keys: &Keys, a: &Admitted, attempt: u8, t_start: u64) -> Option<Receipt> {
+    provisional_of(&a.prov(keys), attempt, t_start)
+}
+
+fn provisional_of(a: &Prov, attempt: u8, t_start: u64) -> Option<Receipt> {
     let s = &a.inner.s.0;
     let reserved = money::reserve_for_route(&a.entry, &a.route).ok()?;
     let usage = Usage { estimated: true, provider_cost_uusd: (a.entry.provider == "openrouter").then_some(reserved), ..Usage::default() };
@@ -886,7 +916,7 @@ fn provisional(keys: &Keys, a: &Admitted, attempt: u8, t_start: u64) -> Option<R
         attempt,
         repo_id: a.route.repo_id,
         pledge_id: a.pledge,
-        worker_device: keys.device_id,
+        worker_device: a.worker,
         gateway_device: a.inner.gateway_device,
         dialect: a.route.dialect,
         provider: a.entry.provider.clone(),
@@ -948,19 +978,17 @@ fn inflight_path(node: &Node, task: &str, attempt: u32) -> std::path::PathBuf {
 
 /// Record: `<public model> <reserved µ$>\n<receipt JSON>`; the donor's own cap settles at the
 /// reservation.
-fn write_inflight(node: &Node, rc: &Receipt, model: &str, reserved: i64) -> Option<tokio::task::JoinHandle<()>> {
-    let path = inflight_path(node, &rc.task_id.text(), rc.attempt.into());
+/// Write one in-flight record (blocking; a torn write fails to parse at recovery and is dropped).
+fn write_inflight_now(path: &std::path::Path, rc: &Receipt, model: &str, reserved: i64) {
+    let Ok(json) = serde_json::to_vec(rc) else { return };
     let mut data = format!("{model} {reserved}\n").into_bytes();
-    data.extend_from_slice(&serde_json::to_vec(rc).ok()?);
-    Some(tokio::task::spawn_blocking(move || {
-        if let Some(d) = path.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        // A torn write (crash mid-write) fails to parse at recovery and is discarded.
-        if std::fs::write(&path, &data).is_err() {
-            log("warn", "in-flight record write failed", &json!({}));
-        }
-    }))
+    data.extend_from_slice(&json);
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if std::fs::write(path, &data).is_err() {
+        log("warn", "in-flight record write failed", &json!({}));
+    }
 }
 
 fn drop_inflight(node: &Node, task: &str, attempt: u32) {

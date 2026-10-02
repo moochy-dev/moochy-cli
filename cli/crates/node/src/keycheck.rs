@@ -149,8 +149,8 @@ pub fn add_local(home: &crate::config::Home, base_url: Option<&str>, key_stdin: 
         LocalHost::Loopback => {}
         LocalHost::Lan => eprintln!("Note: requests to this server cross your local network{}.", if url.starts_with("http://") { " in clear text" } else { "" }),
         LocalHost::Unvetted => eprintln!("WARNING: {url} is not a loopback or private address: its name can be re-pointed elsewhere (development only)."),
-        // Vetted remote GPU server over TLS (CONTRACT §17.3; mo-donor wires the vetted list).
-        LocalHost::Remote => eprintln!("Note: {url} is a vetted remote server; requests travel to it over TLS."),
+        // Remote servers take `add_remote` (vetted host, TLS); not reachable through --base-url.
+        LocalHost::Remote => return Err(usage("a remote server needs --url https://… (vetted, TLS)")),
     }
     let key = if key_stdin {
         let mut raw = zeroize::Zeroizing::new(Vec::new());
@@ -191,15 +191,169 @@ pub fn add_local(home: &crate::config::Home, base_url: Option<&str>, key_stdin: 
     let mut cfg = home.load()?;
     let mut sec = crate::keystore::load_or_init(home, &mut cfg)?;
     sec.providers.retain(|p| p.provider != "local");
-    sec.providers.push(crate::keystore::ProviderKey { provider: "local".into(), key: key.to_string(), base_url: Some(url.to_owned()), allow_unvetted_host: allow_unvetted, models: map.clone(), served_ids: served.iter().filter(|id| !moochy_worker::firewall::is_cloud_routed(id)).cloned().collect() });
+    sec.providers.push(crate::keystore::ProviderKey { provider: "local".into(), key: key.to_string(), base_url: Some(url.to_owned()), allow_unvetted_host: allow_unvetted, models: map.clone(), remote_host: None, trust: None, auth_header: None, served_ids: served.iter().filter(|id| !moochy_worker::firewall::is_cloud_routed(id)).cloned().collect() });
     crate::keystore::save(home, &cfg, &sec)?;
     crate::util::emit(&serde_json::json!({"event": "key_added", "provider": "local", "models": map}));
+    Ok(())
+}
+
+/// `keys add local --url https://…` options (CONTRACT §17.3).
+pub struct Remote {
+    /// `provider::remote_host_key(url)`: the canonical `host:port`.
+    pub host: String,
+    pub ca_file: Option<std::path::PathBuf>,
+    pub cert_sha256: Option<String>,
+    /// Header name for the secret read on stdin (e.g. `x-api-key`); else a Bearer API key.
+    pub auth_header: Option<String>,
+    /// Headless confirmation: must be exactly `host`.
+    pub confirm_host: Option<String>,
+}
+
+/// First certificate of a PEM file, as DER.
+fn pem_cert(pem: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let body = pem.split("-----BEGIN CERTIFICATE-----").nth(1)?.split("-----END CERTIFICATE-----").next()?;
+    let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(b64).ok().filter(|d| !d.is_empty() && d.len() <= 16 << 10)
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim().replace(':', "").to_ascii_lowercase();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(i.checked_mul(2)?..i.checked_mul(2)?.checked_add(2)?)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The adapter options of a stored `local` provider (vetted host, header, certificate check).
+pub fn local_options(p: &crate::keystore::ProviderKey, dev: bool) -> std::result::Result<moochy_worker::provider::LocalOptions, &'static str> {
+    use moochy_worker::provider::{LocalOptions, RemoteTrust};
+    let trust = match p.trust.as_deref() {
+        None | Some("roots") => RemoteTrust::Roots,
+        Some(t) if t.starts_with("ca:") => RemoteTrust::Ca(rustls::pki_types::CertificateDer::from(crate::util::b64d(t.get(3..).unwrap_or("")).ok_or("stored CA is corrupt")?)),
+        Some(t) if t.starts_with("sha256:") => RemoteTrust::Fingerprint(hex32(t.get(7..).unwrap_or("")).ok_or("stored fingerprint is corrupt")?),
+        Some(_) => return Err("unknown certificate check"),
+    };
+    let auth_header = p.auth_header.clone().map(|n| (n, zeroize::Zeroizing::new(p.key.clone())));
+    Ok(LocalOptions { allow_unvetted_host: p.allow_unvetted_host && dev, vetted_hosts: p.remote_host.clone().into_iter().collect(), auth_header, trust })
+}
+
+/// `roots` / `ca` / `fingerprint`, for status and doctor (never the header value).
+pub fn trust_name(p: &crate::keystore::ProviderKey) -> &'static str {
+    match p.trust.as_deref() {
+        Some(t) if t.starts_with("ca:") => "ca",
+        Some(t) if t.starts_with("sha256:") => "fingerprint",
+        _ => "roots",
+    }
+}
+
+/// `moochy keys add local --url https://… [--ca-file PEM | --cert-sha256 HEX]
+/// [--header-from-keystore NAME --key-stdin] --model local/<slug>=<id> [--confirm-host HOST:PORT]`
+/// (CONTRACT §17.3, worker API.md "Remote GPU servers"): the donor confirms the exact host is
+/// theirs (`--yes` never does it), the secret goes to the keystore only, the adapter is built
+/// once to check the whole configuration before anything is stored.
+pub fn add_remote(home: &crate::config::Home, url: &str, r: &Remote, key_stdin: bool, allow_unvetted: bool, models: &[String]) -> Result<()> {
+    if allow_unvetted && std::env::var("MOOCHY_INSECURE_DEV").as_deref() != Ok("1") {
+        return Err(usage("--allow-unvetted-host is only accepted with MOOCHY_INSECURE_DEV=1"));
+    }
+    let trust = match (&r.ca_file, &r.cert_sha256) {
+        (Some(_), Some(_)) => return Err(usage("--ca-file or --cert-sha256, not both")),
+        (Some(f), None) => {
+            let pem = std::fs::read_to_string(f).map_err(|e| usage(format!("--ca-file {}: {e}", f.display())))?;
+            format!("ca:{}", crate::util::b64e(&pem_cert(&pem).ok_or_else(|| usage("--ca-file has no PEM certificate"))?))
+        }
+        (None, Some(h)) => format!("sha256:{}", h.trim().replace(':', "").to_ascii_lowercase()).chars().take(71).collect::<String>(),
+        (None, None) => "roots".to_owned(),
+    };
+    if r.cert_sha256.as_deref().is_some_and(|h| hex32(h).is_none()) {
+        return Err(usage("--cert-sha256 is the SHA-256 of the server certificate: 64 hex digits"));
+    }
+    if r.auth_header.is_some() && !key_stdin {
+        return Err(usage("--header-from-keystore needs the header value on stdin (--key-stdin)"));
+    }
+    let key = if key_stdin {
+        let mut raw = zeroize::Zeroizing::new(Vec::new());
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::io::stdin(), 4097), &mut raw).map_err(|e| usage(format!("read stdin: {e}")))?;
+        let k = zeroize::Zeroizing::new(std::str::from_utf8(&raw).map_err(|_| usage("secret must be UTF-8"))?.trim().to_owned());
+        if raw.len() > 4096 || k.is_empty() || !k.bytes().all(|c| c.is_ascii_graphic() || c == b' ') {
+            return Err(usage("secret must be printable ASCII, at most 4 KiB"));
+        }
+        k
+    } else {
+        zeroize::Zeroizing::new(String::new())
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for m in models {
+        let (slug, id) = m.split_once('=').ok_or_else(|| usage("--model is local/<slug>=<server model id>"))?;
+        if !slug.starts_with("local/") || !crate::node::plain_id(slug) || !crate::node::plain_id(id) || moochy_worker::firewall::is_cloud_routed(id) {
+            return Err(usage(format!("--model {m}: local/<slug>=<server id>, plain ids, not a cloud-routed model")));
+        }
+        map.insert(slug.to_owned(), id.to_owned());
+    }
+    if map.is_empty() {
+        return Err(usage("a remote server needs at least one --model local/<slug>=<server model id>"));
+    }
+    let mut p = crate::keystore::ProviderKey {
+        provider: "local".into(),
+        key: key.to_string(),
+        base_url: Some(url.to_owned()),
+        allow_unvetted_host: allow_unvetted,
+        models: map.clone(),
+        served_ids: Vec::new(),
+        remote_host: Some(r.host.clone()),
+        trust: Some(trust),
+        auth_header: r.auth_header.clone(),
+    };
+    // The whole configuration is checked by the worker before the donor is asked anything.
+    let opts = local_options(&p, allow_unvetted).map_err(usage)?;
+    let cfg = moochy_worker::provider::AdapterConfig {
+        provider: moochy_worker::Provider::Local,
+        api_key: zeroize::Zeroizing::new(if p.auth_header.is_some() { String::new() } else { key.to_string() }),
+        base_url: Some(url.to_owned()),
+        insecure_dev: false,
+        dev_root: None,
+        limits: moochy_worker::provider::Limits::local(),
+    };
+    moochy_worker::provider::check_local_url(url, &opts).map_err(|e| usage(format!("--url: {e}")))?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| net(format!("runtime: {e}")))?;
+    rt.block_on(async { moochy_worker::provider::Adapter::new_local_with(&cfg, &opts).map(drop) }).map_err(|e| usage(format!("remote server: {e}")))?;
+    // The donor states the exact host is theirs: requests (prompts) will be sent to it.
+    eprintln!("Remote model server {} (certificate check: {}{}).", r.host, trust_name(&p), p.auth_header.as_deref().map(|h| format!(", header {h} from the keystore")).unwrap_or_default());
+    eprintln!("Prompts of the projects you donate to will be sent to this server. Only add a server you control.");
+    let confirmed = match &r.confirm_host {
+        Some(c) => c.trim() == r.host,
+        None => crate::owner::ask(&format!("Type {} to confirm it is your server: ", r.host), false)?.trim() == r.host,
+    };
+    if !confirmed {
+        return Err(usage("host not confirmed; nothing stored"));
+    }
+    let mut cfgf = home.load()?;
+    let mut sec = crate::keystore::load_or_init(home, &mut cfgf)?;
+    sec.providers.retain(|x| x.provider != "local");
+    p.models = map.clone();
+    sec.providers.push(p);
+    crate::keystore::save(home, &cfgf, &sec)?;
+    crate::util::emit(&serde_json::json!({"event": "key_added", "provider": "local", "remote": r.host, "models": map}));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_pins() {
+        assert_eq!(hex32(&"ab".repeat(32)), Some([0xab; 32]));
+        assert_eq!(hex32(&"AB:".repeat(32)), Some([0xab; 32]));
+        assert!(hex32("abc").is_none());
+        assert!(hex32(&"zz".repeat(32)).is_none());
+        assert_eq!(pem_cert("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n"), Some(vec![1, 2, 3]));
+        assert!(pem_cert("no pem").is_none());
+    }
 
     #[test]
     fn base_url_and_credentials() {

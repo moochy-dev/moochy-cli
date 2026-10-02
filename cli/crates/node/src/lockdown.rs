@@ -132,8 +132,12 @@ pub fn apply(home: &Home, boot: &mut Boot, unsafe_no_lockdown: bool) -> Result<(
     // current kernel look unprotected and hid real losses).
     let landlock_net = r.landlock_fs && r.abi >= 4;
     let landlock_scope = r.landlock_fs && r.abi >= 6;
+    // macOS has no Landlock: the lockdown is a Seatbelt profile (process-exec/fork denied, files
+    // and network limited), so there is nothing per-ABI to report or warn about (A223).
+    let sandbox = if cfg!(target_os = "macos") { "seatbelt" } else { "landlock+seccomp" };
     let rep = json!({
         "locked": !unsafe_no_lockdown,
+        "sandbox": sandbox,
         "landlock_scope": landlock_scope,
         "no_new_privs": r.no_new_privs,
         "seccomp": r.seccomp,
@@ -143,10 +147,10 @@ pub fn apply(home: &Home, boot: &mut Boot, unsafe_no_lockdown: bool) -> Result<(
         "all_threads": r.all_threads,
     });
     log(if unsafe_no_lockdown { "error" } else { "info" }, if unsafe_no_lockdown { "UNSAFE: background process NOT locked down (--unsafe-no-lockdown)" } else { "background process locked down" }, &rep);
-    if !unsafe_no_lockdown && !landlock_net {
+    if cfg!(target_os = "linux") && !unsafe_no_lockdown && !landlock_net {
         log("warn", "kernel without Landlock network rules (ABI < 4): outbound connections are not limited by moochy; use the systemd unit's RestrictAddressFamilies", &json!({"landlock_abi": r.abi}));
     }
-    if !unsafe_no_lockdown && !landlock_scope {
+    if cfg!(target_os = "linux") && !unsafe_no_lockdown && !landlock_scope {
         log("warn", "kernel without Landlock scoping (ABI < 6): abstract Unix sockets and signals are not confined by moochy", &json!({"landlock_abi": r.abi}));
     }
     record(home, &rep);
@@ -180,14 +184,19 @@ pub fn doctor(home: &Home, running: bool) -> Vec<(bool, &'static str, String)> {
         Some(r) if f(&r, "locked") == true => out.push((
             true,
             "lockdown",
-            format!(
-                "background process locked: seccomp {}, no_new_privs {}, Landlock fs {}, net {}, ABI {}",
-                f(&r, "seccomp"),
-                f(&r, "no_new_privs"),
-                f(&r, "landlock_fs"),
-                f(&r, "landlock_net"),
-                f(&r, "landlock_abi")
-            ),
+            if f(&r, "sandbox") == "seatbelt" {
+                "background process locked: Seatbelt profile (no exec or fork; files and network limited)".to_owned()
+            } else {
+                format!(
+                    "background process locked: seccomp {}, no_new_privs {}, Landlock fs {}, net {}, scope {}, ABI {}",
+                    f(&r, "seccomp"),
+                    f(&r, "no_new_privs"),
+                    f(&r, "landlock_fs"),
+                    f(&r, "landlock_net"),
+                    f(&r, "landlock_scope"),
+                    f(&r, "landlock_abi")
+                )
+            },
         )),
         Some(r) => {
             let reason = f(&r, "reason").as_str().unwrap_or("--unsafe-no-lockdown").to_owned();

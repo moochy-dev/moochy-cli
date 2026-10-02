@@ -904,6 +904,40 @@ pub struct RevokeBoxResponse {
     #[prost(bool, tag = "2")]
     pub token_revoked: bool,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LookupRequest {
+    /// "owner/name" (GitHub) or "github/…" / "gitlab/…/name"
+    #[prost(string, tag = "1")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// "" = repo lookup only
+    #[prost(string, tag = "2")]
+    pub handle: ::prost::alloc::string::String,
+    /// the owner's pseudonym (handle lookups)
+    #[prost(string, tag = "3")]
+    pub owner: ::prost::alloc::string::String,
+    /// an active Ed25519 owner key of `owner` (KEYLOG §4)
+    #[prost(string, tag = "4")]
+    pub owner_key_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub issued_at_ms: i64,
+    /// 64 bytes
+    #[prost(bytes = "bytes", tag = "6")]
+    pub sig: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LookupResponse {
+    /// canonical
+    #[prost(string, tag = "1")]
+    pub repo_slug: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub repo_id: ::prost::alloc::string::String,
+    /// canonical; handle lookups only
+    #[prost(string, tag = "3")]
+    pub handle: ::prost::alloc::string::String,
+    /// handle lookups only
+    #[prost(string, tag = "4")]
+    pub pseudonym: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Role {
@@ -1365,6 +1399,33 @@ pub mod node_link_client {
                 .insert(GrpcMethod::new("moochy.v1.NodeLink", "RevokeBox"));
             self.inner.unary(req, path, codec).await
         }
+        /// A218 (integrator 2026-10-02): the owner CLI checks what it is about to sign against the relay
+        /// itself, not through the background Node's labels. Same rules as the web's /api/lookup.
+        /// Unauthenticated, strictly rate-limited per IP. Repo only (handle empty): the claimed repo's
+        /// canonical slug and id (public). With a handle: answered only when `sig` is an active Ed25519
+        /// owner key of `owner` (never a passkey) over lp("moochy/v1/lookup", handle, repo_slug, owner,
+        /// decimal(issued_at_ms)), issued within 5 minutes, for a person with a donation or membership on
+        /// that repo, which `owner` must hold. Every refusal is NOT_FOUND, alike (no oracle).
+        pub async fn lookup(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LookupRequest>,
+        ) -> std::result::Result<tonic::Response<super::LookupResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/Lookup",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("moochy.v1.NodeLink", "Lookup"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1487,6 +1548,17 @@ pub mod node_link_server {
             tonic::Response<super::RevokeBoxResponse>,
             tonic::Status,
         >;
+        /// A218 (integrator 2026-10-02): the owner CLI checks what it is about to sign against the relay
+        /// itself, not through the background Node's labels. Same rules as the web's /api/lookup.
+        /// Unauthenticated, strictly rate-limited per IP. Repo only (handle empty): the claimed repo's
+        /// canonical slug and id (public). With a handle: answered only when `sig` is an active Ed25519
+        /// owner key of `owner` (never a passkey) over lp("moochy/v1/lookup", handle, repo_slug, owner,
+        /// decimal(issued_at_ms)), issued within 5 minutes, for a person with a donation or membership on
+        /// that repo, which `owner` must hold. Every refusal is NOT_FOUND, alike (no oracle).
+        async fn lookup(
+            &self,
+            request: tonic::Request<super::LookupRequest>,
+        ) -> std::result::Result<tonic::Response<super::LookupResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct NodeLinkServer<T> {
@@ -2127,6 +2199,49 @@ pub mod node_link_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RevokeBoxSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/Lookup" => {
+                    #[allow(non_camel_case_types)]
+                    struct LookupSvc<T: NodeLink>(pub Arc<T>);
+                    impl<T: NodeLink> tonic::server::UnaryService<super::LookupRequest>
+                    for LookupSvc<T> {
+                        type Response = super::LookupResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LookupRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::lookup(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LookupSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
