@@ -67,8 +67,11 @@ pub struct Peer {
     pub pid: Option<i32>,
 }
 
-/// A201: only the `moochy` binary of this user, connected over the 0600 gateway socket, may mint
-/// a sandboxed run token (a same-user script holding run.key and a repo token over TCP cannot).
+/// A201: only this user's processes, over the 0600 gateway socket and holding the 0600 run key,
+/// may mint a sandboxed run token (a TCP client holding run.key and a repo token cannot). Where
+/// `/proc` is readable, the peer must also be the `moochy` binary itself. Under the background
+/// process's own lockdown (§15.2, Landlock) `/proc` is not visible, and the uid + run key
+/// binding stands alone.
 fn launcher_ok(peer: Option<Peer>, state_dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let Some(p) = peer else { return false };
@@ -77,8 +80,13 @@ fn launcher_ok(peer: Option<Peer>, state_dir: &Path) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        let (Some(pid), Ok(me)) = (p.pid, std::env::current_exe()) else { return false };
-        std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == me)
+        let Some(pid) = p.pid else { return false };
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(exe) => std::env::current_exe().is_ok_and(|me| me == exe),
+            // Locked down (Landlock: /proc out of view, other processes out of scope).
+            Err(_) if std::fs::File::open("/proc/self/status").is_err() => true,
+            Err(_) => false,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -86,9 +94,11 @@ fn launcher_ok(peer: Option<Peer>, state_dir: &Path) -> bool {
     }
 }
 
-/// The launcher process is gone (Linux: /proc; elsewhere the closed response is the signal).
+/// The launcher process is known to be gone. Only a definite "no such process" counts: under
+/// lockdown `/proc` is unreadable, and the closed minting connection is the signal instead
+/// (sockets are close-on-exec, so no child inherits it).
 fn launcher_gone(pid: Option<i32>) -> bool {
-    cfg!(target_os = "linux") && pid.is_some_and(|p| !Path::new(&format!("/proc/{p}")).exists())
+    cfg!(target_os = "linux") && pid.is_some_and(|p| std::fs::metadata(format!("/proc/{p}")).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
 }
 
 /// Removes the token when the holding response ends.
@@ -258,7 +268,10 @@ async fn mint(sock: &Path, port: u16, repo_token: &str, key: &str) -> Result<(St
         .map_err(|e| internal(format!("request: {e}")))?;
     let resp = tokio::time::timeout(Duration::from_secs(10), send.send_request(req)).await.map_err(|_| internal("gateway timeout"))?.map_err(|e| internal(format!("gateway: {e}")))?;
     if resp.status() != 200 {
-        return Err(internal(format!("the Moochy app refused a sandboxed session ({})", resp.status())));
+        let status = resp.status();
+        let body = http_body_util::Limited::new(resp.into_body(), 4096).collect().await.map(http_body_util::Collected::to_bytes).unwrap_or_default();
+        let code = serde_json::from_slice::<serde_json::Value>(&body).ok().and_then(|v| v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_default();
+        return Err(internal(format!("the Moochy app refused a sandboxed session ({status} {})", crate::util::clean(&code))));
     }
     let mut body = resp.into_body();
     let mut line = Vec::new();
