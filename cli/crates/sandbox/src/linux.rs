@@ -819,19 +819,35 @@ fn probe_userns() -> std::io::Result<()> {
 }
 
 /// The exact fix `moochy doctor` prints: a per-binary AppArmor profile for the
-/// binary that is actually running (never the global sysctl).
+/// binary that is actually running (never the global sysctl). A binary the user
+/// can replace (e.g. the installer's `~/.local/bin`) must not get `userns`:
+/// any program of that user could drop itself there, so the fix installs it
+/// system-wide first.
 pub fn apparmor_fix() -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .map_or_else(|| "/usr/local/bin/moochy".to_string(), |p| p.to_string_lossy().into_owned());
+    use rustix::fs::{Access, access};
+    let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let replaceable = exe.as_deref().is_some_and(|p| {
+        access(p, Access::WRITE_OK).is_ok() || p.parent().is_some_and(|d| access(d, Access::WRITE_OK).is_ok())
+    });
+    let shown = exe.as_deref().map_or_else(|| "/usr/local/bin/moochy".to_string(), |p| p.to_string_lossy().into_owned());
+    let (install, target) = if replaceable {
+        (
+            format!(
+                "{shown} is writable by you, so it must not get this right (anything you run could replace it). \
+                 Install it system-wide first:\n  sudo install -m 0755 {shown} /usr/local/bin/moochy\n"
+            ),
+            "/usr/local/bin/moochy".to_string(),
+        )
+    } else {
+        (String::new(), shown)
+    };
     format!(
         "Unprivileged user namespaces are restricted on this host \
-         (kernel.apparmor_restrict_unprivileged_userns=1). Grant `userns` to this binary only \
+         (kernel.apparmor_restrict_unprivileged_userns=1). {install}Grant `userns` to this binary only \
          with /etc/apparmor.d/moochy:\n\n\
          abi <abi/4.0>,\n\
          include <tunables/global>\n\
-         profile moochy {exe} flags=(unconfined) {{\n  userns,\n  include if exists <local/moochy>\n}}\n\n\
+         profile moochy {target} flags=(unconfined) {{\n  userns,\n  include if exists <local/moochy>\n}}\n\n\
          then run: sudo apparmor_parser -r /etc/apparmor.d/moochy\n\
          (Do NOT set the sysctl to 0: that hands the permission to every program on the host.)"
     )
