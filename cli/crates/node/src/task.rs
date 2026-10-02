@@ -319,9 +319,13 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         body_chunks: u32::try_from(n).unwrap_or(u32::MAX),
     };
     let route = open.route.clone();
-    let _ = up_tx.try_send(up(submit_up::Msg::Open(open)));
-    for c in sealed.chunks {
-        let _ = up_tx.try_send(up(submit_up::Msg::Body(c)));
+    // Kept (refcounted Bytes) until the provider starts, to resubmit the same task on a new
+    // session after a relay link loss (03 §14, E50).
+    let mut resend = Vec::with_capacity(n.saturating_add(1));
+    resend.push(up(submit_up::Msg::Open(open)));
+    resend.extend(sealed.chunks.into_iter().map(|c| up(submit_up::Msg::Body(c))));
+    for m in &resend {
+        let _ = up_tx.try_send(m.clone());
     }
     // E22: stamp the moment the transport takes the first body chunk.
     let first_tx = Arc::new(AtomicU64::new(0));
@@ -338,6 +342,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         .await
         .map_err(|s| Failure::new("overloaded", true, format!("moochy: the server refused the request ({:?})", s.code())))?
         .into_inner();
+    let session = link.session.clone();
     let (tx, rx) = mpsc::channel(16);
     let ttl = if req.facts.cache_ttl == moochy_worker::firewall::CacheTtl::H1 { 3_600_000 } else { 300_000 };
     let drv = Driver {
@@ -367,6 +372,8 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         truncated: false,
         checkpoints: Vec::new(),
         receipt: None,
+        resend,
+        session,
         entry: req.entry.clone(),
         est_input: req.facts.est_input_tokens,
         ttl: req.facts.cache_ttl,
@@ -428,6 +435,10 @@ struct Driver {
     truncated: bool,
     checkpoints: Vec<pb::Checkpoint>,
     receipt: Option<pb::SignedReceipt>,
+    /// The Submit messages, until the provider starts (resubmission after a link loss).
+    resend: Vec<SubmitUp>,
+    /// Relay session the current Submit stream belongs to.
+    session: tonic::metadata::AsciiMetadataValue,
     /// What the receipt's usage and model are checked against (03 §12.2).
     entry: CatalogEntry,
     est_input: u64,
@@ -457,8 +468,20 @@ impl Driver {
             let step = match m {
                 Ok(Some(SubmitDown { msg: Some(m) })) => self.on_msg(m).await,
                 Ok(Some(SubmitDown { msg: None })) => Step::Continue,
+                // Nothing reached the client yet: resubmit the same task on the next session;
+                // the relay moves its route or replays the final state (03 §14, E50).
+                Ok(None) | Err(_) if !self.started && !self.resend.is_empty() => match self.resubmit().await {
+                    Some(d) => {
+                        down = d;
+                        Step::Continue
+                    }
+                    None => retry_fail("overloaded", "relay link lost"),
+                },
                 Ok(None) | Err(_) => retry_fail("overloaded", "relay link lost"),
             };
+            if self.started && !self.resend.is_empty() {
+                self.resend = Vec::new(); // started: no resubmission any more, free the body
+            }
             if !matches!(step, Step::Continue) {
                 break step;
             }
@@ -555,6 +578,28 @@ impl Driver {
             }
             _ => Step::Continue,
         }
+    }
+
+    /// Wait (≤ 15 s) for a new relay session, then send the identical Submit on it.
+    async fn resubmit(&mut self) -> Option<tonic::Streaming<SubmitDown>> {
+        let deadline = tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(15))?;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(link) = self.node.link_now(std::time::Duration::from_secs(3)).await.filter(|l| l.session != self.session) {
+                let (up_tx, up_rx) = mpsc::channel::<SubmitUp>(self.resend.len().saturating_add(4));
+                for m in &self.resend {
+                    up_tx.try_send(m.clone()).ok()?;
+                }
+                let mut client = link.client.clone();
+                if let Ok(r) = client.submit(crate::link::with_session(&link, ReceiverStream::new(up_rx))).await {
+                    log("info", "task resubmitted after a relay link loss", &json!({"task": self.task_text}));
+                    self.up = up_tx;
+                    self.session = link.session.clone();
+                    return Some(r.into_inner());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        None
     }
 
     fn on_accepted(&mut self, a: &pb::Accepted) -> Step {
