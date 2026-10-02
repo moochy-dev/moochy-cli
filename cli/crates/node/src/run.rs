@@ -165,6 +165,10 @@ pub struct GatewayInfo {
     pub mcp: String,
     pub repo_token: String,
     pub state_dir: std::path::PathBuf,
+    /// `--allow-host`: exact host names reachable on :443 through the sandbox's CONNECT proxy.
+    pub allow_hosts: Vec<String>,
+    /// `--git-writable`: the agent may commit (`hooks/`, `config` stay read-only).
+    pub git_writable: bool,
 }
 
 /// `moochy run -- <cmd…>` (§15.1): mint a sandboxed run token, run the command in
@@ -194,6 +198,10 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
             spec.env.insert(k.into(), v.into());
         }
         spec.run_token = Some(token);
+        spec.allow_hosts.clone_from(&gw.allow_hosts);
+        spec.git_writable = gw.git_writable;
+        // A197, second layer: nothing visible may contain the Moochy home (keys, run key, state).
+        spec.protected.push(gw.state_dir.parent().unwrap_or(&gw.state_dir).to_path_buf());
         // Agents installed outside the system dirs (e.g. ~/.local/bin): their install dir, ro.
         if let Some(dirs) = install_dirs(prog) {
             spec.ro_paths.extend(dirs);

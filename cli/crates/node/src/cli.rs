@@ -35,7 +35,8 @@ COMMANDS:
   env [--repo OWNER/NAME] [--json] [--rotate]
                                   Base URLs and a project token for your tools
   mcp [--repo OWNER/NAME]         MCP server on stdio (needs `moochy up`)
-  run [--repo OWNER/NAME] [--worktree DIR] [--allow-host HOST]... [--unsafe-no-sandbox] -- <cmd>
+  run [--repo OWNER/NAME] [--worktree DIR] [--allow-host HOST]... [--git-writable]
+      [--unsafe-no-sandbox] -- <cmd>
                                   Run your coding agent in a sandbox wired to Moochy: it sees only
                                   this repository (secrets hidden) and reaches only Moochy. Tool
                                   calls from donated tokens reach only sandboxed agents
@@ -151,7 +152,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-sandbox"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-sandbox", "git-writable"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -355,10 +356,15 @@ fn run_cmd(home: &Home, o: &Opts, cmd: &[&str]) -> Result<()> {
         let st = crate::run::run_unsandboxed(&env, &cmd)?;
         std::process::exit(st.code().unwrap_or(1));
     }
-    if !o.allow_hosts.is_empty() {
-        return Err(usage("--allow-host needs the sandbox's CONNECT proxy, which this version does not include yet; nothing ran"));
-    }
-    let gw = crate::run::GatewayInfo { anthropic: r.anthropic_base_url, openai: r.openai_base_url, mcp: r.mcp_url, repo_token: r.token, state_dir: home.state_dir() };
+    let gw = crate::run::GatewayInfo {
+        anthropic: r.anthropic_base_url,
+        openai: r.openai_base_url,
+        mcp: r.mcp_url,
+        repo_token: r.token,
+        state_dir: home.state_dir(),
+        allow_hosts: o.allow_hosts.clone(),
+        git_writable: o.has("git-writable"),
+    };
     let worktree = o.worktree.as_ref().map(|w| std::fs::canonicalize(w).map_err(|e| usage(format!("--worktree {}: {e}", w.display())))).transpose()?;
     let code = crate::run::run_sandboxed(&gw, &cmd, worktree)?;
     std::process::exit(code);
