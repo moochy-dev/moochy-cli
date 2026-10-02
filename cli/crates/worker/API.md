@@ -245,6 +245,31 @@ A donor's own OpenAI-compatible server (Ollama `:11434`, LM Studio `:1234`, vLLM
   - Otherwise usage is `estimated` (output from streamed bytes; Ollama-style `timings` without `cache_n` count all prompt tokens as input).
   - Reasoning is inside `completion_tokens`, bounded by `max_tokens`. `provider_cost_uusd` is `None`; cost = catalog price 0.
 
+### Remote GPU servers over TLS (CONTRACT §17.3, for mo-donor)
+
+A donor's own server on RunPod, Vast or Lambda serves as the same `local` provider kind: same firewall, `Limits::local()`, price 0 and self-reported trust tier. The only differences are the transport and the vetting.
+
+- **Command:** `moochy keys add local --url https://abc123-8000.proxy.runpod.net [--header-from-keystore x-api-key] [--ca-file box-ca.pem | --cert-sha256 HEX]`
+  1. `provider::remote_host_key(url)` returns the canonical `host:port` (lowercase; port explicit, default 443; IPv6 in brackets). Show it, and have the donor confirm it is their server (`--yes` must not skip this). Store it in the donor config's vetted list.
+  2. Loopback and LAN URLs return an error from `remote_host_key`: they need no vetting and keep the `--base-url` rules above.
+  3. Plain `http://` to anything off the LAN is refused, also with `--allow-unvetted-host`. That flag (dev) only skips the vetted list.
+- **Adapter:** `Adapter::new_local_with(&cfg, &LocalOptions { vetted_hosts, auth_header, trust, allow_unvetted_host })`, with `cfg.api_key` empty when `auth_header` is set (both together are refused) and `dev_root: None`.
+  - Pre-check the URL with `provider::check_local_url(url, &opts)`. `LocalHost::Remote` means a vetted remote host.
+  - The base URL is still an origin only; the path stays `/v1/chat/completions`.
+- **Auth header from the keystore:** `auth_header: Some((name, Zeroizing<String>))`, read from the keystore at start, never from config or argv.
+  - The name is a lowercase token: `authorization` (value e.g. `Bearer …`), `x-api-key`, … Framing and routing headers (`host`, `content-length`, `transfer-encoding`, `cookie`, `proxy-*`, `x-forwarded-*`, …) are refused.
+  - The value is a sensitive header: it is never printed by `Debug`, logs or errors. Do not log it on your side either.
+- **Certificates (`RemoteTrust`):**
+  - `Roots` (default): Mozilla roots (webpki-roots, as for hosted providers; no OS store) plus the host name. Fits the platform proxies (`*.proxy.runpod.net`, …).
+  - `Ca(der)`: only this CA, plus the host name. Use it for a self-signed CA on the box (`--ca-file`, PEM → DER on your side).
+  - `Fingerprint([u8; 32])`: SHA-256 of the server certificate's DER (`--cert-sha256`); no CA and no name check, handshake signatures still verified. Re-pin when the box rotates its certificate.
+- **SSRF guards:** you get these by construction; do not re-implement them.
+  - Each new connection resolves the name in the worker and is refused unless every address is public (loopback, LAN, link-local, metadata, v4-mapped all refused: DNS rebinding). The worker dials that exact address.
+  - Redirects are never followed (a 3xx is a provider error).
+  - Zone ids, userinfo, numeric host forms (`2130706433`, `127.1`, `0x7f.1`), a trailing dot and IDN are refused at config time.
+- **Wire:** HTTP/1.1 over TLS (ALPN `http/1.1`), keep-alive pool, driven in the reading task like the plain h1 path. `Adapter::warm()` pre-opens a connection.
+- **doctor/status:** show `local (remote, vetted host:port, trust: roots|ca|fingerprint)`, never the header value.
+
 ### For mo-relay (catalog and trust tier)
 
 - **Catalog entries:** `provider: "local"`, `dialects: ["openai.chat"]`, every price field 0, `max_output` per model, `default_effort: "none"` (or the model's).
