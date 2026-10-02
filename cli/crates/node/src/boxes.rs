@@ -259,7 +259,7 @@ pub fn list(home: &Home, slug: Option<&str>, tokens: bool) -> Result<()> {
         return Ok(());
     }
     let cfg = home.load()?;
-    let log = cfg.pseudonym.as_deref().and_then(|ps| crate::keylog::KeyLog::boxes_on_disk(home, &cfg, ps));
+    let log = crate::keylog::KeyLog::boxes(home, &cfg);
     let r = match (relay, &log) {
         (Ok(r), _) => r,
         (Err(e), Some(_)) => {
@@ -271,15 +271,14 @@ pub fn list(home: &Home, slug: Option<&str>, tokens: bool) -> Result<()> {
     for b in &r.boxes {
         let mut v = box_json(b);
         if let (Some(o), Some(l)) = (v.as_object_mut(), &log) {
-            o.insert("in_key_log".into(), json!(l.iter().any(|(id, ..)| *id == b.device_id)));
+            o.insert("in_key_log".into(), json!(l.iter().any(|x| x.device_id == b.device_id)));
         }
         emit(&v);
     }
     // The key log is per account, not per project: only unfiltered lists add its extra boxes.
     if slug.is_none() {
-        let now = now_ms();
-        for (id, token, exp, revoked) in log.iter().flatten().filter(|(id, ..)| !r.boxes.iter().any(|b| b.device_id == *id)) {
-            emit(&json!({"device_id": clean(id), "token_id": clean(token), "expires_at_ms": exp, "revoked": revoked, "expired": now >= *exp, "source": "key_log"}));
+        for x in log.iter().flatten().filter(|x| !r.boxes.iter().any(|b| b.device_id == x.device_id)) {
+            emit(&json!({"device_id": clean(&x.device_id), "token_id": clean(&x.box_id), "repo_id": clean(&x.repo_id), "expires_at_ms": x.expires_at_ms, "revoked": x.revoked, "expired": x.expired, "source": "key_log"}));
         }
     }
     Ok(())
