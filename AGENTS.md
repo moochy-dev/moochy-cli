@@ -42,7 +42,7 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 ## 6. Web palette (fixed)
 
-Strictly monochrome from three base colors — Ink (dark), Paper (white), Sky (light blue) — and named variants derived from them; no gradients, glows, glass, sheen, constellations, cursor effects or scroll-jacking (CONTRACT §9, product owner review 2026-10-01). Calm, editorial, product-grade; a pet mascot as the brand mark; subtle functional motion only.
+Playful, warm and alive (CONTRACT §9, product owner 2026-10-02, supersedes strict monochrome): Ink/Paper/Sky base + the mascot's warm palette (Apricot, Blush) + Mint/Sun/Coral signals as named tokens; color-blocked sections and illustrations welcome; a living mascot and a real motion system (scroll-driven reveals, View Transitions, live micro-interactions). Still banned: purple/blue neon gradients and glows, glassmorphism, particles, shimmer text, scroll-jacking. Always: WCAG AA, `prefers-reduced-motion`, no-JS works, transform/opacity only, §13 budgets.
 
 ## 7. Final report (always, even when blocked)
 
