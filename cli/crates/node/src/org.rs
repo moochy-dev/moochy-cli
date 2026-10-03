@@ -416,7 +416,9 @@ fn owned(home: &Home, cfg: &crate::config::Config, g: Group, org: &str) -> Resul
         }
     }
     let Some(covered) = covered else { return Ok(None) };
-    let named = |id: &str| rows.iter().find(|q| q.repo_id == id).map(|q| q.repo_slug.clone());
+    // A `person-repo-dropped:` offer asks the owner to sign the removal of a repo the relay already
+    // dropped (§24.3 re-check): it names the repo, but the repo is no longer served (E128).
+    let named = |id: &str| rows.iter().find(|q| q.repo_id == id && !q.request_id.starts_with("person-repo-dropped:")).map(|q| q.repo_slug.clone());
     for q in rows.iter().filter(|q| !covered.contains(&q.repo_id)) {
         eprintln!("warning: the server lists {} ({}) as funded by {}, but your key log does not: not listed", clean(&q.repo_slug), clean(&q.repo_id), clean(path));
     }

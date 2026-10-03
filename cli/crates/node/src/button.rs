@@ -173,7 +173,7 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
     if o.style.is_some() {
         return Err(usage("--style is for the button, not --chart"));
     }
-    let query = |theme_override: Option<&str>| -> String {
+    let query = |theme_override: Option<&str>, card: bool| -> String {
         let mut q: Vec<String> = Vec::new();
         let mut opt = |k: &str, v: Option<&str>, default: &str| {
             if let Some(v) = v.filter(|v| *v != default) {
@@ -187,11 +187,13 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
         opt("period", period.as_deref(), "30d");
         opt("series", series.as_deref(), "both");
         opt("size", size.as_deref(), "m");
-        opt("theme", theme_override.or(theme.as_deref()), "light");
+        // The card follows the reader's scheme unless told, so Light is written out there (as the studio).
+        let t = theme_override.or(theme.as_deref());
+        opt("theme", if card { t.or(Some("light")) } else { t }, if card { "" } else { "light" });
         opt("total", o.total.then_some("1"), "");
         if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
     };
-    let img = format!("{base}{act}chart.svg{}", query(None));
+    let img = format!("{base}{act}chart.svg{}", query(None, false));
     let text = label.unwrap_or(CHART_ALT);
     let alt = html_escape(text);
     // In HTML attributes the query's `&` is written `&amp;`, as the studio does.
@@ -203,10 +205,10 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
         // the default (light) and an explicit theme are one image, as in the studio.
         "html" if theme.as_deref() == Some("auto") => format!(
             "<a href=\"{base}\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"{base}{act}chart.svg{}\">\n    <img alt=\"{alt}\" src=\"{base}{act}chart.svg{}\">\n  </picture>\n</a>",
-            attr(query(Some("dark"))),
-            attr(query(Some("light")))
+            attr(query(Some("dark"), false)),
+            attr(query(Some("light"), false))
         ),
-        "html" => format!("<a href=\"{base}\"><img alt=\"{alt}\" src=\"{base}{act}chart.svg{}\"></a>", attr(query(None))),
+        "html" => format!("<a href=\"{base}\"><img alt=\"{alt}\" src=\"{base}{act}chart.svg{}\"></a>", attr(query(None, false))),
         "rst" => format!(".. image:: {img}\n   :target: {base}\n   :alt: {text}"),
         "iframe" => {
             // The studio's pixel boxes (sparklines are a strip).
@@ -216,7 +218,7 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
                 Some("l") => (640, if spark { 80 } else { 320 }),
                 _ => (480, if spark { 60 } else { 240 }),
             };
-            format!("<iframe src=\"{base}{act}card{}\" title=\"{alt}\" width=\"{w}\" height=\"{h}\" style=\"border:0\" loading=\"lazy\"></iframe>", attr(query(None)))
+            format!("<iframe src=\"{base}{act}card{}\" title=\"{alt}\" width=\"{w}\" height=\"{h}\" style=\"border:0\" loading=\"lazy\"></iframe>", attr(query(None, true)))
         }
         _ => return Err(usage("--format is one of: markdown, html, rst, iframe")),
     })
@@ -391,7 +393,7 @@ mod tests {
         let spark = Options { kind: Some("sparkline".into()), size: Some("s".into()), ..o("iframe") };
         assert_eq!(
             chart(&b, a, &spark).unwrap(),
-            "<iframe src=\"https://moochy.dev/org/gitlab/group/sub/-/card?kind=sparkline&amp;size=s\" title=\"Tokens donated and used on Moochy\" width=\"320\" height=\"40\" style=\"border:0\" loading=\"lazy\"></iframe>"
+            "<iframe src=\"https://moochy.dev/org/gitlab/group/sub/-/card?kind=sparkline&amp;size=s&amp;theme=light\" title=\"Tokens donated and used on Moochy\" width=\"320\" height=\"40\" style=\"border:0\" loading=\"lazy\"></iframe>"
         );
         let (b, a) = group_base(crate::donations::To::Org, "github/acme").unwrap();
         assert_eq!(chart(&b, a, &Options { period: Some("7d".into()), ..Options::default() }).unwrap(), "[![Tokens donated and used on Moochy](https://moochy.dev/org/github/acme/chart.svg?period=7d)](https://moochy.dev/org/github/acme)");
