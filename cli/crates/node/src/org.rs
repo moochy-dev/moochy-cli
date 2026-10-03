@@ -322,6 +322,10 @@ struct OrgInfo {
     path: String,
     #[serde(default)]
     repos: Vec<Covered>,
+    /// Owner view only: covered in the key log, but the server no longer serves them (§24.3: role
+    /// lost or repo made private at a re-check; §19: dropped). Never listed as covered.
+    #[serde(skip)]
+    dropped: Vec<String>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -346,10 +350,13 @@ pub fn list(home: &Home, g: Group, org: &str, json_out: bool) -> Result<()> {
     for r in info.repos.iter_mut().filter(|r| !r.slug.is_empty()) {
         r.slug = qualified(&r.slug);
     }
+    for id in &info.dropped {
+        eprintln!("note: {} ({}) is no longer served by the server (maintainer role lost, made private, or removed): not listed, though your key log still names it", clean(id), clean(&info.path));
+    }
     if json_out && g == Group::Person {
-        crate::util::emit(&json!({"person": info.path, "person_id": info.org_id, "repos": info.repos}));
+        crate::util::emit(&json!({"person": info.path, "person_id": info.org_id, "repos": info.repos, "dropped": info.dropped}));
     } else if json_out {
-        crate::util::emit(&json!({"org": info.path, "org_id": info.org_id, "repos": info.repos}));
+        crate::util::emit(&json!({"org": info.path, "org_id": info.org_id, "repos": info.repos, "dropped": info.dropped}));
     } else if info.repos.is_empty() && g == Group::Person {
         println!("{} ({}) covers no repo yet: moochy person add <PROJECT>", clean(&info.path), clean(&info.org_id));
     } else if info.repos.is_empty() {
@@ -413,8 +420,12 @@ fn owned(home: &Home, cfg: &crate::config::Config, g: Group, org: &str) -> Resul
     for q in rows.iter().filter(|q| !covered.contains(&q.repo_id)) {
         eprintln!("warning: the server lists {} ({}) as funded by {}, but your key log does not: not listed", clean(&q.repo_slug), clean(&q.repo_id), clean(path));
     }
-    let repos = covered.into_iter().map(|repo_id| Covered { slug: named(&repo_id).unwrap_or_default(), repo_id }).collect();
-    Ok(Some(OrgInfo { org_id: l.repo_id.clone(), path: path.to_owned(), repos }))
+    // The relay offers a removal for every repo it still serves; one it dropped (CONTRACT §24.3: a
+    // re-check found no maintainer role or a private repo) has no offer and is not listed.
+    // ponytail: a dropped repo makes every owner list wait out the 5 s agreement loop above.
+    let (repos, dropped): (Vec<String>, Vec<String>) = covered.into_iter().partition(|id| named(id).is_some());
+    let repos = repos.into_iter().map(|repo_id| Covered { slug: named(&repo_id).unwrap_or_default(), repo_id }).collect();
+    Ok(Some(OrgInfo { org_id: l.repo_id.clone(), path: path.to_owned(), repos, dropped }))
 }
 
 /// Anyone's view: the server's public orgs API, on an origin that serves HTTP.
