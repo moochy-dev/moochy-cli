@@ -150,8 +150,9 @@ pub fn group_base(to: crate::donations::To, path: &str) -> Result<(String, &'sta
 
 const CHART_ALT: &str = "Tokens donated and used on Moochy";
 
+/// An HTML attribute value, escaped exactly like the studio's Go `html.EscapeString`.
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('\'', "&#39;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&#34;")
 }
 
 /// The showcase chart snippet (CONTRACT §21.3) for a project or organisation page `base` (its
@@ -164,7 +165,9 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
     let period = pick(o.period.as_deref(), &["7d", "30d", "90d", "12m"], "period")?;
     let theme = pick(o.theme.as_deref(), &["light", "dark", "auto"], "theme")?;
     let size = pick(o.size.as_deref(), &["s", "m", "l"], "size")?;
-    if o.label.as_deref().is_some_and(|l| !valid_label(l, 40)) {
+    // The studio trims the label before using it.
+    let label = o.label.as_deref().map(str::trim);
+    if label.is_some_and(|l| !valid_label(l, 40)) {
         return Err(usage("--label: 1 to 40 characters (letters, digits, spaces, . , : ; ! ? ' ’ & + - ( ) / # @)"));
     }
     if o.style.is_some() {
@@ -179,7 +182,7 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
         };
         opt("goal", o.goal.then_some("1"), "");
         opt("kind", kind.as_deref(), "area");
-        opt("label", o.label.as_deref().map(encode).as_deref(), "");
+        opt("label", label.map(encode).as_deref(), "");
         opt("metric", metric.as_deref(), "tokens");
         opt("period", period.as_deref(), "30d");
         opt("series", series.as_deref(), "both");
@@ -189,18 +192,22 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
         if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
     };
     let img = format!("{base}{act}chart.svg{}", query(None));
-    let alt = html_escape(o.label.as_deref().unwrap_or(CHART_ALT));
+    let text = label.unwrap_or(CHART_ALT);
+    let alt = html_escape(text);
+    // In HTML attributes the query's `&` is written `&amp;`, as the studio does.
+    let attr = |q: String| html_escape(&q);
     Ok(match o.format.as_deref().unwrap_or("markdown") {
         // Markdown alt text: `[` and `]` are not in the label charset.
-        "markdown" => format!("[![{}]({img})]({base})", o.label.as_deref().unwrap_or(CHART_ALT)),
-        // No theme or `auto`: the studio's `<picture>` (light image, dark source).
-        "html" if theme.as_deref().is_none_or(|t| t == "auto") => format!(
+        "markdown" => format!("[![{text}]({img})]({base})"),
+        // Only `auto` follows the reader's theme with `<picture>` (light image, dark source);
+        // the default (light) and an explicit theme are one image, as in the studio.
+        "html" if theme.as_deref() == Some("auto") => format!(
             "<a href=\"{base}\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"{base}{act}chart.svg{}\">\n    <img alt=\"{alt}\" src=\"{base}{act}chart.svg{}\">\n  </picture>\n</a>",
-            query(Some("dark")),
-            query(Some("light"))
+            attr(query(Some("dark"))),
+            attr(query(Some("light")))
         ),
-        "html" => format!("<a href=\"{base}\"><img alt=\"{alt}\" src=\"{img}\"></a>"),
-        "rst" => format!(".. image:: {img}\n   :target: {base}\n   :alt: {}", o.label.as_deref().unwrap_or(CHART_ALT)),
+        "html" => format!("<a href=\"{base}\"><img alt=\"{alt}\" src=\"{base}{act}chart.svg{}\"></a>", attr(query(None))),
+        "rst" => format!(".. image:: {img}\n   :target: {base}\n   :alt: {text}"),
         "iframe" => {
             // The studio's pixel boxes (sparklines are a strip).
             let spark = kind.as_deref() == Some("sparkline");
@@ -209,7 +216,7 @@ pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
                 Some("l") => (640, if spark { 80 } else { 320 }),
                 _ => (480, if spark { 60 } else { 240 }),
             };
-            format!("<iframe src=\"{base}{act}card{}\" title=\"{alt}\" width=\"{w}\" height=\"{h}\" style=\"border:0\" loading=\"lazy\"></iframe>", query(None))
+            format!("<iframe src=\"{base}{act}card{}\" title=\"{alt}\" width=\"{w}\" height=\"{h}\" style=\"border:0\" loading=\"lazy\"></iframe>", attr(query(None)))
         }
         _ => return Err(usage("--format is one of: markdown, html, rst, iframe")),
     })
@@ -348,12 +355,18 @@ mod tests {
             project_chart(&gh, &Options::default()).unwrap(),
             "[![Tokens donated and used on Moochy](https://moochy.dev/p/github/tinyhttp/arrow/chart.svg)](https://moochy.dev/p/github/tinyhttp/arrow)"
         );
+        // The studio's default HTML is one light image; only `auto` is a <picture> (E123).
         assert_eq!(
             project_chart(&gh, &o("html")).unwrap(),
-            "<a href=\"https://moochy.dev/p/github/tinyhttp/arrow\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg?theme=dark\">\n    <img alt=\"Tokens donated and used on Moochy\" src=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg\">\n  </picture>\n</a>"
+            "<a href=\"https://moochy.dev/p/github/tinyhttp/arrow\"><img alt=\"Tokens donated and used on Moochy\" src=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg\"></a>"
         );
-        let auto = Options { theme: Some("auto".into()), ..o("html") };
-        assert_eq!(project_chart(&gh, &auto).unwrap(), project_chart(&gh, &o("html")).unwrap(), "auto = the <picture> form");
+        let auto = Options { theme: Some("auto".into()), kind: Some("bars".into()), label: Some(" Our tokens ".into()), total: true, ..o("html") };
+        assert_eq!(
+            project_chart(&gh, &auto).unwrap(),
+            "<a href=\"https://moochy.dev/p/github/tinyhttp/arrow\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg?kind=bars&amp;label=Our+tokens&amp;theme=dark&amp;total=1\">\n    <img alt=\"Our tokens\" src=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg?kind=bars&amp;label=Our+tokens&amp;total=1\">\n  </picture>\n</a>",
+            "the studio's E123 auto case: label trimmed, & as &amp; in attributes"
+        );
+        assert_eq!(project_chart(&gh, &Options { format: Some("markdown".into()), ..auto }).unwrap(), "[![Our tokens](https://moochy.dev/p/github/tinyhttp/arrow/chart.svg?kind=bars&label=Our+tokens&theme=auto&total=1)](https://moochy.dev/p/github/tinyhttp/arrow)");
         // Every option, alphabetical; GitLab actions after `/-/`.
         let gl = Project { provider: "gitlab", path: "group/sub/project".into() };
         let all = Options {
@@ -371,14 +384,14 @@ mod tests {
         let q = "?goal=1&kind=bars&label=Our+tokens+%26+use&metric=dollars&period=12m&series=used&size=l&theme=dark&total=1";
         let page = "https://moochy.dev/p/gitlab/group/sub/project";
         assert_eq!(project_chart(&gl, &all).unwrap(), format!("[![Our tokens & use]({page}/-/chart.svg{q})]({page})"));
-        assert_eq!(project_chart(&gl, &Options { format: Some("html".into()), ..all }).unwrap(), format!("<a href=\"{page}\"><img alt=\"Our tokens &amp; use\" src=\"{page}/-/chart.svg{q}\"></a>"));
+        assert_eq!(project_chart(&gl, &Options { format: Some("html".into()), ..all }).unwrap(), format!("<a href=\"{page}\"><img alt=\"Our tokens &amp; use\" src=\"{page}/-/chart.svg{}\"></a>", q.replace('&', "&amp;")));
         assert_eq!(project_chart(&gl, &o("rst")).unwrap(), format!(".. image:: {page}/-/chart.svg\n   :target: {page}\n   :alt: Tokens donated and used on Moochy"));
         // Organisations: no short form; the card's pixel box (sparkline = a strip).
         let (b, a) = group_base(crate::donations::To::Org, "gitlab/group/sub").unwrap();
         let spark = Options { kind: Some("sparkline".into()), size: Some("s".into()), ..o("iframe") };
         assert_eq!(
             chart(&b, a, &spark).unwrap(),
-            "<iframe src=\"https://moochy.dev/org/gitlab/group/sub/-/card?kind=sparkline&size=s\" title=\"Tokens donated and used on Moochy\" width=\"320\" height=\"40\" style=\"border:0\" loading=\"lazy\"></iframe>"
+            "<iframe src=\"https://moochy.dev/org/gitlab/group/sub/-/card?kind=sparkline&amp;size=s\" title=\"Tokens donated and used on Moochy\" width=\"320\" height=\"40\" style=\"border:0\" loading=\"lazy\"></iframe>"
         );
         let (b, a) = group_base(crate::donations::To::Org, "github/acme").unwrap();
         assert_eq!(chart(&b, a, &Options { period: Some("7d".into()), ..Options::default() }).unwrap(), "[![Tokens donated and used on Moochy](https://moochy.dev/org/github/acme/chart.svg?period=7d)](https://moochy.dev/org/github/acme)");

@@ -278,7 +278,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             created_at_ms: ms(q.issued_at_ms),
             ..model::Pending::default()
         })
-        .chain(owned.iter().filter(|d| d.status == "pending").map(|d| model::Pending {
+        // A donation request the relay also pushed as a signature request (same id) is listed once.
+        .chain(owned.iter().filter(|d| d.status == "pending" && !pending.requests.iter().any(|q| q.request_id == d.pledge_id)).map(|d| model::Pending {
             request_id: d.pledge_id.clone(),
             kind: "DONATION_REQUEST".into(),
             target: [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone(),
@@ -434,6 +435,18 @@ impl NodeSource {
         rx
     }
 
+    /// The CLI command the TUI runs in the foreground, on this TUI's `--home` (the child does not
+    /// inherit it otherwise): `--home DIR` right after the command word, before any `--`.
+    fn terminal(&self, mut args: Vec<String>) -> ActionResult {
+        match self.home.dir.to_str() {
+            Some(dir) if !args.is_empty() => {
+                args.splice(1..1, ["--home".to_owned(), dir.to_owned()]);
+                ActionResult::Terminal(args)
+            }
+            _ => ActionResult::Refused("the app's home directory is not a UTF-8 path: run the command in a terminal".into()),
+        }
+    }
+
     fn revoke_box(&self, id: &str, prefix: &str) -> ActionResult {
         if !moochy_keylog::entry::is_id(id, prefix) {
             return ActionResult::Refused(if prefix == "bt_" { "not a box token id (bt_…)".into() } else { "not a box id (d_…)".into() });
@@ -551,13 +564,13 @@ impl Source for NodeSource {
                     Ok::<_, String>(accept_args(&request_id, &p.requests, &donations(&mut c, true).await))
                 });
                 match found {
-                    Ok(Some(args)) => ActionResult::Terminal(args),
+                    Ok(Some(args)) => self.terminal(args),
                     Ok(None) => ActionResult::Refused("that request is no longer pending (or names nothing this app can sign): see moochy pending".into()),
                     Err(e) => ActionResult::Refused(e),
                 }
             }
-            Action::OrgAdd { org, repo } => org_args(&org, &repo, "add").map_or_else(|| ActionResult::Refused("not an organisation or project".into()), ActionResult::Terminal),
-            Action::OrgRemove { org, repo } => org_args(&org, &repo, "remove").map_or_else(|| ActionResult::Refused("not an organisation or project".into()), ActionResult::Terminal),
+            Action::OrgAdd { org, repo } => org_args(&org, &repo, "add").map_or_else(|| ActionResult::Refused("not an organisation or project".into()), |a| self.terminal(a)),
+            Action::OrgRemove { org, repo } => org_args(&org, &repo, "remove").map_or_else(|| ActionResult::Refused("not an organisation or project".into()), |a| self.terminal(a)),
             Action::Refresh => ActionResult::Done("refreshed".into()),
         }
     }
@@ -608,6 +621,13 @@ mod tests {
             let (y, m, d) = civil_from_days(z).unwrap();
             assert_eq!(days_from_civil(y, m, d), Some(z));
         }
+    }
+
+    #[test]
+    fn terminal_commands_carry_this_home() {
+        let src = NodeSource::new(Home { dir: "/h/x y".into() }).unwrap();
+        let ActionResult::Terminal(a) = src.terminal(vec!["accept".into(), "--repo".into(), "acme/api".into(), "--".into(), "bob".into()]) else { panic!() };
+        assert_eq!(a, ["accept", "--home", "/h/x y", "--repo", "acme/api", "--", "bob"]);
     }
 
     #[test]

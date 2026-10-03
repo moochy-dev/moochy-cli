@@ -88,7 +88,15 @@ fn doctor(t: Theme, snap: &Snapshot, now: u64) -> Vec<Span<'static>> {
     let warn = |s: String| w::badge(t, Tone::Warn, t.glyph(Glyph::Warn), &s);
     let bad = |s: String| w::badge(t, Tone::Bad, t.glyph(Glyph::Error), &s);
     let mut out = Vec::new();
-    out.push(if snap.me.connected { ok(format!("connected to {}", clean(&snap.me.relay))) } else { bad("not connected: start the app with `moochy up`".into()) });
+    // `connected` is the app's link to the server; the app itself answered (the header says
+    // "node offline" when it does not).
+    out.push(if snap.me.connected {
+        ok(format!("connected to {}", clean(&snap.me.relay)))
+    } else if snap.me.relay.is_empty() {
+        bad("not connected: the app runs without a server (offline mode)".into())
+    } else {
+        bad(format!("not connected: the link to {} is down; the app retries on its own (check the network, `moochy status`)", clean(&snap.me.relay)))
+    });
     let on = snap.devices.iter().filter(|d| d.online).count();
     let here = snap.devices.iter().any(|d| d.this_device && d.online);
     out.push(match (snap.devices.len(), on) {
@@ -291,6 +299,10 @@ mod tests {
         s.me.lockdown = Lockdown::Failed("no landlock".into());
         let out = draw(&mut v, &ctx(&s, &t, ""), 160, 48);
         assert!(out.contains("not locked down: no landlock"), "{out}");
+        // The app answered but its server link is down: say so, never "start the app".
+        s.me.connected = false;
+        let text: String = doctor(t, &s, 0).iter().map(|sp| sp.content.to_string()).collect();
+        assert!(text.contains("the link to relay.moochy.dev is down") && !text.contains("moochy up"), "{text}");
     }
 
     #[test]
