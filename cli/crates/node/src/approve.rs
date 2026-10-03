@@ -132,7 +132,14 @@ pub fn preview(node: &Node, kind: &str, repo: &str, org: &str, subject: Option<&
         .iter()
         .find(|q| q.kind == kind && q.repo_slug.eq_ignore_ascii_case(repo) && q.org_path.eq_ignore_ascii_case(org) && subject.is_none_or(|s| q.subject_username.eq_ignore_ascii_case(s) || q.subject_pseudonym == s))
         .cloned()
-        .ok_or_else(|| Status::not_found(format!("no pending {kind} request for {} (requests appear here after the relay pushes them)", if repo.is_empty() { org } else { repo })))?;
+        .ok_or_else(|| {
+            let target = if repo.is_empty() { org } else { repo };
+            Status::not_found(match (kind, subject) {
+                // The relay offers a revocation for each donor accepted in the key log.
+                ("DONOR_REVOKED", Some(s)) => format!("the server offers no revocation of {} for {}: they are not accepted there (see `moochy decisions`), or this server does not offer revocations yet (update the relay)", clean(s), clean(target)),
+                _ => format!("no pending {kind} request for {} (requests appear here after the relay pushes them)", clean(target)),
+            })
+        })?;
     decode(&q, node.cfg.pseudonym.as_deref()).map_err(|e| Status::failed_precondition(format!("refusing this request: {e}")))
 }
 
