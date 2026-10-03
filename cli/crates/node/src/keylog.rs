@@ -38,9 +38,12 @@ use tokio::time::Instant;
 const TILE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANCHOR_EVERY: Duration = Duration::from_secs(3600);
 
-/// The default relay's key-log verifier key, compiled into release builds
-/// (`MOOCHY_DEFAULT_LOG_VKEY` at build time, CONTRACT §6).
-pub const DEFAULT_LOG_VKEY: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_VKEY");
+/// The default relay's key-log verifier key (CONTRACT §6), compiled into every build so
+/// crates.io installs pin it too; `MOOCHY_DEFAULT_LOG_VKEY` at build time overrides it.
+pub const DEFAULT_LOG_VKEY: Option<&str> = Some(match option_env!("MOOCHY_DEFAULT_LOG_VKEY") {
+    Some(k) => k,
+    None => "moochy.dev/keylog+14e7735e+AbAM8ApnPC061fVEIlr01OIJGRdKHMA2pybcI2wDOtBt",
+});
 
 /// The key this node verifies the log with: the configured `log_key` (`login --log-key`,
 /// `config set log_key`), else the compiled-in key when talking to the default relay. Never
