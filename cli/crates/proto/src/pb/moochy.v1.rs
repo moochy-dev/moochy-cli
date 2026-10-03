@@ -867,6 +867,9 @@ pub struct Donation {
     /// org/person donations: this month's spend per served repo (§19.5, §24.5)
     #[prost(message, repeated, tag = "19")]
     pub per_repo: ::prost::alloc::vec::Vec<RepoSpend>,
+    /// CONTRACT §24: the sponsored profile ("m\_…"), so the donor's node binds the pledge to exactly one person
+    #[prost(string, tag = "20")]
+    pub person_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RepoSpend {
