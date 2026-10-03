@@ -130,7 +130,11 @@ pub fn apply(home: &Home, boot: &mut Boot, unsafe_no_lockdown: bool) -> Result<(
     // The zygote locks itself down before it forks anything, and Boot::load filled the warm set:
     // a live pool means its cage was applied.
     let validator = boot.validator.as_ref().map(|v| v.alive());
-    let rep = if cfg!(target_os = "macos") { seatbelt_status(&p, validator) } else { landlock_status(&r, unsafe_no_lockdown) };
+    let mut rep = if cfg!(target_os = "macos") { seatbelt_status(&p, validator) } else { landlock_status(&r, unsafe_no_lockdown) };
+    // §20: the dashboard's lockdown state names a failed validator cage on every OS.
+    if let (Some(false), Some(o)) = (validator, rep.as_object_mut()) {
+        o.insert("validator_cage".into(), json!("failed"));
+    }
     log(if unsafe_no_lockdown { "error" } else { "info" }, if unsafe_no_lockdown { "UNSAFE: background process NOT locked down (--unsafe-no-lockdown)" } else { "background process locked down" }, &rep);
     if cfg!(target_os = "linux") && !unsafe_no_lockdown && rep.get("landlock_net") != Some(&json!(true)) {
         log("warn", "kernel without Landlock network rules (ABI < 4): outbound connections are not limited by moochy; use the systemd unit's RestrictAddressFamilies", &json!({"landlock_abi": r.abi}));
@@ -225,6 +229,26 @@ fn lockdown_self(p: &moochy_sandbox::DonorPolicy) -> std::result::Result<moochy_
 /// `<state>/lockdown.json`: what the running node achieved, for `moochy doctor`.
 fn record(home: &Home, v: &serde_json::Value) {
     let _ = crate::config::write_private(&home.state_dir().join("lockdown.json"), v.to_string().as_bytes());
+}
+
+/// CONTRACT §20 (`Status.lockdown`): `("enforced", mechanisms)`, `("failed", why)`, `("unsafe", "")`
+/// or `("", "")` (not reported), from this run's record. `locked`: the running node applied it.
+pub fn state(home: &Home, locked: bool) -> (&'static str, String) {
+    let rec = std::fs::read(home.state_dir().join("lockdown.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let Some(r) = rec else { return ("", String::new()) };
+    let on = |k: &str| r.get(k) == Some(&json!(true));
+    if !locked {
+        return if r.get("locked") == Some(&json!(false)) { ("unsafe", String::new()) } else { ("", String::new()) };
+    }
+    if r.get("validator_cage") == Some(&json!("failed")) || r.get("seatbelt_validator") == Some(&json!("failed")) {
+        return ("failed", "request validator cage not applied: not donating until the app restarts".into());
+    }
+    if r.get("sandbox") == Some(&json!("seatbelt")) {
+        return ("enforced", "seatbelt".into());
+    }
+    let parts: Vec<&str> = [("seccomp", "seccomp"), ("landlock_fs", "landlock fs"), ("landlock_net", "landlock net"), ("landlock_scope", "landlock scope")].iter().filter(|(k, _)| on(k)).map(|(_, n)| *n).collect();
+    let abi = r.get("landlock_abi").and_then(serde_json::Value::as_u64).map(|a| format!(" (ABI {a})")).unwrap_or_default();
+    ("enforced", format!("{}{abi}", parts.join(" + ")))
 }
 
 /// `moochy doctor` lines: `(ok, what, detail)`.

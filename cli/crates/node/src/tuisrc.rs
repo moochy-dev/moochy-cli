@@ -5,7 +5,7 @@
 
 use crate::config::Home;
 use crate::pb::link::{
-    Donation, DonationActionRequest, ListBoxesRequest, ListBoxesResponse, ListDevicesRequest, ListDevicesResponse, ListDonationsRequest, ListDonationsResponse, ListOwnedRequest, ListOwnedResponse, RevokeBoxRequest,
+    Donation, DonationActionRequest, ListBoxesRequest, ListBoxesResponse, ListDevicesRequest, ListDevicesResponse, ListDonationsRequest, ListDonationsResponse, ListOwnedRequest, ListOwnedResponse, RevokeBoxRequest, RevokeBoxResponse,
 };
 use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::{DonationsRequest, JournalEntry, JournalRequest, LinkCallRequest, PendingRequest, StatusRequest, WatchRequest};
@@ -61,11 +61,11 @@ async fn donations(c: &mut Client, as_owner: bool) -> Vec<Donation> {
     ListDonationsResponse::decode(r.response.as_slice()).map(|l| l.donations).unwrap_or_default()
 }
 
-/// One relay read through the node's session (`LinkCall`); `None` when the relay or the node
-/// does not answer (an older relay without the RPC included).
-async fn link_call<Q: prost::Message, A: prost::Message + Default>(c: &mut Client, op: &str, q: Q) -> Option<A> {
-    let r = bounded(c.link_call(LinkCallRequest { op: op.into(), request: q.encode_to_vec() })).await.ok()?;
-    A::decode(r.response.as_slice()).ok()
+/// One relay call through the node's session (`LinkCall`); `Err` = the relay's or the node's
+/// refusal (an older relay without the RPC included), cleaned.
+async fn link_call<Q: prost::Message, A: prost::Message + Default>(c: &mut Client, op: &str, q: Q) -> Result<A, String> {
+    let r = bounded(c.link_call(LinkCallRequest { op: op.into(), request: q.encode_to_vec() })).await?;
+    A::decode(r.response.as_slice()).map_err(|_| "malformed answer from the Moochy server".to_owned())
 }
 
 async fn journal(c: &mut Client) -> Vec<JournalEntry> {
@@ -79,15 +79,63 @@ async fn journal(c: &mut Client) -> Vec<JournalEntry> {
 }
 
 /// Per-day sums (oldest first) of the last [`DAYS`] days.
-fn per_day(entries: &[JournalEntry], role: &str, now: u64) -> Vec<u64> {
+fn per_day<'a>(entries: impl Iterator<Item = &'a JournalEntry>, now: u64) -> Vec<u64> {
     let mut d = vec![0u64; DAYS];
-    for e in entries.iter().filter(|e| e.role == role) {
+    for e in entries {
         let age = now.saturating_sub(ms(e.t_ms)).checked_div(DAY_MS).and_then(|a| usize::try_from(a).ok());
         if let Some(slot) = age.and_then(|a| DAYS.checked_sub(a)).and_then(|i| i.checked_sub(1)).and_then(|i| d.get_mut(i)) {
             *slot = slot.saturating_add(uusd(e.cost_uusd));
         }
     }
     d
+}
+
+/// Days since 1970-01-01 → (year, month 1–12, day), and back (Howard Hinnant's algorithms; the
+/// back direction normalises an out-of-range day like Go's `time.Date`).
+fn civil_from_days(z: i64) -> Option<(i64, i64, i64)> {
+    let z = z.checked_add(719_468)?;
+    let era = z.div_euclid(146_097);
+    let doe = z.checked_sub(era.checked_mul(146_097)?)?;
+    let yoe = doe.checked_sub(doe / 1460)?.checked_add(doe / 36_524)?.checked_sub(doe / 146_096)? / 365;
+    let doy = doe.checked_sub(yoe.checked_mul(365)?.checked_add(yoe / 4)?.checked_sub(yoe / 100)?)?;
+    let mp = doy.checked_mul(5)?.checked_add(2)? / 153;
+    let d = doy.checked_sub(mp.checked_mul(153)?.checked_add(2)? / 5)?.checked_add(1)?;
+    let m = if mp < 10 { mp.checked_add(3)? } else { mp.checked_sub(9)? };
+    let y = yoe.checked_add(era.checked_mul(400)?)?.checked_add(i64::from(m <= 2))?;
+    Some((y, m, d))
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
+    let y = if m <= 2 { y.checked_sub(1)? } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
+    let mp = if m > 2 { m.checked_sub(3)? } else { m.checked_add(9)? };
+    let doy = mp.checked_mul(153)?.checked_add(2)?.checked_div(5)?.checked_add(d)?.checked_sub(1)?;
+    let doe = yoe.checked_mul(365)?.checked_add(yoe / 4)?.checked_sub(yoe / 100)?.checked_add(doy)?;
+    era.checked_mul(146_097)?.checked_add(doe)?.checked_sub(719_468)
+}
+
+/// When a monthly limit starts again: the period start plus one calendar month in UTC, as the
+/// relay computes it (`time.UnixMilli(start).UTC().AddDate(0, 1, 0)`, relay/internal/sched).
+fn renews_at(period_start_ms: i64) -> u64 {
+    let day = i64::try_from(DAY_MS).unwrap_or(i64::MAX);
+    let next = || {
+        let (days, rest) = (period_start_ms.div_euclid(day), period_start_ms.rem_euclid(day));
+        let (y, m, d) = civil_from_days(days)?;
+        let (y, m) = if m == 12 { (y.checked_add(1)?, 1) } else { (y, m.checked_add(1)?) };
+        days_from_civil(y, m, d)?.checked_mul(day)?.checked_add(rest)
+    };
+    if period_start_ms <= 0 { 0 } else { next().and_then(|v| u64::try_from(v).ok()).unwrap_or(0) }
+}
+
+/// The receipt of a journal row and what this node concluded about it (`moochy verify`).
+fn receipt(e: &JournalEntry) -> Option<model::Receipt> {
+    let check = match e.receipt_check.as_str() {
+        "verified" => model::ReceiptCheck::Verified,
+        "" => model::ReceiptCheck::Unchecked,
+        c => model::ReceiptCheck::Failed(c.strip_prefix("failed: ").unwrap_or(c).to_owned()),
+    };
+    (!e.receipt_ref.is_empty()).then(|| model::Receipt { id: e.receipt_ref.clone(), check })
 }
 
 #[allow(clippy::too_many_lines, reason = "one mapping per tab, in tab order")]
@@ -104,24 +152,34 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             link_call::<_, ListDevicesResponse>(&mut c4, "list_devices", ListDevicesRequest::default()),
             link_call::<_, ListOwnedResponse>(&mut c5, "list_owned", ListOwnedRequest::default())
         );
-        (m, o, b.map(|l| l.boxes).unwrap_or_default(), d.map(|l| l.devices).unwrap_or_default(), t.map(|l| l.owned))
+        (m, o, b.unwrap_or_default(), d.map(|l| l.devices).unwrap_or_default(), t.ok().map(|l| l.owned))
     } else {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
+        (Vec::new(), Vec::new(), ListBoxesResponse::default(), Vec::new(), None)
     };
     let entries = journal(c).await;
     let now = crate::util::now_ms();
+    // Worker rows that name no donation yet (older node): matched by the project served.
+    let served_for = |e: &JournalEntry, d: &Donation| if e.pledge_id.is_empty() { d.org.is_empty() && d.person.is_empty() && e.repo.eq_ignore_ascii_case(&d.repo_slug) } else { e.pledge_id == d.pledge_id };
     let cfg = home.load().ok();
+    let web = crate::decisions::web_origin(home);
     let mut s = Snapshot {
         me: model::Me {
             handle: String::new(),
             pseudonym: cfg.as_ref().and_then(|c| c.pseudonym.clone()).unwrap_or_default(),
             relay: st.relay.clone(),
-            // ponytail: the relay serves the web on its own origin (BaseURL); a separate web base when that changes.
-            web: st.relay.clone(),
+            // The public site, as `moochy decisions` and the share lines name it.
+            web: web.clone(),
             connected: st.link_state == "up",
             roles: st.roles.clone(),
             // ponytail: Status has only `locked`; mechanisms and failures once the node reports them.
-            lockdown: if st.locked { model::Lockdown::Enforced(String::new()) } else { model::Lockdown::Unknown },
+            lockdown: match st.lockdown.as_str() {
+                "enforced" => model::Lockdown::Enforced(st.lockdown_detail.clone()),
+                "failed" => model::Lockdown::Failed(st.lockdown_detail.clone()),
+                "unsafe" => model::Lockdown::Unsafe,
+                // An older node: only `locked`.
+                _ if st.locked => model::Lockdown::Enforced(String::new()),
+                _ => model::Lockdown::Unknown,
+            },
         },
         ..Snapshot::default()
     };
@@ -138,9 +196,11 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             spent_uusd: uusd(d.spent_uusd),
             schedule: d.schedule.clone(),
             models: d.models.clone(),
-            // ponytail: the link's Donation has no per-project split yet (integrator request).
             per_repo_uusd: d.per_repo.iter().map(|r| (r.repo_slug.clone(), uusd(r.spent_uusd))).collect(),
-            ..model::Donation::default()
+            // ponytail: what THIS device served for it (the journal names the donation); the
+            // account-wide series needs a per-day field on the link's Donation (integrator).
+            per_day_uusd: per_day(entries.iter().filter(|e| e.role == "worker" && served_for(e, d)), now),
+            renews_at_ms: if matches!(d.status.as_str(), "active" | "paused") { renews_at(d.period_start_ms) } else { 0 },
         })
         .collect();
     // Decisions: the trail of every donation to my projects; projects: grouped from the same list.
@@ -181,9 +241,10 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
                 paused_since_ms: ms(t.paused_since_ms),
             })
             .collect();
+        // Organisations and person profiles (§24: `m_`, shown as `person github/login`).
         s.orgs = targets
             .iter()
-            .filter(|t| t.id.starts_with("o_"))
+            .filter(|t| t.id.starts_with("o_") || t.id.starts_with("m_"))
             .map(|t| model::Org {
                 id: t.id.clone(),
                 path: t.path.clone(),
@@ -191,7 +252,10 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
                 donors: u32::try_from(t.donors).unwrap_or(0),
                 month_uusd: uusd(t.month_uusd),
                 paused_since_ms: ms(t.paused_since_ms),
-                ..model::Org::default()
+                person: t.id.starts_with("m_"),
+                // ponytail: per-day use of an org's covered repos is relay data (OwnedTarget has
+                // no series yet: integrator request); this node only sees its own requests.
+                per_day_uusd: Vec::new(),
             })
             .collect();
     }
@@ -221,7 +285,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             subject: d.donor.clone(),
             summary: format!("{} µ$/month", d.budget_uusd),
             created_at_ms: ms(d.created_at_ms),
-            ..model::Pending::default()
+            // As `moochy decisions` prints it: the passkey accept page on the public site.
+            decide_url: name_arg(&d.pledge_id).map(|id| format!("{web}/decide/{id}")).unwrap_or_default(),
         }))
         .collect();
     // Settings: what `moochy config show` prints (the config file holds no secret), plus the doors.
@@ -239,9 +304,25 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
         s.devices.push(model::Device { id: st.device_id.clone(), name: "this device".into(), roles: st.roles.clone(), online: true, this_device: true });
     }
     s.boxes = boxes
+        .boxes
         .iter()
         .filter(|b| !b.revoked)
         .map(|b| model::BoxDevice { id: b.device_id.clone(), project: b.repo_slug.clone(), expires_at_ms: ms(b.expires_at_ms), online: b.online })
+        .collect();
+    // §17.1: metadata only (the relay never returns a token's secret after its creation).
+    s.box_tokens = boxes
+        .tokens
+        .iter()
+        .map(|t| model::BoxToken {
+            id: t.token_id.clone(),
+            project: t.repo_slug.clone(),
+            created_at_ms: ms(t.created_at_ms),
+            expires_at_ms: ms(t.expires_at_ms),
+            cap_uusd: uusd(t.cap_uusd_month),
+            max_boxes: t.max_boxes,
+            boxes_enrolled: t.used,
+            revoked: t.revoked,
+        })
         .collect();
     s.keys = st.keys.iter().map(|k| model::ProviderKey { provider: k.provider.clone(), present: true, models: k.models.clone() }).collect();
     s.alerts = st
@@ -255,8 +336,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
     if st.paused {
         s.alerts.push(model::Alert { level: "warn".into(), text: "serving is paused on this device (moochy resume)".into() });
     }
-    s.donated_per_day_uusd = per_day(&entries, "worker", now);
-    s.used_per_day_uusd = per_day(&entries, "gateway", now);
+    s.donated_per_day_uusd = per_day(entries.iter().filter(|e| e.role == "worker"), now);
+    s.used_per_day_uusd = per_day(entries.iter().filter(|e| e.role == "gateway"), now);
     s.served = entries
         .iter()
         .rev()
@@ -273,7 +354,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             outcome: e.status.clone(),
         })
         .collect();
-    s.activity = entries.iter().rev().take(MAX_SERVED).map(|e| model::Activity { at_ms: ms(e.t_ms), text: format!("{} {} {} {}", e.role, e.repo, e.model, e.status), ..model::Activity::default() }).collect();
+    s.activity = entries.iter().rev().take(MAX_SERVED).map(|e| model::Activity { at_ms: ms(e.t_ms), text: format!("{} {} {} {}", e.role, e.repo, e.model, e.status), receipt: receipt(e) }).collect();
     Ok(s)
 }
 
@@ -351,6 +432,25 @@ impl NodeSource {
             }
         });
         rx
+    }
+
+    fn revoke_box(&self, id: &str, prefix: &str) -> ActionResult {
+        if !moochy_keylog::entry::is_id(id, prefix) {
+            return ActionResult::Refused(if prefix == "bt_" { "not a box token id (bt_…)".into() } else { "not a box id (d_…)".into() });
+        }
+        let r = self.rt.block_on(async {
+            let mut c = connect(&self.home).await?;
+            link_call::<_, RevokeBoxResponse>(&mut c, "revoke_box", RevokeBoxRequest { id: id.into() }).await
+        });
+        match r {
+            Ok(r) if prefix == "bt_" => ActionResult::Done(format!("revoked token {id}{}", match r.revoked_devices.len() {
+                0 => String::new(),
+                1 => " and the box it enrolled".into(),
+                n => format!(" and the {n} boxes it enrolled"),
+            })),
+            Ok(_) => ActionResult::Done(format!("revoked box {id}")),
+            Err(e) => ActionResult::Refused(e),
+        }
     }
 
     fn donation_action(&self, id: &str, action: &str, amount_uusd: i64, reason: &str) -> ActionResult {
@@ -438,19 +538,10 @@ impl Source for NodeSource {
                 }
                 self.donation_action(&request_id, "refuse", 0, &reason)
             }
-            Action::RevokeBox(id) | Action::RevokeBoxToken(id) => {
-                if !moochy_keylog::entry::is_id(&id, "d_") && !moochy_keylog::entry::is_id(&id, "bt_") {
-                    return ActionResult::Refused("not a box or box token id".into());
-                }
-                let r = self.rt.block_on(async {
-                    let mut c = connect(&self.home).await?;
-                    bounded(c.link_call(LinkCallRequest { op: "revoke_box".into(), request: RevokeBoxRequest { id: id.clone() }.encode_to_vec() })).await
-                });
-                match r {
-                    Ok(_) => ActionResult::Done(format!("revoked {id}")),
-                    Err(e) => ActionResult::Refused(e),
-                }
-            }
+            // `moochy box revoke <d_…>` / `moochy box token revoke <bt_…>` (§17.1): one relay call;
+            // a token takes every box it enrolled with it.
+            Action::RevokeBox(id) => self.revoke_box(&id, "d_"),
+            Action::RevokeBoxToken(id) => self.revoke_box(&id, "bt_"),
             // Owner-key signatures need the passphrase and the decoded-body confirmation on the
             // terminal (A217/A218): the TUI suspends and runs the exact CLI command.
             Action::Accept { request_id } => {
@@ -506,11 +597,51 @@ mod tests {
     }
 
     #[test]
+    fn renewal_is_one_calendar_month_like_the_relay() {
+        // Go: time.Date(2026, 1, 31, 10, 0, 0, 0, UTC).AddDate(0, 1, 0) = 2026-03-03T10:00Z.
+        let at = |y, m, d, h: i64| (days_from_civil(y, m, d).unwrap() * 86_400 + h * 3600) * 1000;
+        assert_eq!(renews_at(at(2026, 1, 31, 10)), u64::try_from(at(2026, 3, 3, 10)).unwrap());
+        assert_eq!(renews_at(at(2026, 12, 17, 0)), u64::try_from(at(2027, 1, 17, 0)).unwrap());
+        assert_eq!(renews_at(at(2028, 1, 30, 0)), u64::try_from(at(2028, 3, 1, 0)).unwrap(), "leap year");
+        assert_eq!(renews_at(0), 0);
+        for z in [-1000, 0, 1, 19_000, 20_000, 2_932_896] {
+            let (y, m, d) = civil_from_days(z).unwrap();
+            assert_eq!(days_from_civil(y, m, d), Some(z));
+        }
+    }
+
+    #[test]
+    fn receipts_and_their_check() {
+        let e = |r: &str, c: &str| JournalEntry { receipt_ref: r.into(), receipt_check: c.into(), ..JournalEntry::default() };
+        assert_eq!(receipt(&e("", "verified")), None);
+        assert_eq!(receipt(&e("abc", "verified")).unwrap().check, model::ReceiptCheck::Verified);
+        assert_eq!(receipt(&e("abc", "")).unwrap().check, model::ReceiptCheck::Unchecked);
+        assert_eq!(receipt(&e("abc", "failed: resp_commit_mismatch")).unwrap().check, model::ReceiptCheck::Failed("resp_commit_mismatch".into()));
+    }
+
+    #[test]
+    fn lockdown_state_from_the_record() {
+        let dir = std::env::temp_dir().join(format!("moochy-tuisrc-{}", std::process::id()));
+        let home = Home { dir: dir.clone() };
+        std::fs::create_dir_all(home.state_dir()).unwrap();
+        let put = |v: serde_json::Value| std::fs::write(home.state_dir().join("lockdown.json"), v.to_string()).unwrap();
+        put(serde_json::json!({"locked": true, "sandbox": "landlock+seccomp", "seccomp": true, "landlock_fs": true, "landlock_net": true, "landlock_scope": false, "landlock_abi": 5}));
+        assert_eq!(crate::lockdown::state(&home, true), ("enforced", "seccomp + landlock fs + landlock net (ABI 5)".into()));
+        put(serde_json::json!({"locked": true, "sandbox": "seatbelt", "seatbelt_validator": "failed"}));
+        assert_eq!(crate::lockdown::state(&home, true).0, "failed");
+        put(serde_json::json!({"locked": false, "sandbox": "landlock+seccomp"}));
+        assert_eq!(crate::lockdown::state(&home, false), ("unsafe", String::new()));
+        std::fs::remove_file(home.state_dir().join("lockdown.json")).unwrap();
+        assert_eq!(crate::lockdown::state(&home, true), ("", String::new()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn per_day_buckets() {
         let now = 100 * DAY_MS;
         let e = |role: &str, age_ms: u64, cost: i64| JournalEntry { role: role.into(), t_ms: i64::try_from(now - age_ms).unwrap(), cost_uusd: cost, ..JournalEntry::default() };
         let v = [e("worker", 0, 5), e("worker", DAY_MS - 1, 7), e("worker", DAY_MS, 11), e("worker", 30 * DAY_MS, 99), e("gateway", 0, 3), e("worker", 0, -4)];
-        let d = per_day(&v, "worker", now);
+        let d = per_day(v.iter().filter(|e| e.role == "worker"), now);
         assert_eq!(d.len(), DAYS);
         assert_eq!(d[DAYS - 1], 12, "today");
         assert_eq!(d[DAYS - 2], 11, "yesterday");

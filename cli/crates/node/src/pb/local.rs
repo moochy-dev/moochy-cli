@@ -50,6 +50,14 @@ pub struct StatusResponse {
     /// logged; relay/peer-derived strings inside: clean before printing.
     #[prost(string, repeated, tag = "20")]
     pub alerts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// CONTRACT §15.2/§20: "enforced" (detail = the mechanisms in force, e.g. "seccomp + landlock fs
+    ///
+    /// * landlock net (ABI 6)" or "seatbelt"), "failed" (detail = why the donor does not serve),
+    ///   "unsafe" (--unsafe-no-lockdown) or "" (not reported).
+    #[prost(string, tag = "21")]
+    pub lockdown: ::prost::alloc::string::String,
+    #[prost(string, tag = "22")]
+    pub lockdown_detail: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProviderKeyInfo {
@@ -329,6 +337,15 @@ pub struct JournalEntry {
     pub tokens_in: u64,
     #[prost(uint64, tag = "12")]
     pub tokens_out: u64,
+    /// CONTRACT §20: the public receipt of this request (`moochy verify` reference, "" = none) and
+    /// what this node concluded: "verified" | "failed: <code>" | "" (not checked).
+    #[prost(string, tag = "13")]
+    pub receipt_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "14")]
+    pub receipt_check: ::prost::alloc::string::String,
+    /// worker: the donation that paid ("" = unknown)
+    #[prost(string, tag = "15")]
+    pub pledge_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct McpOpen {

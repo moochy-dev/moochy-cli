@@ -67,7 +67,8 @@ pub fn append(e: &JournalEntry) {
 }
 
 fn encode(e: &JournalEntry) -> Value {
-    let mut v = json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms, "tokens_in": e.tokens_in, "tokens_out": e.tokens_out});
+    let mut v = json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms, "tokens_in": e.tokens_in, "tokens_out": e.tokens_out,
+        "receipt_ref": e.receipt_ref, "receipt_check": e.receipt_check, "pledge_id": e.pledge_id});
     if let Some(o) = v.as_object_mut() {
         if !e.request.is_empty() {
             o.insert("request_b64".into(), json!(b64e(&e.request)));
@@ -96,6 +97,9 @@ fn decode(line: &str) -> Option<JournalEntry> {
         response: b("response_b64"),
         tokens_in: v.get("tokens_in").and_then(Value::as_u64).unwrap_or(0),
         tokens_out: v.get("tokens_out").and_then(Value::as_u64).unwrap_or(0),
+        receipt_ref: s("receipt_ref"),
+        receipt_check: s("receipt_check"),
+        pledge_id: s("pledge_id"),
     })
 }
 
