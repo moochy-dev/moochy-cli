@@ -91,12 +91,33 @@ pub struct ApproveRequest {
     /// DONOR_REVOKED instead of DONOR_APPROVED
     #[prost(bool, tag = "4")]
     pub revoke: bool,
+    /// CONTRACT §19.4: "github/acme", "gitlab/group\[/sub…\]"; set = the org's approval (repo empty)
+    #[prost(string, tag = "5")]
+    pub org: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClaimRequest {
     #[prost(string, tag = "1")]
     pub repo: ::prost::alloc::string::String,
     #[prost(bool, tag = "2")]
+    pub dry_run: bool,
+    /// CONTRACT §19.2: set = ORG_CLAIMED of this org (repo empty)
+    #[prost(string, tag = "3")]
+    pub org: ::prost::alloc::string::String,
+}
+/// CONTRACT §19.3: which of the owner's projects an organisation's donations fund.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OrgRepoRequest {
+    /// "github/acme", "gitlab/group\[/sub…\]"
+    #[prost(string, tag = "1")]
+    pub org: ::prost::alloc::string::String,
+    /// a project in the link's canonical form
+    #[prost(string, tag = "2")]
+    pub repo: ::prost::alloc::string::String,
+    /// ORG_REPO_REMOVED instead of ORG_REPO_ADDED
+    #[prost(bool, tag = "3")]
+    pub remove: bool,
+    #[prost(bool, tag = "4")]
     pub dry_run: bool,
 }
 /// What the owner signs (or would sign), decoded from the exact body bytes.
@@ -129,13 +150,20 @@ pub struct SignResponse {
     /// the relay-proposed body (dry run), for the CLI to rebuild with the owner key
     #[prost(bytes = "vec", tag = "11")]
     pub body_to_sign: ::prost::alloc::vec::Vec<u8>,
+    /// CONTRACT §19, from ApprovalRequest: display labels only (the CLI binds the decoded body and the
+    /// server's Lookup). ORG_CLAIMED: repo_id empty; ORG_REPO\_*: repo_id = the project; DONOR\_* of an
+    /// org: repo_id = org_id = the o\_ id in the body.
+    #[prost(string, tag = "12")]
+    pub org_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "13")]
+    pub org_path: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubmitEntryRequest {
     /// the pending request answered; empty for OWNER_KEY_ADDED
     #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    /// REPO_CLAIMED, DONOR_APPROVED/REVOKED, MEMBER_ADDED/REMOVED, OWNER_KEY_ADDED
+    /// REPO_CLAIMED, DONOR_APPROVED/REVOKED, MEMBER_ADDED/REMOVED, OWNER_KEY_ADDED, ORG_CLAIMED, ORG_REPO_ADDED/REMOVED
     #[prost(string, tag = "2")]
     pub kind: ::prost::alloc::string::String,
     /// exact signed body (KEYLOG §2)
@@ -598,6 +626,28 @@ pub mod local_control_client {
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "Claim"));
             self.inner.unary(req, path, codec).await
         }
+        /// CONTRACT §19.3: ORG_REPO_ADDED / ORG_REPO_REMOVED previews (dry run only, like Claim).
+        pub async fn org_repo(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OrgRepoRequest>,
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/OrgRepo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "OrgRepo"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Requests waiting for this owner's signature.
         pub async fn pending(
             &mut self,
@@ -919,6 +969,11 @@ pub mod local_control_server {
         async fn claim(
             &self,
             request: tonic::Request<super::ClaimRequest>,
+        ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status>;
+        /// CONTRACT §19.3: ORG_REPO_ADDED / ORG_REPO_REMOVED previews (dry run only, like Claim).
+        async fn org_repo(
+            &self,
+            request: tonic::Request<super::OrgRepoRequest>,
         ) -> std::result::Result<tonic::Response<super::SignResponse>, tonic::Status>;
         /// Requests waiting for this owner's signature.
         async fn pending(
@@ -1381,6 +1436,51 @@ pub mod local_control_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ClaimSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/OrgRepo" => {
+                    #[allow(non_camel_case_types)]
+                    struct OrgRepoSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::UnaryService<super::OrgRepoRequest>
+                    for OrgRepoSvc<T> {
+                        type Response = super::SignResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OrgRepoRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::org_repo(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OrgRepoSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

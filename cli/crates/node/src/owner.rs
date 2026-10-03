@@ -472,12 +472,12 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let preview = rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let r = match words {
-            ["approve", donor] => c.approve(ApproveRequest { repo: slug.into(), donor: (*donor).into(), dry_run: true, revoke }).await,
+            ["approve", donor] => c.approve(ApproveRequest { repo: slug.into(), donor: (*donor).into(), dry_run: true, revoke, ..ApproveRequest::default() }).await,
             ["members", op, user] => {
                 let op = if *op == "add" { Op::Add } else { Op::Remove };
                 c.members(MembersRequest { repo: slug.into(), op: op as i32, user: (*user).into(), cap_uusd_month: cap, device, dry_run: true }).await
             }
-            _ => c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await,
+            _ => c.claim(ClaimRequest { repo: slug.into(), dry_run: true, ..ClaimRequest::default() }).await,
         };
         r.map(tonic::Response::into_inner).map_err(|s| status(&s))
     })?;
@@ -493,7 +493,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let mut claim = (want.kind != Kind::RepoClaimed)
         .then(|| rt.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
-            c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await.ok().map(tonic::Response::into_inner)
+            c.claim(ClaimRequest { repo: slug.into(), dry_run: true, ..ClaimRequest::default() }).await.ok().map(tonic::Response::into_inner)
         }))
         .flatten()
         .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false, device_owner: None }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));

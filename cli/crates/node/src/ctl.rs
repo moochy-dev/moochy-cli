@@ -6,7 +6,7 @@ use crate::node::{LinkState, Node, lock};
 use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
 use crate::pb::local::{
-    ApproveRequest, ClaimRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
+    ApproveRequest, ClaimRequest, OrgRepoRequest, EnvRequest, EnvResponse, JournalEntry, JournalRequest, McpDown, McpUp, MembersRequest, PauseRequest,
     LogoutRequest, LogoutResponse, PauseResponse, PendingRequest, PendingResponse, PoolSummary, ReportRequest, ReportResponse, ShutdownRequest, ShutdownResponse, SignResponse, StatusRequest, SubmitEntryRequest, DonationsRequest, DonationsResponse, VerifyRequest, VerifyResponse, TrustOwnerKeyRequest, TrustOwnerKeyResponse,
     StatusResponse, mcp_up, members_request,
 };
@@ -188,6 +188,11 @@ impl LocalControl for Ctl {
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+    }
+
+    // mo-donor replaces this with the ORG_REPO_* preview (CONTRACT §19.3).
+    async fn org_repo(&self, _r: Request<OrgRepoRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("this moochy app cannot prepare organisation entries yet; update moochy"))
     }
 
     async fn trust_owner_key(&self, r: Request<TrustOwnerKeyRequest>) -> std::result::Result<Response<TrustOwnerKeyResponse>, Status> {
