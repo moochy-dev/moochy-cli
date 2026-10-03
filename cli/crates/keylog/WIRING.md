@@ -414,4 +414,9 @@ id prefix tells the target. Existing logs and vectors verify unchanged. Vectors:
   the request's). Until then the existing `_ =>` arms refuse them (fail closed). Nodes submit
   org entries over the link like other owner-signed kinds; the relay answers `ungated` until its
   gate (11a) exists.
+- **`moochy owner status`: the orgs I own.** `view.state(|s| s.owned_orgs(&me))` →
+  `Vec<(org_id, Vec<repo_id>)>`, sorted by id: each org this account owns and the repos it covers
+  (active `ORG_REPO_ADDED`, repo claimed by the same owner: exactly the repos its donations serve).
+  Resolve ids to slugs like repo ids. After a takeover (§19.2) the org leaves the old owner's list;
+  the new owner's starts with no repos until they re-add them (and re-approve donors).
 - **Mac.** `moochy-keylog` cannot be cross-checked here (ring); the integrator's Mac build covers it.

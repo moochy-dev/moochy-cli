@@ -764,6 +764,33 @@ impl State {
         self.repos.get(repo_id).map(|r| r.owner.as_str())
     }
 
+    /// The orgs `pseudonym` owns, each with the repos it covers (ORG_REPO_ADDED active and
+    /// the repo claimed by the same owner: the repos its donations serve, §19.3), sorted by
+    /// id. A takeover (§19.2) drops the org from the previous owner's list and starts the
+    /// new owner's with no repos. For `moochy owner status`.
+    #[must_use]
+    pub fn owned_orgs(&self, pseudonym: &str) -> Vec<(&str, Vec<&str>)> {
+        let mut out: Vec<(&str, Vec<&str>)> = self
+            .repos
+            .iter()
+            .filter(|(id, o)| id.starts_with("o_") && o.owner == pseudonym)
+            .map(|(id, o)| {
+                let mut repos: Vec<&str> = o
+                    .covers
+                    .iter()
+                    .filter(|(rid, c)| {
+                        c.active && self.repos.get(*rid).is_some_and(|r| r.owner == pseudonym)
+                    })
+                    .map(|(rid, _)| rid.as_str())
+                    .collect();
+                repos.sort_unstable();
+                (id.as_str(), repos)
+            })
+            .collect();
+        out.sort_unstable_by_key(|(id, _)| *id);
+        out
+    }
+
     /// SHA-256 of the catalog JSON logged for `version`.
     #[must_use]
     pub fn catalog_sha256(&self, version: u64) -> Option<&[u8; 32]> {

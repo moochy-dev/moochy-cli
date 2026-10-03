@@ -82,6 +82,16 @@ fn org_state_and_sealable() {
         st.owner("o_01HZG000000000000000000001"),
         Some(v["me"].as_str().unwrap())
     );
+    // owned_orgs (the `moochy owner status` accessor): an org taken over leaves the old
+    // owner's list and starts the new owner's with only the repos they re-added.
+    for (who, want) in v["owned_orgs"].as_object().unwrap() {
+        let mut got = serde_json::Map::new();
+        for (org, repos) in st.owned_orgs(who) {
+            got.insert(org.to_owned(), repos.into());
+        }
+        assert_eq!(Value::Object(got), *want, "owned_orgs({who})");
+    }
+    assert_eq!(v["owned_orgs"].as_object().unwrap().len(), 3);
     for (name, h) in v["invalid_records"].as_object().unwrap() {
         assert!(parse_record(&unhex(h.as_str().unwrap())).is_err(), "{name}");
     }
@@ -121,10 +131,16 @@ fn alerts(v: &Value, owner_keys: Vec<[u8; 32]>) -> Vec<String> {
 #[test]
 fn org_monitor_alerts() {
     let v = load();
-    // My owner key known: the takeovers of my repo r5 and my org o4 by another account.
+    // My owner key known: the takeovers of my repos r5, r7, r6 and my orgs o4, o6 by another account.
     assert_eq!(
         alerts(&v, keys(&v, "known_owner_keys")),
-        ["ClaimedByOther:26:r_", "ClaimedByOther:39:o_"]
+        [
+            "ClaimedByOther:26:r_",
+            "ClaimedByOther:39:o_",
+            "ClaimedByOther:49:r_",
+            "ClaimedByOther:50:o_",
+            "ClaimedByOther:51:r_"
+        ]
     );
     // My owner key unknown (a rogue owner key on my account): every claim, org entry and
     // approval it signed for my repos and orgs alerts, org ones included.
