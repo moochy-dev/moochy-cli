@@ -47,6 +47,10 @@ allow-dirty = ["ci"]
 
 # Native runners for every Linux target (no cross toolchain in the musl
 # artifacts that the reproducibility check rebuilds).
+# publish-crates.yml checks out the repository: it needs contents: read.
+[dist.github-custom-job-permissions]
+"publish-crates" = { contents = "read" }
+
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
