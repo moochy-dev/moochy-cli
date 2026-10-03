@@ -389,9 +389,13 @@ impl KeyLog {
     pub fn seal(&self, repo_id: &str, gateway: &str, w: &PoolWorker) -> Result<[u8; 32], Code> {
         let view = self.view();
         let s = match view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index) {
-            // The gate already passed: only a route denial falls through to the person rule.
-            Err(Code::NotApproved | Code::IndexMismatch | Code::Unclaimed) if !gateway.is_empty() => {
-                view.state(|st| person_seal(st, &w.worker_device, repo_id, gateway, w.key_log_index, w.approval_log_index))??
+            // The gate already passed: only a route denial falls through to the person rule; when
+            // no person route exists either, the refusal keeps the repo/org rule's code.
+            Err(e @ (Code::NotApproved | Code::IndexMismatch | Code::Unclaimed)) if !gateway.is_empty() => {
+                match view.state(|st| person_seal(st, &w.worker_device, repo_id, gateway, w.key_log_index, w.approval_log_index))? {
+                    Err(Code::NotApproved) => return Err(e),
+                    r => r?,
+                }
             }
             r => r?,
         };
