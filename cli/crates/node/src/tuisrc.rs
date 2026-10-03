@@ -280,14 +280,14 @@ impl NodeSource {
         rx
     }
 
-    fn donation_action(&self, pledge_id: &str, action: &str, amount_uusd: i64, reason: &str) -> ActionResult {
-        let q = DonationActionRequest { pledge_id: pledge_id.into(), action: action.into(), amount_uusd, reason: reason.into(), ..DonationActionRequest::default() };
+    fn donation_action(&self, id: &str, action: &str, amount_uusd: i64, reason: &str) -> ActionResult {
+        let q = DonationActionRequest { pledge_id: id.into(), action: action.into(), amount_uusd, reason: reason.into(), ..DonationActionRequest::default() };
         let r = self.rt.block_on(async {
             let mut c = connect(&self.home).await?;
             bounded(c.donations(DonationsRequest { op: "action".into(), request: q.encode_to_vec() })).await
         });
         match r {
-            Ok(_) => ActionResult::Done(format!("{action}: {pledge_id}")),
+            Ok(_) => ActionResult::Done(format!("{}: {id}", if action == "reclaim" { "updated" } else { action })),
             Err(e) => ActionResult::Refused(e),
         }
     }
