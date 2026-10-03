@@ -35,7 +35,7 @@ fn valid_id(id: &str) -> bool {
 
 fn decision_json(d: &Donation, origin: &str) -> serde_json::Value {
     let money = |v: i64| fmt_dollars(u64::try_from(v).unwrap_or(0));
-    let mut v = json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "donor": clean(&d.donor), "status": clean(&d.status),
+    let mut v = json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "donor": clean(&d.donor), "status": clean(&d.status),
         "monthly_limit": money(d.budget_uusd), "per_request_limit": money(d.per_task_cap_uusd), "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(),
         "created_at_ms": d.created_at_ms,
         "events": d.events.iter().map(|e| json!({"event": clean(&e.event), "via": clean(&e.via), "at_ms": e.at_ms, "reason": clean(&e.reason), "log_index": e.log_index})).collect::<Vec<_>>()});
@@ -48,19 +48,21 @@ fn decision_json(d: &Donation, origin: &str) -> serde_json::Value {
     v
 }
 
-fn fetch(home: &Home, slug: Option<&str>) -> Result<Vec<Donation>> {
+/// Decisions to show: those of project `slug` (the server filters), or of organisation `org`
+/// (filtered here: the link has no org filter).
+fn fetch(home: &Home, slug: Option<&str>, org: Option<&str>) -> Result<Vec<Donation>> {
     let q = ListDonationsRequest { as_owner: true, repo_slug: slug.unwrap_or_default().into() };
     let b = crate::donations::call(home, "list", q.encode_to_vec())?;
     let r = ListDonationsResponse::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
     if !r.as_owner {
         return Err(usage("the Moochy server cannot list donation decisions yet (update pending): decide on the web, Activity → Decisions"));
     }
-    Ok(r.donations)
+    Ok(r.donations.into_iter().filter(|d| org.is_none_or(|o| d.org.eq_ignore_ascii_case(o))).collect())
 }
 
-/// `moochy decisions [--repo P] [--json]`.
-pub fn list(home: &Home, slug: Option<&str>, json_out: bool) -> Result<()> {
-    let mut v = fetch(home, slug)?;
+/// `moochy decisions [--repo P | --org github/ORG] [--json]`.
+pub fn list(home: &Home, slug: Option<&str>, org: Option<&str>, json_out: bool) -> Result<()> {
+    let mut v = fetch(home, slug, org)?;
     // Waiting first (oldest first), then the rest (newest first).
     v.sort_by_key(|d| if d.status == "pending" { (0, d.created_at_ms) } else { (1, d.created_at_ms.saturating_neg()) });
     let origin = web_origin(home);
@@ -70,7 +72,7 @@ pub fn list(home: &Home, slug: Option<&str>, json_out: bool) -> Result<()> {
             continue;
         }
         let who = if d.donor.is_empty() { "a hidden donor".into() } else { clean(&d.donor) };
-        let line = format!("{:<28} {:<9} {who}, up to {} a month ({})", clean(&d.repo_slug), clean(&d.status), fmt_dollars(u64::try_from(d.budget_uusd).unwrap_or(0)), clean(&d.pledge_id));
+        let line = format!("{:<28} {:<9} {who}, up to {} a month ({})", crate::donations::target(d), clean(&d.status), fmt_dollars(u64::try_from(d.budget_uusd).unwrap_or(0)), clean(&d.pledge_id));
         println!("{line}");
         if d.status == "pending" {
             println!("    accept with your passkey: {origin}/decide/{}   refuse: moochy decisions refuse {} [--reason TEXT]", clean(&d.pledge_id), clean(&d.pledge_id));
@@ -114,7 +116,7 @@ pub fn refuse(home: &Home, id: &str, reason: Option<&str>, yes: bool) -> Result<
     if d.status != "declined" {
         return Err(usage(format!("the server did not refuse it (status {}): an old server may not support refusing from the CLI", clean(&d.status))));
     }
-    emit(&json!({"event": "donation_refused", "pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug)}));
+    emit(&json!({"event": "donation_refused", "pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org)}));
     Ok(())
 }
 
@@ -125,7 +127,7 @@ pub fn accept_link(home: &Home, id: &str) -> Result<()> {
     }
     let url = format!("{}/decide/{id}", web_origin(home));
     emit(&json!({"event": "decide_on_web", "pledge_id": id, "decide_url": url}));
-    eprintln!("Accepting a donor is signed with your passkey: open {url}\n(with a CLI owner key: moochy accept <donor> --repo PROJECT)");
+    eprintln!("Accepting a donor is signed with your passkey: open {url}\n(with a CLI owner key: moochy accept <donor> --repo PROJECT | --org github/ORG)");
     Ok(())
 }
 

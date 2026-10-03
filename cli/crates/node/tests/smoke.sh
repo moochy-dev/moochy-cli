@@ -53,8 +53,8 @@ R=$(M '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion"
 echo "$R" | grep -q '"protocolVersion":"2025-06-18"' && ok "mcp http initialize" || ko init "$R"
 R=$(M '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
 echo "$R" | python3 -c "import json,sys;t=json.load(sys.stdin)['result']['tools'];assert [x['name'] for x in t]==['moochy_delegate','moochy_pool_status'];assert t[0]['inputSchema']['properties']['model']['enum']==['moochy/stub']" && ok "mcp tools/list (2 tools, model enum)" || ko list "$R"
-R=$(M '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"moochy_delegate","arguments":{"prompt":"summarize","files":["src/main.rs"]}}}')
-echo "$R" | grep -q 'untrusted-content' && echo "$R" | grep -q 'stub response' && ok "mcp http delegate (files, untrusted wrap)" || ko delegate "$R"
+R=$(M '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"moochy_delegate","arguments":{"prompt":"summarize","file_contents":[{"path":"src/main.rs","text":"fn main() {}"}]}}}')
+echo "$R" | grep -q 'untrusted-content' && echo "$R" | grep -q 'stub response' && ok "mcp http delegate (file_contents, untrusted wrap)" || ko delegate "$R"
 R=$(M '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"moochy_delegate","arguments":{"prompt":"x","files":[".env"]}}}')
 echo "$R" | grep -q '"isError":true' && ok "mcp files deny .env" || ko denyenv "$R"
 R=$(M '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"_meta":{"progressToken":"p1"},"name":"moochy_delegate","arguments":{"prompt":"x"}}}')
@@ -67,6 +67,10 @@ $B --home $H pause | grep -q '"paused":true' && ok pause || ko pause x
 $B --home $H journal | grep -q '"role":"gateway"' && ok journal || ko journal x
 sleep 1
 RSS=$(awk '/VmRSS/{print $2}' /proc/$PID/status); echo "idle RSS ${RSS} kB"
+# CONTRACT §19.6: --org is always provider-qualified and never mixed with --repo (slug confusion).
+O=$($B --home $H donate --org acme/widget --cap 5 --yes 2>&1); [ $? = 2 ] && echo "$O" | grep -q 'github/ORG' && ok "donate --org owner/name refused" || ko donate-org "$O"
+O=$($B --home $H decisions --org github/acme --repo acme/widget 2>&1); [ $? = 2 ] && ok "--org with --repo refused" || ko org-repo "$O"
+O=$($B --home $H donate --org github/acme --cap 5 --yes 2>&1); echo "$O" | grep -q 'organisation github/acme' && ok "donate --org reaches the link" || ko donate-org-ok "$O"
 $B --home $H down >/dev/null && sleep 0.5
 kill -0 $PID 2>/dev/null && ko down "still running" || ok "down"
 [ -e $H/state/node.json ] && ko cleanup node.json || ok "node.json removed"
