@@ -33,6 +33,7 @@ pub mod login;
 pub mod mcp;
 pub mod native;
 pub mod node;
+pub mod org;
 pub mod owner;
 pub mod run;
 pub mod pb;

@@ -62,7 +62,8 @@ impl Origin {
     }
 }
 
-pub fn client_config(ca_file: Option<&Path>) -> Result<Arc<ClientConfig>> {
+/// The relay's trust roots: `--ca-file` alone (development), else the web PKI.
+pub fn roots(ca_file: Option<&Path>) -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     match ca_file {
         Some(p) => {
@@ -76,6 +77,11 @@ pub fn client_config(ca_file: Option<&Path>) -> Result<Arc<ClientConfig>> {
         }
         None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
     }
+    Ok(roots)
+}
+
+pub fn client_config(ca_file: Option<&Path>) -> Result<Arc<ClientConfig>> {
+    let roots = roots(ca_file)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])

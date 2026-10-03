@@ -506,24 +506,16 @@ fn org_arg(o: &Opts) -> Result<Option<String>> {
 
 /// `moochy claim --org ORG`, `moochy org add|remove <PROJECT> --org ORG`, `moochy org list --org
 /// ORG`, `moochy approve|accept <donor> --org ORG [--revoke]` (CONTRACT §19.2–19.4, §19.6).
-/// Arguments are checked first; signing then fails closed: this version's key log defines no
-/// ORG_CLAIMED / ORG_REPO_ADDED / ORG_REPO_REMOVED entry nor an organisation approval, and the
-/// owner key never signs a body it cannot read back field by field (A217).
-fn org_cmd(_home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
-    let org = org_arg(o)?.ok_or_else(|| usage(format!("--org is required: {ORG_FORMS}")))?;
-    let what = match w {
-        ["claim"] => "an organisation claim (ORG_CLAIMED)".to_owned(),
-        ["org", op @ ("add" | "remove"), repo] => {
-            let repo = canonical_repo(repo)?;
-            format!("{} {} ({})", if *op == "add" { "adding" } else { "removing" }, clean(&repo), if *op == "add" { "ORG_REPO_ADDED" } else { "ORG_REPO_REMOVED" })
-        }
-        ["org", "list"] => "the list of covered projects".to_owned(),
-        ["approve" | "accept", donor] if !donor.is_empty() => format!("{} for the organisation ({})", clean(donor), if o.has("revoke") { "DONOR_REVOKED" } else { "DONOR_APPROVED" }),
-        _ => return Err(usage(format!("org <add|remove> <PROJECT> --org ORG | org list --org ORG | claim --org ORG | accept <donor> --org ORG: ORG is {ORG_FORMS}"))),
-    };
-    // ponytail: refused until mo-keylog lands the §19 entry kinds and the relay their append path;
-    // then this binds and signs like `owner::sign` does for projects.
-    Err(usage(format!("{}: this moochy cannot handle {what} yet (CONTRACT §19, organisation entries are not in its key log); update moochy", clean(&org))))
+fn org_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    let org = org_arg(o)?.ok_or_else(|| usage(format!("--org is required: {ORG_FORMS}")))?.to_ascii_lowercase();
+    let yes = o.has("yes");
+    match w {
+        ["claim"] => crate::org::sign(home, &org, crate::org::Op::Claim, yes),
+        ["org", op @ ("add" | "remove"), repo] => crate::org::sign(home, &org, crate::org::Op::Repo { repo: &canonical_repo(repo)?.to_ascii_lowercase(), remove: *op == "remove" }, yes),
+        ["org", "list"] => crate::org::list(home, &org, o.has("json")),
+        ["approve" | "accept", donor] if !donor.is_empty() => crate::org::sign(home, &org, crate::org::Op::Donor { donor, revoke: o.has("revoke") }, yes),
+        _ => Err(usage(format!("org <add|remove> <PROJECT> --org ORG | org list --org ORG | claim --org ORG | accept <donor> --org ORG: ORG is {ORG_FORMS}"))),
+    }
 }
 
 /// A `--repo` value in the link's canonical form (`owner/name` = GitHub, `gitlab/…`).
