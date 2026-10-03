@@ -8,6 +8,16 @@
 //! which worker keys a Gateway may seal to ([`KeyLog::seal`], CONTRACT §15.4) and which Gateway
 //! keys a Worker accepts ([`KeyLog::gateway_key`], 03 §7.2).
 //!
+//! Person sponsorships (CONTRACT §24.4) are a separate route, never a widening of the member
+//! one: `moochy_keylog::State::person_sealable(worker, repo, gateway)` allows a worker of donor D
+//! for repo R only when D is approved for a person M, `PERSON_CLAIMED(M)` and
+//! `PERSON_REPO_ADDED(M,R)` are active and `gateway` is a device of M's owner. The Gateway tries it
+//! with its own device after the repo/org rule ([`KeyLog::seal`]); the Worker uses it, with the
+//! signed request's gateway device, for its own pledges that target a person
+//! ([`KeyLog::person_gateway_key`]) and the member rule for every other pledge, so a non-member
+//! never spends a repo/org donation and a member never spends a person donation. The relay sends
+//! `approval_log_index` = the smallest such person approval and sets `Assign.gateway_device`.
+//!
 //! Requires the log's note key (`config set log_key`). Without it, or before the first verified
 //! checkpoint, nothing is sealed and no task is accepted, except under `MOOCHY_INSECURE_DEV=1`
 //! (D14, relay-asserted, tests and development only).
