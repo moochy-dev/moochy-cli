@@ -215,6 +215,14 @@ impl KeyLog {
         )
     }
 
+    /// `moochy owner status` (§19, keylog WIRING §11b): the orgs `pseudonym` owns in the mirror,
+    /// each with the repos it covers, sorted. `None`: no key log on this node.
+    pub fn owned_orgs(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Vec<(String, Vec<String>)>> {
+        Self::mirror(home, cfg)?
+            .state(|s| s.owned_orgs(pseudonym).into_iter().map(|(o, r)| (o.to_owned(), r.into_iter().map(str::to_owned).collect())).collect())
+            .ok()
+    }
+
     /// `moochy box list` (§17.1, WIRING §9b): this account's boxes in the mirror, in log order,
     /// revoked and expired ones included. `None`: no key log on this node (or not logged in).
     pub fn boxes(home: &Home, cfg: &Config) -> Option<Vec<BoxRow>> {

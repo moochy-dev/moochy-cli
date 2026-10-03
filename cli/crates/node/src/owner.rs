@@ -229,9 +229,14 @@ pub fn show_status(home: &Home) -> Result<()> {
     let Some(active) = crate::keylog::KeyLog::active_owner_key(home, &cfg, &me) else {
         return Err(usage("no public key log on this machine (log_key): owner keys cannot be checked"));
     };
+    let orgs = crate::keylog::KeyLog::owned_orgs(home, &cfg, &me).unwrap_or_default();
+    for l in org_lines(&orgs) {
+        eprintln!("{l}");
+    }
+    let orgs_json: Vec<_> = orgs.iter().map(|(o, r)| json!({"org_id": o, "repos": r})).collect();
     let Some(id) = active else {
         eprintln!("No CLI owner key in the public key log for your account{}.", if here { " (this device has a key file the log does not list: run `moochy owner init` after removing it, or check the log)" } else { "" });
-        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here}));
+        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here, "orgs": orgs_json}));
         return Ok(());
     };
     let row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &me, &id).flatten();
@@ -240,8 +245,19 @@ pub fn show_status(home: &Home) -> Result<()> {
         None => eprintln!("Owner key {id}."),
     }
     eprintln!("It {SIGNS}.");
-    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here}));
+    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here, "orgs": orgs_json}));
     Ok(())
+}
+
+/// `owner status` (§19): the organisations this account owns in the verified key log, each with
+/// the projects its donations fund. Ids are validated ASCII in the log; still printed `clean`.
+fn org_lines(orgs: &[(String, Vec<String>)]) -> Vec<String> {
+    orgs.iter()
+        .map(|(o, r)| {
+            let covers = if r.is_empty() { "funds none of your projects yet (`moochy org add`)".to_owned() } else { format!("funds {}", r.iter().map(|x| clean(x)).collect::<Vec<_>>().join(", ")) };
+            format!("Organisation {}: {covers}.", clean(o))
+        })
+        .collect()
 }
 
 /// `moochy owner init` (first key) / `moochy owner rotate` (new key, the current one signs too).
@@ -646,6 +662,14 @@ mod tests {
     const MALLORY: &str = "ps_mmmmmmmmmmmmmmmm";
     const ME: &str = "ps_zzzzzzzzzzzzzzzz";
     const OK: &str = "ok_00000000000000000000000000000000";
+
+    #[test]
+    fn org_lines_name_orgs_and_their_projects() {
+        let orgs = vec![("o_a".to_owned(), vec!["r_1".to_owned(), "r_2".to_owned()]), ("o_b\x1b[2J".to_owned(), vec![])];
+        let l = org_lines(&orgs);
+        assert_eq!(l[0], "Organisation o_a: funds r_1, r_2.");
+        assert!(l[1].starts_with("Organisation o_b") && !l[1].contains('\x1b') && l[1].contains("funds none"), "{}", l[1]);
+    }
 
     fn grant(kind: &str, subject: &str, label: &str, body_subject: &str) -> SignResponse {
         SignResponse {
