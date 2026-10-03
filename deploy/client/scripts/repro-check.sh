@@ -48,6 +48,8 @@ build() {
 		umask "$2"
 		export TZ=$3 LANG=$4 LC_ALL=$4 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=$src/cli/target SOURCE_DATE_EPOCH=$epoch
 		export RUSTFLAGS="--remap-path-prefix=$src=/build --remap-path-prefix=$cargo_home=/cargo"
+		# dist 0.33 appends these for every musl target (cargo-dist src/build/cargo.rs).
+		[[ $target == *-musl ]] && RUSTFLAGS+=" -Ctarget-feature=+crt-static -Clink-self-contained=yes"
 		# Exactly what `dist build` runs: same profile, same package set (feature unification).
 		cargo build --profile dist --locked -j "$jobs" --workspace --target "$target" >&2
 	)
