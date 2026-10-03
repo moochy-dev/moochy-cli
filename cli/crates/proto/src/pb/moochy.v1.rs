@@ -754,6 +754,10 @@ pub struct DonateRequest {
     /// always | nights | weekends | nights_weekends
     #[prost(string, tag = "8")]
     pub schedule: ::prost::alloc::string::String,
+    /// CONTRACT §19: donate to an organisation ("github/acme", "gitlab/group\[/sub…\]") instead of a
+    /// project; exactly one of repo_slug and org is set (INVALID_ARGUMENT otherwise).
+    #[prost(string, tag = "9")]
+    pub org: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationActionRequest {
@@ -812,6 +816,9 @@ pub struct Donation {
     /// pending: when the request expires unanswered
     #[prost(int64, tag = "16")]
     pub expires_at_ms: i64,
+    /// CONTRACT §19: set (and repo_slug empty) for a donation to an organisation
+    #[prost(string, tag = "17")]
+    pub org: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationEvent {
