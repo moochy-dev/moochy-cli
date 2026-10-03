@@ -391,7 +391,7 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
                 o.insert(
                     "warning".into(),
                     json!(format!(
-                        "an owner key {} you did not create was bound on your account with no email proof and no authorization: approvals it signs are not yours. Revoke it on moochy.dev and check your account's sessions",
+                        "an owner key {} you did not create was bound on your account with no email proof and no authorization: approvals and organisation entries it signs are not yours. Revoke it on moochy.dev and check your account's sessions",
                         clean(owner_key)
                     )),
                 );
@@ -413,8 +413,11 @@ fn alert_fields(a: &Alert) -> serde_json::Value {
         Alert::Rejected { idx, kind, code } => json!({"alert": "rejected", "idx": idx, "kind": kind.name(), "code": code.as_str()}),
         Alert::UnknownKey { idx, device_id } => json!({"alert": "unknown_key", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id)}),
         Alert::KeyHijack { idx, device_id, pseudonym } => json!({"alert": "key_hijack", "idx": idx, "device_id": clean(device_id), "pseudonym": clean(pseudonym)}),
-        Alert::NotSignedByMe { idx, kind, repo_id, signer } => json!({"alert": "unsigned", "idx": idx, "kind": kind.name(), "repo_id": clean(repo_id), "signer": clean(signer)}),
-        Alert::RepoClaimedByOther { idx, repo_id, owner } => json!({"alert": "repo_claimed_by_other", "idx": idx, "repo_id": clean(repo_id), "owner": clean(owner)}),
+        Alert::NotSignedByMe { idx, kind, repo_id, signer } => target(json!({"alert": "unsigned", "idx": idx, "kind": kind.name(), "signer": clean(signer)}), repo_id),
+        Alert::RepoClaimedByOther { idx, repo_id, owner } => {
+            let alert = if is_org(repo_id) { "org_claimed_by_other" } else { "repo_claimed_by_other" };
+            target(json!({"alert": alert, "idx": idx, "owner": clean(owner)}), repo_id)
+        }
         Alert::UnknownOwnerKey { idx, owner_key } => json!({"alert": "unknown_owner_key", "idx": idx, "kind": "OWNER_KEY_ADDED", "owner_key": clean(owner_key)}),
         Alert::OwnerKeyRevoked { idx, owner_key } => json!({"alert": "owner_key_revoked", "idx": idx, "kind": "OWNER_KEY_REVOKED", "owner_key": clean(owner_key)}),
         Alert::UnknownPasskey { idx, owner_key, rp_id, email_proof } => json!({"alert": "unknown_passkey", "idx": idx, "kind": "OWNER_KEY_ADDED", "owner_key": clean(owner_key), "rp_id": clean(rp_id), "email_proof": email_proof}),
@@ -423,6 +426,20 @@ fn alert_fields(a: &Alert) -> serde_json::Value {
         Alert::BoxOutsideRepo { idx, device_id, repo_id } => json!({"alert": "box_outside_repo", "idx": idx, "kind": "KEY_ADDED", "device_id": clean(device_id), "repo_id": clean(repo_id)}),
         Alert::UnprovenOwnerKey { idx, owner_key, known } => json!({"alert": "unproven_owner_key", "idx": idx, "kind": "OWNER_KEY_ADDED", "owner_key": clean(owner_key), "known": known}),
     }
+}
+
+/// CONTRACT §19: an `o_…` id is an organisation (the key log reuses the repo alerts for org
+/// entries; the prefixes never collide).
+fn is_org(id: &str) -> bool {
+    id.starts_with("o_")
+}
+
+/// Names the alert's target `org_id` or `repo_id` from its prefix, never one for the other.
+fn target(mut v: serde_json::Value, id: &str) -> serde_json::Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert(if is_org(id) { "org_id" } else { "repo_id" }.into(), json!(clean(id)));
+    }
+    v
 }
 
 /// The monitor's view of the relay link: the node's current authenticated channel.
@@ -581,5 +598,18 @@ mod tests {
     fn passkey_ids_from_digests() {
         let cose = b"\xa5\x01\x02\x03\x26";
         assert_eq!(super::passkey_id(&moochy_keylog::state::passkey_digest(cose)), moochy_keylog::entry::owner_key_id(cose));
+    }
+
+    #[test]
+    fn org_alerts_name_the_org() {
+        use moochy_keylog::{Alert, Kind};
+        let (o, r) = ("o_01ARZ3NDEKTSV4RRFFQ69G5FAV", "r_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let taken = |id: &str| super::alert_fields(&Alert::RepoClaimedByOther { idx: 7, repo_id: id.into(), owner: "ps_mmmmmmmmmmmmmmmm".into() });
+        let v = taken(o);
+        assert_eq!((v["alert"].as_str(), v["org_id"].as_str(), v.get("repo_id")), (Some("org_claimed_by_other"), Some(o), None));
+        let v = taken(r);
+        assert_eq!((v["alert"].as_str(), v["repo_id"].as_str(), v.get("org_id")), (Some("repo_claimed_by_other"), Some(r), None));
+        let v = super::alert_fields(&Alert::NotSignedByMe { idx: 8, kind: Kind::DonorApproved, repo_id: o.into(), signer: "ok_x".into() });
+        assert_eq!((v["alert"].as_str(), v["org_id"].as_str(), v.get("repo_id")), (Some("unsigned"), Some(o), None));
     }
 }

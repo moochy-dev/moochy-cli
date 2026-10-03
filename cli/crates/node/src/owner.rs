@@ -217,6 +217,10 @@ fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
     }
 }
 
+/// What any owner key of the account can sign (KEYLOG §2, CONTRACT §19): `owner status` and
+/// `owner trust` say it, organisations included.
+const SIGNS: &str = "signs for your projects and your organisations: claims, the donors you accept, members, and which of your projects an organisation's donations fund";
+
 /// `moochy owner status` (KEYLOG §4c): this account's CLI owner key as the public key log shows it.
 pub fn show_status(home: &Home) -> Result<()> {
     let cfg = home.load()?;
@@ -235,6 +239,7 @@ pub fn show_status(home: &Home) -> Result<()> {
         Some(k) => eprintln!("Owner key {id} (log #{}): {}.{}", k.idx, proof_text(k.proof), if here { "" } else { " Its secret is not on this device." }),
         None => eprintln!("Owner key {id}."),
     }
+    eprintln!("It {SIGNS}.");
     crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here}));
     Ok(())
 }
@@ -617,7 +622,7 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
         None => "not checked: no public key log on this machine",
     };
     eprintln!("Owner key {id} of your account, registered in the public key log at #{}{}: {how}.", d.log_index, if d.revoked { " (since revoked)" } else { "" });
-    eprintln!("Trust it only if YOU registered it (e.g. a passkey you added on moochy.dev). If not, your account may be compromised.");
+    eprintln!("Trust it only if YOU registered it (e.g. a passkey you added on moochy.dev): it {SIGNS}. If not, your account may be compromised.");
     if !yes && !matches!(ask("Type yes to trust it: ", false)?.as_str(), "yes" | "y") {
         return Err(usage("not trusted"));
     }
