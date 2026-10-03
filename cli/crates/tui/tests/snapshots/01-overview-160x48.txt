@@ -10,9 +10,9 @@
 │                                  ││ last 30 days                ││ last 30 days                ││                             ││                             │
 ╰──────────────────────────────────╯╰─────────────────────────────╯╰─────────────────────────────╯╰─────────────────────────────╯╰─────────────────────────────╯
 ╭ My donations this month ─────────────────────────────────────────────────────────────╮╭ Needs you ───────────────────────────────────────────────────────────╮
-│ ✔ github/tokio-rs/axum          ██████████████████████████░░░░░░░░░░░░  68%   $27.42 ││ ◆ @grace → github/acme/widgets 42m                                   │
+│ ● github/tokio-rs/axum          ██████████████████████████░░░░░░░░░░░░  68%   $27.42 ││ ◆ @grace → github/acme/widgets 42m                                   │
 │ ‖ github/rust-lang/rustfmt      paused                                        $14.10 ││ ◆ @heidi → github/acme/widgets 3h                                    │
-│ ✔ gitlab/inkscape               ███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → github/acme 1d                           │
+│ ● gitlab/inkscape               ███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → github/acme 1d                           │
 │ ■ github/sharkdp/bat            stopped                                       $10.00 ││ ▲ rustfmt donation is at 94% of its monthly limit                    │
 │                                                                                      ││ ✖ pi-headless has been offline for 3 days                            │
 ╰──────────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────────────────────╯
@@ -59,9 +59,9 @@
 |                                  || last 30 days                || last 30 days                ||                             ||                             |
 +----------------------------------++-----------------------------++-----------------------------++-----------------------------++-----------------------------+
 + My donations this month -------------------------------------------------------------++ Needs you -----------------------------------------------------------+
-| + github/tokio-rs/axum          ##########################------------  68%   $27.42 || ~ @grace -> github/acme/widgets 42m                                  |
+| * github/tokio-rs/axum          ##########################------------  68%   $27.42 || ~ @grace -> github/acme/widgets 42m                                  |
 | = github/rust-lang/rustfmt      paused                                        $14.10 || ~ @heidi -> github/acme/widgets 3h                                   |
-| + gitlab/inkscape               ###########---------------------------  31%   $18.65 || ~ github/acme/gadgets-pro -> github/acme 1d                          |
+| * gitlab/inkscape               ###########---------------------------  31%   $18.65 || ~ github/acme/gadgets-pro -> github/acme 1d                          |
 | # github/sharkdp/bat            stopped                                       $10.00 || ! rustfmt donation is at 94% of its monthly limit                    |
 |                                                                                      || x pi-headless has been offline for 3 days                            |
 +--------------------------------------------------------------------------------------++----------------------------------------------------------------------+

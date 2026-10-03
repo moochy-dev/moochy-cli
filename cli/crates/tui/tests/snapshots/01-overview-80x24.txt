@@ -9,9 +9,9 @@
 │                              ││ last 30 days         ││ last 30 days         │
 ╰──────────────────────────────╯╰──────────────────────╯╰──────────────────────╯
 ╭ My donations this month ─────────────────╮╭ Needs you ───────────────────────╮
-│ ✔ tokio-rs/axum ██████░░░░  68%   $27.42 ││ ◆ @grace → acme/widgets 42m      │
+│ ● tokio-rs/axum ██████░░░░  68%   $27.42 ││ ◆ @grace → acme/widgets 42m      │
 │ ‖ rust-lang/ru… paused            $14.10 ││ ◆ @heidi → acme/widgets 3h       │
-│ ✔ gitlab/inksc… ███░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → … 1d │
+│ ● gitlab/inksc… ███░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → … 1d │
 │ ■ sharkdp/bat   stopped           $10.00 ││ ▲ rustfmt donation is at 94% of… │
 │                                          ││ ✖ pi-headless has been offline … │
 ╰──────────────────────────────────────────╯╰──────────────────────────────────╯
@@ -34,9 +34,9 @@
 |                              || last 30 days         || last 30 days         |
 +------------------------------++----------------------++----------------------+
 + My donations this month -----------------++ Needs you -----------------------+
-| + tokio-rs/axum ######----  68%   $27.42 || ~ @grace -> acme/widgets 42m     |
+| * tokio-rs/axum ######----  68%   $27.42 || ~ @grace -> acme/widgets 42m     |
 | = rust-lang/ru~ paused            $14.10 || ~ @heidi -> acme/widgets 3h      |
-| + gitlab/inksc~ ###-------  31%   $18.65 || ~ github/acme/gadgets-pro -> ~ 1 |
+| * gitlab/inksc~ ###-------  31%   $18.65 || ~ github/acme/gadgets-pro -> ~ 1 |
 | # sharkdp/bat   stopped           $10.00 || ! rustfmt donation is at 94% of~ |
 |                                          || x pi-headless has been offline ~ |
 +------------------------------------------++----------------------------------+

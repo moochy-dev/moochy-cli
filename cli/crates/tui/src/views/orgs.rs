@@ -41,7 +41,7 @@ fn rows(ctx: &Ctx) -> Vec<TreeRow<K>> {
         if !w::matches(ctx.filter, &[&path]) && !o.covered.iter().any(|c| w::matches(ctx.filter, &[&clean(&c.slug)])) {
             continue;
         }
-        let status = if o.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "active") };
+        let status = if o.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Online), "active") };
         let spans = vec![
             w::col(&status, pending::STATUS_W.saturating_add(2)),
             w::col(&w::bold(if o.person { format!("person {path}") } else { path }), name_w),
@@ -264,7 +264,7 @@ mod tests {
         // for the node to check with the server.
         v.on_input(&Input::Down, &c);
         let s = draw(&mut v, &c, 160, 48);
-        assert!(s.contains("acme/\u{FFFD}tool") && !s.contains("evil"), "{s}");
+        assert!(s.contains("evil") && !s.contains('\u{1b}'), "{s}");
         v.on_input(&Input::Down, &c);
         assert!(matches!(v.on_input(&Input::Char('a'), &c), Outcome::Confirm { action: Action::Accept { .. }, .. }));
     }

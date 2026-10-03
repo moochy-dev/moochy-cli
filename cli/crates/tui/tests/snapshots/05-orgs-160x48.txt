@@ -2,12 +2,12 @@
  ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 ╭ Organisations · 7 ────────────────────────────────────────────────────────────────────────╮╭ github/acme ────────────────────────────────────────────────────╮
-│ ▶ ✔ active        github/acme           $28.30  4 donors                                  ││ Id         org_acme                                             │
-│     ✔ covered     github/acme/widgets   $21.00 of $30.00 cap                              ││ Status     ✔ active                                             │
+│ ▶ ● active        github/acme           $28.30  4 donors                                  ││ Id         org_acme                                             │
+│     ✔ covered     github/acme/widgets   $21.00 of $30.00 cap                              ││ Status     ● active                                             │
 │     ✔ covered     github/acme/gadgets    $6.40  no cap                                    ││ Donors     4 approved                                           │
 │     ✔ covered     github/acme/docs       $0.90 of $5.00 cap                               ││ This month $28.30 across 3 covered repos                        │
 │     ◆ waiting     github/acme/gadget…  add to the org's covered repos (share cap $5.00)   ││ 30 days    ▃▆▃▆▂▅▂▄▁▄▇▃▆▃▅▂▅▁▄▇▄▆▃▆▂▅▂▅█▄                       │
-│   ✔ active        person github/alice    $1.20  2 donors                                  ││ Page       https://moochy.dev/org/github/acme                   │
+│   ● active        person github/alice    $1.20  2 donors                                  ││ Page       https://moochy.dev/org/github/acme                   │
 │     ✔ covered     gitlab/alice/notes     $1.20  no cap                                    ││                                                                 │
 │                                                                                           ││ Covered repos                                                   │
 │                                                                                           ││   github/acme/widgets ████████░░░░ $21.00 of $30.00 cap         │
@@ -51,12 +51,12 @@
  (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 + Organisations - 7 ------------------------------------------------------------------------++ github/acme ----------------------------------------------------+
-| > + active        github/acme           $28.30  4 donors                                  || Id         org_acme                                             |
-|     + covered     github/acme/widgets   $21.00 of $30.00 cap                              || Status     + active                                             |
+| > * active        github/acme           $28.30  4 donors                                  || Id         org_acme                                             |
+|     + covered     github/acme/widgets   $21.00 of $30.00 cap                              || Status     * active                                             |
 |     + covered     github/acme/gadgets    $6.40  no cap                                    || Donors     4 approved                                           |
 |     + covered     github/acme/docs       $0.90 of $5.00 cap                               || This month $28.30 across 3 covered repos                        |
 |     ~ waiting     github/acme/gadget~  add to the org's covered repos (share cap $5.00)   || 30 days    _=_=.-.-.-#_=_-.-.-#-=_=.-.-#-                       |
-|   + active        person github/alice    $1.20  2 donors                                  || Page       https://moochy.dev/org/github/acme                   |
+|   * active        person github/alice    $1.20  2 donors                                  || Page       https://moochy.dev/org/github/acme                   |
 |     + covered     gitlab/alice/notes     $1.20  no cap                                    ||                                                                 |
 |                                                                                           || Covered repos                                                   |
 |                                                                                           ||   github/acme/widgets ########---- $21.00 of $30.00 cap         |

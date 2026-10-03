@@ -83,7 +83,7 @@ pub fn refuse(p: &Pending) -> Outcome {
 #[must_use]
 pub fn claim_status(t: Theme, now_ms: u64, paused_since_ms: u64) -> Vec<Line<'static>> {
     if paused_since_ms == 0 {
-        return vec![w::kv_span(t, "Status", w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "active"))];
+        return vec![w::kv_span(t, "Status", w::badge(t, Tone::Good, t.glyph(Glyph::Online), "active"))];
     }
     vec![
         w::kv_span(t, "Status", w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), &format!("paused {}", w::ago_long(now_ms, paused_since_ms)))),

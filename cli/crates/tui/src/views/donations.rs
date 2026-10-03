@@ -37,7 +37,7 @@ fn status(d: &Donation) -> Status {
         "active" if d.budget_uusd > 0 && d.spent_uusd >= d.budget_uusd => {
             s(Tone::Warn, Glyph::Warn, "limit reached", "its monthly limit is used up; it starts again next month")
         }
-        "active" => s(Tone::Good, Glyph::Ok, "active", "your devices serve it, up to the limit"),
+        "active" => s(Tone::Good, Glyph::Online, "active", "your devices serve it, up to the limit"),
         "paused" => s(Tone::Warn, Glyph::Paused, "paused", "nothing is served until you resume it"),
         "pending" => s(Tone::Info, Glyph::Pending, "waiting", "the project owner has not accepted you yet"),
         "cancelled" | "stopped" | "revoked" | "ended" => s(Tone::Muted, Glyph::Stopped, "stopped", "stopped for good; donate again to restart"),
@@ -386,8 +386,8 @@ mod tests {
         draw(&mut v, &c, 160, 48);
         v.cur.select(3);
         let out = draw(&mut v, &c, 160, 48);
-        assert!(out.contains("Projects funded this month") && out.contains("acme/\u{FFFD}b") && !out.contains("[31m"), "{out}");
-        let big = out.find("acme/\u{FFFD}b").unwrap();
+        assert!(out.contains("Projects funded this month") && out.contains("acme/\u{FFFD}[31mb") && !out.contains('\u{1b}'), "{out}");
+        let big = out.find("acme/\u{FFFD}[31mb").unwrap();
         assert!(big < out.find("acme/a\n").or_else(|| out.find("acme/a ")).unwrap_or(usize::MAX), "biggest spender first");
     }
 

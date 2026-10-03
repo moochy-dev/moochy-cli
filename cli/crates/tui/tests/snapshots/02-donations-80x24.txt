@@ -3,9 +3,9 @@
  1 Home 2 Donations 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
 ╭ Donations · 4 · $70.17 spent this month ─────────────────────────────────────╮
 │   Status          Donating to              Spent / limit     Used            │
-│ ▶ ✔ active        github/tokio-rs/axum     $27.42 / $40.00   ██████░░░  68%  │
+│ ▶ ● active        github/tokio-rs/axum     $27.42 / $40.00   ██████░░░  68%  │
 │   ‖ paused        github/rust-lang/rustfmt $14.10 / $15.00   ████████░  94%  │
-│   ✔ active        org gitlab/inkscape      $18.65 / $60.00   ██░░░░░░░  31%  │
+│   ● active        org gitlab/inkscape      $18.65 / $60.00   ██░░░░░░░  31%  │
 │   ■ stopped       github/sharkdp/bat       $10.00 / $10.00   █████████ 100%  │
 │                                                                              │
 │                                                                              │
@@ -13,7 +13,7 @@
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ project github/tokio-rs/axum ────────────────────────────────────────────────╮
-│ Status     ✔ active  your devices serve it, up to the limit                  │
+│ Status     ● active  your devices serve it, up to the limit                  │
 │ Limit      $40.00 a month · $0.50 per task                                   │
 │ Spent      $27.42   ██████████░░░░░░  68%                                    │
 │ Left       $12.58                                                            │
@@ -28,9 +28,9 @@
  1 Home 2 Donations 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
 + Donations - 4 - $70.17 spent this month -------------------------------------+
 |   Status          Donating to              Spent / limit     Used            |
-| > + active        github/tokio-rs/axum     $27.42 / $40.00   ######---  68%  |
+| > * active        github/tokio-rs/axum     $27.42 / $40.00   ######---  68%  |
 |   = paused        github/rust-lang/rustfmt $14.10 / $15.00   ########-  94%  |
-|   + active        org gitlab/inkscape      $18.65 / $60.00   ##-------  31%  |
+|   * active        org gitlab/inkscape      $18.65 / $60.00   ##-------  31%  |
 |   # stopped       github/sharkdp/bat       $10.00 / $10.00   ######### 100%  |
 |                                                                              |
 |                                                                              |
@@ -38,7 +38,7 @@
 |                                                                              |
 +------------------------------------------------------------------------------+
 + project github/tokio-rs/axum ------------------------------------------------+
-| Status     + active  your devices serve it, up to the limit                  |
+| Status     * active  your devices serve it, up to the limit                  |
 | Limit      $40.00 a month - $0.50 per task                                   |
 | Spent      $27.42   ##########------  68%                                    |
 | Left       $12.58                                                            |
