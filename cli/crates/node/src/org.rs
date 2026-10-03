@@ -274,12 +274,15 @@ struct Covered {
 /// key log, reads the server's public orgs API (`GET /api/v1/orgs/{provider}/{path…}`, §19.6).
 pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
     let cfg = home.load()?;
-    let info = match owned(home, &cfg, org) {
+    let mut info = match owned(home, &cfg, org) {
         Ok(Some(i)) => i,
         // The server does not know the org: the public API would not either.
         Err(e) if e.exit == crate::util::Exit::Usage => return Err(e),
         _ => public(&cfg, org)?,
     };
+    for r in &mut info.repos {
+        r.slug = qualified(&r.slug);
+    }
     if json_out {
         crate::util::emit(&json!({"org": info.path, "org_id": info.org_id, "repos": info.repos}));
     } else if info.repos.is_empty() {
@@ -291,6 +294,12 @@ pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A project as CONTRACT §9 names it canonically: the legacy `owner/name` form is GitHub, shown as
+/// `github/owner/name` like the org it belongs to; provider-qualified slugs stay as they are.
+fn qualified(slug: &str) -> String {
+    if slug.split('/').count() == 2 { format!("github/{slug}") } else { slug.to_owned() }
 }
 
 /// The owner's view (WIRING §4). `Ok(None)`: not this account's org in the key log.
@@ -418,5 +427,12 @@ mod tests {
         check_org(&mut b, Some("alice"), &l).unwrap();
         assert_eq!(b.name, "alice");
         assert!(matches!(parse_body(Kind::DonorApproved, &body(&b, OK, 2)), Ok(Body::Grant { repo_id: ORG, subject: ALICE, .. })));
+    }
+
+    #[test]
+    fn listed_projects_are_provider_qualified() {
+        assert_eq!(qualified("acme/app1"), "github/acme/app1");
+        assert_eq!(qualified("github/acme/app1"), "github/acme/app1");
+        assert_eq!(qualified("gitlab/grp/sub/tool"), "gitlab/grp/sub/tool");
     }
 }
