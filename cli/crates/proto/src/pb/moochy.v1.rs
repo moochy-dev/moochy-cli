@@ -396,6 +396,12 @@ pub struct ApprovalRequest {
     /// "github/acme", "gitlab/group\[/sub…\]"
     #[prost(string, tag = "12")]
     pub org_path: ::prost::alloc::string::String,
+    /// CONTRACT §24: "m\_…"
+    #[prost(string, tag = "13")]
+    pub person_id: ::prost::alloc::string::String,
+    /// "github/{login}", "gitlab/{username}"
+    #[prost(string, tag = "14")]
+    pub person_path: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogTileRequest {
@@ -790,6 +796,10 @@ pub struct DonateRequest {
     /// project; exactly one of repo_slug and org is set (INVALID_ARGUMENT otherwise).
     #[prost(string, tag = "9")]
     pub org: ::prost::alloc::string::String,
+    /// CONTRACT §24: sponsor a person ("github/{login}", "gitlab/{username}"); exactly one of
+    /// repo_slug, org and person is set.
+    #[prost(string, tag = "10")]
+    pub person: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationActionRequest {
@@ -851,6 +861,9 @@ pub struct Donation {
     /// CONTRACT §19: set (and repo_slug empty) for a donation to an organisation
     #[prost(string, tag = "17")]
     pub org: ::prost::alloc::string::String,
+    /// CONTRACT §24: set (repo_slug and org empty) for a person sponsorship
+    #[prost(string, tag = "18")]
+    pub person: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationEvent {
