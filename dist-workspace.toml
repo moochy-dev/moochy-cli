@@ -12,8 +12,7 @@ cargo-dist-version = "0.33.0"
 dist = false
 ci = "github"
 installers = ["shell", "npm", "homebrew"]
-# Windows (and the PowerShell installer) once the client builds there:
-# https://github.com/moochy-dev/moochy-cli/issues/7
+# Linux and macOS only (product owner, 2026-10-03).
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
