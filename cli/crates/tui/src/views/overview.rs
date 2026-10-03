@@ -6,12 +6,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::{Command, Ctx, Input, Outcome, View};
 use crate::sanitize::clean;
 use crate::theme::{Glyph, Theme};
-use crate::widgets::{ago, charts, dollars, latency, status_glyph, tokens};
+use crate::widgets::{ago, charts, dollars, latency, short_slug, status_glyph, tokens, trunc};
 
 const TAB_DONATIONS: usize = 1;
 const TAB_SERVED: usize = 2;
@@ -106,12 +106,8 @@ impl View for OverviewView {
     }
 }
 
-fn block<'a>(th: &Theme, title: &'a str) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_set(th.border_set())
-        .border_style(th.border())
-        .title(Span::styled(format!(" {title} "), th.bold()))
+fn block<'a>(th: &Theme, title: &str) -> Block<'a> {
+    crate::widgets::block(*th, title)
 }
 
 fn donated_month(ctx: &Ctx) -> u64 {
@@ -188,10 +184,10 @@ fn tile_money(f: &mut Frame, area: Rect, ctx: &Ctx, title: &str, per_day: &[u64]
     let data = per_day.get(per_day.len().saturating_sub(w)..).unwrap_or_default();
     if spark.height >= 3 {
         let [g, cap] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(spark);
-        f.render_widget(charts::sparkline(th, data, style), g);
+        f.render_widget(charts::sparkline(*th, data, style), g);
         f.render_widget(Paragraph::new(Line::styled(format!("last {} days", data.len()), th.muted())), cap);
     } else {
-        f.render_widget(charts::sparkline(th, data, style), spark);
+        f.render_widget(charts::sparkline(*th, data, style), spark);
     }
 }
 
@@ -251,7 +247,7 @@ fn render_meters(f: &mut Frame, area: Rect, ctx: &Ctx) {
         if d.status == "stopped" || d.status == "paused" {
             l.push(Span::styled(format!("{:<w$}", clean(&d.status), w = usize::from(meter_w)), th.glyph_style(g)));
         } else {
-            l.extend(charts::meter(th, d.spent_uusd, d.budget_uusd, meter_w).spans);
+            l.extend(charts::meter(*th, d.spent_uusd, d.budget_uusd, meter_w).spans);
         }
         l.push(Span::styled(money, th.money()));
         lines.push(Line::from(l));
@@ -325,22 +321,6 @@ fn render_live(f: &mut Frame, area: Rect, ctx: &Ctx) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// `github/owner/name` → `owner/name` when the full slug does not fit in `n`.
-fn short_slug(s: &str, n: usize) -> String {
-    match s.split_once('/') {
-        Some((_, rest)) if s.chars().count() > n && rest.contains('/') => rest.to_string(),
-        _ => s.to_string(),
-    }
-}
-
-fn trunc(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        return s.to_string();
-    }
-    let mut t: String = s.chars().take(n.saturating_sub(1)).collect();
-    t.push('…');
-    t
-}
 
 fn render_welcome(f: &mut Frame, area: Rect, ctx: &Ctx) {
     let th = ctx.theme;

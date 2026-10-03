@@ -18,6 +18,8 @@ pub enum Action {
     OrgAdd { org: String, repo: String },
     OrgRemove { org: String, repo: String },
     RevokeBox(String),
+    /// Revoke a box enrollment token (§17.1): boxes already enrolled keep running until expiry.
+    RevokeBoxToken(String),
     Refresh,
 }
 
@@ -103,6 +105,13 @@ impl Source for FakeSource {
             }
             Action::OrgAdd { org, repo } => ActionResult::Terminal(vec!["org".into(), "add".into(), org, repo]),
             Action::OrgRemove { org, repo } => ActionResult::Terminal(vec!["org".into(), "remove".into(), org, repo]),
+            Action::RevokeBoxToken(id) => match self.state.box_tokens.iter_mut().find(|b| b.id == id) {
+                Some(b) => {
+                    b.revoked = true;
+                    ActionResult::Done(format!("Token {id} revoked"))
+                }
+                None => ActionResult::Refused(format!("no token {id}")),
+            },
             Action::RevokeBox(id) => {
                 self.state.boxes.retain(|b| b.id != id);
                 ActionResult::Done(format!("Box {id} revoked"))

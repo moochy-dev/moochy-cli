@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use super::{Command, Ctx, Input, Outcome, View};
 use crate::app::GLOBAL_KEYS;
@@ -76,8 +76,17 @@ impl View for SettingsView {
         if !me.handle.is_empty() {
             lines.push(kv("account", format!("@{} ({})", clean(me.handle.trim_start_matches('@')), clean(&me.pseudonym))));
         }
-        if !me.lockdown.is_empty() {
-            lines.push(kv("lockdown", clean(&me.lockdown)));
+        let lock = match &me.lockdown {
+            crate::model::Lockdown::Unknown => String::new(),
+            crate::model::Lockdown::Enforced(m) => format!("locked down ({})", clean(m)),
+            crate::model::Lockdown::Failed(why) => format!("not locked down: {}", clean(why)),
+            crate::model::Lockdown::Unsafe => "UNSAFE: --unsafe-no-lockdown".into(),
+        };
+        if !lock.is_empty() {
+            lines.push(kv("lockdown", lock));
+        }
+        if !me.web.is_empty() {
+            lines.push(kv("web", crate::widgets::web_origin(&me.web)));
         }
         for (k, v) in &ctx.snap.config {
             lines.push(kv(&clean(k), clean(v)));
@@ -140,10 +149,6 @@ impl View for SettingsView {
     }
 }
 
-fn block<'a>(th: &Theme, title: &'a str, focus: bool) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_set(th.border_set())
-        .border_style(if focus { th.border_focus() } else { th.border() })
-        .title(Span::styled(format!(" {title} "), if focus { th.accent() } else { th.bold() }))
+fn block<'a>(th: &Theme, title: &str, focus: bool) -> Block<'a> {
+    if focus { crate::widgets::block_focus(*th, title) } else { crate::widgets::block(*th, title) }
 }

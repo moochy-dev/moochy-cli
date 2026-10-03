@@ -11,6 +11,13 @@ pub fn score(pattern: &str, text: &str) -> Option<i64> {
     Some(total)
 }
 
+/// The `/` filter of every list: each whitespace-separated term must fuzzy-match at least one of
+/// the row's fields. An empty filter matches everything.
+#[must_use]
+pub fn matches(filter: &str, fields: &[&str]) -> bool {
+    filter.split_whitespace().all(|term| fields.iter().any(|f| word_score(term, f).is_some()))
+}
+
 fn word_score(word: &str, text: &str) -> Option<i64> {
     let mut pat = word.chars().flat_map(char::to_lowercase).peekable();
     let mut s: i64 = 0;
@@ -46,5 +53,10 @@ mod tests {
         // Word starts and runs beat scattered letters.
         assert!(score("sv", "Served") < score("se", "Served"));
         assert!(score("pa", "Pause donation") > score("pa", "Open alerts"));
+        assert!(super::matches("", &["x"]));
+        assert!(super::matches("cld", &["claude-sonnet"]));
+        assert!(super::matches("ACME son", &["github/acme/widget", "claude-sonnet"]));
+        assert!(!super::matches("gpt", &["claude-sonnet"]));
+        assert!(!super::matches("acme zz", &["acme"]));
     }
 }

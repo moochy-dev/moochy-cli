@@ -15,6 +15,7 @@ pub struct Snapshot {
     pub decisions: Vec<Decision>,
     pub devices: Vec<Device>,
     pub boxes: Vec<BoxDevice>,
+    pub box_tokens: Vec<BoxToken>,
     pub keys: Vec<ProviderKey>,
     pub activity: Vec<Activity>,
     pub alerts: Vec<Alert>,
@@ -29,10 +30,27 @@ pub struct Snapshot {
 pub struct Me {
     pub handle: String,
     pub pseudonym: String,
+    /// The relay the node links to (`relay.moochy.dev`): status only, never used for links.
     pub relay: String,
+    /// The public web origin (`https://moochy.dev`, CONTRACT §9): share links and /decide pages.
+    pub web: String,
     pub connected: bool,
     pub roles: Vec<String>,
-    pub lockdown: String,
+    pub lockdown: Lockdown,
+}
+
+/// The node's self-lockdown (CONTRACT §15): what `moochy doctor` reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Lockdown {
+    /// Not reported yet (an old node, or still starting).
+    #[default]
+    Unknown,
+    /// Locked down; the mechanisms in force (`landlock + seccomp`, `seatbelt`).
+    Enforced(String),
+    /// Lockdown could not be applied: the donor refuses to serve; why.
+    Failed(String),
+    /// Started with `--unsafe-no-lockdown` (debugging only).
+    Unsafe,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,6 +70,10 @@ pub struct Donation {
     pub models: Vec<String>,
     /// Org donations: spend per project this month.
     pub per_repo_uusd: Vec<(String, u64)>,
+    /// Spend per day for the last 30 days (oldest first).
+    pub per_day_uusd: Vec<u64>,
+    /// When the monthly limit starts again (Unix ms); 0 = one-off or unknown.
+    pub renews_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -90,6 +112,8 @@ pub struct Org {
     pub donors: u32,
     pub month_uusd: u64,
     pub paused_since_ms: u64,
+    /// Use per day across covered repos for the last 30 days (oldest first).
+    pub per_day_uusd: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -109,6 +133,9 @@ pub struct Pending {
     pub subject: String,
     pub summary: String,
     pub created_at_ms: u64,
+    /// The passkey accept page (`{web}/decide/{id}`) as the node reports it; empty → built from
+    /// `Me.web`. Only shown when it is on the web origin.
+    pub decide_url: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,6 +165,21 @@ pub struct BoxDevice {
     pub online: bool,
 }
 
+/// A box enrollment token (CONTRACT §17.1): metadata only — the token itself is shown once at
+/// creation and never again.
+#[derive(Clone, Debug, Default)]
+pub struct BoxToken {
+    pub id: String,
+    pub project: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    /// Monthly cap of each box enrolled with it; 0 = the repo's default.
+    pub cap_uusd: u64,
+    pub max_boxes: u32,
+    pub boxes_enrolled: u32,
+    pub revoked: bool,
+}
+
 /// A provider key as the keystore reports it: presence and metadata, never the value.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderKey {
@@ -149,6 +191,8 @@ pub struct ProviderKey {
 #[derive(Clone, Debug, Default)]
 pub struct Activity {
     pub at_ms: u64,
+    /// The receipt this entry is about, if any, with its local verification.
+    pub receipt: Option<Receipt>,
     pub text: String,
 }
 
@@ -156,4 +200,21 @@ pub struct Activity {
 pub struct Alert {
     pub level: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Receipt {
+    pub id: String,
+    pub check: ReceiptCheck,
+}
+
+/// What `moochy verify` concluded about a receipt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReceiptCheck {
+    #[default]
+    Unchecked,
+    /// Relay signature valid and the ledger entry matches.
+    Verified,
+    /// Something did not match; what.
+    Failed(String),
 }

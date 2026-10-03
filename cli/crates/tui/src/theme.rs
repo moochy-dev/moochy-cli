@@ -285,7 +285,7 @@ impl Theme {
             Glyph::Served => ("↑", "^"),
             Glyph::Used => ("↓", "v"),
             Glyph::Coin => ("◉", "$"),
-            Glyph::Selected => ("▌", ">"),
+            Glyph::Selected => ("▶", ">"),
             Glyph::Up => ("▲", "^"),
             Glyph::Down => ("▼", "v"),
         };
