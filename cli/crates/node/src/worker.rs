@@ -377,7 +377,7 @@ const OWN_PLEDGES_REFRESH_MS: u64 = 250;
 /// (CONTRACT §24.4, [`requester_key`]). Returns whether the pledge targets a person.
 async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<bool, &'static str> {
     let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|(s, person)| (s == "active", *person));
-    if known(node).map(|k| k.0) != Some(true) {
+    if known(node).is_none_or(|k| !k.0) {
         refresh_own_pledges(node, pledge).await?;
     }
     let person = match known(node) {

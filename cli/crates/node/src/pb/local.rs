@@ -94,6 +94,9 @@ pub struct ApproveRequest {
     /// CONTRACT §19.4: "github/acme", "gitlab/group\[/sub…\]"; set = the org's approval (repo empty)
     #[prost(string, tag = "5")]
     pub org: ::prost::alloc::string::String,
+    /// CONTRACT §24.4: "github/{login}", "gitlab/{username}"; set = the person's approval (repo, org empty)
+    #[prost(string, tag = "6")]
+    pub person: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClaimRequest {
@@ -104,6 +107,9 @@ pub struct ClaimRequest {
     /// CONTRACT §19.2: set = ORG_CLAIMED of this org (repo empty)
     #[prost(string, tag = "3")]
     pub org: ::prost::alloc::string::String,
+    /// CONTRACT §24: set = PERSON_CLAIMED of this person (repo, org empty)
+    #[prost(string, tag = "4")]
+    pub person: ::prost::alloc::string::String,
 }
 /// CONTRACT §19.3: which of the owner's projects an organisation's donations fund.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -119,6 +125,9 @@ pub struct OrgRepoRequest {
     pub remove: bool,
     #[prost(bool, tag = "4")]
     pub dry_run: bool,
+    /// CONTRACT §24.3: set (and org empty) = PERSON_REPO_ADDED / PERSON_REPO_REMOVED
+    #[prost(string, tag = "5")]
+    pub person: ::prost::alloc::string::String,
 }
 /// What the owner signs (or would sign), decoded from the exact body bytes.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -157,6 +166,11 @@ pub struct SignResponse {
     pub org_id: ::prost::alloc::string::String,
     #[prost(string, tag = "13")]
     pub org_path: ::prost::alloc::string::String,
+    /// CONTRACT §24, from ApprovalRequest: display labels (PERSON\_*, DONOR\_* of a person: the m\_ id).
+    #[prost(string, tag = "14")]
+    pub person_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub person_path: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubmitEntryRequest {
