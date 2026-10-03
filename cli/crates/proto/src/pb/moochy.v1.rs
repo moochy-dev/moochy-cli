@@ -340,6 +340,28 @@ pub struct LogEntryAck {
 pub struct ApprovalRequests {
     #[prost(message, repeated, tag = "1")]
     pub requests: ::prost::alloc::vec::Vec<ApprovalRequest>,
+    /// CONTRACT §19.2a: this owner's claims (repos and orgs) that are paused because they were not
+    /// re-verified for 30 days, or close to it. Display only: the next web sign-in resumes them.
+    #[prost(message, repeated, tag = "2")]
+    pub claims: ::prost::alloc::vec::Vec<ClaimStatus>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClaimStatus {
+    /// "r\_…" or "o\_…"
+    #[prost(string, tag = "1")]
+    pub target_id: ::prost::alloc::string::String,
+    /// "github/owner/name", "gitlab/group/…", or the org path
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// last successful re-check at the provider
+    #[prost(int64, tag = "3")]
+    pub verified_at_ms: i64,
+    /// 0 = not paused (reminder window only)
+    #[prost(int64, tag = "4")]
+    pub paused_since_ms: i64,
+    /// day 90: the claim is released if still not re-verified
+    #[prost(int64, tag = "5")]
+    pub releases_at_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ApprovalRequest {
