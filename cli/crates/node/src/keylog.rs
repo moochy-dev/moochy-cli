@@ -385,14 +385,15 @@ impl KeyLog {
         self.view().gateway_allowed(device, repo_id).ok().map(|d| d.sign_pub)
     }
 
-    /// Worker side for a pledge of this donor that targets a person (CONTRACT §24.4): the logged
-    /// signing key of `gateway` when this donor device `me` may serve it on `repo_id` under a
-    /// person sponsorship. Only from a fresh verified log; `Err` carries the refusal code.
-    pub fn person_gateway_key(&self, me: &str, gateway: &str, repo_id: &str) -> Result<[u8; 32], Code> {
+    /// Worker side for a pledge of this donor that sponsors the person `person_id` (CONTRACT
+    /// §24.4, `Donation.person_id`): the logged signing key of `gateway` when this donor device
+    /// `me` may serve it on `repo_id` under that sponsorship. Only from a fresh verified log; `Err`
+    /// carries the refusal code. See [`person_requester`] for an empty `person_id`.
+    pub fn person_gateway_key(&self, me: &str, gateway: &str, repo_id: &str, person_id: &str) -> Result<[u8; 32], Code> {
         if !self.verified() {
             return Err(Code::NoCheckpoint);
         }
-        self.view().state(|st| person_requester(st, me, gateway, repo_id))?
+        self.view().state(|st| person_requester(st, me, gateway, repo_id, person_id))?
     }
 
     /// Gateway sealing rule (CONTRACT §15.4, A174, A184): the gate is verified, the worker is
@@ -423,11 +424,25 @@ impl KeyLog {
     }
 }
 
-/// §24.4, Worker side: the person rule with the signed request's gateway, then that device's
-/// logged signing key (the rule checked it is logged and usable).
-fn person_requester(st: &State, me: &str, gateway: &str, repo_id: &str) -> Result<[u8; 32], Code> {
+/// §24.4, Worker side: the person rule with the signed request's gateway (A296: bound to this
+/// donor, devices checked), then exactly the pledge's profile `person_id`: claimed by the
+/// requester's owner, covering `repo_id`, approving this donor. Returns the gateway's logged
+/// signing key. An empty `person_id` (a relay that does not send `Donation.person_id` yet) falls
+/// back to "some person of the requester's owner that covers the repo and approved this donor",
+/// exact per owner but not per profile.
+fn person_requester(st: &State, me: &str, gateway: &str, repo_id: &str, person_id: &str) -> Result<[u8; 32], Code> {
     st.person_sealable(me, repo_id, gateway)?;
-    st.device(gateway).map(|d| d.sign_pub).ok_or(Code::UnknownDevice)
+    let g = st.device(gateway).ok_or(Code::UnknownDevice)?;
+    if !person_id.is_empty() {
+        let w = st.device(me).ok_or(Code::UnknownDevice)?;
+        // ponytail: owned_people scans the log's claims (per person task, off the data path); ask
+        // mo-keylog for an O(1) `person_covers(m, r)` if logs grow large.
+        let covers = st.owned_people(&g.pseudonym).iter().any(|(m, rs)| *m == person_id && rs.contains(&repo_id));
+        if !covers || !st.donor_approved(person_id, &w.pseudonym) {
+            return Err(Code::NotApproved);
+        }
+    }
+    Ok(g.sign_pub)
 }
 
 /// §24.4, Gateway side: the person rule with this device as the requester, at exactly the
@@ -710,7 +725,7 @@ mod tests {
         for q in v["person_sealable"].as_array().unwrap() {
             let (w, r, g, code) = (q["worker"].as_str().unwrap(), q["repo"].as_str().unwrap(), q["gateway"].as_str().unwrap(), q["code"].as_str().unwrap());
             let want_idx = q["approval_idx"].as_u64().unwrap();
-            let worker = super::person_requester(&st, w, g, r);
+            let worker = super::person_requester(&st, w, g, r, "");
             let gateway = super::person_seal(&st, w, r, g, st.device(w).map_or(0, |d| d.idx), want_idx);
             match code {
                 "" => {
@@ -729,17 +744,26 @@ mod tests {
     fn person_gate_refusals() {
         let (st, _) = people();
         let idx = |w: &str| st.device(w).map_or(0, |d| d.idx);
-        assert!(super::person_requester(&st, W2, D1, R1).is_ok());
+        assert!(super::person_requester(&st, W2, D1, R1, "").is_ok());
         // Foreign device: another member of the covered repo never spends the sponsorship.
-        assert_eq!(super::person_requester(&st, W2, D7, R1), Err(Code::NotApproved));
+        assert_eq!(super::person_requester(&st, W2, D7, R1, ""), Err(Code::NotApproved));
         assert_eq!(super::person_seal(&st, W2, R1, D7, idx(W2), 24).err(), Some(Code::NotApproved));
         // Uncovered repos: removed (r3) and never covered (r4).
         for r in ["r_01HZY000000000000000000003", "r_01HZY000000000000000000004"] {
-            assert_eq!(super::person_requester(&st, W2, D1, r), Err(Code::NotApproved), "{r}");
+            assert_eq!(super::person_requester(&st, W2, D1, r, ""), Err(Code::NotApproved), "{r}");
         }
         // Revoked donor: DONOR_REVOKED on m1, even though the repo itself still approves D2.
-        assert_eq!(super::person_requester(&st, W3, D1, R1), Err(Code::NotApproved));
+        assert_eq!(super::person_requester(&st, W3, D1, R1, ""), Err(Code::NotApproved));
         assert!(st.sealable(W3, R1).is_ok());
+        // Bound to exactly the pledge's profile (Donation.person_id).
+        let (m1, m2, m3) = ("m_01HZH000000000000000000001", "m_01HZH000000000000000000002", "m_01HZH000000000000000000003");
+        let d5 = "d_01HZX000000000000000000005"; // E's device; E owns m3, which covers r1
+        assert!(super::person_requester(&st, W2, D1, R1, m1).is_ok());
+        assert_eq!(super::person_requester(&st, W2, D1, R1, m3), Err(Code::NotApproved), "another owner's profile");
+        assert_eq!(super::person_requester(&st, W2, D1, R1, m2), Err(Code::NotApproved), "an unclaimed profile");
+        assert_eq!(super::person_requester(&st, W2, D1, "r_01HZY000000000000000000003", m1), Err(Code::NotApproved), "uncovered repo");
+        assert!(super::person_requester(&st, W3, d5, R1, m3).is_ok());
+        assert_eq!(super::person_requester(&st, W3, d5, R1, m1), Err(Code::NotApproved), "D2 revoked on m1; E is not m1's owner");
         // A relay pointing the person route at another approval index.
         assert_eq!(super::person_seal(&st, W2, R1, D1, idx(W2), 25).err(), Some(Code::IndexMismatch));
     }

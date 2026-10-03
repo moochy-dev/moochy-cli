@@ -291,7 +291,7 @@ pub fn on_assign(node: &Arc<Node>, task: String, attempt: u32) {
         acked_tx.send_replace(true);
         lock(&INFLIGHT).remove(&(task.clone(), attempt));
         // Attempts that reached a receipt were journaled in `finish`; the others (refused before
-        // any receipt) here, before the stream drain below (up to 10 s).
+        // any receipt, so no tokens) here, before the stream drain below (up to 10 s).
         let ms = u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX);
         if !out.4 {
             node.journal(JournalEntry {
@@ -353,15 +353,17 @@ async fn receive(task: &str, attempt: u32, down: &mut tonic::Streaming<ServeDown
 
 /// The logged signing key of the requesting Gateway `device` (03 §7.2 1–2). A repo/org pledge: its
 /// user is the repo's owner or an owner-signed member. A person pledge (CONTRACT §24.4): it is a
-/// device of the sponsored person's owner, the person covers `repo_id` and approved this donor;
-/// otherwise `Err` (`not_approved`, never the member rule, so another member of the repo never
-/// spends the sponsorship). `Ok(None)`: no verified key log (the caller refuses outside D14).
-fn requester_key(node: &Node, person: bool, device: &str, repo_id: &str) -> Result<Option<[u8; 32]>, String> {
+/// device of the owner of exactly the sponsored profile `Some(person_id)` (`Donation.person_id`;
+/// empty from an older relay: any profile of that owner, see `keylog::person_requester`), which
+/// covers `repo_id` and approved this donor; otherwise `Err` (`not_approved`, never the member
+/// rule, so another member of the repo never spends the sponsorship). `Ok(None)`: no verified
+/// key log (the caller refuses outside D14).
+fn requester_key(node: &Node, person: Option<&str>, device: &str, repo_id: &str) -> Result<Option<[u8; 32]>, String> {
     let Some(l) = node.keylog.as_ref().filter(|l| l.verified()) else { return Ok(None) };
-    if !person {
+    let Some(person_id) = person else {
         return Ok(l.gateway_key(device, repo_id));
-    }
-    match l.person_gateway_key(node.device_id().unwrap_or_default(), device, repo_id) {
+    };
+    match l.person_gateway_key(node.device_id().unwrap_or_default(), device, repo_id, person_id) {
         Ok(pk) => Ok(Some(pk)),
         Err(c) => Err(format!("{}: this person sponsorship does not cover this request (key log)", c.as_str())),
     }
@@ -374,8 +376,9 @@ const OWN_PLEDGES_REFRESH_MS: u64 = 250;
 /// this donor's own active donations (listed on our own authenticated session), and with a
 /// verified key log this device must hold an owner-signed DONOR_APPROVED for the repo, unless the
 /// pledge targets a person: that route is checked with the signed request's gateway device
-/// (CONTRACT §24.4, [`requester_key`]). Returns whether the pledge targets a person.
-async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<bool, &'static str> {
+/// (CONTRACT §24.4, [`requester_key`]). Returns the sponsored profile when the pledge targets a
+/// person (`Some("")` when the relay did not name its `m_` id).
+async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<Option<String>, &'static str> {
     let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|(s, person)| (s == "active", *person));
     if known(node).is_none_or(|k| !k.0) {
         refresh_own_pledges(node, pledge).await?;
@@ -392,7 +395,7 @@ async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<b
     {
         return Err("this project has not approved this donor (key log)");
     }
-    Ok(person)
+    Ok(person.then(|| lock(&node.own_people).get(pledge).cloned().unwrap_or_default()))
 }
 
 /// Refresh this donor's own donations (`ListDonations` on our own session), at most every 250 ms.
@@ -427,7 +430,9 @@ async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'stati
     match timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest::default()))).await {
         Ok(Ok(r)) => {
             *last = now_ms();
-            *lock(&node.own_pledges) = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, (d.status, !d.person.is_empty()))).collect();
+            let ds = r.into_inner().donations;
+            *lock(&node.own_people) = ds.iter().take(10_000).filter(|d| !d.person.is_empty() && !d.person_id.is_empty()).map(|d| (d.pledge_id.clone(), d.person_id.clone())).collect();
+            *lock(&node.own_pledges) = ds.into_iter().take(10_000).map(|d| (d.pledge_id, (d.status, !d.person.is_empty()))).collect();
         }
         Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => {
             lock(&node.own_pledges).insert(want.to_owned(), ("active".into(), false));
@@ -590,7 +595,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("bad_envelope", false, Some("the relay named another requesting device than the signed request".into())));
     }
     let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
-    match requester_key(node, person, &inner.gateway_device.text(), &assign.repo_id).map_err(|d| with_ck("unauthorized_task", false, Some(d)))? {
+    match requester_key(node, person.as_deref(), &inner.gateway_device.text(), &assign.repo_id).map_err(|d| with_ck("unauthorized_task", false, Some(d)))? {
         Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
         // D14: relay-asserted membership only without a verified key log and in insecure dev
         // mode; the body hash still binds.
@@ -858,6 +863,10 @@ async fn finish(
     journal: (&str, Option<Texts>),
 ) {
     let ucost = u64::try_from(e.local).unwrap_or(0);
+    // CONTRACT §20: the receipt's split, as the Gateway journals it (in = input + cache reads and
+    // writes, out = output).
+    let u = &e.usage;
+    let tokens = (u.input.saturating_add(u.cache_read).saturating_add(u.cache_write_5m).saturating_add(u.cache_write_1h), u.output);
     let Some(signed) = build_receipt(keys, a, attempt, sealer, &e.req_id, e.usage, e.cost, e.status, &e.model, e.times) else {
         log("error", "receipt signing failed", &json!({"task": refuse.task}));
         return;
@@ -882,6 +891,8 @@ async fn finish(
         request,
         response,
         ms: u32::try_from(now.saturating_sub(t0)).unwrap_or(u32::MAX),
+        tokens_in: tokens.0,
+        tokens_out: tokens.1,
         ..JournalEntry::default()
     });
     let sent = refuse.tx.send(up(serve_up::Msg::End(signed.clone()))).await.is_ok();
