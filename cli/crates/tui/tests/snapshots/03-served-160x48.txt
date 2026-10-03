@@ -1,0 +1,98 @@
+# served 160x48 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
+╭ Last 60 min ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ↑ 19 served · ↓ 9 used · $4.31 · p50 2.4s · ✖ 5 failed                                                                                                       │
+│ ↑ served                                       ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅████████████ │
+│ ↓ used                                         ▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃ │
+│           60m ago                                                                                                                                        now │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Requests · 28 · live ─────────────────────────────────────────────────────────────────────╮╭ Request ────────────────────────────────────────────────────────╮
+│   Age  Kind     Project                   Model                     Cost      Outcome     ││ When       just now (2026-10-03 14:04 UTC)                      │
+│ ▶ now  ↑ served github/tokio-rs/axum      claude-sonnet-5-5         <$0.01    ✔ ok        ││ Kind       ↑ served  a device of yours answered it with your    │
+│   1m   ↑ served github/acme/widgets       deepseek-v4               $0.08     ✔ ok        ││ key                                                             │
+│   3m   ↓ used   github/rust-lang/rustfmt  claude-opus-5-5           $0.16     ✔ ok        ││ Project    github/tokio-rs/axum                                 │
+│   4m   ↑ served github/acme/gadgets       claude-haiku-4-5          $0.10     ✔ ok        ││ Model      claude-sonnet-5-5                                    │
+│   6m   ↑ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.18     ✔ ok        ││ Tokens     1.2k in · 300 out                                    │
+│   8m   ↓ used   github/tokio-rs/axum      claude-sonnet-5-5         $0.25     ✔ ok        ││ Cost       $0.0081                                              │
+│   9m   ↑ served github/acme/widgets       deepseek-v4               $0.20     ✖ refused   ││ Latency    380ms                                                │
+│   11m  ↑ served github/rust-lang/rustfmt  claude-opus-5-5           $0.13     ✔ ok        ││ Outcome    ✔ ok                                                 │
+│   13m  ↓ used   github/acme/gadgets       claude-haiku-4-5          $0.07     ✖ error     ││                                                                 │
+│   14m  ↑ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.15     ✔ ok        ││                                                                 │
+│   16m  ↑ served github/tokio-rs/axum      claude-sonnet-5-5         $0.23     ✔ ok        ││                                                                 │
+│   17m  ↓ used   github/acme/widgets       deepseek-v4               $0.17     ✔ ok        ││                                                                 │
+│   19m  ↑ served github/rust-lang/rustfmt  claude-opus-5-5           $0.25     ✔ ok        ││                                                                 │
+│   21m  ↑ served github/acme/gadgets       claude-haiku-4-5          $0.05     ✔ ok        ││                                                                 │
+│   22m  ↓ used   gitlab/inkscape/inkscape  gpt-5.2-mini              $0.12     ✔ ok        ││                                                                 │
+│   24m  ↑ served github/tokio-rs/axum      claude-sonnet-5-5         $0.20     ✔ ok        ││                                                                 │
+│   25m  ↑ served github/acme/widgets       deepseek-v4               $0.14     ✖ refused   ││                                                                 │
+│   27m  ↓ used   github/rust-lang/rustfmt  claude-opus-5-5           $0.22     ✔ ok        ││                                                                 │
+│   29m  ↑ served github/acme/gadgets       claude-haiku-4-5          $0.16     ✖ error     ││                                                                 │
+│   30m  ↑ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.10     ✔ ok        ││                                                                 │
+│   32m  ↓ used   github/tokio-rs/axum      claude-sonnet-5-5         $0.17     ✔ ok        ││                                                                 │
+│   34m  ↑ served github/acme/widgets       deepseek-v4               $0.11     ✔ ok        ││                                                                 │
+│   35m  ↑ served github/rust-lang/rustfmt  claude-opus-5-5           $0.19     ✔ ok        ││                                                                 │
+│   37m  ↓ used   github/acme/gadgets       claude-haiku-4-5          $0.13     ✔ ok        ││                                                                 │
+│   38m  ↑ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.21     ✔ ok        ││                                                                 │
+│   40m  ↑ served github/tokio-rs/axum      claude-sonnet-5-5         $0.15     ✔ ok        ││                                                                 │
+│   42m  ↓ used   github/acme/widgets       deepseek-v4               $0.09     ✖ refused   ││                                                                 │
+│   43m  ↑ served github/rust-lang/rustfmt  claude-opus-5-5           $0.16     ✔ ok        ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+╰───────────────────────────────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────╯
+ g newest (live)  s sort  / filter  : commands  q quit  ? help
+# served 160x48 --ascii
+ (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
++ Last 60 min -------------------------------------------------------------------------------------------------------------------------------------------------+
+| ^ 19 served - v 9 used - $4.31 - p50 2.4s - x 5 failed                                                                                                       |
+| ^ served                                       -------------------------------------------------------------------------------------------------############ |
+| v used                                         _____________________________________________________________________________________________________________ |
+|           60m ago                                                                                                                                        now |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------+
++ Requests - 28 - live ---------------------------------------------------------------------++ Request --------------------------------------------------------+
+|   Age  Kind     Project                   Model                     Cost      Outcome     || When       just now (2026-10-03 14:04 UTC)                      |
+| > now  ^ served github/tokio-rs/axum      claude-sonnet-5-5         <$0.01    + ok        || Kind       ^ served  a device of yours answered it with your    |
+|   1m   ^ served github/acme/widgets       deepseek-v4               $0.08     + ok        || key                                                             |
+|   3m   v used   github/rust-lang/rustfmt  claude-opus-5-5           $0.16     + ok        || Project    github/tokio-rs/axum                                 |
+|   4m   ^ served github/acme/gadgets       claude-haiku-4-5          $0.10     + ok        || Model      claude-sonnet-5-5                                    |
+|   6m   ^ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.18     + ok        || Tokens     1.2k in - 300 out                                    |
+|   8m   v used   github/tokio-rs/axum      claude-sonnet-5-5         $0.25     + ok        || Cost       $0.0081                                              |
+|   9m   ^ served github/acme/widgets       deepseek-v4               $0.20     x refused   || Latency    380ms                                                |
+|   11m  ^ served github/rust-lang/rustfmt  claude-opus-5-5           $0.13     + ok        || Outcome    + ok                                                 |
+|   13m  v used   github/acme/gadgets       claude-haiku-4-5          $0.07     x error     ||                                                                 |
+|   14m  ^ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.15     + ok        ||                                                                 |
+|   16m  ^ served github/tokio-rs/axum      claude-sonnet-5-5         $0.23     + ok        ||                                                                 |
+|   17m  v used   github/acme/widgets       deepseek-v4               $0.17     + ok        ||                                                                 |
+|   19m  ^ served github/rust-lang/rustfmt  claude-opus-5-5           $0.25     + ok        ||                                                                 |
+|   21m  ^ served github/acme/gadgets       claude-haiku-4-5          $0.05     + ok        ||                                                                 |
+|   22m  v used   gitlab/inkscape/inkscape  gpt-5.2-mini              $0.12     + ok        ||                                                                 |
+|   24m  ^ served github/tokio-rs/axum      claude-sonnet-5-5         $0.20     + ok        ||                                                                 |
+|   25m  ^ served github/acme/widgets       deepseek-v4               $0.14     x refused   ||                                                                 |
+|   27m  v used   github/rust-lang/rustfmt  claude-opus-5-5           $0.22     + ok        ||                                                                 |
+|   29m  ^ served github/acme/gadgets       claude-haiku-4-5          $0.16     x error     ||                                                                 |
+|   30m  ^ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.10     + ok        ||                                                                 |
+|   32m  v used   github/tokio-rs/axum      claude-sonnet-5-5         $0.17     + ok        ||                                                                 |
+|   34m  ^ served github/acme/widgets       deepseek-v4               $0.11     + ok        ||                                                                 |
+|   35m  ^ served github/rust-lang/rustfmt  claude-opus-5-5           $0.19     + ok        ||                                                                 |
+|   37m  v used   github/acme/gadgets       claude-haiku-4-5          $0.13     + ok        ||                                                                 |
+|   38m  ^ served gitlab/inkscape/inkscape  gpt-5.2-mini              $0.21     + ok        ||                                                                 |
+|   40m  ^ served github/tokio-rs/axum      claude-sonnet-5-5         $0.15     + ok        ||                                                                 |
+|   42m  v used   github/acme/widgets       deepseek-v4               $0.09     x refused   ||                                                                 |
+|   43m  ^ served github/rust-lang/rustfmt  claude-opus-5-5           $0.16     + ok        ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
++-------------------------------------------------------------------------------------------++-----------------------------------------------------------------+
+ g newest (live)  s sort  / filter  : commands  q quit  ? help

@@ -14,8 +14,9 @@ use crate::theme::{Glyph, Theme};
 use crate::widgets::{self as w, TableCursor, Tone, charts, list};
 
 const MINUTE_MS: u64 = 60_000;
-/// The chart always covers the last hour, resampled into the width it gets.
+/// The chart always covers the last hour, in 5-minute buckets spread over the width it gets.
 const MINUTES: u16 = 60;
+const BUCKET_MIN: u64 = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Sort {
@@ -83,14 +84,19 @@ fn failed(o: &str) -> bool {
 }
 
 impl ServedView {
-    fn summary(t: Theme, rows: &[&Served], now: u64, minutes: u16) -> (Line<'static>, Vec<u64>) {
-        let mut buckets = vec![0u64; usize::from(minutes)];
+    fn summary(t: Theme, rows: &[&Served], now: u64, minutes: u16) -> (Line<'static>, [Vec<u64>; 2]) {
+        let n = usize::try_from(u64::from(minutes) / BUCKET_MIN).unwrap_or(0);
+        let mut buckets = [vec![0u64; n], vec![0u64; n]];
         let (mut served, mut used, mut failures, mut uusd) = (0u64, 0u64, 0u64, 0u64);
         let mut lat = Vec::new();
         for s in rows {
             let age = now.saturating_sub(s.at_ms) / MINUTE_MS;
-            let Some(i) = usize::try_from(age).ok().and_then(|a| usize::from(minutes).checked_sub(a)?.checked_sub(1)) else { continue };
-            if let Some(b) = buckets.get_mut(i) {
+            if age >= u64::from(minutes) {
+                continue;
+            }
+            let i = n.saturating_sub(1).saturating_sub(usize::try_from(age / BUCKET_MIN).unwrap_or(0));
+            let kind = usize::from(s.direction == "used");
+            if let Some(b) = buckets.get_mut(kind).and_then(|k| k.get_mut(i)) {
                 *b = b.saturating_add(1);
             }
             match s.direction.as_str() {
@@ -181,13 +187,22 @@ impl View for ServedView {
         let spark_block = w::block(t, "Last 60 min");
         let inner = spark_block.inner(top);
         f.render_widget(spark_block, top);
-        let [l1, l2, l3] = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        let [l1, l2, l3, l4] = Layout::vertical([Constraint::Length(1); 4]).areas(inner);
         f.render_widget(Paragraph::new(list::fit(line, usize::from(l1.width))), l1);
-        // The whole hour across the whole width: the left edge is 60 minutes ago, the right is now.
-        let data = charts::resample(&buckets, usize::from(l2.width));
-        f.render_widget(charts::sparkline(t, &data, t.money()), l2);
-        let gap = usize::from(l3.width).saturating_sub(13);
-        f.render_widget(Paragraph::new(Line::from(w::muted(t, format!("60m ago{:gap$}now", ""))) ), l3);
+        // One row per kind, the whole hour across the whole width: left is 60 minutes ago, right is now.
+        let spark_w = usize::from(l2.width).saturating_sub(10);
+        let [sv, us] = &buckets;
+        let max = sv.iter().chain(us.iter()).copied().max().unwrap_or(0);
+        for (area, data, label, style) in [(l2, sv, format!("{} served ", t.glyph(Glyph::Served)), t.money()), (l3, us, format!("{} used   ", t.glyph(Glyph::Used)), t.info())] {
+            // Both rows on one scale, so their heights compare.
+            let mut scaled = charts::resample(data, spark_w);
+            scaled.push(max);
+            let mut spark = charts::spark_text(t, &scaled, spark_w.saturating_add(1), style);
+            spark.content = spark.content.chars().take(spark_w).collect::<String>().into();
+            f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{label:<10}"), style), spark])), area);
+        }
+        let gap = usize::from(l4.width).saturating_sub(20);
+        f.render_widget(Paragraph::new(Line::from(w::muted(t, format!("{:10}60m ago{:gap$}now", "", "")))), l4);
 
         let (list_a, detail) = if rows.is_empty() { (rest, None) } else { w::split(rest, 10) };
         self.cur.sync(rows.len(), list_a);

@@ -33,7 +33,7 @@ mod tests;
 
 pub use fixtures::demo_source;
 pub use snapshot::snapshot;
-pub use term::run;
+pub use term::{run, run_views};
 
 /// `moochy tui` flags (CONTRACT §20.4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

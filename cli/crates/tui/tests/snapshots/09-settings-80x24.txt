@@ -1,0 +1,50 @@
+# settings 80x24 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+╭ Appearance ──────────────────────────────────────────────────────────────────╮
+│ ▶ Theme     dark          enter or t                                         │
+│   Colours   truecolor     enter or c                                         │
+│   Glyphs    Unicode       enter or a                                         │
+│ Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.               │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Node ────────────────────────────────────────────────────────────────────────╮
+│ Account         @alice (brave-otter-42)                                      │
+│ Web             https://moochy.dev                                           │
+│ Relay           https://relay.moochy.dev                                     │
+│ Node sock       ~/.local/state/moochy/node.sock                              │
+│ Role            donor + maintainer                                           │
+│ Sandbox         landlock + seccomp (enforced)                                │
+│ Serve hours     always                                                       │
+│ Max concurrent  2                                                            │
+│ Notifications   email: weekly digest                                         │
+│ Keylog monitor  on (last check 6h ago)                                       │
+│                                                                              │
+│ Keybindings: press ? for the full list.                                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ enter change  t light/dark  c colours  a ascii  / filter  q quit  ? help
+# settings 80x24 --ascii
+ (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
++ Appearance ------------------------------------------------------------------+
+| > Theme     dark          enter or t                                         |
+|   Colours   truecolor     enter or c                                         |
+|   Glyphs    ASCII         enter or a                                         |
+| Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.               |
+|                                                                              |
++------------------------------------------------------------------------------+
++ Node ------------------------------------------------------------------------+
+| Account         @alice (brave-otter-42)                                      |
+| Web             https://moochy.dev                                           |
+| Relay           https://relay.moochy.dev                                     |
+| Node sock       ~/.local/state/moochy/node.sock                              |
+| Role            donor + maintainer                                           |
+| Sandbox         landlock + seccomp (enforced)                                |
+| Serve hours     always                                                       |
+| Max concurrent  2                                                            |
+| Notifications   email: weekly digest                                         |
+| Keylog monitor  on (last check 6h ago)                                       |
+|                                                                              |
+| Keybindings: press ? for the full list.                                      |
++------------------------------------------------------------------------------+
+ enter change  t light/dark  c colours  a ascii  / filter  q quit  ? help
