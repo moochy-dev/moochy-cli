@@ -699,31 +699,32 @@ impl App {
         let filter = self.filters.get(self.active).filter(|f| !f.is_empty()).map(|f| format!(" /{} ", clean(f)));
         let fw = filter.as_ref().map_or(0, |f| Line::raw(f.as_str()).width() as u16);
         let avail = area.width.saturating_sub(fw);
-        // Every tab at the same level, whichever is active (the bar never jumps): full titles,
-        // then the designed medium labels, then the short ones, then numbers only.
-        let mut chosen = Vec::new();
-        for level in 0..4u8 {
-            chosen = self
-                .views
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let (medium, short) = v.labels();
-                    let name = match level {
-                        0 => v.title(),
-                        1 => medium,
-                        2 => short,
-                        _ => "",
-                    };
-                    let num = TAB_KEYS.get(i).copied().unwrap_or("");
-                    if name.is_empty() { format!(" {num} ") } else { format!(" {num} {name}") }
-                })
-                .collect();
-            let w: usize = chosen.iter().map(|s: &String| Line::raw(s.as_str()).width()).sum();
-            if w <= usize::from(avail) {
+        // The active tab always shows its full title; the others use one label level for all.
+        // The level is the first that fits even when the widest title is the active one, so it
+        // never changes when you switch tabs (the bar does not jump): full titles, the designed
+        // medium labels, the short ones, numbers only.
+        let label = |i: usize, v: &dyn View, level: u8| -> String {
+            let (medium, short) = v.labels();
+            let name = match level {
+                0 => v.title(),
+                1 => medium,
+                2 => short,
+                _ => "",
+            };
+            let num = TAB_KEYS.get(i).copied().unwrap_or("");
+            if name.is_empty() { format!(" {num}") } else { format!(" {num} {name}") }
+        };
+        let wid = |s: &str| Line::raw(s).width();
+        let mut level = 3u8;
+        for l in 0..4u8 {
+            let base: usize = self.views.iter().enumerate().map(|(i, v)| wid(&label(i, v.as_ref(), l))).sum();
+            let grow = self.views.iter().enumerate().map(|(i, v)| wid(&label(i, v.as_ref(), 0)).saturating_sub(wid(&label(i, v.as_ref(), l)))).max().unwrap_or(0);
+            if base.saturating_add(grow) <= usize::from(avail) {
+                level = l;
                 break;
             }
         }
+        let chosen: Vec<String> = self.views.iter().enumerate().map(|(i, v)| label(i, v.as_ref(), if i == self.active { 0 } else { level })).collect();
         let mut spans = Vec::new();
         self.tab_hits.clear();
         let mut x = area.x;

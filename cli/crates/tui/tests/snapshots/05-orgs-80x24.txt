@@ -1,6 +1,6 @@
 # orgs 80x24 dark (light: same text)
  ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+ 1 Home 2 Given 3 Served 4 Repos 5 Organisations 6 Decide 7 Keys 8 Log 9 Prefs
 ╭ Organisations · 7 ───────────────────────────────────────────────────────────╮
 │ ▶ ✔ active        github/acme           $28.30  4 donors                     │
 │     ✔ covered     github/acme/widgets   $21.00 of $30.00 cap                 │
@@ -25,7 +25,7 @@
  a add/accept  x remove  r refuse  / filter  : commands  q quit  ? help
 # orgs 80x24 --ascii
  (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+ 1 Home 2 Given 3 Served 4 Repos 5 Organisations 6 Decide 7 Keys 8 Log 9 Prefs
 + Organisations - 7 -----------------------------------------------------------+
 | > + active        github/acme           $28.30  4 donors                     |
 |     + covered     github/acme/widgets   $21.00 of $30.00 cap                 |
