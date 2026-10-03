@@ -8,6 +8,7 @@
 //! - [`stream`]: incremental SSE/JSON response parser: usage, model, tool-call boundaries.
 //! - [`inspect`]: tool-call structural checks and tripwire (gateway side).
 //! - [`validate`]: single-use request validator child + its parent-side client (CONTRACT §15.2).
+//! - [`redact`]: provider-key redaction of everything that leaves the donor (A291).
 //! - [`reemit`]: canonical re-emission of donor responses to the agent (CONTRACT §15.4).
 //! - [`clean_text`]: strip terminal control sequences from displayed donor text.
 //! - [`store`]: outbox, served-task set, local reservation counters (one crash-safe log).
@@ -19,6 +20,7 @@ pub mod firewall;
 pub mod inspect;
 pub mod json;
 pub mod provider;
+pub mod redact;
 pub mod reemit;
 pub mod store;
 pub mod stream;

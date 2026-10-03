@@ -174,7 +174,8 @@ pub struct Failure {
     /// Rate-limit headers of an HTTP error response (a 429 usually reports zero headroom);
     /// `None` for failures without a response. Boxed: keeps `Result<_, Failure>` small.
     pub rate_limit: Option<Box<RateLimit>>,
-    /// The provider's error body (bounded), to seal to the Gateway as the native error.
+    /// The provider's error body (bounded). Stays on the donor's machine (A291: a provider may
+    /// echo the API key in it); the requester gets [`Failure::public_message`].
     pub body: Bytes,
     pub detail: &'static str,
 }
@@ -194,6 +195,36 @@ impl Failure {
             FailKind::InvalidRequest | FailKind::TooLarge => ("provider_error", false),
         }
     }
+}
+
+impl Failure {
+    /// What the requester is told (CONTRACT §23, A291): our own words from the kind and the
+    /// HTTP status, never the provider's error text. A context-window overflow keeps the wording
+    /// agents react to ("prompt is too long").
+    pub fn public_message(&self) -> String {
+        let what = match self.kind {
+            FailKind::RateLimited => "the donor's provider is rate limiting this key",
+            FailKind::Overloaded => "the donor's provider is overloaded",
+            FailKind::Auth => "the donor's provider refused the donor's API key",
+            FailKind::ModelUnavailable => "the donor's provider does not serve this model",
+            FailKind::InvalidRequest if context_overflow(&self.body) => "prompt is too long: the request exceeds the model's context window",
+            FailKind::InvalidRequest => "the donor's provider refused the request as invalid",
+            FailKind::TooLarge => "the request is too large for the donor's provider",
+            FailKind::ProviderError | FailKind::Network | FailKind::Timeout | FailKind::Unsupported => self.detail,
+        };
+        match self.status {
+            Some(st) => format!("{what} (HTTP {st})"),
+            None => what.to_owned(),
+        }
+    }
+}
+
+/// Does a provider error body say the prompt overflows the context window? Matched on fixed
+/// phrases only; nothing of the body is copied.
+fn context_overflow(body: &[u8]) -> bool {
+    const PHRASES: [&[u8]; 5] = [b"prompt is too long", b"context_length_exceeded", b"maximum context length", b"context window", b"too many tokens"];
+    let lower: Vec<u8> = body.iter().take(64 << 10).map(u8::to_ascii_lowercase).collect();
+    PHRASES.iter().any(|p| lower.windows(p.len()).any(|w| w == *p))
 }
 
 impl std::fmt::Display for Failure {
@@ -650,6 +681,8 @@ pub struct Adapter {
     /// Idle HTTP/1.1 keep-alive connections (`http://` loopback dev targets only).
     h1_idle: Arc<StdMutex<Vec<H1Conn>>>,
     limits: Limits,
+    /// This adapter's key (or auth header value) in every form a provider could echo (A291).
+    redactor: crate::redact::Redactor,
 }
 
 impl std::fmt::Debug for Adapter {
@@ -691,6 +724,8 @@ impl Adapter {
             return Err(ConfigError("a dev trust root is only accepted with a loopback dev base URL"));
         }
         let key = cfg.api_key.trim();
+        let header_secret = opts.auth_header.as_ref().map_or(&b""[..], |(_, v)| v.as_bytes());
+        let redactor = crate::redact::Redactor::new(&[key.as_bytes(), header_secret]);
         let mut auth_name = HeaderName::from_static(if cfg.provider == Provider::Anthropic { "x-api-key" } else { "authorization" });
         // Local servers usually take no key (Ollama/LM Studio ignore it): empty = no auth header.
         let auth = if let Some((name, value)) = &opts.auth_header {
@@ -728,11 +763,16 @@ impl Adapter {
             (true, true) => Some(TlsConnector::from(local_tls_config(&opts.trust)?)),
         };
         let use_h2 = target.tls && !local;
-        Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, use_h2, h2: Mutex::new(None), h1_idle: Arc::default(), limits: cfg.limits })
+        Ok(Self { provider: cfg.provider, target, auth_name, auth, tls, use_h2, h2: Mutex::new(None), h1_idle: Arc::default(), limits: cfg.limits, redactor })
     }
 
     pub fn provider(&self) -> Provider {
         self.provider
+    }
+
+    /// Hides this adapter's key in anything that leaves the donor's machine (A291).
+    pub fn redactor(&self) -> &crate::redact::Redactor {
+        &self.redactor
     }
 
     /// Open (or keep) the warm HTTP/2 connection. Call at startup, on key add, and every
@@ -1724,5 +1764,17 @@ mod tests {
             assert_eq!(full(p, d).as_deref(), url, "{p:?} {d:?}");
             assert_eq!(p.serves(d), url.is_some(), "Provider::serves agrees with the adapter table");
         }
+    }
+
+    #[test]
+    fn public_message_never_carries_provider_text() {
+        let key = "sk-ant-api03-CANARY291-0123456789abcdef";
+        let f = |kind, status, body: String| Failure { kind, status: Some(status), retry_after_ms: None, rate_limit: None, body: Bytes::from(body), detail: "provider returned an error status" };
+        for (kind, status) in [(FailKind::InvalidRequest, 400), (FailKind::Auth, 401), (FailKind::Overloaded, 529), (FailKind::ProviderError, 500), (FailKind::RateLimited, 429)] {
+            let m = f(kind, status, format!(r#"{{"error":{{"message":"header x-api-key {key}: malformed"}}}}"#)).public_message();
+            assert!(!m.contains("CANARY") && !m.contains("x-api-key") && m.ends_with(&format!("(HTTP {status})")), "{m}");
+        }
+        let m = f(FailKind::InvalidRequest, 400, r#"{"error":{"message":"Prompt is too long: 250000 tokens > 200000 maximum"}}"#.into()).public_message();
+        assert_eq!(m, "prompt is too long: the request exceeds the model's context window (HTTP 400)");
     }
 }
