@@ -40,6 +40,25 @@ pub struct StatusResponse {
     pub warm_adapters: u32,
     #[prost(uint64, tag = "17")]
     pub catalog_version: u64,
+    /// CONTRACT §20: provider keys present on this device (names only: never values or URLs).
+    #[prost(message, repeated, tag = "18")]
+    pub keys: ::prost::alloc::vec::Vec<ProviderKeyInfo>,
+    /// the background process locked itself down (§15.2)
+    #[prost(bool, tag = "19")]
+    pub locked: bool,
+    /// Recent key-log monitor alerts, oldest first (≤ 16), each `{"message","fields"}` JSON as
+    /// logged; relay/peer-derived strings inside: clean before printing.
+    #[prost(string, repeated, tag = "20")]
+    pub alerts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ProviderKeyInfo {
+    /// anthropic | openrouter | deepseek | openai | xai | local
+    #[prost(string, tag = "1")]
+    pub provider: ::prost::alloc::string::String,
+    /// `local`: the public slugs it serves (`local/<slug>`)
+    #[prost(string, repeated, tag = "2")]
+    pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PoolSummary {
@@ -411,6 +430,26 @@ pub struct TrustOwnerKeyResponse {
     /// acknowledged (false on a dry run)
     #[prost(bool, tag = "4")]
     pub trusted: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchEvent {
+    #[prost(int64, tag = "1")]
+    pub t_ms: i64,
+    /// snapshot: something changed (or events were coalesced): re-read the state.
+    /// served:   a request this device served (role worker) or a project of mine used (role gateway).
+    /// pending:  the requests waiting for my signature or my claims' state changed (re-read Pending).
+    /// donation: a donation's status changed (re-read Donations).
+    /// alert:    a key-log monitor alert (`detail` = the alert JSON, as Status.alerts).
+    /// link:     the relay link changed (`detail` = Status.link_state); also sent on pause/resume.
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// kind = served, without request/response bytes
+    #[prost(message, optional, tag = "3")]
+    pub served: ::core::option::Option<JournalEntry>,
+    #[prost(string, tag = "4")]
+    pub detail: ::prost::alloc::string::String,
 }
 /// Generated client implementations.
 pub mod local_control_client {
@@ -940,6 +979,34 @@ pub mod local_control_client {
                 .insert(GrpcMethod::new("moochy.v1.LocalControl", "LinkCall"));
             self.inner.unary(req, path, codec).await
         }
+        /// CONTRACT §20 (`moochy tui`): live dashboard events until the client hangs up. Bounded and
+        /// rate-limited per watcher: at most 20 events per second plus one `snapshot` per 250 ms; what
+        /// does not fit (burst, slow reader, lagged journal) is coalesced into one `snapshot` event, the
+        /// signal to re-read Status / Pending / Donations / Journal. Metadata only, never content.
+        pub async fn watch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::WatchEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.LocalControl/Watch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.LocalControl", "Watch"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1083,6 +1150,20 @@ pub mod local_control_server {
             tonic::Response<super::LinkCallResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the Watch method.
+        type WatchStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::WatchEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// CONTRACT §20 (`moochy tui`): live dashboard events until the client hangs up. Bounded and
+        /// rate-limited per watcher: at most 20 events per second plus one `snapshot` per 250 ms; what
+        /// does not fit (burst, slow reader, lagged journal) is coalesced into one `snapshot` event, the
+        /// signal to re-read Status / Pending / Donations / Journal. Metadata only, never content.
+        async fn watch(
+            &self,
+            request: tonic::Request<super::WatchRequest>,
+        ) -> std::result::Result<tonic::Response<Self::WatchStream>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct LocalControlServer<T> {
@@ -2006,6 +2087,52 @@ pub mod local_control_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.LocalControl/Watch" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchSvc<T: LocalControl>(pub Arc<T>);
+                    impl<
+                        T: LocalControl,
+                    > tonic::server::ServerStreamingService<super::WatchRequest>
+                    for WatchSvc<T> {
+                        type Response = super::WatchEvent;
+                        type ResponseStream = T::WatchStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalControl>::watch(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

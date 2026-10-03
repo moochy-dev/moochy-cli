@@ -88,7 +88,7 @@ struct Ctl {
     node: Arc<Node>,
 }
 
-fn link_state(node: &Node) -> String {
+pub(crate) fn link_state(node: &Node) -> String {
     if node.offline {
         return "offline".into();
     }
@@ -144,6 +144,14 @@ impl LocalControl for Ctl {
             provider_keys: u32::try_from(n.secrets.providers.len()).unwrap_or(u32::MAX),
             warm_adapters: u32::try_from(n.adapters.len()).unwrap_or(u32::MAX),
             catalog_version: n.catalog().version,
+            keys: n
+                .secrets
+                .providers
+                .iter()
+                .map(|p| crate::pb::local::ProviderKeyInfo { provider: p.provider.clone(), models: p.models.keys().cloned().collect() })
+                .collect(),
+            locked: n.locked,
+            alerts: n.keylog.as_ref().map(|k| k.alerts.borrow().clone()).unwrap_or_default(),
         }))
     }
 
@@ -280,6 +288,14 @@ impl LocalControl for Ctl {
                 }
             }
         });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type WatchStream = ReceiverStream<std::result::Result<crate::pb::local::WatchEvent, Status>>;
+
+    async fn watch(&self, _: Request<crate::pb::local::WatchRequest>) -> std::result::Result<Response<Self::WatchStream>, Status> {
+        let (tx, rx) = mpsc::channel(crate::watch::QUEUE);
+        tokio::spawn(crate::watch::run(self.node.clone(), tx));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
