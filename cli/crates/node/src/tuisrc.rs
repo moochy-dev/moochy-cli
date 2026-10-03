@@ -175,6 +175,12 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             created_at_ms: ms(d.created_at_ms),
         }))
         .collect();
+    // Settings: what `moochy config show` prints (the config file holds no secret), plus the doors.
+    if let Some(serde_json::Value::Object(m)) = cfg.as_ref().and_then(|c| serde_json::to_value(c).ok()) {
+        s.config = m.into_iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect();
+    }
+    s.config.push(("gateway_url".into(), st.gateway_url.clone()));
+    s.config.push(("mcp_url".into(), st.mcp_url.clone()));
     s.devices = vec![model::Device { id: st.device_id.clone(), name: "this device".into(), roles: st.roles.clone(), online: true, this_device: true }];
     s.boxes = boxes
         .iter()

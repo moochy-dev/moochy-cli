@@ -303,8 +303,8 @@ fn tui_argv() -> Option<(Option<PathBuf>, Vec<String>)> {
 /// CONTRACT §20: the dashboard, over `node.sock` (or the demo fixtures, which need no node).
 fn tui(home: Option<PathBuf>, args: &[String]) -> Result<()> {
     let opts = moochy_tui::Options::parse(args).map_err(usage)?;
-    if opts.demo {
-        let mut src = moochy_tui::demo_source();
+    if opts.demo || opts.hostile {
+        let mut src = moochy_tui::fixture_source(&opts);
         if opts.snapshot.is_some() {
             print!("{}", moochy_tui::snapshot(&mut src, &opts).map_err(internal)?);
             return Ok(());
