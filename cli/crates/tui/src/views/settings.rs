@@ -101,12 +101,13 @@ impl View for SettingsView {
             let b = block(th, "Keybindings", false);
             let inner = b.inner(r);
             f.render_widget(b, r);
+            let fit = |l: Line<'static>| crate::widgets::list::fit(l, usize::from(inner.width));
             let mut lines: Vec<Line> = GLOBAL_KEYS
                 .iter()
-                .map(|(k, w)| Line::from(vec![Span::styled(format!("{k:<12}"), th.key()), Span::raw(*w)]))
+                .map(|(k, w)| fit(Line::from(vec![Span::styled(format!("{k:<12}"), th.key()), Span::raw(*w)])))
                 .collect();
             lines.push(Line::raw(""));
-            lines.push(Line::styled("Each tab adds its own keys in the footer and in ?.", th.muted()));
+            lines.push(fit(Line::styled("Each tab adds keys of its own (footer, ?).", th.muted())));
             f.render_widget(Paragraph::new(lines), inner);
         }
     }

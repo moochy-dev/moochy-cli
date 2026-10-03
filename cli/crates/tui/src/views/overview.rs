@@ -115,6 +115,15 @@ impl View for OverviewView {
     }
 }
 
+/// All devices online ●, some ▲ (degraded is attention, not healthy), none ○.
+fn fleet(on: usize, all: usize) -> Glyph {
+    match on {
+        0 => Glyph::Offline,
+        n if n >= all => Glyph::Online,
+        _ => Glyph::Warn,
+    }
+}
+
 fn mood(ctx: &Ctx) -> Mood {
     if !ctx.snap.me.connected {
         Mood::Sleepy
@@ -184,8 +193,8 @@ fn render_card(f: &mut Frame, area: Rect, ctx: &Ctx, fold: bool) {
     });
     if fold {
         let on = s.devices.iter().filter(|d| d.online).count();
-        let g = if on == s.devices.len() { Glyph::Online } else { Glyph::Offline };
-        lines.push(Line::from(vec![Span::styled(format!("{} ", t.glyph(g)), t.glyph_style(g)), Span::raw(format!("{on}/{} devices", s.devices.len()))]));
+        let g = fleet(on, s.devices.len());
+        lines.push(Line::from(vec![Span::styled(format!("{} ", t.glyph(g)), t.glyph_style(g)), Span::raw(format!("{on}/{} online", s.devices.len()))]));
         let (sv, us, _) = live_counts(ctx);
         lines.push(Line::from(vec![
             Span::styled(format!("{}{sv} ", t.glyph(Glyph::Served)), t.money()),
@@ -220,7 +229,7 @@ fn tile_money(f: &mut Frame, area: Rect, ctx: &Ctx, title: &str, per_day: &[u64]
     f.render_widget(Paragraph::new(w::list::fit(Line::from(l), usize::from(num.width))), num);
     // Always the last 30 days, spread over the whole width (the period never depends on it).
     let days = per_day.get(per_day.len().saturating_sub(TREND_DAYS)..).unwrap_or_default();
-    let data = charts::resample(days, usize::from(spark.width));
+    let data = charts::floor_zeros(charts::resample(days, usize::from(spark.width)));
     f.render_widget(charts::sparkline(t, &data, style), spark);
     let caption = if days.is_empty() { "no data yet".to_string() } else { format!("last {TREND_DAYS} days") };
     f.render_widget(Paragraph::new(Line::from(w::muted(t, caption))), cap);
@@ -254,7 +263,7 @@ fn tile_devices(f: &mut Frame, area: Rect, ctx: &Ctx) {
     let on = s.devices.iter().filter(|d| d.online).count();
     let boxes = s.boxes.iter().filter(|b| b.online).count();
     let keys = s.keys.iter().filter(|k| k.present).count();
-    let g = if on == s.devices.len() { Glyph::Online } else { Glyph::Offline };
+    let g = fleet(on, s.devices.len());
     let lines = vec![
         Line::from(vec![Span::styled(format!("{} ", t.glyph(g)), t.glyph_style(g)), Span::raw(format!("{on}/{} online", s.devices.len()))]),
         Line::from(vec![Span::styled(format!("{} ", t.glyph(Glyph::Online)), t.info()), Span::raw(format!("{boxes}/{} boxes up", s.boxes.len()))]),
@@ -275,10 +284,12 @@ fn render_meters(f: &mut Frame, area: Rect, ctx: &Ctx) {
     }
     let name_w = usize::from((inner.width / 5).saturating_mul(2).clamp(14, 34)).saturating_sub(3);
     let mut lines = Vec::new();
-    for d in ctx.snap.donations.iter().take(usize::from(inner.height)) {
+    let shown: Vec<_> = ctx.snap.donations.iter().take(usize::from(inner.height)).collect();
+    let names: Vec<String> = shown.iter().map(|d| clean(if d.target.is_empty() { &d.person } else { &d.target })).collect();
+    let drop = w::hosts_dropped(names.iter().map(|n| (n.as_str(), name_w)));
+    for (d, n) in shown.into_iter().zip(&names) {
         let g = w::status_glyph(&d.status);
-        let target = if d.target.is_empty() { &d.person } else { &d.target };
-        let name = w::trunc(&w::short_slug(&clean(target), name_w), name_w);
+        let name = w::trunc(&w::slug(n, drop), name_w);
         let money = format!(" {:>8}", w::dollars(d.spent_uusd));
         let meter_w = usize::from(inner.width).saturating_sub(name_w).saturating_sub(3).saturating_sub(money.len());
         let mut l = vec![Span::styled(format!("{} ", t.glyph(g)), t.glyph_style(g)), Span::raw(format!("{name:<name_w$} "))];
@@ -301,15 +312,21 @@ fn render_needs(f: &mut Frame, area: Rect, ctx: &Ctx) {
     f.render_widget(b, area);
     let wd = usize::from(inner.width);
     let mut lines = Vec::new();
+    let room_of = |p: &crate::model::Pending| {
+        let subject = w::trunc(&clean(&p.subject), wd.saturating_sub(8).min(24));
+        wd.saturating_sub(subject.chars().count()).saturating_sub(w::ago(ctx.now_ms, p.created_at_ms).len()).saturating_sub(6)
+    };
+    let targets: Vec<String> = s.pending.iter().map(|p| clean(&p.target)).collect();
+    let drop = w::hosts_dropped(targets.iter().zip(&s.pending).map(|(t, p)| (t.as_str(), room_of(p))));
     for p in &s.pending {
         let when = w::ago(ctx.now_ms, p.created_at_ms);
         let subject = w::trunc(&clean(&p.subject), wd.saturating_sub(8).min(24));
-        let room = wd.saturating_sub(subject.chars().count()).saturating_sub(when.len()).saturating_sub(6);
+        let room = room_of(p);
         let arrow = if t.ascii { "->" } else { "→" };
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", t.glyph(Glyph::Pending)), t.warn()),
             Span::styled(subject, t.bold()),
-            w::muted(t, format!(" {arrow} {} ", w::trunc(&w::short_slug(&clean(&p.target), room), room))),
+            w::muted(t, format!(" {arrow} {} ", w::trunc(&w::slug(&clean(&p.target), drop), room))),
             w::muted(t, when),
         ]));
     }
@@ -343,10 +360,12 @@ fn render_live(f: &mut Frame, area: Rect, ctx: &Ctx) {
     let mut lines = vec![Line::styled(head, t.muted().add_modifier(Modifier::BOLD))];
     let mut rows: Vec<_> = ctx.snap.served.iter().collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.at_ms));
-    for r in rows.into_iter().take(usize::from(inner.height.saturating_sub(1))) {
+    rows.truncate(usize::from(inner.height.saturating_sub(1)));
+    let drop = w::hosts_dropped(rows.iter().map(|r| (r.project.as_str(), proj_w.saturating_sub(1))));
+    for r in rows {
         let (dg, ds) = if r.direction == "served" { (Glyph::Served, t.money()) } else { (Glyph::Used, t.ok()) };
         let og = w::status_glyph(&r.outcome);
-        let project = w::trunc(&w::short_slug(&clean(&r.project), proj_w.saturating_sub(1)), proj_w.saturating_sub(1));
+        let project = w::trunc(&w::slug(&clean(&r.project), drop), proj_w.saturating_sub(1));
         let mut l = vec![
             w::muted(t, format!("{:>4}  ", w::ago(ctx.now_ms, r.at_ms))),
             Span::styled(format!("{} ", t.glyph(dg)), ds),
@@ -360,21 +379,21 @@ fn render_live(f: &mut Frame, area: Rect, ctx: &Ctx) {
             l.push(w::muted(t, format!("  {:>7}  ", w::latency(r.latency_ms))));
             l.push(Span::styled(clean(&r.outcome), t.glyph_style(og)));
         }
-        lines.push(Line::from(l));
+        let l = Line::from(l);
+        lines.push(if r.at_ms > ctx.fresh_ms { l.style(t.accent()) } else { l });
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_welcome(f: &mut Frame, area: Rect, ctx: &Ctx) {
     let t = *ctx.theme;
-    let mut lines = hamster(t, mood(ctx));
-    lines.extend([
-        Line::raw(""),
-        Line::styled("Nothing here yet — let's change that.", t.accent()),
-        Line::raw(""),
+    let mut lines = w::align_block(hamster(t, mood(ctx)));
+    lines.extend([Line::raw(""), Line::styled("Nothing here yet — let's change that.", t.accent()), Line::raw("")]);
+    // One block, centred as a whole: the label column lines up.
+    lines.extend(w::align_block(vec![
         Line::from(vec![Span::styled("Donate    ", t.money()), w::key("moochy donate --repo github/owner/name --cap $20")]),
         Line::from(vec![Span::styled("Maintain  ", t.ok()), w::key("moochy claim github/you/repo")]),
         Line::from(vec![Span::styled("Learn     ", t.info()), Span::raw(format!("{}/docs", w::web_origin(&ctx.snap.me.web)))]),
-    ]);
+    ]));
     w::empty(f, area, t, "Welcome", lines);
 }

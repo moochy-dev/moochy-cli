@@ -1,6 +1,6 @@
 # devices 80x24 dark (light: same text)
  ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Devices & keys 8 Log 9 Prefs
+ 1 Home 2 Donated 3 Live 4 Repos 5 Orgs 6 Decide 7 Devices & keys 8 Log 9 Prefs
 Keys stay on this machine. Moochy never stores them online.
 ╭ Devices & keys ──────────────────────────────────────────────────────────────╮
 │   State      Name                            Details                         │
@@ -11,21 +11,21 @@ Keys stay on this machine. Moochy never stores them online.
 │   ────────── Provider keys · 4                                               │
 │   ✔ present  anthropic                       claude-opus-5-5, claude-sonnet… │
 │   ✔ present  deepseek                        deepseek-v4                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
+│   ■ absent   openai                          -                               │
+│   ✔ present  ollama (local)                  qwen3-coder:30b                 │
+╰─────────────────────────────────────────────────────────────────── ↓ 6 more ─╯
 ╭ Safety ──────────────────────────────────────────────────────────────────────╮
 │ Lockdown   ✔ locked down (landlock + seccomp)                                │
-│                                                                              │
-│ Doctor                                                                       │
-│   ✔ connected to relay.moochy.dev                                            │
-│   ✔ 2 of 3 devices online                                                    │
-│   ✔ 3 provider keys (anthropic, deepseek, ollama (local))                    │
-│   ▲ 1 cloud box expires within 24 h                                          │
-│   full check: moochy doctor                                                  │
+│ Doctor     ✔ connected to relay.moochy.dev                                   │
+│            ▲ 2 of 3 devices online                                           │
+│            ✔ 3 provider keys (anthropic, deepseek, ollama (local))           │
+│            ▲ 1 cloud box expires within 24 h                                 │
+│            full check: moochy doctor                                         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
  x revoke box/token  / filter  : commands  q quit  ? help
 # devices 80x24 --ascii
  (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Devices & keys 8 Log 9 Prefs
+ 1 Home 2 Donated 3 Live 4 Repos 5 Orgs 6 Decide 7 Devices & keys 8 Log 9 Prefs
 Keys stay on this machine. Moochy never stores them online.
 + Devices & keys --------------------------------------------------------------+
 |   State      Name                            Details                         |
@@ -36,15 +36,15 @@ Keys stay on this machine. Moochy never stores them online.
 |   ---------- Provider keys - 4                                               |
 |   + present  anthropic                       claude-opus-5-5, claude-sonnet~ |
 |   + present  deepseek                        deepseek-v4                     |
-+------------------------------------------------------------------------------+
+|   # absent   openai                          -                               |
+|   + present  ollama (local)                  qwen3-coder:30b                 |
++------------------------------------------------------------------- v 6 more -+
 + Safety ----------------------------------------------------------------------+
 | Lockdown   + locked down (landlock + seccomp)                                |
-|                                                                              |
-| Doctor                                                                       |
-|   + connected to relay.moochy.dev                                            |
-|   + 2 of 3 devices online                                                    |
-|   + 3 provider keys (anthropic, deepseek, ollama (local))                    |
-|   ! 1 cloud box expires within 24 h                                          |
-|   full check: moochy doctor                                                  |
+| Doctor     + connected to relay.moochy.dev                                   |
+|            ! 2 of 3 devices online                                           |
+|            + 3 provider keys (anthropic, deepseek, ollama (local))           |
+|            ! 1 cloud box expires within 24 h                                 |
+|            full check: moochy doctor                                         |
 +------------------------------------------------------------------------------+
  x revoke box/token  / filter  : commands  q quit  ? help

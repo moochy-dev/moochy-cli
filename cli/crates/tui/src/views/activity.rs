@@ -109,6 +109,7 @@ impl View for ActivityView {
             .highlight_symbol(list::marker(t))
             .block(w::block_focus(t, title));
         f.render_stateful_widget(table, list_a, &mut self.cur.state);
+        self.cur.more(f, list_a, t);
         if let (Some(area), Some(a)) = (detail, self.cur.selected().and_then(|i| rows.get(i))) {
             let mut lines = vec![
                 Line::from(vec![w::muted(t, format!("{}  ", w::datetime(a.at_ms))), w::muted(t, format!("({})  ", w::ago_long(ctx.now_ms, a.at_ms))), kind(t, a)]),

@@ -166,9 +166,10 @@ impl Source for FakeSource {
             tokens_out: tokens / 6,
             cost_uusd: tokens.saturating_mul(4),
             latency_ms: 300u64.saturating_add(self.ticks.wrapping_mul(613) % 2_400),
-            outcome: "ok".into(),
+            outcome: if self.ticks.is_multiple_of(7) { "error" } else { "ok" }.into(),
         };
-        let toast = (self.ticks % 4 == 1).then(|| format!("{} {} for {}", if row.direction == "served" { "Served" } else { "Used" }, row.model, row.project));
+        // Routine requests flash their row; only a failure is worth a toast.
+        let toast = (row.outcome == "error").then(|| format!("A request for {} failed (provider error)", row.project));
         self.state.served.insert(0, row);
         self.state.served.truncate(200);
         toast

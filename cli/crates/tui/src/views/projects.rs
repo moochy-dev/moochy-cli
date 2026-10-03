@@ -65,6 +65,9 @@ fn detail(ctx: &Ctx, key: K) -> (String, Vec<Line<'static>>) {
             } else {
                 v.push(w::kv(t, "This month", format!("{} used (no goal set)", w::dollars(p.month_uusd))));
             }
+            if p.per_day_uusd.iter().any(|&x| x > 0) {
+                v.push(Line::from(vec![w::muted(t, format!("{:<10} ", "30 days")), charts::spark_text(t, &p.per_day_uusd, 30, t.money())]));
+            }
             v.push(w::kv(t, "Donors", format!("{} active{}{} waiting", p.donors, w::dot(t), p.pending)));
             v.push(list_or(t, "Members", &p.members, "only you"));
             v.push(list_or(t, "Funded by", &p.funded_by, "no organisation"));

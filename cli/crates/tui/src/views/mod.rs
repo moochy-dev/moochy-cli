@@ -27,6 +27,8 @@ pub struct Ctx<'a> {
     /// The `/` filter text, if any, for the focused list.
     pub filter: &'a str,
     pub now_ms: u64,
+    /// Requests newer than this (`at_ms >`) just arrived: lists flash them. `u64::MAX` = none.
+    pub fresh_ms: u64,
 }
 
 /// A shell command: what palette entries, the global keys and views (via [`Outcome::Command`])

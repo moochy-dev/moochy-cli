@@ -27,6 +27,17 @@ pub fn sparkline(t: Theme, data: &[u64], style: Style) -> Sparkline<'_> {
     if t.ascii { s.bar_set(ASCII_BARS) } else { s }
 }
 
+/// Zero values raised to the lowest visible bar (1/16 of the largest), so a quiet day reads as
+/// low rather than missing in a [`sparkline`].
+#[must_use]
+pub fn floor_zeros(mut data: Vec<u64>) -> Vec<u64> {
+    let floor = (data.iter().copied().max().unwrap_or(0) / 16).max(1);
+    if data.iter().any(|&v| v > 0) {
+        data.iter_mut().filter(|v| **v == 0).for_each(|v| *v = floor);
+    }
+    data
+}
+
 /// Parts per thousand of `used` over `total` (0 when `total` is 0), capped at 1000.
 #[must_use]
 pub fn permille(used: u64, total: u64) -> u64 {
@@ -99,7 +110,8 @@ pub fn spark_text(t: Theme, data: &[u64], width: usize, style: Style) -> Span<'s
     let set = if t.ascii { &A } else { &U };
     let s: String = data
         .iter()
-        .map(|&v| if v == 0 { " " } else { set.get((permille(v, max).saturating_mul(7) / 1000) as usize).copied().unwrap_or("#") })
+        // A quiet day (0) is the lowest bar, not a gap: low, never missing.
+        .map(|&v| set.get((permille(v, max).saturating_mul(7) / 1000) as usize).copied().unwrap_or("#"))
         .collect();
     Span::styled(s, style)
 }
@@ -116,6 +128,7 @@ mod tests {
         assert_eq!(bar(t, 30, 10, 4, Style::default()).to_string(), "####");
         assert_eq!(bar(t, 3, 0, 4, Style::default()).to_string(), "----");
         assert_eq!(spark_text(t, &[0, 1, 2, 4, 8], 4, Style::default()).content, "..-#");
+        assert_eq!(spark_text(Theme::default(), &[0, 8], 2, Style::default()).content, "▁█");
         assert_eq!(resample(&[1, 2, 3], 6), vec![1, 1, 2, 2, 3, 3]);
         assert_eq!(resample(&[1, 3, 5, 7], 2), vec![2, 6]);
         assert_eq!(resample(&[], 5), Vec::<u64>::new());

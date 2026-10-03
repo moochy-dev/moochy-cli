@@ -95,9 +95,10 @@ fn org_detail(t: Theme, ctx: &Ctx, o: &Org) -> Vec<Line<'static>> {
         out.push(Line::from(w::bold("Covered repos")));
         let top = o.covered.iter().map(|c| c.share_cap_uusd.max(c.used_uusd)).max().unwrap_or(0);
         let name_w = o.covered.iter().map(|c| c.slug.chars().count()).max().unwrap_or(0).min(28);
+        let drop = w::hosts_dropped(o.covered.iter().map(|c| (c.slug.as_str(), name_w)));
         for c in &o.covered {
             let (of, style) = if c.share_cap_uusd == 0 { (top, t.ok()) } else { (c.share_cap_uusd, if c.used_uusd >= c.share_cap_uusd { t.err() } else { t.ok() }) };
-            let mut l = vec![Span::raw(format!("  {:<name_w$} ", w::trunc(&w::short_slug(&clean(&c.slug), name_w), name_w)))];
+            let mut l = vec![Span::raw(format!("  {:<name_w$} ", w::trunc(&w::slug(&clean(&c.slug), drop), name_w)))];
             l.extend(charts::bar(t, c.used_uusd, of, 12, style).spans);
             l.push(w::muted(t, format!(" {}", cap_text(c.used_uusd, c.share_cap_uusd))));
             out.push(Line::from(l));

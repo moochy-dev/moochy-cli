@@ -3,13 +3,13 @@
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 Keys stay on this machine. Moochy never stores them online.                                  ╭ Safety ─────────────────────────────────────────────────────────╮
 ╭ Devices & keys ───────────────────────────────────────────────────────────────────────────╮│ Lockdown   ✔ locked down (landlock + seccomp)                   │
-│   State      Name                                   Details                               ││                                                                 │
-│   ────────── Devices · 3                                                                  ││ Doctor                                                          │
-│ ▶ ● online   alice-mbp · this device                donor, maintainer                     ││   ✔ connected to relay.moochy.dev                               │
-│   ● online   garage-tower (4090)                    donor                                 ││   ✔ 2 of 3 devices online                                       │
-│   ○ offline  pi-headless                            donor                                 ││   ✔ 3 provider keys (anthropic, deepseek, ollama (local))       │
-│   ────────── Provider keys · 4                                                            ││   ▲ 1 cloud box expires within 24 h                             │
-│   ✔ present  anthropic                              claude-opus-5-5, claude-sonnet-5-5, … ││   full check: moochy doctor                                     │
+│   State      Name                                   Details                               ││ Doctor     ✔ connected to relay.moochy.dev                      │
+│   ────────── Devices · 3                                                                  ││            ▲ 2 of 3 devices online                              │
+│ ▶ ● online   alice-mbp · this device                donor, maintainer                     ││            ✔ 3 provider keys (anthropic, deepseek, ollama       │
+│   ● online   garage-tower (4090)                    donor                                 ││ (local))                                                        │
+│   ○ offline  pi-headless                            donor                                 ││            ▲ 1 cloud box expires within 24 h                    │
+│   ────────── Provider keys · 4                                                            ││            full check: moochy doctor                            │
+│   ✔ present  anthropic                              claude-opus-5-5, claude-sonnet-5-5, … ││                                                                 │
 │   ✔ present  deepseek                               deepseek-v4                           ││                                                                 │
 │   ■ absent   openai                                 -                                     ││                                                                 │
 │   ✔ present  ollama (local)                         qwen3-coder:30b                       ││                                                                 │
@@ -52,13 +52,13 @@ Keys stay on this machine. Moochy never stores them online.                     
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 Keys stay on this machine. Moochy never stores them online.                                  + Safety ---------------------------------------------------------+
 + Devices & keys ---------------------------------------------------------------------------+| Lockdown   + locked down (landlock + seccomp)                   |
-|   State      Name                                   Details                               ||                                                                 |
-|   ---------- Devices - 3                                                                  || Doctor                                                          |
-| > * online   alice-mbp - this device                donor, maintainer                     ||   + connected to relay.moochy.dev                               |
-|   * online   garage-tower (4090)                    donor                                 ||   + 2 of 3 devices online                                       |
-|   o offline  pi-headless                            donor                                 ||   + 3 provider keys (anthropic, deepseek, ollama (local))       |
-|   ---------- Provider keys - 4                                                            ||   ! 1 cloud box expires within 24 h                             |
-|   + present  anthropic                              claude-opus-5-5, claude-sonnet-5-5, ~ ||   full check: moochy doctor                                     |
+|   State      Name                                   Details                               || Doctor     + connected to relay.moochy.dev                      |
+|   ---------- Devices - 3                                                                  ||            ! 2 of 3 devices online                              |
+| > * online   alice-mbp - this device                donor, maintainer                     ||            + 3 provider keys (anthropic, deepseek, ollama       |
+|   * online   garage-tower (4090)                    donor                                 || (local))                                                        |
+|   o offline  pi-headless                            donor                                 ||            ! 1 cloud box expires within 24 h                    |
+|   ---------- Provider keys - 4                                                            ||            full check: moochy doctor                            |
+|   + present  anthropic                              claude-opus-5-5, claude-sonnet-5-5, ~ ||                                                                 |
 |   + present  deepseek                               deepseek-v4                           ||                                                                 |
 |   # absent   openai                                 -                                     ||                                                                 |
 |   + present  ollama (local)                         qwen3-coder:30b                       ||                                                                 |

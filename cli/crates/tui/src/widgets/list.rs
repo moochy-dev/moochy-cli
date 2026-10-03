@@ -66,6 +66,27 @@ pub fn fit(line: Line<'static>, w: usize) -> Line<'static> {
     Line::from(spans).style(line.style)
 }
 
+/// `↑ 3 · ↓ 12 more` on the bottom border of a list that does not show all its rows, so nothing
+/// is ever hidden silently (k9s / lazygit show a position too). `offset` = first row shown.
+pub fn more(f: &mut Frame, area: Rect, t: Theme, offset: usize, shown: usize, len: usize) {
+    let below = len.saturating_sub(offset).saturating_sub(shown);
+    if offset == 0 && below == 0 {
+        return;
+    }
+    let (up, down) = if t.ascii { ("^", "v") } else { ("↑", "↓") };
+    let text = match (offset, below) {
+        (0, b) => format!(" {down} {b} more "),
+        (a, 0) => format!(" {up} {a} more "),
+        (a, b) => format!(" {up} {a} · {down} {b} more "),
+    };
+    let w = Line::raw(text.as_str()).width() as u16;
+    if area.height < 2 || area.width < w.saturating_add(4) {
+        return;
+    }
+    let r = Rect { x: area.right().saturating_sub(w).saturating_sub(2), y: area.bottom().saturating_sub(1), width: w, height: 1 };
+    f.render_widget(Paragraph::new(Line::styled(text, t.accent())), r);
+}
+
 /// A cursor over a table drawn inside a bordered block with one header row.
 #[derive(Default, Debug)]
 pub struct TableCursor {
@@ -105,6 +126,11 @@ impl TableCursor {
     #[must_use]
     pub fn selected(&self) -> Option<usize> {
         self.state.selected().filter(|&i| i < self.len)
+    }
+
+    /// The `↓ N more` marker for the table just drawn in `area` (call after rendering it).
+    pub fn more(&self, f: &mut Frame, area: Rect, t: Theme) {
+        more(f, area, t, self.state.offset(), usize::from(self.body.height), self.len);
     }
 
     pub fn select(&mut self, i: usize) {
@@ -226,6 +252,7 @@ impl TreeList {
         });
         let list = List::new(items).block(block_focus(t, counted(title, rows.len(), total))).highlight_symbol(marker(t)).highlight_style(t.selected());
         f.render_stateful_widget(list, list_a, &mut self.state);
+        more(f, list_a, t, self.state.offset(), usize::from(list_a.height.saturating_sub(2)), rows.len());
         if let Some(d) = det_a {
             f.render_widget(Paragraph::new(detail.1).wrap(Wrap { trim: false }).block(block(t, detail.0)), d);
         }

@@ -1,6 +1,6 @@
 # activity 80x24 dark (light: same text)
  ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Activity 9 Prefs
+ 1 Home 2 Donated 3 Live 4 Repos 5 Orgs 6 Decide 7 Keys 8 Activity 9 Prefs
 ╭ Journal · 8 ─────────────────────────────────────────────────────────────────╮
 │   Age  Kind        Entry                                                     │
 │ ▶ 4m   ◉ receipt   Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2… │
@@ -25,7 +25,7 @@
  g/G newest/oldest  / filter  : commands  q quit  ? help
 # activity 80x24 --ascii
  (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Activity 9 Prefs
+ 1 Home 2 Donated 3 Live 4 Repos 5 Orgs 6 Decide 7 Keys 8 Activity 9 Prefs
 + Journal - 8 -----------------------------------------------------------------+
 |   Age  Kind        Entry                                                     |
 | > 4m   $ receipt   Served claude-sonnet-5-5 for github/tokio-rs/axum - 18.2~ |

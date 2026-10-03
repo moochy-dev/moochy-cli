@@ -1,6 +1,6 @@
 # projects 80x24 dark (light: same text)
  ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
- 1 Home 2 Given 3 Served 4 Projects 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
+ 1 Home 2 Donated 3 Live 4 Projects 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
 ╭ Projects · 5 ────────────────────────────────────────────────────────────────╮
 │ ▶ ● active        github/acme/widgets   $31.25 of $50.00                     │
 │     ◆ waiting     @grace               $25.00/month · claude-sonnet-5-5 · c… │
@@ -17,15 +17,15 @@
 │ Status     ● active                                                          │
 │ This month $31.25 of $50.00 goal                                             │
 │            ████████████░░░░░░░░  62%                                         │
+│ 30 days    ▁▂▃▃▄▅▆▇▁▂▂▃▄▅▅▆▇▁▂▃▄▄▅▆▇█▂▃▃▄                                    │
 │ Donors     7 active · 2 waiting                                              │
 │ Members    alice, bob, chen                                                  │
 │ Funded by  @dana, @eve, org:acme                                             │
-│ Page       https://moochy.dev/p/github/acme/widgets                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
  a accept  r refuse  / filter  : commands  q quit  ? help
 # projects 80x24 --ascii
  (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
- 1 Home 2 Given 3 Served 4 Projects 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
+ 1 Home 2 Donated 3 Live 4 Projects 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
 + Projects - 5 ----------------------------------------------------------------+
 | > * active        github/acme/widgets   $31.25 of $50.00                     |
 |     ~ waiting     @grace               $25.00/month - claude-sonnet-5-5 - c~ |
@@ -42,9 +42,9 @@
 | Status     * active                                                          |
 | This month $31.25 of $50.00 goal                                             |
 |            ############--------  62%                                         |
+| 30 days    ..__--=#..._---=#.._---=##.__-                                    |
 | Donors     7 active - 2 waiting                                              |
 | Members    alice, bob, chen                                                  |
 | Funded by  @dana, @eve, org:acme                                             |
-| Page       https://moochy.dev/p/github/acme/widgets                          |
 +------------------------------------------------------------------------------+
  a accept  r refuse  / filter  : commands  q quit  ? help

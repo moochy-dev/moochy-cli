@@ -115,18 +115,23 @@ impl DonationsView {
         spent.extend(charts::meter(t, d.spent_uusd, d.budget_uusd, 16).spans);
         v.push(Line::from(spent));
         v.push(w::kv(t, "Left", w::dollars(d.budget_uusd.saturating_sub(d.spent_uusd))));
+        // The share link (§22.3) high up, so it is on screen at 80×24.
+        if let Some(url) = share_url(web, d) {
+            v.push(w::kv_span(t, "Share", Span::styled(url, t.info())));
+        }
         if d.per_day_uusd.iter().any(|&x| x > 0) {
             let days = d.per_day_uusd.len().min(30);
             v.push(Line::from(vec![Span::styled(format!("{:<10} ", format!("{days} days")), t.muted()), charts::spark_text(t, &d.per_day_uusd, 30, t.money())]));
         }
-        if d.renews_at_ms > 0 && live(d) {
-            v.push(w::kv(t, "Renews", format!("{} ({})", w::date(d.renews_at_ms), w::until(now, d.renews_at_ms))));
-        }
-        v.push(w::kv(t, "Schedule", if d.schedule.is_empty() { "any time".to_owned() } else { clean(&d.schedule) }));
+        // One line for when it runs and when it starts again.
+        let base = if d.schedule.is_empty() { "any time".to_owned() } else { clean(&d.schedule) };
+        let sched = if d.renews_at_ms > 0 && live(d) {
+            format!("{base}{}renews {} ({})", w::dot(t), w::day_month(d.renews_at_ms), w::until(now, d.renews_at_ms))
+        } else {
+            base
+        };
+        v.push(w::kv(t, "Schedule", sched));
         v.push(w::kv(t, "Models", if d.models.is_empty() { "any model you have a key for".to_owned() } else { d.models.iter().map(|m| clean(m)).collect::<Vec<_>>().join(", ") }));
-        if let Some(url) = share_url(web, d) {
-            v.push(w::kv_span(t, "Share", Span::styled(url, t.info())));
-        }
         if d.org || !d.person.is_empty() {
             v.push(Line::default());
             v.push(Line::from(w::bold("Projects funded this month")));
@@ -138,8 +143,9 @@ impl DonationsView {
             repos.sort_by_key(|r| std::cmp::Reverse(r.1));
             let top = repos.first().map_or(0, |r| r.1);
             let name_w = usize::from(width.saturating_sub(26)).clamp(8, 40);
+            let drop = w::hosts_dropped(repos.iter().take(MAX_REPOS).map(|r| (r.0.as_str(), name_w)));
             for (name, used) in repos.iter().take(MAX_REPOS) {
-                let n = w::trunc(&w::short_slug(&clean(name), name_w), name_w);
+                let n = w::trunc(&w::slug(&clean(name), drop), name_w);
                 let mut l = vec![Span::styled(format!("  {:>8} ", w::dollars(*used)), t.money())];
                 l.extend(charts::bar(t, *used, top, 10, t.money()).spans);
                 l.push(Span::raw(format!(" {n}")));
@@ -175,7 +181,7 @@ impl View for DonationsView {
     }
 
     fn labels(&self) -> (&'static str, &'static str) {
-        ("Donations", "Given")
+        ("Donations", "Donated")
     }
 
     fn hints(&self) -> &'static [(&'static str, &'static str)] {
@@ -224,13 +230,14 @@ impl View for DonationsView {
                 header.push("Schedule");
             }
             let cw = list::table_widths(list_a, &widths);
+            let room = |d: &Donation| cw.get(1).copied().unwrap_or(0).saturating_sub(if kind(d) == "project" { 0 } else { 7 });
+            let drop = w::hosts_dropped(rows.iter().map(|d| (target(d), room(d))));
             let body = rows.iter().map(|d| {
                 let mut who = Vec::new();
                 if kind(d) != "project" {
                     who.push(w::muted(t, format!("{} ", kind(d))));
                 }
-                let name_w = cw.get(1).copied().unwrap_or(0).saturating_sub(if kind(d) == "project" { 0 } else { 7 });
-                who.push(Span::raw(w::short_slug(&clean(target(d)), name_w)));
+                who.push(Span::raw(w::slug(&clean(target(d)), drop)));
                 let mut cells = vec![
                     Cell::from(badge(t, d)),
                     Cell::from(list::fit(Line::from(who), cw.get(1).copied().unwrap_or(0))),
@@ -254,6 +261,7 @@ impl View for DonationsView {
                 .highlight_symbol(list::marker(t))
                 .block(w::block_focus(t, title));
             f.render_stateful_widget(table, list_a, &mut self.cur.state);
+            self.cur.more(f, list_a, t);
         }
         if let (Some(area), Some(d)) = (detail, self.cur.selected().and_then(|i| rows.get(i))) {
             let title = format!("{} {}", kind(d), clean(target(d)));
@@ -370,7 +378,7 @@ mod tests {
         }
         let t = themes()[0];
         let out = draw(&mut DonationsView::default(), &ctx(&s, &t, ""), 160, 48);
-        assert!(out.contains("Renews") && out.contains("in 3d") && out.contains("4 days"), "{out}");
+        assert!(out.contains("renews") && out.contains("in 3d") && out.contains("4 days"), "{out}");
         let e = Snapshot::default();
         let out = draw(&mut DonationsView::default(), &ctx(&e, &t, ""), 80, 24);
         assert!(out.contains("No donations yet") && out.contains("moochy donate"), "{out}");

@@ -36,7 +36,7 @@ pub enum Signal {
 /// The global bindings: one table for the footer, the help overlay, the palette and Settings.
 pub const GLOBAL_KEYS: &[(&str, &str)] = &[
     ("1-9", "go to tab"),
-    ("tab/S-tab", "next / previous tab (also ] and [)"),
+    ("tab/S-tab", "next / prev tab, also ] ["),
     ("j/k arrows", "move"),
     ("g/G", "first / last"),
     ("PgUp/PgDn", "page"),
@@ -44,7 +44,7 @@ pub const GLOBAL_KEYS: &[(&str, &str)] = &[
     ("/", "filter this list"),
     ("esc", "clear filter / back"),
     (": ctrl-k", "command palette"),
-    ("ctrl-r", "refresh (r too, where the tab has no r)"),
+    ("ctrl-r", "refresh (also r)"),
     ("?", "help"),
     ("ctrl-z", "suspend"),
     ("q", "quit"),
@@ -54,6 +54,9 @@ const FOOTER_GLOBAL: &[(&str, &str)] = &[("/", "filter"), (":", "commands"), ("?
 const TOAST_MS: u64 = 4_000;
 const MAX_TOASTS: usize = 3;
 const MAX_INPUT: usize = 64;
+const FLASH_MS: u64 = 1_000;
+const SMILE_MS: u64 = 1_500;
+const SMILE_EVERY_MS: u64 = 10_000;
 const MAX_EARLY_KEYS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,8 +105,13 @@ pub struct App {
     pub external: Option<Vec<String>>,
     pub now_ms: u64,
     /// Last served/used count, to make the hamster happy when a new request shows up.
-    last_served: usize,
+    /// Newest request time seen (a newer one is "new").
+    last_served: u64,
     happy_until_ms: u64,
+    last_smile_ms: u64,
+    /// Rows newer than `fresh_from_ms` flash until `fresh_until_ms`.
+    fresh_from_ms: u64,
+    fresh_until_ms: u64,
     /// Keys typed before the first snapshot (bounded): replayed once there is data to act on.
     early: Vec<KeyEvent>,
     tab_hits: Vec<(u16, u16, usize)>,
@@ -153,6 +161,9 @@ impl App {
             now_ms,
             last_served: 0,
             happy_until_ms: 0,
+            last_smile_ms: 0,
+            fresh_from_ms: 0,
+            fresh_until_ms: 0,
             early: Vec::new(),
             tab_hits: Vec::new(),
             tab_row: 1,
@@ -173,8 +184,14 @@ impl App {
     /// When the next toast expires, so the loop can wake up for it (no timer otherwise).
     #[must_use]
     pub fn next_deadline(&self) -> Option<u64> {
-        let t = self.toasts.iter().map(|t| t.until_ms).min();
-        if self.happy_until_ms > self.now_ms { t.map_or(Some(self.happy_until_ms), |t| Some(t.min(self.happy_until_ms))) } else { t }
+        let now = self.now_ms;
+        self.toasts.iter().map(|t| t.until_ms).chain([self.happy_until_ms, self.fresh_until_ms]).filter(|&d| d > now).min()
+    }
+
+    /// True while the hamster smiles about a new request.
+    #[must_use]
+    pub fn smiling(&self) -> bool {
+        self.happy_until_ms > self.now_ms
     }
 
     /// Drops expired toasts; true when something disappeared.
@@ -182,7 +199,9 @@ impl App {
         let n = self.toasts.len();
         let now = self.now_ms;
         self.toasts.retain(|t| t.until_ms > now);
-        n != self.toasts.len() || (self.happy_until_ms != 0 && self.happy_until_ms <= now && std::mem::take(&mut self.happy_until_ms) != 0)
+        let smile_over = self.happy_until_ms != 0 && self.happy_until_ms <= now && std::mem::take(&mut self.happy_until_ms) != 0;
+        let flash_over = self.fresh_until_ms != 0 && self.fresh_until_ms <= now && std::mem::take(&mut self.fresh_until_ms) != 0;
+        n != self.toasts.len() || smile_over || flash_over
     }
 
     pub fn toast(&mut self, glyph: Glyph, text: &str) {
@@ -217,11 +236,18 @@ impl App {
             AppEvent::Term(Event::Resize(..) | Event::FocusGained) | AppEvent::Signal(Signal::Resumed) => true,
             AppEvent::Term(_) => false,
             AppEvent::Source(SourceEvent::Snapshot(s)) => {
-                let served = s.served.len();
-                if served > self.last_served && self.conn == Conn::Live {
-                    self.happy_until_ms = self.now_ms.saturating_add(TOAST_MS);
+                // A new request: its row flashes for a second; the hamster smiles, at most once
+                // every 10 s so the smile still means something.
+                let newest = s.served.iter().map(|r| r.at_ms).max().unwrap_or(0);
+                if newest > self.last_served && self.conn == Conn::Live {
+                    self.fresh_from_ms = self.last_served;
+                    self.fresh_until_ms = self.now_ms.saturating_add(FLASH_MS);
+                    if self.now_ms >= self.last_smile_ms.saturating_add(SMILE_EVERY_MS) {
+                        self.happy_until_ms = self.now_ms.saturating_add(SMILE_MS);
+                        self.last_smile_ms = self.now_ms;
+                    }
                 }
-                self.last_served = served;
+                self.last_served = newest;
                 self.snap = *s;
                 self.conn = Conn::Live;
                 self.replay_early();
@@ -487,7 +513,8 @@ impl App {
         }
         let empty = String::new();
         let filter = self.filters.get(self.active).unwrap_or(&empty);
-        let ctx = Ctx { snap: &self.snap, theme: &self.theme, filter, now_ms: self.now_ms };
+        let fresh_ms = if self.now_ms < self.fresh_until_ms { self.fresh_from_ms } else { u64::MAX };
+        let ctx = Ctx { snap: &self.snap, theme: &self.theme, filter, now_ms: self.now_ms, fresh_ms };
         let out = match self.views.get_mut(self.active) {
             Some(v) => v.on_input(input, &ctx),
             None => Outcome::Ignored,
@@ -629,7 +656,8 @@ impl App {
         self.render_tabs(f, tabs);
         let empty = String::new();
         let filter = self.filters.get(self.active).unwrap_or(&empty);
-        let ctx = Ctx { snap: &self.snap, theme: &self.theme, filter, now_ms: self.now_ms };
+        let fresh_ms = if self.now_ms < self.fresh_until_ms { self.fresh_from_ms } else { u64::MAX };
+        let ctx = Ctx { snap: &self.snap, theme: &self.theme, filter, now_ms: self.now_ms, fresh_ms };
         if let Some(v) = self.views.get_mut(self.active) {
             v.render(f, main, &ctx);
         }
@@ -836,12 +864,12 @@ impl App {
         let [body, _, foot] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
         if two {
             let [a, b] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body);
-            f.render_widget(Paragraph::new(left), a);
-            f.render_widget(Paragraph::new(right), b);
+            f.render_widget(Paragraph::new(fit_all(left, a.width)), a);
+            f.render_widget(Paragraph::new(fit_all(right, b.width)), b);
         } else {
             left.push(Line::raw(""));
             left.extend(right);
-            f.render_widget(Paragraph::new(left).scroll((scroll, 0)), body);
+            f.render_widget(Paragraph::new(fit_all(left, body.width)).scroll((scroll, 0)), body);
         }
         f.render_widget(Paragraph::new(mouse), foot);
     }
@@ -849,7 +877,7 @@ impl App {
     fn render_palette(&self, f: &mut Frame, main: Rect, input: &str, sel: usize) {
         let th = &self.theme;
         let items = self.palette_matches(input);
-        let h = (items.len().min(10) as u16).saturating_add(4);
+        let h = (items.len().clamp(1, 10) as u16).saturating_add(4); // room for "No command matches"
         let w = 60.min(main.width.saturating_sub(4));
         let r = Rect { x: main.x.saturating_add(main.width.saturating_sub(w) / 2), y: main.y.saturating_add(1), width: w, height: h.min(main.height) };
         f.render_widget(Clear, r);
@@ -887,8 +915,13 @@ impl App {
 /// Number-key labels for tabs.
 const TAB_KEYS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
-fn help_line<'a>(th: &Theme, k: &'a str, w: &'a str) -> Line<'a> {
-    Line::from(vec![Span::raw("  "), Span::styled(format!("{k:<12}"), th.key()), Span::raw(w)])
+fn help_line(th: &Theme, k: &str, w: &str) -> Line<'static> {
+    Line::from(vec![Span::raw("  "), Span::styled(format!("{k:<12}"), th.key()), Span::raw(w.to_string())])
+}
+
+/// Help lines cut to their column with `…` (nothing runs into the border).
+fn fit_all(lines: Vec<Line<'static>>, w: u16) -> Vec<Line<'static>> {
+    lines.into_iter().map(|l| crate::widgets::list::fit(l, usize::from(w))).collect()
 }
 
 fn render_confirm(th: &Theme, f: &mut Frame, main: Rect, title: &str, body: &str, yes: bool) {

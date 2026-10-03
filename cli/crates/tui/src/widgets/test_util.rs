@@ -23,7 +23,7 @@ pub fn theme(ascii: bool) -> Theme {
 }
 
 pub fn ctx<'a>(snap: &'a Snapshot, theme: &'a Theme, filter: &'a str) -> Ctx<'a> {
-    Ctx { snap, theme, filter, now_ms: NOW }
+    Ctx { snap, theme, filter, now_ms: NOW, fresh_ms: u64::MAX }
 }
 
 /// Renders `view` at w×h and returns the screen as text lines; asserts no control bytes and, in
@@ -57,8 +57,8 @@ pub fn maint_fixture() -> Snapshot {
     Snapshot {
         me: Me { handle: "maya".into(), relay: "relay.moochy.dev".into(), web: "https://moochy.dev".into(), connected: true, ..Me::default() },
         projects: vec![
-            Project { id: "r_1".into(), slug: "github/acme/widget".into(), donors: 3, pending: 1, month_uusd: 12_000_000, goal_uusd: 50_000_000, members: vec!["maya".into(), "bo".into()], funded_by: vec!["github/acme".into()], paused_since_ms: 0 },
-            Project { id: "r_2".into(), slug: "github/acme/gadget".into(), donors: 0, pending: 0, month_uusd: 0, goal_uusd: 0, members: vec![], funded_by: vec![], paused_since_ms: NOW - 31 * DAY },
+            Project { id: "r_1".into(), slug: "github/acme/widget".into(), donors: 3, pending: 1, month_uusd: 12_000_000, goal_uusd: 50_000_000, members: vec!["maya".into(), "bo".into()], funded_by: vec!["github/acme".into()], paused_since_ms: 0, per_day_uusd: vec![] },
+            Project { id: "r_2".into(), slug: "github/acme/gadget".into(), donors: 0, pending: 0, month_uusd: 0, goal_uusd: 0, members: vec![], funded_by: vec![], paused_since_ms: NOW - 31 * DAY, per_day_uusd: vec![] },
             Project { id: "r_3".into(), slug: "github/acme/\u{1b}]52;c;evil\u{7}tool".into(), ..Project::default() },
         ],
         orgs: vec![Org { id: "o_1".into(), path: "github/acme".into(), covered: vec![CoveredRepo { slug: "github/acme/widget".into(), used_uusd: 3_000_000, share_cap_uusd: 10_000_000 }], donors: 2, month_uusd: 3_000_000, paused_since_ms: 0, per_day_uusd: vec![0, 1_000_000, 2_000_000], person: false }],

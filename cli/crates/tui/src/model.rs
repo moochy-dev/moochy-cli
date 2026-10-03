@@ -102,6 +102,8 @@ pub struct Project {
     pub funded_by: Vec<String>,
     /// §19.2a: 0 = active; else the Unix ms it was paused at.
     pub paused_since_ms: u64,
+    /// Use per day for the last 30 days (oldest first).
+    pub per_day_uusd: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default)]

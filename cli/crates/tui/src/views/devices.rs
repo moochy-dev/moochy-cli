@@ -102,7 +102,8 @@ fn doctor(t: Theme, snap: &Snapshot, now: u64) -> Vec<Span<'static>> {
     out.push(match (snap.devices.len(), on) {
         (0, _) => bad("no device: `moochy login`".into()),
         (n, 0) => warn(format!("0 of {n} devices online")),
-        (n, o) if here => ok(format!("{o} of {n} devices online")),
+        (n, o) if here && o >= n => ok(format!("{o} of {n} devices online")),
+        (n, o) if here => warn(format!("{o} of {n} devices online")),
         (n, o) => warn(format!("{o} of {n} devices online, not this one")),
     });
     let present: Vec<String> = snap.keys.iter().filter(|x| x.present).map(|x| clean(&x.provider)).collect();
@@ -137,7 +138,8 @@ impl View for DevicesView {
         let t = *ctx.theme;
         let now = ctx.now_ms;
         let items = items(ctx);
-        let (list_a, side) = w::split(area, 10);
+        // The list gets the height first; Safety is 8 rows (lockdown, doctor, the full check).
+        let (list_a, side) = w::split(area, 8);
         let promise_rows = u16::try_from(KEYS_PROMISE.len()).unwrap_or(u16::MAX).div_ceil(list_a.width.max(1)).min(3);
         let [promise, list_a] = Layout::vertical([Constraint::Length(promise_rows), Constraint::Min(0)]).areas(list_a);
         f.render_widget(Paragraph::new(Span::styled(KEYS_PROMISE, w::tone(t, Tone::Good))).wrap(Wrap { trim: true }), promise);
@@ -183,13 +185,14 @@ impl View for DevicesView {
                 .highlight_symbol(list::marker(t))
                 .block(w::block_focus(t, self.title()));
             f.render_stateful_widget(table, list_a, &mut self.cur.state);
+            self.cur.more(f, list_a, t);
         }
         let Some(side) = side else { return };
-        let mut lines = vec![w::kv_span(t, "Lockdown", lockdown(t, &ctx.snap.me.lockdown)), Line::raw(""), Line::from(w::bold("Doctor"))];
-        for s in doctor(t, ctx.snap, now) {
-            lines.push(Line::from(vec![Span::raw("  "), s]));
+        let mut lines = vec![w::kv_span(t, "Lockdown", lockdown(t, &ctx.snap.me.lockdown))];
+        for (i, s) in doctor(t, ctx.snap, now).into_iter().enumerate() {
+            lines.push(w::kv_span(t, if i == 0 { "Doctor" } else { "" }, s));
         }
-        lines.push(Line::from(vec![w::muted(t, "  full check: "), w::key("moochy doctor")]));
+        lines.push(Line::from(vec![w::muted(t, format!("{:<11}full check: ", "")), w::key("moochy doctor")]));
         match self.cur.selected().and_then(|i| items.get(i)) {
             Some(Item::Box(b)) => {
                 lines.push(Line::raw(""));

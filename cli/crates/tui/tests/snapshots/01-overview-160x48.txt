@@ -2,7 +2,7 @@
  ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 ╭ moochy ──────────────────────────╮╭ Donated this month ─────────╮╭ Used by my projects ────────╮╭ Live · 5 min ───────────────╮╭ Devices ────────────────────╮
-│   ╭╮     ╭╮   Hi @alice          ││ ◉ $70.17 of $115.00         ││ ◉ $40.15 of $75.00          ││ 4 requests                  ││ ○ 2/3 online                │
+│   ╭╮     ╭╮   Hi @alice          ││ ◉ $70.17 of $115.00         ││ ◉ $40.15 of $75.00          ││ 4 requests                  ││ ▲ 2/3 online                │
 │  ╭┴┴─────┴┴╮  ◆ 3 to decide      ││   ▁         ▄ ▃ ▁     █ ▆   ││   █ ▃     ▃    █     █ ▃    ││ ↑ 3 served  ↓ 1 used        ││ ● 1/2 boxes up              │
 │ ◖  ^  ᴗ  ^  ◗ ● relay up         ││   █ █ ▆  ▃ ▁█ █ █▂ ▆ ▄█▂█▁▆ ││  ▁█ █ ▆ █ █ ▆ ▁█ ▁▆ ▁█ █ ▆  ││ avg 1.2s                    ││ ✔ 3/4 provider keys         │
 │  ╰─────────╯  donor + maintainer ││  ▆█▄█▂█▁▆█ ██▇█▆██▂█▁██████ ││  ██▄█ █ █▄█ █ ██▄██ ██▄█ █▂ ││                             ││                             │
@@ -51,7 +51,7 @@
  (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 + moochy --------------------------++ Donated this month ---------++ Used by my projects --------++ Live - 5 min ---------------++ Devices --------------------+
-|   ()     ()   Hi @alice          || $ $70.17 of $115.00         || $ $40.15 of $75.00          || 4 requests                  || o 2/3 online                |
+|   ()     ()   Hi @alice          || $ $70.17 of $115.00         || $ $40.15 of $75.00          || 4 requests                  || ! 2/3 online                |
 |  /---------\  ~ 3 to decide      ||   .         - - .     # =   ||   # -     -    #     # -    || ^ 3 served  v 1 used        || * 1/2 boxes up              |
 | (  ^  .  ^  ) * relay up         ||   # # =  - .# # #. = -#.#.= ||  .# # = # # = .# .= .# # =  || avg 1.2s                    || + 3/4 provider keys         |
 |  \_________/  donor + maintainer ||  =#-#.#.=# ####=##.#.###### ||  ##-# # #-# # ##-## ##-# #. ||                             ||                             |

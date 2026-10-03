@@ -82,7 +82,7 @@ pub fn demo() -> Snapshot {
                 budget_uusd: 40_000_000,
                 per_task_cap_uusd: 500_000,
                 spent_uusd: 27_420_000,
-                schedule: s("monthly, renews 1 Nov"),
+                schedule: s("monthly"),
                 models: vec![s("claude-sonnet-5-5"), s("claude-haiku-4-5")],
                 per_repo_uusd: vec![],
                 per_day_uusd: trend(3),
@@ -97,7 +97,7 @@ pub fn demo() -> Snapshot {
                 budget_uusd: 15_000_000,
                 per_task_cap_uusd: 250_000,
                 spent_uusd: 14_100_000,
-                schedule: s("monthly, renews 1 Nov"),
+                schedule: s("monthly"),
                 models: vec![s("deepseek-v4")],
                 per_repo_uusd: vec![],
                 per_day_uusd: trend(5),
@@ -146,6 +146,7 @@ pub fn demo() -> Snapshot {
                 members: vec![s("alice"), s("bob"), s("chen")],
                 funded_by: vec![s("@dana"), s("@eve"), s("org:acme")],
                 paused_since_ms: 0,
+                per_day_uusd: trend(19),
             },
             Project {
                 id: s("prj_gadgets"),
@@ -157,6 +158,7 @@ pub fn demo() -> Snapshot {
                 members: vec![s("alice")],
                 funded_by: vec![s("@frank")],
                 paused_since_ms: 0,
+                per_day_uusd: trend(23),
             },
             Project {
                 id: s("prj_notes"),
@@ -168,6 +170,7 @@ pub fn demo() -> Snapshot {
                 members: vec![s("alice")],
                 funded_by: vec![],
                 paused_since_ms: ago(9 * DAY),
+                per_day_uusd: vec![],
             },
         ],
         orgs: vec![Org {

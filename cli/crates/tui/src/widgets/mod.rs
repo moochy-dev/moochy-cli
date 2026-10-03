@@ -63,6 +63,21 @@ pub fn empty(f: &mut Frame, area: Rect, t: Theme, title: &str, lines: Vec<Line<'
     f.render_widget(Paragraph::new(text).alignment(Alignment::Center).wrap(Wrap { trim: true }).block(b), area);
 }
 
+/// Pads `lines` to the widest one, so a centred group keeps its left edge (a block, not a ragged
+/// stack).
+#[must_use]
+pub fn align_block(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let w = lines.iter().map(Line::width).max().unwrap_or(0);
+    lines
+        .into_iter()
+        .map(|mut l| {
+            let pad = w.saturating_sub(l.width());
+            l.spans.push(Span::raw(" ".repeat(pad)));
+            l
+        })
+        .collect()
+}
+
 /// "Nothing matches …" for a filter that hides every row.
 #[must_use]
 pub fn no_match(t: Theme, filter: &str) -> Vec<Line<'static>> {
@@ -176,6 +191,22 @@ pub fn trunc(s: &str, n: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// One rule per column and frame: when any slug overflows its room, every slug in the column
+/// drops its forge prefix (never `owner/name` next to `github/owner/name`).
+#[must_use]
+pub fn hosts_dropped<'a>(cells: impl IntoIterator<Item = (&'a str, usize)>) -> bool {
+    cells.into_iter().any(|(s, room)| s.chars().count() > room)
+}
+
+/// `github/owner/name` → `owner/name` when `drop_host` (see [`hosts_dropped`]).
+#[must_use]
+pub fn slug(s: &str, drop_host: bool) -> String {
+    match s.split_once('/') {
+        Some((_, rest)) if drop_host && rest.contains('/') => rest.to_string(),
+        _ => s.to_string(),
+    }
 }
 
 /// `github/owner/name` → `owner/name` when the full slug does not fit in `n`.
@@ -295,6 +326,14 @@ pub fn date(at_ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `1 Nov` (UTC) from Unix ms.
+#[must_use]
+pub fn day_month(at_ms: u64) -> String {
+    const M: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (_, m, d) = civil(at_ms / 86_400_000);
+    format!("{d} {}", M.get(usize::try_from(m.saturating_sub(1)).unwrap_or(0)).copied().unwrap_or("?"))
+}
+
 /// `2026-10-03 14:05` (UTC) from Unix ms.
 #[must_use]
 pub fn datetime(at_ms: u64) -> String {
@@ -409,6 +448,7 @@ mod tests {
         assert_eq!(until(10, 5), "expired");
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(951_782_400_000), "2000-02-29");
+        assert_eq!(day_month(1_793_491_200_000), "1 Nov");
         assert_eq!(datetime(1_791_036_300_000), "2026-10-03 14:05");
         assert_eq!(trunc("abcdef", 4), "abc…");
         assert_eq!(trunc("abc", 4), "abc");

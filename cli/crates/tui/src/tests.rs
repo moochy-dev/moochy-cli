@@ -161,3 +161,41 @@ fn keys_typed_before_the_first_snapshot_are_kept() {
     app.on_event(AppEvent::Source(SourceEvent::Snapshot(Box::new(fixtures::demo()))));
     assert_eq!(app.active(), 3, "replayed once the data is there");
 }
+
+#[test]
+fn routine_requests_flash_and_smile_rarely_without_toasts() {
+    use crate::app::{App, AppEvent};
+    use crate::source::{FakeSource, Source, SourceEvent};
+    use crate::theme::Theme;
+
+    // U1: a routine request is no toast; the hamster smiles at most once per 10 s.
+    let mut src = FakeSource::new(fixtures::demo(), fixtures::DEMO_NOW_MS);
+    src.live = true;
+    let mut app = App::new(Theme::default(), fixtures::DEMO_NOW_MS);
+    app.on_event(AppEvent::Source(SourceEvent::Snapshot(Box::new(src.snapshot().unwrap()))));
+    let mut smiles = 0;
+    for i in 1..=6u64 {
+        app.now_ms = fixtures::DEMO_NOW_MS + i * 3_000;
+        app.expire();
+        let toast = src.tick();
+        assert!(toast.is_none() || i % 7 == 0, "tick {i}: routine request toasted: {toast:?}");
+        app.on_event(AppEvent::Source(SourceEvent::Snapshot(Box::new(src.snapshot().unwrap()))));
+        if app.smiling() {
+            smiles += 1;
+        }
+    }
+    // Ticks here are microseconds apart in real time, so some rows share a timestamp: 1 or 2.
+    assert!((1..=2).contains(&smiles), "one smile per 10 s over 18 s of requests every 3 s, got {smiles}");
+}
+
+#[test]
+fn palette_says_when_nothing_matches() {
+    let f = snap((80, 24), ":zzqx", |_| {});
+    assert!(f.contains("No command matches “zzqx”"), "{f}");
+}
+
+#[test]
+fn scrolled_lists_say_how_much_is_hidden() {
+    let f = snap((80, 24), "7", |_| {});
+    assert!(f.contains("more"), "a cut list shows ↓ N more:\n{f}");
+}

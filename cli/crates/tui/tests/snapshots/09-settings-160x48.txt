@@ -3,7 +3,7 @@
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 ╭ Appearance ───────────────────────────────────────────────────────────────────────────────╮╭ Keybindings ────────────────────────────────────────────────────╮
 │ ▶ Theme     dark          enter or t                                                      ││ 1-9         go to tab                                           │
-│   Colours   truecolor     enter or c                                                      ││ tab/S-tab   next / previous tab (also ] and [)                  │
+│   Colours   truecolor     enter or c                                                      ││ tab/S-tab   next / prev tab, also ] [                           │
 │   Glyphs    Unicode       enter or a                                                      ││ j/k arrows  move                                                │
 │ Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.                            ││ g/G         first / last                                        │
 │                                                                                           ││ PgUp/PgDn   page                                                │
@@ -11,12 +11,12 @@
 ╭ Node ─────────────────────────────────────────────────────────────────────────────────────╮│ /           filter this list                                    │
 │ Account         @alice (brave-otter-42)                                                   ││ esc         clear filter / back                                 │
 │ Web             https://moochy.dev                                                        ││ : ctrl-k    command palette                                     │
-│ Relay           https://relay.moochy.dev                                                  ││ ctrl-r      refresh (r too, where the tab has no r)             │
+│ Relay           https://relay.moochy.dev                                                  ││ ctrl-r      refresh (also r)                                    │
 │ Node sock       ~/.local/state/moochy/node.sock                                           ││ ?           help                                                │
 │ Role            donor + maintainer                                                        ││ ctrl-z      suspend                                             │
 │ Sandbox         landlock + seccomp (enforced)                                             ││ q           quit                                                │
 │ Serve hours     always                                                                    ││                                                                 │
-│ Max concurrent  2                                                                         ││ Each tab adds its own keys in the footer and in ?.              │
+│ Max concurrent  2                                                                         ││ Each tab adds keys of its own (footer, ?).                      │
 │ Notifications   email: weekly digest                                                      ││                                                                 │
 │ Keylog monitor  on (last check 6h ago)                                                    ││                                                                 │
 │                                                                                           ││                                                                 │
@@ -52,7 +52,7 @@
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 + Appearance -------------------------------------------------------------------------------++ Keybindings ----------------------------------------------------+
 | > Theme     dark          enter or t                                                      || 1-9         go to tab                                           |
-|   Colours   truecolor     enter or c                                                      || tab/S-tab   next / previous tab (also ] and [)                  |
+|   Colours   truecolor     enter or c                                                      || tab/S-tab   next / prev tab, also ] [                           |
 |   Glyphs    ASCII         enter or a                                                      || j/k arrows  move                                                |
 | Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.                            || g/G         first / last                                        |
 |                                                                                           || PgUp/PgDn   page                                                |
@@ -60,12 +60,12 @@
 + Node -------------------------------------------------------------------------------------+| /           filter this list                                    |
 | Account         @alice (brave-otter-42)                                                   || esc         clear filter / back                                 |
 | Web             https://moochy.dev                                                        || : ctrl-k    command palette                                     |
-| Relay           https://relay.moochy.dev                                                  || ctrl-r      refresh (r too, where the tab has no r)             |
+| Relay           https://relay.moochy.dev                                                  || ctrl-r      refresh (also r)                                    |
 | Node sock       ~/.local/state/moochy/node.sock                                           || ?           help                                                |
 | Role            donor + maintainer                                                        || ctrl-z      suspend                                             |
 | Sandbox         landlock + seccomp (enforced)                                             || q           quit                                                |
 | Serve hours     always                                                                    ||                                                                 |
-| Max concurrent  2                                                                         || Each tab adds its own keys in the footer and in ?.              |
+| Max concurrent  2                                                                         || Each tab adds keys of its own (footer, ?).                      |
 | Notifications   email: weekly digest                                                      ||                                                                 |
 | Keylog monitor  on (last check 6h ago)                                                    ||                                                                 |
 |                                                                                           ||                                                                 |

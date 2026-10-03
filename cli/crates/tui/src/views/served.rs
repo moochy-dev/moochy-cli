@@ -157,6 +157,10 @@ impl View for ServedView {
         "Served"
     }
 
+    fn labels(&self) -> (&'static str, &'static str) {
+        ("Served", "Live")
+    }
+
     fn hints(&self) -> &'static [(&'static str, &'static str)] {
         &[("g", "newest (live)"), ("s", "sort")]
     }
@@ -232,11 +236,14 @@ impl View for ServedView {
         header.push("Outcome");
         let cw = list::table_widths(list_a, &widths);
         let cut = |s: String, i: usize| Cell::from(w::trunc(&s, cw.get(i).copied().unwrap_or(0)));
-        let body = rows.iter().map(|s| {
+        let proj_w = cw.get(2).copied().unwrap_or(0);
+        let projects: Vec<String> = rows.iter().map(|s| clean(&s.project)).collect();
+        let drop = w::hosts_dropped(projects.iter().map(|p| (p.as_str(), proj_w)));
+        let body = rows.iter().zip(&projects).map(|(s, project)| {
             let mut cells = vec![
                 Cell::from(w::muted(t, w::ago(ctx.now_ms, s.at_ms))),
                 Cell::from(direction(t, s)),
-                cut(w::short_slug(&clean(&s.project), cw.get(2).copied().unwrap_or(0)), 2),
+                cut(w::slug(project, drop), 2),
                 cut(clean(&s.model), 3),
             ];
             if wide {
@@ -247,7 +254,8 @@ impl View for ServedView {
                 cells.push(Cell::from(w::latency(s.latency_ms)));
             }
             cells.push(Cell::from(outcome(t, s)));
-            Row::new(cells)
+            // Just arrived: the row flashes Mint bold for a second (no toast for routine requests).
+            if s.at_ms > ctx.fresh_ms { Row::new(cells).style(t.accent()) } else { Row::new(cells) }
         });
         let table = Table::new(body, widths)
             .header(Row::new(header).style(t.muted()))
@@ -255,6 +263,7 @@ impl View for ServedView {
             .highlight_symbol(list::marker(t))
             .block(w::block_focus(t, title));
         f.render_stateful_widget(table, list_a, &mut self.cur.state);
+        self.cur.more(f, list_a, t);
         if let (Some(area), Some(s)) = (detail, self.cur.selected().and_then(|i| rows.get(i))) {
             f.render_widget(Paragraph::new(Self::detail(t, s, ctx.now_ms)).wrap(Wrap { trim: false }).block(w::block(t, "Request")), area);
         }
