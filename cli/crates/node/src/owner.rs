@@ -478,6 +478,66 @@ pub(crate) fn check_own_key(home: &Home, cfg: &crate::config::Config, me: Option
 /// (KEYLOG §5), sign, and hand the entry to the Node to relay.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, device: bool, cap: i64) -> Result<()> {
+    let (also, donor) = match (revoke, words) {
+        (true, ["approve", donor]) => (covering_orgs(home, slug, donor, yes)?, *donor),
+        _ => (Vec::new(), ""),
+    };
+    let done = sign_entries(home, slug, words, yes, revoke, device, cap);
+    // The org revokes the human asked for run even if the project's own entry failed.
+    for org in &also {
+        crate::org::sign(home, org, crate::org::Op::Donor { donor, revoke: true }, false)?;
+    }
+    done
+}
+
+/// A269 (§19.4): a project-level DONOR_REVOKED does not stop a donor approved through an
+/// organisation of yours that funds the project. Such organisations come from the verified key
+/// log; the org revoke is offered and needs its own yes (`--yes` only prints the command: it never
+/// signs more than was typed). Returns the organisations to revoke the donor for.
+fn covering_orgs(home: &Home, slug: &str, donor: &str, yes: bool) -> Result<Vec<String>> {
+    let cfg = home.load()?;
+    let Some(orgs) = cfg.pseudonym.as_deref().and_then(|me| crate::keylog::KeyLog::owned_orgs(home, &cfg, me)) else { return Ok(Vec::new()) };
+    if orgs.iter().all(|(_, r)| r.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let rt = rt()?;
+    // The project's id from the server, dialed directly; the revoke reports its own errors.
+    let Ok(l) = lookup(&cfg, &rt, slug, None) else { return Ok(Vec::new()) };
+    let ids: Vec<String> = orgs.into_iter().filter(|(_, r)| r.contains(&l.repo_id)).map(|(o, _)| o).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The org's path: from the relay's pushed ORG_REPO_REMOVED offer for this (org, project).
+    let pushed = rt
+        .block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
+            c.pending(crate::pb::local::PendingRequest {}).await.ok()
+        })
+        .map(|r| r.into_inner().requests)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for o in &ids {
+        let path = pushed.iter().find(|q| q.org_id == *o && q.repo_id == l.repo_id).and_then(|q| crate::config::canonical_org(&q.org_path));
+        let target = path.as_deref().map_or_else(|| format!("<path of {}>", clean(o)), |p| clean(p).into_owned());
+        eprintln!(
+            "Note: your organisation {target} ({}) funds {}. If it accepted {}, they keep serving {} through it after this revoke; to stop them on every project of the organisation: moochy approve {} --revoke --org {target}",
+            clean(o),
+            clean(&l.repo_slug),
+            clean(donor),
+            clean(&l.repo_slug),
+            clean(donor)
+        );
+        if let Some(p) = path
+            && !yes
+            && matches!(ask(&format!("Revoke {} for {} too? Type yes: ", clean(donor), clean(&p)), false)?.as_str(), "yes" | "y")
+        {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, device: bool, cap: i64) -> Result<()> {
     let cfg = home.load()?;
     let rt = rt()?;
     // `--device` (a CI device as a member): only to add, and the device's account comes from the
