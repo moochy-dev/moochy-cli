@@ -234,6 +234,14 @@ impl KeyLog {
             .ok()
     }
 
+    /// `moochy owner status` (§24): the person profiles `pseudonym` claimed in the mirror, each
+    /// with the repos it covers, sorted. `None`: no key log on this node.
+    pub fn owned_people(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Vec<(String, Vec<String>)>> {
+        Self::mirror(home, cfg)?
+            .state(|s| s.owned_people(pseudonym).into_iter().map(|(m, r)| (m.to_owned(), r.into_iter().map(str::to_owned).collect())).collect())
+            .ok()
+    }
+
     /// `moochy box list` (§17.1, WIRING §9b): this account's boxes in the mirror, in log order,
     /// revoked and expired ones included. `None`: no key log on this node (or not logged in).
     pub fn boxes(home: &Home, cfg: &Config) -> Option<Vec<BoxRow>> {
@@ -494,10 +502,12 @@ fn is_org(id: &str) -> bool {
     id.starts_with("o_")
 }
 
-/// Names the alert's target `org_id` or `repo_id` from its prefix, never one for the other.
+/// Names the alert's target `org_id`, `person_id` (CONTRACT §24, `m_…`) or `repo_id` from its
+/// prefix, never one for another.
 fn target(mut v: serde_json::Value, id: &str) -> serde_json::Value {
     if let Some(o) = v.as_object_mut() {
-        o.insert(if is_org(id) { "org_id" } else { "repo_id" }.into(), json!(clean(id)));
+        let k = if is_org(id) { "org_id" } else if id.starts_with("m_") { "person_id" } else { "repo_id" };
+        o.insert(k.into(), json!(clean(id)));
     }
     v
 }
@@ -732,5 +742,8 @@ mod tests {
         assert_eq!((v["alert"].as_str(), v["repo_id"].as_str(), v.get("org_id")), (Some("repo_claimed_by_other"), Some(r), None));
         let v = super::alert_fields(&Alert::NotSignedByMe { idx: 8, kind: Kind::DonorApproved, repo_id: o.into(), signer: "ok_x".into() });
         assert_eq!((v["alert"].as_str(), v["org_id"].as_str(), v.get("repo_id")), (Some("unsigned"), Some(o), None));
+        let m = "m_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let v = super::alert_fields(&Alert::NotSignedByMe { idx: 9, kind: Kind::PersonRepoAdded, repo_id: m.into(), signer: "ok_x".into() });
+        assert_eq!((v["alert"].as_str(), v["person_id"].as_str(), v.get("repo_id")), (Some("unsigned"), Some(m), None));
     }
 }
