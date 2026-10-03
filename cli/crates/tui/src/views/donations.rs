@@ -66,11 +66,60 @@ fn live(d: &Donation) -> bool {
 }
 
 fn visible<'a>(ctx: &Ctx<'a>) -> Vec<&'a Donation> {
-    ctx.snap.donations.iter().filter(|d| k::matches(ctx.filter, &[&d.target, &d.status, &d.schedule, &d.models.join(" ")])).collect()
+    ctx.snap.donations.iter().filter(|d| k::matches(ctx.filter, &[target(d), kind(d), &d.status, &d.schedule, &d.models.join(" ")])).collect()
+}
+
+/// What the donation funds: a project path, an org path or a person path (§24).
+fn target(d: &Donation) -> &str {
+    if d.target.is_empty() { &d.person } else { &d.target }
+}
+
+/// `project`, `org` or `person`: shown next to the target so the three never read alike.
+fn kind(d: &Donation) -> &'static str {
+    if !d.person.is_empty() {
+        "person"
+    } else if d.org {
+        "org"
+    } else {
+        "project"
+    }
+}
+
+/// The target's canonical public page (CONTRACT §9, §19.6, §24.6; §22.3 share link) on the
+/// relay's origin: `/p/{provider}/{owner}/{name}`, `/org/{provider}/{path}`,
+/// `/people/{provider}/{login}`. Display only. `None` when the relay or the path is not a plain
+/// slug of the right shape (fail closed: never show a confusable link).
+fn share_url(relay: &str, d: &Donation) -> Option<String> {
+    let seg = |x: &str| !x.is_empty() && x != "." && x != ".." && x.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let path = target(d);
+    let parts: Vec<&str> = path.split('/').collect();
+    let n = parts.len();
+    let shape = match (parts.first().copied(), kind(d)) {
+        (Some("github"), "project") => n == 3,
+        (Some("gitlab"), "project") => n >= 3,
+        (Some("github" | "gitlab"), "person") | (Some("github"), "org") => n == 2,
+        (Some("gitlab"), "org") => n >= 2,
+        _ => false,
+    };
+    if !shape || path.len() > 512 || !parts.iter().all(|x| seg(x)) {
+        return None;
+    }
+    let base = relay.trim().trim_end_matches('/');
+    let host = base.strip_prefix("https://").unwrap_or(base);
+    let host = host.strip_suffix(":443").unwrap_or(host);
+    if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '[' | ']')) {
+        return None;
+    }
+    let prefix = match kind(d) {
+        "person" => "people",
+        "org" => "org",
+        _ => "p",
+    };
+    Some(format!("https://{host}/{prefix}/{path}"))
 }
 
 impl DonationsView {
-    fn detail(&self, t: Theme, d: &Donation) -> Vec<Line<'static>> {
+    fn detail(&self, t: Theme, d: &Donation, relay: &str) -> Vec<Line<'static>> {
         let st = status(t, d);
         let label = |s: &str| k::dim(format!("{s:<9}"));
         let mut v = vec![Line::from(vec![label("Status"), k::badge(t, st.tone, st.glyph, &st.label), k::dim(format!("  {}", st.why))])];
@@ -87,10 +136,14 @@ impl DonationsView {
         v.push(Line::from(vec![label("Schedule"), Span::raw(sched)]));
         let models = if d.models.is_empty() { "any model you have a key for".to_owned() } else { d.models.iter().map(|m| clean(m)).collect::<Vec<_>>().join(", ") };
         v.push(Line::from(vec![label("Models"), Span::raw(models)]));
-        if d.org {
+        if let Some(url) = share_url(relay, d) {
+            v.push(Line::from(vec![label("Share"), Span::raw(url)]));
+        }
+        if d.org || !d.person.is_empty() {
             v.push(Line::from(k::dim("Projects funded this month")));
             if d.per_repo_uusd.is_empty() {
-                v.push(Line::from(k::dim("  none yet: the organisation's projects have not used it")));
+                let who = if d.org { "the organisation's projects have" } else { "the repos this person covers have" };
+                v.push(Line::from(k::dim(format!("  none yet: {who} not used it"))));
             }
             let mut repos: Vec<&(String, u64)> = d.per_repo_uusd.iter().collect();
             repos.sort_by_key(|r| std::cmp::Reverse(r.1));
@@ -192,6 +245,8 @@ impl View for DonationsView {
                 Line::from(k::key("moochy donate --repo github/owner/name --cap $20")),
                 Line::raw("or to an organisation:"),
                 Line::from(k::key("moochy donate --org github/owner --cap $50")),
+                Line::raw("or sponsor a maintainer's own tokens:"),
+                Line::from(k::key("moochy donate --person github/login --cap $20")),
                 Line::raw(""),
                 Line::from(k::dim("It starts once the project owner accepts you, and shows up here.")),
             ];
@@ -219,14 +274,14 @@ impl View for DonationsView {
             }
             let body = rows.iter().map(|d| {
                 let st = status(t, d);
-                let mut target = Vec::new();
-                if d.org {
-                    target.push(k::dim("org "));
+                let mut who = Vec::new();
+                if kind(d) != "project" {
+                    who.push(k::dim(format!("{} ", kind(d))));
                 }
-                target.push(Span::raw(clean(&d.target)));
+                who.push(Span::raw(clean(target(d))));
                 let mut cells = vec![
                     Cell::from(k::badge(t, st.tone, st.glyph, &st.label)),
-                    Cell::from(Line::from(target)),
+                    Cell::from(Line::from(who)),
                     Cell::from(format!("{} / {}", dollars(d.spent_uusd), dollars(d.budget_uusd))),
                 ];
                 if w >= 80 {
@@ -245,8 +300,8 @@ impl View for DonationsView {
             f.render_stateful_widget(table, list, &mut self.cur.state);
         }
         if let (Some(area), Some(d)) = (detail, self.cur.selected().and_then(|i| rows.get(i))) {
-            let title = format!(" {}{} ", if d.org { "org " } else { "" }, clean(&d.target));
-            f.render_widget(Paragraph::new(self.detail(t, d)).wrap(Wrap { trim: false }).block(k::block(t, title)), area);
+            let title = format!(" {} {} ", kind(d), clean(target(d)));
+            f.render_widget(Paragraph::new(self.detail(t, d, &ctx.snap.me.relay)).wrap(Wrap { trim: false }).block(k::block(t, title)), area);
         }
     }
 
@@ -263,7 +318,7 @@ impl View for DonationsView {
         if d.id.is_empty() {
             return Outcome::Ignored;
         }
-        let target = clean(&d.target);
+        let name = clean(target(d));
         let id = clean(&d.id);
         let refuse = |me: &mut Self, why: &str| {
             me.note = Some(why.to_owned());
@@ -273,19 +328,19 @@ impl View for DonationsView {
             Input::Char('p') => match d.status.as_str() {
                 "active" => Outcome::Confirm {
                     title: "Pause this donation".into(),
-                    body: format!("Pause your donation to {target}? Nothing is served to it until you resume it. Same as `moochy donations pause {id}`."),
+                    body: format!("Pause your donation to {name}? Nothing is served to it until you resume it. Same as `moochy donations pause {id}`."),
                     action: Action::PauseDonation(d.id.clone()),
                 },
                 "paused" => Outcome::Confirm {
                     title: "Resume this donation".into(),
-                    body: format!("Resume your donation to {target}? Your devices serve it again, up to its limit. Same as `moochy donations resume {id}`."),
+                    body: format!("Resume your donation to {name}? Your devices serve it again, up to its limit. Same as `moochy donations resume {id}`."),
                     action: Action::ResumeDonation(d.id.clone()),
                 },
                 _ => refuse(self, "only an active or paused donation can be paused or resumed"),
             },
             Input::Char('x') if live(d) => Outcome::Confirm {
                 title: "Stop this donation".into(),
-                body: format!("Stop donating to {target} for good? This cannot be undone: donate again to restart. Same as `moochy donations stop {id}`."),
+                body: format!("Stop donating to {name} for good? This cannot be undone: donate again to restart. Same as `moochy donations stop {id}`."),
                 action: Action::StopDonation(d.id.clone()),
             },
             Input::Char('-') if live(d) => {
@@ -296,7 +351,7 @@ impl View for DonationsView {
                 }
                 let whole = (ceil / DOLLAR).saturating_mul(DOLLAR);
                 let value = if whole >= floor { whole } else { ceil };
-                self.lower = Some(Lower { id: d.id.clone(), target: d.target.clone(), budget: d.budget_uusd, spent: d.spent_uusd, floor, ceil, value });
+                self.lower = Some(Lower { id: d.id.clone(), target: target(d).to_owned(), budget: d.budget_uusd, spent: d.spent_uusd, floor, ceil, value });
                 self.note = None;
                 Outcome::Redraw
             }
@@ -326,12 +381,17 @@ mod tests {
         let mut org = d("pl_org", "github/acme", "active", 50 * DOLLAR, 12 * DOLLAR);
         org.org = true;
         org.per_repo_uusd = vec![("github/acme/a".into(), 2 * DOLLAR), ("github/acme/\u{1b}[31mb".into(), 10 * DOLLAR)];
+        let mut person = d("m_01J", "", "active", 20 * DOLLAR, 4 * DOLLAR);
+        person.person = "github/octocat".into();
+        person.per_repo_uusd = vec![("github/octocat/hello".into(), 3 * DOLLAR), ("github/other/lib".into(), DOLLAR)];
         Snapshot {
+            me: crate::model::Me { relay: "moochy.dev".into(), ..crate::model::Me::default() },
             donations: vec![
                 d("pl_1", "github/foo/bar", "active", 20 * DOLLAR, 3_100_000),
                 d("pl_2", "gitlab/x/y", "paused", 10 * DOLLAR, 0),
                 d("pl_3", "github/done/it", "cancelled", 5 * DOLLAR, 5 * DOLLAR),
                 org,
+                person,
             ],
             ..Snapshot::default()
         }
@@ -363,11 +423,62 @@ mod tests {
         let c = ctx(&s, &t);
         assert_eq!(v.on_input(&Input::End, &c), Outcome::Ignored, "cursor not synced yet");
         draw(&mut v, &s, t, "", 160, 48);
-        v.on_input(&Input::End, &c);
+        v.cur.select(3);
         let out = draw(&mut v, &s, t, "", 160, 48);
         assert!(out.contains("Projects funded this month") && out.contains("github/acme/\u{FFFD}[31mb"), "{out}");
         let big = out.find("[31mb").unwrap();
         assert!(big < out.find("github/acme/a ").unwrap_or(usize::MAX), "biggest spender first");
+    }
+
+    #[test]
+    fn share_urls_are_canonical_or_absent() {
+        let d = |target: &str, org: bool, person: &str| Donation { target: target.into(), org, person: person.into(), ..Donation::default() };
+        let u = |relay: &str, x: &Donation| share_url(relay, x);
+        assert_eq!(u("moochy.dev", &d("github/foo/bar", false, "")).as_deref(), Some("https://moochy.dev/p/github/foo/bar"));
+        assert_eq!(u("https://moochy.dev/", &d("gitlab/g/sub/repo", false, "")).as_deref(), Some("https://moochy.dev/p/gitlab/g/sub/repo"));
+        assert_eq!(u("moochy.dev:443", &d("github/acme", true, "")).as_deref(), Some("https://moochy.dev/org/github/acme"));
+        assert_eq!(u("moochy.dev", &d("gitlab/grp/sub", true, "")).as_deref(), Some("https://moochy.dev/org/gitlab/grp/sub"));
+        assert_eq!(u("moochy.dev", &d("", false, "github/octocat")).as_deref(), Some("https://moochy.dev/people/github/octocat"));
+        // Wrong shapes, hostile bytes, unknown providers, no relay: no link at all.
+        for (relay, x) in [
+            ("moochy.dev", d("github/acme", false, "")),
+            ("moochy.dev", d("github/a/b/c", false, "")),
+            ("moochy.dev", d("github/foo/bar", true, "")),
+            ("moochy.dev", d("github/../x", false, "")),
+            ("moochy.dev", d("github/foo/b\u{1b}]52;c;x\u{7}", false, "")),
+            ("moochy.dev", d("bitbucket/foo/bar", false, "")),
+            ("moochy.dev", d("", false, "github/a/b")),
+            ("", d("github/foo/bar", false, "")),
+            ("evil.dev/\u{1b}[2J", d("github/foo/bar", false, "")),
+            ("javascript:alert(1)//x", d("github/foo/bar", false, "")),
+        ] {
+            assert_eq!(u(relay, &x), None, "{relay} {x:?}");
+        }
+    }
+
+    #[test]
+    fn person_sponsorship_reads_like_an_org_donation() {
+        let s = snap();
+        let t = themes()[0];
+        let c = ctx(&s, &t);
+        let mut v = DonationsView::default();
+        draw(&mut v, &s, t, "", 80, 24);
+        v.on_input(&Input::End, &c);
+        for t in themes() {
+            let out = draw(&mut v, &s, t, "", 80, 24);
+            assert!(out.contains("person github/octocat") && out.contains("Projects funded this month") && out.contains("github/octocat/hello"), "{out}");
+            assert!(out.contains("https://moochy.dev/people/github/octocat"), "{out}");
+        }
+        let Outcome::Confirm { action, body, .. } = v.on_input(&Input::Char('p'), &c) else { panic!() };
+        assert_eq!(action, Action::PauseDonation("m_01J".into()));
+        assert!(body.contains("github/octocat"));
+        assert_eq!(v.on_input(&Input::Char('-'), &c), Outcome::Redraw);
+        assert!(v.lower.is_some());
+        v.on_input(&Input::Back, &c);
+        let Outcome::Confirm { action, .. } = v.on_input(&Input::Char('x'), &c) else { panic!() };
+        assert_eq!(action, Action::StopDonation("m_01J".into()));
+        let out = draw(&mut v, &s, t, "octo", 80, 24);
+        assert!(out.contains("person github/octocat") && !out.contains("github/foo/bar"), "{out}");
     }
 
     #[test]
