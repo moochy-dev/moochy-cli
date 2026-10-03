@@ -19,7 +19,7 @@
 - name: Musl std for the pinned toolchain
   if: runner.os == 'Linux'
   shell: bash
-  working-directory: cli
+  # dist drops working-directory from these steps, so paths are from the root.
   # Install the pinned toolchain itself: on a fresh runner `rustup target add` would
   # add the target to the runner's default toolchain instead.
-  run: rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --target "$(uname -m)-unknown-linux-musl"
+  run: rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' cli/rust-toolchain.toml)" --profile minimal --target "$(uname -m)-unknown-linux-musl"
