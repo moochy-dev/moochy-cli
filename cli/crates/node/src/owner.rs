@@ -304,12 +304,12 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
     if !p.repo_slug.eq_ignore_ascii_case(ask.repo_slug) {
         return Err(refuse(&format!("project {}", clean(&p.repo_slug))));
     }
-    match (parse_body(kind, &p.body_to_sign), ask.subject) {
+    let b = match (parse_body(kind, &p.body_to_sign), ask.subject) {
         (Ok(Body::Claim { repo_id, provider, provider_repo_id, owner, .. }), None) => {
             if repo_id != p.repo_id || me != Some(owner) || p.subject != owner {
                 return Err(refuse("a claim naming another account or project"));
             }
-            Ok(Bound { kind, repo_id: repo_id.into(), subject: owner.into(), claim: Some((provider.into(), provider_repo_id.into())), name: owner.into(), slug: ask.repo_slug.into() })
+            Bound { kind, repo_id: repo_id.into(), subject: owner.into(), claim: Some((provider.into(), provider_repo_id.into())), name: owner.into(), slug: ask.repo_slug.into() }
         }
         (Ok(Body::Grant { repo_id, subject, .. }), Some(arg)) => {
             if repo_id != p.repo_id || subject != p.subject {
@@ -327,10 +327,16 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
             if !ok {
                 return Err(refuse(&format!("subject {}", clean(subject))));
             }
-            Ok(Bound { kind, repo_id: repo_id.into(), subject: subject.into(), claim: None, name: name.into(), slug: ask.repo_slug.into() })
+            Bound { kind, repo_id: repo_id.into(), subject: subject.into(), claim: None, name: name.into(), slug: ask.repo_slug.into() }
         }
-        _ => Err(refuse("a malformed entry")),
+        _ => return Err(refuse("a malformed entry")),
+    };
+    // §19: these commands name a project. The same body on an organisation id (`o_…`) would
+    // accept the donor for every project the organisation covers, behind a project's label.
+    if !b.repo_id.starts_with("r_") {
+        return Err(refuse(&format!("an entry for {}, not a project", clean(&b.repo_id))));
     }
+    Ok(b)
 }
 
 /// A218: what the server itself (dialed directly, not through `node.sock`) says the project and
@@ -697,6 +703,15 @@ mod tests {
         let mut p = grant("DONOR_APPROVED", ALICE, "alice", ALICE);
         p.repo_slug = "evil/repo".into();
         assert!(bind(&approve("alice"), Some(ME), &p).is_err());
+        // §19: an org approval (the donor for every covered project) behind the project's label,
+        // with a Lookup that agrees (a lying server).
+        let org = "o_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut p = grant("DONOR_APPROVED", ALICE, "alice", ALICE);
+        (p.repo_id, p.body_to_sign) = (org.into(), grant_body(org, ALICE, OK, 1));
+        let mut s = server("alice", ALICE);
+        s.repo_id = org.into();
+        assert!(bind(&approve("alice"), Some(ME), &p).is_err());
+        assert!(verified(&approve("alice"), &p, &s).is_err());
         // A pseudonym argument never matches a label.
         assert!(bind(&approve(MALLORY), Some(ME), &grant("DONOR_APPROVED", ALICE, MALLORY, ALICE)).is_err());
         // `members add d_… --device` (E32): the label is the device id, the body its owner's pseudonym.
