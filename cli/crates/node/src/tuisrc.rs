@@ -90,6 +90,19 @@ fn per_day<'a>(entries: impl Iterator<Item = &'a JournalEntry>, now: u64) -> Vec
     d
 }
 
+/// A relay per-day series (link.proto: last 30 UTC days, oldest first, zero-filled) as the
+/// model's [`DAYS`] slots ending today: longer answers keep their last days, shorter ones are
+/// zero-padded at the old end, negatives count as 0. `None` = the relay sent none (older relay).
+fn relay_series(v: &[i64]) -> Option<Vec<u64>> {
+    if v.is_empty() {
+        return None;
+    }
+    let recent = v.get(v.len().saturating_sub(DAYS)..).unwrap_or_default();
+    let mut out = vec![0u64; DAYS.saturating_sub(recent.len())];
+    out.extend(recent.iter().map(|x| uusd(*x)));
+    Some(out)
+}
+
 /// Days since 1970-01-01 → (year, month 1–12, day), and back (Howard Hinnant's algorithms; the
 /// back direction normalises an out-of-range day like Go's `time.Date`).
 fn civil_from_days(z: i64) -> Option<(i64, i64, i64)> {
@@ -197,9 +210,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             schedule: d.schedule.clone(),
             models: d.models.clone(),
             per_repo_uusd: d.per_repo.iter().map(|r| (r.repo_slug.clone(), uusd(r.spent_uusd))).collect(),
-            // ponytail: what THIS device served for it (the journal names the donation); the
-            // account-wide series needs a per-day field on the link's Donation (integrator).
-            per_day_uusd: per_day(entries.iter().filter(|e| e.role == "worker" && served_for(e, d)), now),
+            // Account-wide from the relay; an older relay: what THIS device served for it.
+            per_day_uusd: relay_series(&d.per_day_uusd).unwrap_or_else(|| per_day(entries.iter().filter(|e| e.role == "worker" && served_for(e, d)), now)),
             renews_at_ms: if matches!(d.status.as_str(), "active" | "paused") { renews_at(d.period_start_ms) } else { 0 },
         })
         .collect();
@@ -253,9 +265,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
                 month_uusd: uusd(t.month_uusd),
                 paused_since_ms: ms(t.paused_since_ms),
                 person: t.id.starts_with("m_"),
-                // ponytail: per-day use of an org's covered repos is relay data (OwnedTarget has
-                // no series yet: integrator request); this node only sees its own requests.
-                per_day_uusd: Vec::new(),
+                // Use across the covered repos, from the relay (this node only sees its own).
+                per_day_uusd: relay_series(&t.per_day_uusd).unwrap_or_default(),
             })
             .collect();
     }
@@ -654,6 +665,19 @@ mod tests {
         std::fs::remove_file(home.state_dir().join("lockdown.json")).unwrap();
         assert_eq!(crate::lockdown::state(&home, true), ("", String::new()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relay_series_fill_thirty_days_ending_today() {
+        assert_eq!(relay_series(&[]), None, "older relay: the journal fallback");
+        let full: Vec<i64> = (1..=30).collect();
+        assert_eq!(relay_series(&full).unwrap(), (1..=30).collect::<Vec<u64>>());
+        let long: Vec<i64> = (1..=40).collect();
+        assert_eq!(relay_series(&long).unwrap(), (11..=40).collect::<Vec<u64>>(), "the last 30 days");
+        let short = relay_series(&[5, -3, 7]).unwrap();
+        assert_eq!(short.len(), DAYS);
+        assert_eq!(short[DAYS - 3..], [5, 0, 7], "padded at the old end; negatives are 0");
+        assert!(short[..DAYS - 3].iter().all(|x| *x == 0));
     }
 
     #[test]
