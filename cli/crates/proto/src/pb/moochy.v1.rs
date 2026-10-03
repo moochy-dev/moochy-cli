@@ -364,6 +364,16 @@ pub struct ApprovalRequest {
     /// human-readable, for display only (never signed as-is)
     #[prost(string, tag = "10")]
     pub summary: ::prost::alloc::string::String,
+    /// CONTRACT §19: ORG_CLAIMED / ORG_REPO_ADDED / ORG_REPO_REMOVED and DONOR_APPROVED/REVOKED of an
+    /// org. Display labels only, like repo_slug: the CLI checks the decoded body_to_sign and the
+    /// server's Lookup, never these strings (A218).
+    ///
+    /// "o\_…"
+    #[prost(string, tag = "11")]
+    pub org_id: ::prost::alloc::string::String,
+    /// "github/acme", "gitlab/group\[/sub…\]"
+    #[prost(string, tag = "12")]
+    pub org_path: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogTileRequest {

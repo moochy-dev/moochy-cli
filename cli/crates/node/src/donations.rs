@@ -59,8 +59,13 @@ pub(crate) fn call(home: &crate::config::Home, op: &str, request: Vec<u8>) -> Re
     })
 }
 
+/// What a donation funds, for people: the project, or `org github/acme` (CONTRACT §19).
+pub(crate) fn target(d: &Donation) -> String {
+    if d.org.is_empty() { clean(&d.repo_slug).into_owned() } else { format!("org {}", clean(&d.org)) }
+}
+
 fn donation_json(d: &Donation) -> serde_json::Value {
-    json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
+    json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
         "per_request_limit_uusd": d.per_task_cap_uusd, "spent_uusd": d.spent_uusd, "reserved_uusd": d.reserved_uusd,
         "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule)})
 }
@@ -80,28 +85,30 @@ pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
         if json_out {
             emit(&donation_json(d));
         } else {
-            println!("{:<28} {:<9} {} of {} this month  ({})", clean(&d.repo_slug), clean(&d.status), dollars(d.spent_uusd), dollars(d.budget_uusd), clean(&d.pledge_id));
+            println!("{:<28} {:<9} {} of {} this month  ({})", target(d), clean(&d.status), dollars(d.spent_uusd), dollars(d.budget_uusd), clean(&d.pledge_id));
         }
     }
     if r.donations.is_empty() && !json_out {
-        println!("No donations yet: `moochy donate --repo OWNER/NAME --cap $20`");
+        println!("No donations yet: `moochy donate --repo OWNER/NAME --cap $20` (or --org github/ORG)");
     }
     Ok(())
 }
 
-/// `moochy donate --repo OWNER/NAME --cap $N [--yes]`: start donating up to $N a month. The
-/// donation waits for the project owner's approval (signed with their owner key).
-pub fn donate(home: &crate::config::Home, slug: &str, monthly_uusd: i64, yes: bool) -> Result<()> {
+/// `moochy donate --repo OWNER/NAME | --org github/ORG --cap $N [--yes]`: start donating up to $N
+/// a month. The donation waits for the owner's approval (signed with their owner key). `org`:
+/// `slug` is an organisation (CONTRACT §19), funding the repos its owner covers.
+pub fn donate(home: &crate::config::Home, slug: &str, org: bool, monthly_uusd: i64, yes: bool) -> Result<()> {
     if monthly_uusd <= 0 {
         return Err(usage("set a monthly limit: --cap $20 (or --budget-uusd N)"));
     }
-    eprintln!("Donating tokens to {} up to {} a month (at most {} per request).", clean(slug), dollars(monthly_uusd), dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)));
+    let what = if org { format!("the organisation {}", clean(slug)) } else { clean(slug).into_owned() };
+    eprintln!("Donating tokens to {what} up to {} a month (at most {} per request).", dollars(monthly_uusd), dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)));
     if !yes {
         use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() {
             return Err(usage("pass --yes to donate non-interactively"));
         }
-        eprint!("Donate tokens to {} up to {} a month? [y/N] ", clean(slug), dollars(monthly_uusd));
+        eprint!("Donate tokens to {what} up to {} a month? [y/N] ", dollars(monthly_uusd));
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
         if !matches!(line.trim(), "y" | "Y" | "yes") {
@@ -110,7 +117,9 @@ pub fn donate(home: &crate::config::Home, slug: &str, monthly_uusd: i64, yes: bo
     }
     let q = DonateRequest {
         request_id: crate::util::ulid()?,
-        repo_slug: slug.into(),
+        // §19: exactly one of repo_slug and org.
+        repo_slug: if org { String::new() } else { slug.into() },
+        org: if org { slug.into() } else { String::new() },
         budget_uusd: monthly_uusd,
         // D19: one request may use at most $5 by default (or the whole monthly limit when smaller).
         per_task_cap_uusd: monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD),

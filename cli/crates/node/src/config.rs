@@ -310,6 +310,19 @@ pub fn canonical_slug(s: &str) -> Option<String> {
     }
 }
 
+/// An organisation as `--org` names it (CONTRACT §19.1): `github/{org}` or
+/// `gitlab/{group}[/{subgroup}…]` (up to 20 levels). Always provider-qualified, so it can never be
+/// read as a legacy `owner/name` project: `github/acme` is a project only without `--org`.
+pub fn canonical_org(s: &str) -> Option<String> {
+    let segs: Vec<&str> = s.split('/').collect();
+    let ok = s.len() <= 300 && segs.iter().all(|p| valid_segment(p));
+    match segs.as_slice() {
+        ["github", _] if ok => Some(s.to_owned()),
+        ["gitlab", rest @ ..] if ok && (1..=20).contains(&rest.len()) => Some(s.to_owned()),
+        _ => None,
+    }
+}
+
 pub fn valid_slug(s: &str) -> bool {
     canonical_slug(s).is_some()
 }
@@ -332,5 +345,18 @@ mod tests {
         assert!(c("bitbucket/a/b").is_none() && c("acme/x/y").is_none() && c("gitlab/a/-/b").is_none() && c("a/b.git").is_none());
         let deep = format!("gitlab/{}p", "g/".repeat(20));
         assert!(c(&deep).is_some() && c(&format!("gitlab/g/{}", &deep[7..])).is_none(), "20 group levels at most");
+    }
+
+    #[test]
+    fn orgs() {
+        let o = super::canonical_org;
+        assert_eq!(o("github/acme").as_deref(), Some("github/acme"));
+        assert_eq!(o("gitlab/group").as_deref(), Some("gitlab/group"));
+        assert_eq!(o("gitlab/group/sub/subsub").as_deref(), Some("gitlab/group/sub/subsub"));
+        // Never a project, never a personal `owner/name`, never another provider.
+        for bad in ["acme", "acme/widget", "github/acme/widget", "github", "gitlab", "gitlab/", "bitbucket/acme", "github/-acme", "gitlab/g/../x", "github/a b"] {
+            assert!(o(bad).is_none(), "{bad}");
+        }
+        assert!(o(&format!("gitlab/{}g", "g/".repeat(19))).is_some() && o(&format!("gitlab/{}g", "g/".repeat(20))).is_none(), "20 levels at most");
     }
 }
