@@ -94,11 +94,13 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
-  donate --repo PROJECT --cap $N [--yes]
+  donate --repo PROJECT | --org ORG --cap $N [--yes]
                                   Donate tokens to a project, up to $N a month (it starts once
-                                  the project owner accepts you)
+                                  the project owner accepts you); --org donates to an organisation
+                                  (github/ORG or gitlab/GROUP[/SUB…]), shared by the projects its
+                                  owner covers
   donations [--json] | donations <pause|resume|stop> <id>
-                                  Your donations: what each project used this month
+                                  Your donations: what each project or organisation used this month
   owner trust <ok_id>             Mark an owner key you created elsewhere (a passkey added on
                                   the web) as yours, so the key-log monitor stops alerting
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
@@ -107,18 +109,22 @@ COMMANDS:
   owner status                    Your owner key in the public key log and how it was bound
                                   (confirmed email, passkey, rotation, or before the email rule)
   pending                         Requests waiting for your signature (maintainers)
-  decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] [--yes]
+  decisions [--repo PROJECT | --org ORG] [--json] | decisions refuse <id> [--reason TEXT] [--yes]
             | decisions accept <id>
                                   Donors asking to donate to your projects, and what was decided
                                   (who, when, how); accepting is signed with your passkey on the web
-  accept <donor> --repo PROJECT [--revoke] [--yes]
-                                  Accept a donor for your project (--revoke removes them);
-                                  `approve` is the same command
+  accept <donor> --repo PROJECT | --org ORG [--revoke] [--yes]
+                                  Accept a donor for your project, or once for your organisation
+                                  (--revoke removes them); `approve` is the same command
   members <add|remove> <user> --repo PROJECT [--device] [--cap $N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
                                   up to $N a month
   claim <PROJECT> [--yes]         Confirm you maintain a project, signed by your owner key
                                   (also: claim --repo PROJECT)
+  claim --org ORG [--yes]         Confirm you own an organisation (github/ORG: an admin;
+                                  gitlab/GROUP[/SUB…]: an Owner)
+  org <add|remove> <PROJECT> --org ORG [--yes] | org list --org ORG [--json]
+                                  Which of your projects your organisation's donations fund
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_ENROLL (cloud box enrollment token),
      MOOCHY_INSECURE_DEV=1 (development only)
@@ -172,6 +178,8 @@ struct Opts {
     roles: Option<String>,
     name: Option<String>,
     repo: Option<String>,
+    /// CONTRACT §19: an organisation (`github/acme`, `gitlab/group[/sub…]`), never with `--repo`.
+    org: Option<String>,
     base_url: Option<String>,
     cap: Option<i64>,
     out: Option<PathBuf>,
@@ -209,6 +217,7 @@ fn parse() -> Result<Opts> {
             Long("roles") => o.roles = Some(s(p.value().map_err(err)?)?),
             Long("name") => o.name = Some(s(p.value().map_err(err)?)?),
             Long("repo") => o.repo = Some(s(p.value().map_err(err)?)?),
+            Long("org") => o.org = Some(s(p.value().map_err(err)?)?),
             Long("base-url" | "url") => o.base_url = Some(s(p.value().map_err(err)?)?),
             Long("cert-sha256") => o.cert_sha256 = Some(s(p.value().map_err(err)?)?),
             Long("header-from-keystore") => o.auth_header = Some(s(p.value().map_err(err)?)?),
@@ -270,7 +279,7 @@ fn run() -> Result<()> {
     let home = Home::resolve(o.home.clone())?;
     let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     // A cloud box (§17.1) has no owner powers and no donor role.
-    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
+    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "org" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
         crate::boxes::refuse_on_box(&home.load()?, cmd)?;
     }
     match w.as_slice() {
@@ -321,6 +330,8 @@ fn run() -> Result<()> {
             println!("{}", crate::util::clean_value(&serde_json::to_value(&cfg).ctx("config")?));
             Ok(())
         }
+        ["claim"] | ["approve" | "accept", _] if o.org.is_some() => org_cmd(&home, &o, &w),
+        ["org", ..] => org_cmd(&home, &o, &w),
         ["approve" | "claim", _] | ["members", "add" | "remove", _] | ["claim"] => owner_ops(&home, &o, &w),
         ["verify", r] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
@@ -328,7 +339,7 @@ fn run() -> Result<()> {
             println!("{}", v.into_inner().result_json);
             Ok(())
         }),
-        ["donate"] => crate::donations::donate(&home, &slug_or_detect(&o)?, o.cap.unwrap_or(0), o.has("yes")),
+        ["donate"] => donate(&home, &o),
         // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
         ["donations", act, id] => crate::donations::action(&home, act, id),
@@ -419,13 +430,25 @@ fn logout(home: &Home, o: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// `moochy donate --repo PROJECT | --org ORG --cap $N` (CONTRACT §19.6).
+fn donate(home: &Home, o: &Opts) -> Result<()> {
+    let (target, org) = match org_arg(o)? {
+        Some(org) => (org, true),
+        None => (slug_or_detect(o)?, false),
+    };
+    crate::donations::donate(home, &target, org, o.cap.unwrap_or(0), o.has("yes"))
+}
+
 /// `moochy decisions …` (CONTRACT §16.6).
 fn decisions_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     match w {
-        [] => crate::decisions::list(home, repo_filter(o)?.as_deref(), o.has("json")),
+        [] => {
+            let org = org_arg(o)?;
+            crate::decisions::list(home, repo_filter(o)?.as_deref(), org.as_deref(), o.has("json"))
+        }
         ["refuse", id] => crate::decisions::refuse(home, id, o.reason.as_deref(), o.has("yes")),
         ["accept", id] => crate::decisions::accept_link(home, id),
-        _ => Err(usage("decisions [--repo PROJECT] [--json] | decisions refuse <id> [--reason TEXT] | decisions accept <id>")),
+        _ => Err(usage("decisions [--repo PROJECT | --org ORG] [--json] | decisions refuse <id> [--reason TEXT] | decisions accept <id>")),
     }
 }
 
@@ -469,6 +492,39 @@ fn repo_filter(o: &Opts) -> Result<Option<String>> {
 }
 
 const REPO_FORMS: &str = "owner/name, github/owner/name or gitlab/group[/subgroup…]/name";
+
+const ORG_FORMS: &str = "github/ORG or gitlab/GROUP[/SUBGROUP…]";
+
+/// `--org` in canonical form (CONTRACT §19.1). Never together with `--repo` (§19.6): a donation,
+/// approval or filter targets a project or an organisation, never a guess between the two.
+fn org_arg(o: &Opts) -> Result<Option<String>> {
+    if o.org.is_some() && o.repo.is_some() {
+        return Err(usage("--org and --repo do not go together: name a project or an organisation"));
+    }
+    o.org.as_deref().map(|r| crate::config::canonical_org(r).ok_or_else(|| usage(format!("--org is {ORG_FORMS}")))).transpose()
+}
+
+/// `moochy claim --org ORG`, `moochy org add|remove <PROJECT> --org ORG`, `moochy org list --org
+/// ORG`, `moochy approve|accept <donor> --org ORG [--revoke]` (CONTRACT §19.2–19.4, §19.6).
+/// Arguments are checked first; signing then fails closed: this version's key log defines no
+/// ORG_CLAIMED / ORG_REPO_ADDED / ORG_REPO_REMOVED entry nor an organisation approval, and the
+/// owner key never signs a body it cannot read back field by field (A217).
+fn org_cmd(_home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    let org = org_arg(o)?.ok_or_else(|| usage(format!("--org is required: {ORG_FORMS}")))?;
+    let what = match w {
+        ["claim"] => "an organisation claim (ORG_CLAIMED)".to_owned(),
+        ["org", op @ ("add" | "remove"), repo] => {
+            let repo = canonical_repo(repo)?;
+            format!("{} {} ({})", if *op == "add" { "adding" } else { "removing" }, clean(&repo), if *op == "add" { "ORG_REPO_ADDED" } else { "ORG_REPO_REMOVED" })
+        }
+        ["org", "list"] => "the list of covered projects".to_owned(),
+        ["approve" | "accept", donor] if !donor.is_empty() => format!("{} for the organisation ({})", clean(donor), if o.has("revoke") { "DONOR_REVOKED" } else { "DONOR_APPROVED" }),
+        _ => return Err(usage(format!("org <add|remove> <PROJECT> --org ORG | org list --org ORG | claim --org ORG | accept <donor> --org ORG: ORG is {ORG_FORMS}"))),
+    };
+    // ponytail: refused until mo-keylog lands the §19 entry kinds and the relay their append path;
+    // then this binds and signs like `owner::sign` does for projects.
+    Err(usage(format!("{}: this moochy cannot handle {what} yet (CONTRACT §19, organisation entries are not in its key log); update moochy", clean(&org))))
+}
 
 /// A `--repo` value in the link's canonical form (`owner/name` = GitHub, `gitlab/…`).
 fn canonical_repo(r: &str) -> Result<String> {
@@ -646,6 +702,9 @@ fn sign_json(q: &crate::pb::local::SignResponse) -> serde_json::Value {
 
 /// Owner signatures (CONTRACT §15.4): previewed by the Node, signed here with the owner key.
 fn owner_ops(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    if o.org.is_some() {
+        return Err(usage("--org is for claim, accept/approve, org, donate and decisions; members belong to a project (--repo)"));
+    }
     // Plan 07 and the web claim page: `moochy claim <owner/repo>` (positional, E84).
     if let ["claim", repo] = w {
         let slug = crate::config::canonical_slug(repo).ok_or_else(|| usage(format!("claim <project>: {REPO_FORMS}")))?;
