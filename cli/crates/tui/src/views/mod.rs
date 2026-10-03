@@ -13,6 +13,7 @@ use crate::theme::Theme;
 pub mod activity;
 pub mod decisions;
 pub mod devices;
+mod donor_kit;
 pub mod donations;
 pub mod orgs;
 pub mod overview;

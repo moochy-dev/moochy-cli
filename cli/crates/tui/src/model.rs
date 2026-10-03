@@ -41,6 +41,9 @@ pub struct Donation {
     /// `github/owner/name`, `gitlab/…`, or an org path when [`Donation::org`] is true.
     pub target: String,
     pub org: bool,
+    /// CONTRACT §24: the sponsored person (`github/{login}`, `gitlab/{username}`, link.proto
+    /// `Donation.person`); empty unless this is a person sponsorship.
+    pub person: String,
     pub status: String,
     pub budget_uusd: u64,
     pub per_task_cap_uusd: u64,
