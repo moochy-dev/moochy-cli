@@ -120,6 +120,7 @@ pub fn donate(home: &crate::config::Home, slug: &str, org: bool, monthly_uusd: i
         // §19: exactly one of repo_slug and org.
         repo_slug: if org { String::new() } else { slug.into() },
         org: if org { slug.into() } else { String::new() },
+        person: String::new(),
         budget_uusd: monthly_uusd,
         // D19: one request may use at most $5 by default (or the whole monthly limit when smaller).
         per_task_cap_uusd: monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD),

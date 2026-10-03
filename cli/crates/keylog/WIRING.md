@@ -435,3 +435,61 @@ id prefix tells the target. Existing logs and vectors verify unchanged. Vectors:
   Resolve ids to slugs like repo ids. After a takeover (§19.2) the org leaves the old owner's list;
   the new owner's starts with no repos until they re-add them (and re-approve donors).
 - **Mac.** `moochy-keylog` cannot be cross-checked here (ring); the integrator's Mac build covers it.
+
+## 12. People (CONTRACT §24, spec/KEYLOG.md §2d)
+
+New kinds: 16 `PERSON_CLAIMED`, 17 `PERSON_REPO_ADDED`, 18 `PERSON_REPO_REMOVED`, all owner-signed
+(Ed25519 or passkey). `DONOR_APPROVED` / `DONOR_REVOKED` may target a person id (`m_…`). Existing
+logs and vectors verify unchanged. Vectors: `people.json`.
+
+### 12a. mo-people (relay): append path, gate, pool
+
+- **Bodies.** `tlog.PersonClaim{PersonID, Provider, ProviderUserID /* numeric provider user id */,
+  Owner, Signer, IssuedAtMs}.Body()`, `tlog.PersonRepo{PersonID, RepoID, Signer, IssuedAtMs}.Body()`,
+  `tlog.Grant{RepoID: personID, Subject: donor, …}` for a sponsor approval. `Parse()` returns the
+  new types (never `OrgClaim` / `OrgRepo`). `KindByName` knows the names; `Kind.OwnerSigned()` is
+  true for 16–18.
+- **Fail closed.** `AppendSigned` refuses kinds 16–18 with `ungated`; after your gate (`Owner` is
+  this user and signed in **as** that provider user id; repo public with a maintainer role for
+  `PERSON_REPO_ADDED`) append with `klog.Append` (skew, signature, state rules run there).
+- **Log rules you can rely on.** A `PERSON_CLAIMED` naming another owner than the person's current
+  one is `already_claimed` (never a takeover); the same `(provider, provider_user_id)` under a
+  second `m_` id is `repo_binding` (allocate one `m_` per provider user, never reuse it);
+  `PERSON_REPO_*` need the person's owner key (`not_owner`), the person claimed (`unclaimed`), and
+  `issued_at` after the claim and after the previous entry for (person, repo) (`replay`). The repo
+  need not be claimed. Build bodies with `IssuedAtMs = max(now, OwnerSinceMs(m_…)+1)`.
+- **Pool / `PoolSync`.** For a person donation's worker use `klog.PersonSealable(worker, repo,
+  gateway)` (the person rule alone, as the donor's Node checks it). `dev, approvalIdx, err :=
+  klog.SealableFor(worker, repo, gateway)`: exactly
+  `Sealable(worker, repo)` when that allows; else the person path (gateway device = a logged,
+  unrevoked, unexpired gateway of the pseudonym owning a person M that covers `repo` and approved the
+  worker's donor) with the **smallest** such approval index. Put it in `approval_log_index`.
+  `klog.Owner(m_…)`, `OwnerSinceMs(m_…)`, `DonorApproved(m_…, ps)` answer for people;
+  `klog.OwnedPeople(ps)` → person id → covered repo ids (sorted), for `moochy person list`.
+- **Submit.** `GatewayAllowed` is unchanged (a person never spends the repo's or its orgs'
+  donations through it). For a person donation, accept the requester with
+  `klog.PersonGatewayAllowed(gateway, repo)`: a logged, unrevoked, unexpired gateway device (scope
+  allowing the repo) of the owner of a person covering the repo (`not_member` otherwise), and route
+  it **only** to that person's donations.
+
+### 12b. mo-donor: node gate and alerts
+
+- **Sealing gate.** `view.state(|s| s.person_sealable(worker, repo, gateway))` (and `_at(…, now_ms)`):
+  the person rule **alone** (a repo/org approval never satisfies it, and it never satisfies
+  `sealable`), `Sealable { enc_pub, key_idx, approval_idx }` with the smallest person approval index.
+  Gateway side: `gateway` = this Node's own device id; compare `key_idx` / `approval_idx` with
+  `PoolWorker` yourself and keep the `View::gate` check. Worker side, for a person pledge: `gateway` =
+  the task's gateway device, then verify the task signature with that device's `sign_pub`.
+  `s.sealable_for(worker, repo, gateway)` = `sealable` when it allows, else `person_sealable` (what
+  the relay's `SealableFor` answers). Errors: `not_approved` (another member of the repo, a device
+  of another account, an uncovered repo, an unapproved sponsor), `unclaimed` (not an `r_` id),
+  device codes for either device.
+- **Alerts: no new variant.** `Alert::NotSignedByMe { kind: PERSON_* | DONOR_*, repo_id: "m_…" }`
+  for a person claim naming me, or an entry on my person, signed by an owner key I do not know;
+  the message says "your person profile m_…". A takeover cannot happen (refused, `Rejected` alert).
+- **CLI.** `parse_body` returns `Body::PersonClaim { person_id, provider, provider_user_id, owner,
+  signer, issued_at_ms }` and `Body::PersonRepo { person_id, repo_id, signer, issued_at_ms }`;
+  builders `entry::person_claim_body`, `entry::person_repo_body`, `entry::grant_body(person_id, …)`;
+  `Kind::from_name` knows the names (add 16–18 to `kind_num`). `view.state(|s| s.owned_people(&me))`
+  → `Vec<(person_id, Vec<repo_id>)>` sorted, for `moochy person list` / `owner status`.
+- **Mac.** `moochy-keylog` cannot be cross-checked here (ring); the integrator's Mac build covers it.

@@ -44,7 +44,8 @@ pub enum Alert {
         pseudonym: String,
     },
     /// A claim, approval or membership on my repo, or an org entry on my organisation
-    /// (§19: `repo_id` is then the `o_…` id), signed by a key I do not know.
+    /// (§19: `repo_id` is then the `o_…` id) or my person profile (§24: the `m_…` id),
+    /// signed by a key I do not know.
     NotSignedByMe {
         idx: u64,
         kind: Kind,
@@ -290,6 +291,12 @@ impl Mirror {
             }
             | Body::OrgRepo {
                 org_id: repo_id, ..
+            }
+            | Body::PersonClaim {
+                person_id: repo_id, ..
+            }
+            | Body::PersonRepo {
+                person_id: repo_id, ..
             } => self.state.owner(repo_id).map(str::to_owned),
             _ => None,
         };
@@ -303,7 +310,9 @@ impl Mirror {
                 Body::Claim { signer, .. }
                 | Body::Grant { signer, .. }
                 | Body::OrgClaim { signer, .. }
-                | Body::OrgRepo { signer, .. } => Some(signer),
+                | Body::OrgRepo { signer, .. }
+                | Body::PersonClaim { signer, .. }
+                | Body::PersonRepo { signer, .. } => Some(signer),
                 Body::OwnerPasskey { authorizer, .. } | Body::OwnerKey { authorizer, .. } => {
                     authorizer
                 }
@@ -459,6 +468,12 @@ impl Mirror {
                 owner,
                 signer,
                 ..
+            }
+            | Body::PersonClaim {
+                person_id: repo_id,
+                owner,
+                signer,
+                ..
             } => {
                 if owner == me.pseudonym && !signer_known(signer) {
                     alerts.push(Alert::NotSignedByMe {
@@ -481,6 +496,11 @@ impl Mirror {
             }
             | Body::OrgRepo {
                 org_id: repo_id,
+                signer,
+                ..
+            }
+            | Body::PersonRepo {
+                person_id: repo_id,
                 signer,
                 ..
             } if owner_before.as_deref() == Some(me.pseudonym.as_str())

@@ -116,10 +116,10 @@ pub struct Node {
     pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
-    /// Worker: this donor's own donations (pledge id → status), from `ListDonations` on our own
-    /// session, and when they were fetched (ms). The relay's pledge assignment is never trusted
-    /// alone (T-03-088).
-    pub own_pledges: Mutex<HashMap<String, String>>,
+    /// Worker: this donor's own donations (pledge id → (status, targets a person §24)), from
+    /// `ListDonations` on our own session, and when they were fetched (ms). The relay's pledge
+    /// assignment is never trusted alone (T-03-088).
+    pub own_pledges: Mutex<HashMap<String, (String, bool)>>,
     /// Worker: local model server mapping, public slug → server model id, and the ids it lists.
     pub local_models: HashMap<String, String>,
     pub local_served: std::collections::HashSet<String>,
@@ -388,7 +388,7 @@ impl Node {
     /// with no verified checkpoint yet (D14). A refusal is logged once per worker.
     fn sealable(&self, repo_id: &str, w: &mut PoolWorker) -> bool {
         let r = match &self.keylog {
-            Some(l) => match l.seal(repo_id, w) {
+            Some(l) => match l.seal(repo_id, self.device_id().unwrap_or_default(), w) {
                 Ok(sign_pub) => {
                     w.sign_pub = Some(sign_pub);
                     return true;
