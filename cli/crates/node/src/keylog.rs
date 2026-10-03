@@ -8,6 +8,16 @@
 //! which worker keys a Gateway may seal to ([`KeyLog::seal`], CONTRACT §15.4) and which Gateway
 //! keys a Worker accepts ([`KeyLog::gateway_key`], 03 §7.2).
 //!
+//! Person sponsorships (CONTRACT §24.4) are a separate route, never a widening of the member
+//! one: `moochy_keylog::State::person_sealable(worker, repo, gateway)` allows a worker of donor D
+//! for repo R only when D is approved for a person M, `PERSON_CLAIMED(M)` and
+//! `PERSON_REPO_ADDED(M,R)` are active and `gateway` is a device of M's owner. The Gateway tries it
+//! with its own device after the repo/org rule ([`KeyLog::seal`]); the Worker uses it, with the
+//! signed request's gateway device, for its own pledges that target a person
+//! ([`KeyLog::person_gateway_key`]) and the member rule for every other pledge, so a non-member
+//! never spends a repo/org donation and a member never spends a person donation. The relay sends
+//! `approval_log_index` = the smallest such person approval and sets `Assign.gateway_device`.
+//!
 //! Requires the log's note key (`config set log_key`). Without it, or before the first verified
 //! checkpoint, nothing is sealed and no task is accepted, except under `MOOCHY_INSECURE_DEV=1`
 //! (D14, relay-asserted, tests and development only).
@@ -17,7 +27,8 @@ use crate::node::{Node, PoolWorker, lock};
 use crate::pb::link::LogTileRequest;
 use crate::util::{clean, log};
 use moochy_keylog::monitor::{self, Event, Gate, Monitor, View};
-use moochy_keylog::{Alert, Code, Me, NoteKey};
+use moochy_keylog::state::Sealable;
+use moochy_keylog::{Alert, Code, Me, NoteKey, State};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -63,7 +74,12 @@ pub struct KeyLog {
     state: std::path::PathBuf,
     /// Newest checkpoint note served by the relay (latest wins).
     notes: watch::Sender<Option<Vec<u8>>>,
+    /// The last [`MAX_ALERTS`] monitor alerts (error-level events, their log fields as JSON),
+    /// oldest first: `Status.alerts` and the dashboard's `Watch` (CONTRACT §20).
+    pub alerts: watch::Sender<Vec<String>>,
 }
+
+pub const MAX_ALERTS: usize = 16;
 
 /// Own keys created while the node runs (`<state>/owner_keys`, `<state>/device_keys`): one
 /// base64url key per line, deduplicated.
@@ -155,6 +171,7 @@ impl KeyLog {
                 monitor: Mutex::new(Some(m)),
                 state,
                 notes: watch::channel(None).0,
+                alerts: watch::channel(Vec::new()).0,
             })),
             Err(e) => {
                 log("error", "key log disabled: mirror cannot be opened", &json!({"error": e.to_string()}));
@@ -223,6 +240,14 @@ impl KeyLog {
             .ok()
     }
 
+    /// `moochy owner status` (§24): the person profiles `pseudonym` claimed in the mirror, each
+    /// with the repos it covers, sorted. `None`: no key log on this node.
+    pub fn owned_people(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Vec<(String, Vec<String>)>> {
+        Self::mirror(home, cfg)?
+            .state(|s| s.owned_people(pseudonym).into_iter().map(|(m, r)| (m.to_owned(), r.into_iter().map(str::to_owned).collect())).collect())
+            .ok()
+    }
+
     /// `moochy box list` (§17.1, WIRING §9b): this account's boxes in the mirror, in log order,
     /// revoked and expired ones included. `None`: no key log on this node (or not logged in).
     pub fn boxes(home: &Home, cfg: &Config) -> Option<Vec<BoxRow>> {
@@ -267,11 +292,20 @@ impl KeyLog {
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
         let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now() };
+        let alerts = self.alerts.clone();
         tokio::spawn(async move {
             m.run(&mut link, |e| {
                 let (level, msg, mut fields) = event_fields(e);
                 if let Some(o) = fields.as_object_mut() {
                     o.insert("keylog".into(), json!(e.message()));
+                }
+                if level == "error" {
+                    alerts.send_modify(|v| {
+                        if v.len() >= MAX_ALERTS {
+                            v.remove(0);
+                        }
+                        v.push(json!({"message": &msg, "fields": &fields}).to_string());
+                    });
                 }
                 log(level, &msg, &fields);
             })
@@ -351,13 +385,35 @@ impl KeyLog {
         self.view().gateway_allowed(device, repo_id).ok().map(|d| d.sign_pub)
     }
 
+    /// Worker side for a pledge of this donor that targets a person (CONTRACT §24.4): the logged
+    /// signing key of `gateway` when this donor device `me` may serve it on `repo_id` under a
+    /// person sponsorship. Only from a fresh verified log; `Err` carries the refusal code.
+    pub fn person_gateway_key(&self, me: &str, gateway: &str, repo_id: &str) -> Result<[u8; 32], Code> {
+        if !self.verified() {
+            return Err(Code::NoCheckpoint);
+        }
+        self.view().state(|st| person_requester(st, me, gateway, repo_id))?
+    }
+
     /// Gateway sealing rule (CONTRACT §15.4, A174, A184): the gate is verified, the worker is
     /// logged, unrevoked and owner-approved for `repo_id` at exactly the relay's indexes, and the
     /// relay-advertised keys are the logged ones. Returns the LOGGED signing key (receipts and
-    /// progress checkpoints are verified with it, never with a relay-supplied one).
-    pub fn seal(&self, repo_id: &str, w: &PoolWorker) -> Result<[u8; 32], Code> {
+    /// progress checkpoints are verified with it, never with a relay-supplied one). `gateway` is
+    /// this node's own device: when the repo/org rule does not allow the worker, the person rule
+    /// (§24.4) is tried with it as the requester.
+    pub fn seal(&self, repo_id: &str, gateway: &str, w: &PoolWorker) -> Result<[u8; 32], Code> {
         let view = self.view();
-        let s = view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index)?;
+        let s = match view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index) {
+            // The gate already passed: only a route denial falls through to the person rule; when
+            // no person route exists either, the refusal keeps the repo/org rule's code.
+            Err(e @ (Code::NotApproved | Code::IndexMismatch | Code::Unclaimed)) if !gateway.is_empty() => {
+                match view.state(|st| person_seal(st, &w.worker_device, repo_id, gateway, w.key_log_index, w.approval_log_index))? {
+                    Err(Code::NotApproved) => return Err(e),
+                    r => r?,
+                }
+            }
+            r => r?,
+        };
         let sign_pub = view.state(|st| st.device(&w.worker_device).map(|d| d.sign_pub))?.ok_or(Code::UnknownDevice)?;
         let same_sign = w.sign_pub.is_none_or(|p| crate::util::ct_eq(&p, &sign_pub));
         if !crate::util::ct_eq(&s.enc_pub, &w.enc_pub) || !same_sign {
@@ -365,6 +421,23 @@ impl KeyLog {
         }
         Ok(sign_pub)
     }
+}
+
+/// §24.4, Worker side: the person rule with the signed request's gateway, then that device's
+/// logged signing key (the rule checked it is logged and usable).
+fn person_requester(st: &State, me: &str, gateway: &str, repo_id: &str) -> Result<[u8; 32], Code> {
+    st.person_sealable(me, repo_id, gateway)?;
+    st.device(gateway).map(|d| d.sign_pub).ok_or(Code::UnknownDevice)
+}
+
+/// §24.4, Gateway side: the person rule with this device as the requester, at exactly the
+/// relay's key and approval indexes (a relay pointing at another approval: `index_mismatch`).
+fn person_seal(st: &State, worker: &str, repo_id: &str, gateway: &str, key_idx: u64, approval_idx: u64) -> Result<Sealable, Code> {
+    let s = st.person_sealable(worker, repo_id, gateway)?;
+    if s.key_idx != key_idx || s.approval_idx != approval_idx {
+        return Err(Code::IndexMismatch);
+    }
+    Ok(s)
 }
 
 /// Log level + stable machine fields of a monitor event (the message carries the keywords
@@ -448,10 +521,12 @@ fn is_org(id: &str) -> bool {
     id.starts_with("o_")
 }
 
-/// Names the alert's target `org_id` or `repo_id` from its prefix, never one for the other.
+/// Names the alert's target `org_id`, `person_id` (CONTRACT §24, `m_…`) or `repo_id` from its
+/// prefix, never one for another.
 fn target(mut v: serde_json::Value, id: &str) -> serde_json::Value {
     if let Some(o) = v.as_object_mut() {
-        o.insert(if is_org(id) { "org_id" } else { "repo_id" }.into(), json!(clean(id)));
+        let k = if is_org(id) { "org_id" } else if id.starts_with("m_") { "person_id" } else { "repo_id" };
+        o.insert(k.into(), json!(clean(id)));
     }
     v
 }
@@ -608,6 +683,67 @@ pub fn check_receipt_ack(node: &Node, receipt: &[u8], ack: &crate::pb::link::Rec
 
 #[cfg(test)]
 mod tests {
+    use moochy_keylog::{Code, State, entry::parse_record};
+
+    /// spec/vectors/keylog/people.json (mo-keylog's Go generator) applied to a fresh state.
+    fn people() -> (State, serde_json::Value) {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../spec/vectors/keylog/people.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        let mut st = State::default();
+        for (i, s) in v["log"].as_array().unwrap().iter().enumerate() {
+            let h = s["record_hex"].as_str().unwrap();
+            let rec: Vec<u8> = (0..h.len()).step_by(2).map(|j| u8::from_str_radix(&h[j..j + 2], 16).unwrap()).collect();
+            let _ = st.apply(i as u64, &parse_record(&rec).unwrap(), true);
+        }
+        (st, v)
+    }
+
+    const D1: &str = "d_01HZX000000000000000000001"; // the person's device
+    const W2: &str = "d_01HZX000000000000000000002"; // sponsor D's worker, approved for m1
+    const W3: &str = "d_01HZX000000000000000000003"; // D2's worker: revoked on m1, approved for r1
+    const D7: &str = "d_01HZX000000000000000000007"; // another member of r1
+    const R1: &str = "r_01HZY000000000000000000001";
+
+    #[test]
+    fn person_gate_follows_the_vectors() {
+        let (st, v) = people();
+        for q in v["person_sealable"].as_array().unwrap() {
+            let (w, r, g, code) = (q["worker"].as_str().unwrap(), q["repo"].as_str().unwrap(), q["gateway"].as_str().unwrap(), q["code"].as_str().unwrap());
+            let want_idx = q["approval_idx"].as_u64().unwrap();
+            let worker = super::person_requester(&st, w, g, r);
+            let gateway = super::person_seal(&st, w, r, g, st.device(w).map_or(0, |d| d.idx), want_idx);
+            match code {
+                "" => {
+                    assert_eq!(worker.ok(), st.device(g).map(|d| d.sign_pub), "{q}");
+                    assert_eq!(gateway.map(|s| s.approval_idx).ok(), Some(want_idx), "{q}");
+                }
+                c => {
+                    assert_eq!(worker.err().map(Code::as_str), Some(c), "{q}");
+                    assert_eq!(gateway.err().map(Code::as_str), Some(c), "{q}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn person_gate_refusals() {
+        let (st, _) = people();
+        let idx = |w: &str| st.device(w).map_or(0, |d| d.idx);
+        assert!(super::person_requester(&st, W2, D1, R1).is_ok());
+        // Foreign device: another member of the covered repo never spends the sponsorship.
+        assert_eq!(super::person_requester(&st, W2, D7, R1), Err(Code::NotApproved));
+        assert_eq!(super::person_seal(&st, W2, R1, D7, idx(W2), 24).err(), Some(Code::NotApproved));
+        // Uncovered repos: removed (r3) and never covered (r4).
+        for r in ["r_01HZY000000000000000000003", "r_01HZY000000000000000000004"] {
+            assert_eq!(super::person_requester(&st, W2, D1, r), Err(Code::NotApproved), "{r}");
+        }
+        // Revoked donor: DONOR_REVOKED on m1, even though the repo itself still approves D2.
+        assert_eq!(super::person_requester(&st, W3, D1, R1), Err(Code::NotApproved));
+        assert!(st.sealable(W3, R1).is_ok());
+        // A relay pointing the person route at another approval index.
+        assert_eq!(super::person_seal(&st, W2, R1, D1, idx(W2), 25).err(), Some(Code::IndexMismatch));
+    }
+
     #[test]
     fn passkey_ids_from_digests() {
         let cose = b"\xa5\x01\x02\x03\x26";
@@ -625,5 +761,8 @@ mod tests {
         assert_eq!((v["alert"].as_str(), v["repo_id"].as_str(), v.get("org_id")), (Some("repo_claimed_by_other"), Some(r), None));
         let v = super::alert_fields(&Alert::NotSignedByMe { idx: 8, kind: Kind::DonorApproved, repo_id: o.into(), signer: "ok_x".into() });
         assert_eq!((v["alert"].as_str(), v["org_id"].as_str(), v.get("repo_id")), (Some("unsigned"), Some(o), None));
+        let m = "m_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let v = super::alert_fields(&Alert::NotSignedByMe { idx: 9, kind: Kind::PersonRepoAdded, repo_id: m.into(), signer: "ok_x".into() });
+        assert_eq!((v["alert"].as_str(), v["person_id"].as_str(), v.get("repo_id")), (Some("unsigned"), Some(m), None));
     }
 }

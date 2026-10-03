@@ -1,0 +1,98 @@
+# activity 160x48 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
+╭ Journal · 8 ──────────────────────────────────────────────────────────────────────────────╮╭ Entry ──────────────────────────────────────────────────────────╮
+│   Age  Kind        Entry                                                                  ││ 2026-10-03 14:01  (4m ago)  ◉ receipt                           │
+│ ▶ 4m   ◉ receipt   Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2k tokens · $0… ││ Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2k       │
+│   11m  ✔ verified  Receipt verified for github/tokio-rs/axum ($0.21)                      ││ tokens · $0.21                                                  │
+│   42m  ◆ decision  @grace asked to donate to github/acme/widgets                          ││ Check      ◆ not verified yet                                   │
+│   2h   ◆ decision  Accepted @dana for github/acme/widgets (passkey)                       ││ Verify     moochy verify r_01JB2Y8V9Q3K7M4N5P6R8S0T1X           │
+│   3h   ◉ donation  Donation to github/rust-lang/rustfmt paused (94% of the limit)         ││                                                                 │
+│   6h   ✔ key log   Key log: checkpoint 18,442 consistent with the Git anchor              ││                                                                 │
+│   1d   ● device    Device garage-tower (4090) came online                                 ││                                                                 │
+│   2d   ● device    Box box_ci_02 created for github/acme/gadgets (expires in 2 days)      ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+╰───────────────────────────────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────╯
+ g/G newest/oldest  / filter  : commands  q quit  ? help
+# activity 160x48 --ascii
+ (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
++ Journal - 8 ------------------------------------------------------------------------------++ Entry ----------------------------------------------------------+
+|   Age  Kind        Entry                                                                  || 2026-10-03 14:01  (4m ago)  $ receipt                           |
+| > 4m   $ receipt   Served claude-sonnet-5-5 for github/tokio-rs/axum - 18.2k tokens - $0~ || Served claude-sonnet-5-5 for github/tokio-rs/axum - 18.2k       |
+|   11m  + verified  Receipt verified for github/tokio-rs/axum ($0.21)                      || tokens - $0.21                                                  |
+|   42m  ~ decision  @grace asked to donate to github/acme/widgets                          || Check      ~ not verified yet                                   |
+|   2h   ~ decision  Accepted @dana for github/acme/widgets (passkey)                       || Verify     moochy verify r_01JB2Y8V9Q3K7M4N5P6R8S0T1X           |
+|   3h   $ donation  Donation to github/rust-lang/rustfmt paused (94% of the limit)         ||                                                                 |
+|   6h   + key log   Key log: checkpoint 18,442 consistent with the Git anchor              ||                                                                 |
+|   1d   * device    Device garage-tower (4090) came online                                 ||                                                                 |
+|   2d   * device    Box box_ci_02 created for github/acme/gadgets (expires in 2 days)      ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
++-------------------------------------------------------------------------------------------++-----------------------------------------------------------------+
+ g/G newest/oldest  / filter  : commands  q quit  ? help

@@ -219,7 +219,7 @@ fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
 
 /// What any owner key of the account can sign (KEYLOG §2, CONTRACT §19): `owner status` and
 /// `owner trust` say it, organisations included.
-const SIGNS: &str = "signs for your projects and your organisations: claims, the donors you accept, members, and which of your projects an organisation's donations fund";
+const SIGNS: &str = "signs for your projects, your organisations and your person profile: claims, the donors you accept, members, and which projects an organisation's donations or your sponsors' tokens fund";
 
 /// `moochy owner status` (KEYLOG §4c): this account's CLI owner key as the public key log shows it.
 pub fn show_status(home: &Home) -> Result<()> {
@@ -234,6 +234,12 @@ pub fn show_status(home: &Home) -> Result<()> {
         eprintln!("{l}");
     }
     let orgs_json: Vec<_> = orgs.iter().map(|(o, r)| json!({"org_id": o, "repos": r})).collect();
+    // §24.6: the person profiles this account claimed, and the repos each covers.
+    let people = crate::keylog::KeyLog::owned_people(home, &cfg, &me).unwrap_or_default();
+    for l in person_lines(&people) {
+        eprintln!("{l}");
+    }
+    let people_json: Vec<_> = people.iter().map(|(m, r)| json!({"person_id": m, "repos": r})).collect();
     // §19.2a: as the relay last pushed them to the running app (none when it is not running).
     let claims = rt()?
         .block_on(async {
@@ -251,7 +257,7 @@ pub fn show_status(home: &Home) -> Result<()> {
         .collect();
     let Some(id) = active else {
         eprintln!("No CLI owner key in the public key log for your account{}.", if here { " (this device has a key file the log does not list: run `moochy owner init` after removing it, or check the log)" } else { "" });
-        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here, "orgs": orgs_json, "claims": claims_json}));
+        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here, "orgs": orgs_json, "people": people_json, "claims": claims_json}));
         return Ok(());
     };
     let row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &me, &id).flatten();
@@ -260,7 +266,7 @@ pub fn show_status(home: &Home) -> Result<()> {
         None => eprintln!("Owner key {id}."),
     }
     eprintln!("It {SIGNS}.");
-    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here, "orgs": orgs_json, "claims": claims_json}));
+    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here, "orgs": orgs_json, "people": people_json, "claims": claims_json}));
     Ok(())
 }
 
@@ -289,6 +295,16 @@ fn org_lines(orgs: &[(String, Vec<String>)]) -> Vec<String> {
         .map(|(o, r)| {
             let covers = if r.is_empty() { "funds none of your projects yet (`moochy org add`)".to_owned() } else { format!("funds {}", r.iter().map(|x| clean(x)).collect::<Vec<_>>().join(", ")) };
             format!("Organisation {}: {covers}.", clean(o))
+        })
+        .collect()
+}
+
+fn person_lines(people: &[(String, Vec<String>)]) -> Vec<String> {
+    people
+        .iter()
+        .map(|(m, r)| {
+            let covers = if r.is_empty() { "covers no repo yet (`moochy person add`)".to_owned() } else { format!("covers {}", r.iter().map(|x| clean(x)).collect::<Vec<_>>().join(", ")) };
+            format!("Person profile {}: {covers}.", clean(m))
         })
         .collect()
 }
@@ -518,7 +534,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let done = sign_entries(home, slug, words, yes, revoke, device, cap);
     // The org revokes the human asked for run even if the project's own entry failed.
     for org in &also {
-        crate::org::sign(home, org, crate::org::Op::Donor { donor, revoke: true }, false)?;
+        crate::org::sign(home, crate::org::Group::Org, org, crate::org::Op::Donor { donor, revoke: true }, false)?;
     }
     done
 }

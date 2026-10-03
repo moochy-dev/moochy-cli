@@ -864,6 +864,91 @@ pub struct Donation {
     /// CONTRACT §24: set (repo_slug and org empty) for a person sponsorship
     #[prost(string, tag = "18")]
     pub person: ::prost::alloc::string::String,
+    /// org/person donations: this month's spend per served repo (§19.5, §24.5)
+    #[prost(message, repeated, tag = "19")]
+    pub per_repo: ::prost::alloc::vec::Vec<RepoSpend>,
+    /// CONTRACT §24: the sponsored profile ("m\_…"), so the donor's node binds the pledge to exactly one person
+    #[prost(string, tag = "20")]
+    pub person_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepoSpend {
+    /// provider-qualified ("github/acme/widgets")
+    #[prost(string, tag = "1")]
+    pub repo_slug: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub spent_uusd: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDevicesRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeviceInfo {
+    /// "d\_…"
+    #[prost(string, tag = "1")]
+    pub device_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// donor | maintainer | box
+    #[prost(string, repeated, tag = "3")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "4")]
+    pub online: bool,
+    #[prost(int64, tag = "5")]
+    pub last_seen_ms: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDevicesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub devices: ::prost::alloc::vec::Vec<DeviceInfo>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListOwnedRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CoveredRepo {
+    /// provider-qualified
+    #[prost(string, tag = "1")]
+    pub repo_slug: ::prost::alloc::string::String,
+    /// this month, drawn from the org's/person's donations
+    #[prost(int64, tag = "2")]
+    pub used_uusd: i64,
+    /// 0 = no cap (§19.5)
+    #[prost(int64, tag = "3")]
+    pub share_cap_uusd: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OwnedTarget {
+    /// "r\_…" | "o\_…" | "m\_…"
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// "github/acme/widgets" | "github/acme" | "github/alice"
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// used this month
+    #[prost(int64, tag = "3")]
+    pub month_uusd: i64,
+    /// 0 = no goal
+    #[prost(int64, tag = "4")]
+    pub goal_uusd: i64,
+    /// approved donors
+    #[prost(int32, tag = "5")]
+    pub donors: i32,
+    /// approval requests waiting
+    #[prost(int32, tag = "6")]
+    pub pending: i32,
+    /// §19.2a, 0 = not paused
+    #[prost(int64, tag = "7")]
+    pub paused_since_ms: i64,
+    /// orgs and people only
+    #[prost(message, repeated, tag = "8")]
+    pub covered: ::prost::alloc::vec::Vec<CoveredRepo>,
+    /// projects only: orgs whose donations also serve it
+    #[prost(string, repeated, tag = "9")]
+    pub funded_by: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListOwnedResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub owned: ::prost::alloc::vec::Vec<OwnedTarget>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationEvent {
@@ -1519,6 +1604,59 @@ pub mod node_link_client {
             req.extensions_mut().insert(GrpcMethod::new("moochy.v1.NodeLink", "Lookup"));
             self.inner.unary(req, path, codec).await
         }
+        /// CONTRACT §20 (the TUI), integrator 2026-10-03: read-only views for the session's user,
+        /// authenticated like ListDonations. Bounded lists (≤ 256 entries), never another user's data.
+        /// The devices of my account (never other accounts', never keys).
+        pub async fn list_devices(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListDevicesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDevicesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/ListDevices",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "ListDevices"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// What I own as a maintainer: claimed projects (r\_), organisations (o\_, §19) and my person
+        /// profile (m\_, §24), with this month's use and their covered repos.
+        pub async fn list_owned(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListOwnedRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListOwnedResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/ListOwned",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "ListOwned"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1652,6 +1790,25 @@ pub mod node_link_server {
             &self,
             request: tonic::Request<super::LookupRequest>,
         ) -> std::result::Result<tonic::Response<super::LookupResponse>, tonic::Status>;
+        /// CONTRACT §20 (the TUI), integrator 2026-10-03: read-only views for the session's user,
+        /// authenticated like ListDonations. Bounded lists (≤ 256 entries), never another user's data.
+        /// The devices of my account (never other accounts', never keys).
+        async fn list_devices(
+            &self,
+            request: tonic::Request<super::ListDevicesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDevicesResponse>,
+            tonic::Status,
+        >;
+        /// What I own as a maintainer: claimed projects (r\_), organisations (o\_, §19) and my person
+        /// profile (m\_, §24), with this month's use and their covered repos.
+        async fn list_owned(
+            &self,
+            request: tonic::Request<super::ListOwnedRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListOwnedResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct NodeLinkServer<T> {
@@ -2335,6 +2492,96 @@ pub mod node_link_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LookupSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/ListDevices" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListDevicesSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::ListDevicesRequest>
+                    for ListDevicesSvc<T> {
+                        type Response = super::ListDevicesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListDevicesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::list_devices(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListDevicesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/ListOwned" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListOwnedSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::ListOwnedRequest>
+                    for ListOwnedSvc<T> {
+                        type Response = super::ListOwnedResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListOwnedRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::list_owned(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListOwnedSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

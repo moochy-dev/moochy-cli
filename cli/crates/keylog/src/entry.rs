@@ -48,6 +48,11 @@ pub enum Kind {
     /// The org owner covers (or stops covering) one of their own claimed repos (§19.3).
     OrgRepoAdded = 14,
     OrgRepoRemoved = 15,
+    /// Binds a person (`m_…`, a provider user) to its own account, for good (CONTRACT §24.2).
+    PersonClaimed = 16,
+    /// The person covers (or stops covering) a public repo they maintain (§24.3).
+    PersonRepoAdded = 17,
+    PersonRepoRemoved = 18,
 }
 
 impl Kind {
@@ -69,6 +74,9 @@ impl Kind {
             13 => Self::OrgClaimed,
             14 => Self::OrgRepoAdded,
             15 => Self::OrgRepoRemoved,
+            16 => Self::PersonClaimed,
+            17 => Self::PersonRepoAdded,
+            18 => Self::PersonRepoRemoved,
             _ => return None,
         })
     }
@@ -76,7 +84,7 @@ impl Kind {
     /// Parses a kind name as used in `SignedLogEntry.kind` / `ApprovalRequest.kind`.
     #[must_use]
     pub fn from_name(s: &str) -> Option<Self> {
-        (1..=15).filter_map(Self::from_u32).find(|k| k.name() == s)
+        (1..=18).filter_map(Self::from_u32).find(|k| k.name() == s)
     }
 
     #[must_use]
@@ -97,10 +105,13 @@ impl Kind {
             Self::OrgClaimed => "ORG_CLAIMED",
             Self::OrgRepoAdded => "ORG_REPO_ADDED",
             Self::OrgRepoRemoved => "ORG_REPO_REMOVED",
+            Self::PersonClaimed => "PERSON_CLAIMED",
+            Self::PersonRepoAdded => "PERSON_REPO_ADDED",
+            Self::PersonRepoRemoved => "PERSON_REPO_REMOVED",
         }
     }
 
-    /// Kinds 3–7 and 13–15 carry an owner-key signature.
+    /// Kinds 3–7 and 13–18 carry an owner-key signature.
     #[must_use]
     pub fn owner_signed(self) -> bool {
         matches!(
@@ -113,6 +124,9 @@ impl Kind {
                 | Self::OrgClaimed
                 | Self::OrgRepoAdded
                 | Self::OrgRepoRemoved
+                | Self::PersonClaimed
+                | Self::PersonRepoAdded
+                | Self::PersonRepoRemoved
         )
     }
 }
@@ -166,7 +180,7 @@ pub enum Body<'a> {
         issued_at_ms: u64,
     },
     /// DONOR_APPROVED / DONOR_REVOKED / MEMBER_ADDED / MEMBER_REMOVED. For DONOR_*,
-    /// `repo_id` may be an org id (`o_…`, §19.4).
+    /// `repo_id` may be an org id (`o_…`, §19.4) or a person id (`m_…`, §24.4).
     Grant {
         repo_id: &'a str,
         subject: &'a str,
@@ -185,6 +199,22 @@ pub enum Body<'a> {
     /// ORG_REPO_ADDED / ORG_REPO_REMOVED (§19.3).
     OrgRepo {
         org_id: &'a str,
+        repo_id: &'a str,
+        signer: &'a str,
+        issued_at_ms: u64,
+    },
+    /// PERSON_CLAIMED (§24.2).
+    PersonClaim {
+        person_id: &'a str,
+        provider: &'a str,
+        provider_user_id: &'a str,
+        owner: &'a str,
+        signer: &'a str,
+        issued_at_ms: u64,
+    },
+    /// PERSON_REPO_ADDED / PERSON_REPO_REMOVED (§24.3); the repo need not be claimed.
+    PersonRepo {
+        person_id: &'a str,
         repo_id: &'a str,
         signer: &'a str,
         issued_at_ms: u64,
@@ -425,6 +455,37 @@ pub fn org_claim_body(
     )
 }
 
+/// PERSON_CLAIMED body (§24.2; signed like REPO_CLAIMED; `provider_user_id` is numeric).
+#[must_use]
+pub fn person_claim_body(
+    person_id: &str,
+    provider: &str,
+    provider_user_id: &str,
+    owner: &str,
+    signer: &str,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    claim_body(
+        person_id,
+        provider,
+        provider_user_id,
+        owner,
+        signer,
+        issued_at_ms,
+    )
+}
+
+/// PERSON_REPO_ADDED / PERSON_REPO_REMOVED body (§24.3): same layout as a grant.
+#[must_use]
+pub fn person_repo_body(
+    person_id: &str,
+    repo_id: &str,
+    signer: &str,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    grant_body(person_id, repo_id, signer, issued_at_ms)
+}
+
 /// ORG_REPO_ADDED / ORG_REPO_REMOVED body (§19.3): same layout as a grant.
 #[must_use]
 pub fn org_repo_body(org_id: &str, repo_id: &str, signer: &str, issued_at_ms: u64) -> Vec<u8> {
@@ -577,11 +638,16 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 reason: r,
             }
         }
-        Kind::RepoClaimed | Kind::OrgClaimed => {
+        Kind::RepoClaimed | Kind::OrgClaimed | Kind::PersonClaimed => {
             let [r, pv, pid, o, sg, t] = unlp::<6>(b)?;
             let (r, pv, pid, o, sg, t) = (s(r)?, s(pv)?, s(pid)?, s(o)?, s(sg)?, u64_of(t)?);
             let org = kind == Kind::OrgClaimed;
-            if !is_id(r, if org { "o_" } else { "r_" })
+            let prefix = match kind {
+                Kind::OrgClaimed => "o_",
+                Kind::PersonClaimed => "m_",
+                _ => "r_",
+            };
+            if !is_id(r, prefix)
                 || !(pv == "github" || pv == "gitlab")
                 || !is_decimal(pid)
                 || !is_pseudonym(o)
@@ -590,7 +656,16 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
             {
                 return Err(bad);
             }
-            if org {
+            if kind == Kind::PersonClaimed {
+                Body::PersonClaim {
+                    person_id: r,
+                    provider: pv,
+                    provider_user_id: pid,
+                    owner: o,
+                    signer: sg,
+                    issued_at_ms: t,
+                }
+            } else if org {
                 Body::OrgClaim {
                     org_id: r,
                     provider: pv,
@@ -623,11 +698,28 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
                 issued_at_ms: t,
             }
         }
+        Kind::PersonRepoAdded | Kind::PersonRepoRemoved => {
+            let [m, r, sg, t] = unlp::<4>(b)?;
+            let (m, r, sg, t) = (s(m)?, s(r)?, s(sg)?, u64_of(t)?);
+            if !is_id(m, "m_") || !is_id(r, "r_") || !is_owner_key_id(sg) || t == 0 {
+                return Err(bad);
+            }
+            Body::PersonRepo {
+                person_id: m,
+                repo_id: r,
+                signer: sg,
+                issued_at_ms: t,
+            }
+        }
         Kind::DonorApproved | Kind::DonorRevoked | Kind::MemberAdded | Kind::MemberRemoved => {
             let [r, sub, sg, t] = unlp::<4>(b)?;
             let (r, sub, sg, t) = (s(r)?, s(sub)?, s(sg)?, u64_of(t)?);
-            let org = matches!(kind, Kind::DonorApproved | Kind::DonorRevoked) && is_id(r, "o_");
-            if !(is_id(r, "r_") || org) || !is_pseudonym(sub) || !is_owner_key_id(sg) || t == 0 {
+            let donor = matches!(kind, Kind::DonorApproved | Kind::DonorRevoked);
+            if !(is_id(r, "r_") || donor && (is_id(r, "o_") || is_id(r, "m_")))
+                || !is_pseudonym(sub)
+                || !is_owner_key_id(sg)
+                || t == 0
+            {
                 return Err(bad);
             }
             Body::Grant {

@@ -157,12 +157,23 @@ fn clip(parts: &[Bytes]) -> Vec<u8> {
 }
 
 fn journal(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64) {
-    journal_text(node, task, slug, model, status, cost, t0, None);
+    journal_text(node, task, slug, model, status, cost, t0, None, (0, 0));
+}
+
+/// Tokens in (input, cache reads and writes) and out, as the verified receipt of `e` says.
+/// ponytail: re-opens the receipt once per finished task (off the data path); keep the usage from
+/// `check_receipt` if this ever shows up in a profile.
+fn receipt_tokens(e: &Evidence) -> (u64, u64) {
+    let rc = e.worker_sign_pub.zip(<[u8; 64]>::try_from(e.receipt.donor_sig.as_ref()).ok()).and_then(|(pk, sig)| crypto::open_receipt(&pk, &e.receipt.receipt, &sig).ok());
+    rc.map_or((0, 0), |rc| {
+        let u = &rc.usage;
+        (u.input.saturating_add(u.cache_read).saturating_add(u.cache_write_5m).saturating_add(u.cache_write_1h), u.output)
+    })
 }
 
 /// Journal entry; `text` = (request, response) only when `journal_full_text` is on (opt-in).
 #[allow(clippy::too_many_arguments)]
-fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64, text: Option<(&Bytes, &[Bytes])>) {
+fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64, text: Option<(&Bytes, &[Bytes])>, tokens: (u64, u64)) {
     let (request, response) = match text.filter(|_| node.cfg.journal_full_text) {
         Some((rq, rs)) => (clip(std::slice::from_ref(rq)), clip(rs)),
         None => (Vec::new(), Vec::new()),
@@ -178,6 +189,8 @@ fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, 
         status: status.into(),
         cost_uusd: cost.and_then(|c| i64::try_from(c).ok()).unwrap_or(0),
         ms: u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX),
+        tokens_in: tokens.0,
+        tokens_out: tokens.1,
     });
 }
 
@@ -357,7 +370,8 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         if status != "ok" {
             log("warn", "task failed", &json!({"task": task_id, "code": status}));
         }
-        journal_text(&node, &task_id, &slug, &model, &status, cost, t0, Some((&req_body, ev.as_ref().map_or(&[][..], |e| e.response.as_slice()))));
+        let tokens = ev.as_ref().map_or((0, 0), receipt_tokens);
+        journal_text(&node, &task_id, &slug, &model, &status, cost, t0, Some((&req_body, ev.as_ref().map_or(&[][..], |e| e.response.as_slice()))), tokens);
         if let Some(e) = ev {
             node.keep_evidence(e);
         }

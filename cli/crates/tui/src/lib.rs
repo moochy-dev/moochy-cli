@@ -33,7 +33,7 @@ mod tests;
 
 pub use fixtures::demo_source;
 pub use snapshot::snapshot;
-pub use term::run;
+pub use term::{run, run_views};
 
 /// `moochy tui` flags (CONTRACT §20.4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -42,6 +42,8 @@ pub struct Options {
     pub demo: bool,
     /// `--hostile`: the demo world with escape sequences in every peer string (E121); implies demo.
     pub hostile: bool,
+    /// `--demo=empty`: a brand-new account (every empty state).
+    pub empty: bool,
     /// `--snapshot COLSxROWS`: print one frame and exit.
     pub snapshot: Option<(u16, u16)>,
     /// `--keys "…"`: the key script played before the snapshot ([`snapshot`] module docs).
@@ -54,7 +56,7 @@ pub struct Options {
     pub ansi: bool,
 }
 
-pub const USAGE: &str = "moochy tui [--demo] [--theme light|dark] [--ascii] [--snapshot COLSxROWS [--keys \"…\"] [--ansi]]";
+pub const USAGE: &str = "moochy tui [--demo[=empty]] [--theme light|dark] [--ascii] [--snapshot COLSxROWS [--keys \"…\"] [--ansi]]";
 
 impl Options {
     /// Parses the flags after `tui` (fails closed on anything unknown).
@@ -68,7 +70,11 @@ impl Options {
             };
             let mut value = || inline.clone().or_else(|| it.next().cloned()).ok_or(format!("{flag} needs a value\nusage: {USAGE}"));
             match flag {
-                "--demo" => o.demo = true,
+                "--demo" => match inline.as_deref() {
+                    None => o.demo = true,
+                    Some("empty") => (o.demo, o.empty) = (true, true),
+                    Some(v) => return Err(format!("--demo takes no value or =empty, not {}", sanitize::clean(v))),
+                },
                 "--hostile" => (o.demo, o.hostile) = (true, true),
                 "--ascii" => o.ascii = true,
                 "--ansi" => o.ansi = true,
@@ -96,5 +102,14 @@ impl Options {
 /// The demo (or hostile) fixture source for these options.
 #[must_use]
 pub fn fixture_source(opts: &Options) -> source::FakeSource {
-    if opts.hostile { fixtures::hostile() } else { demo_source() }
+    let mut s = if opts.hostile {
+        fixtures::hostile()
+    } else if opts.empty {
+        source::FakeSource::new(model::Snapshot::default(), fixtures::DEMO_NOW_MS)
+    } else {
+        demo_source()
+    };
+    // Interactive demo only: snapshots stay byte-for-byte stable.
+    s.live = opts.snapshot.is_none() && !opts.empty;
+    s
 }

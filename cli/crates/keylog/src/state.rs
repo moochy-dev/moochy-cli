@@ -57,6 +57,9 @@ pub enum Code {
     Expired,
     /// A box KEY_ADDED whose expiry is not within (logged_at, logged_at + 30 days].
     BoxExpiry,
+    /// A PERSON_CLAIMED naming another owner than the person's current one (§24.2: a
+    /// person profile is never taken over).
+    AlreadyClaimed,
 }
 
 impl Code {
@@ -96,6 +99,7 @@ impl Code {
             Self::OwnerKeyProof => "owner_key_proof",
             Self::Expired => "expired",
             Self::BoxExpiry => "box_expiry",
+            Self::AlreadyClaimed => "already_claimed",
         }
     }
 }
@@ -135,8 +139,8 @@ struct Grant {
     issued: u64,
 }
 
-/// A claimed repo (`r_…`) or organisation (`o_…`, §19): the prefixes never collide, so
-/// DONOR_* on an org id runs the repo path unchanged.
+/// A claimed repo (`r_…`), organisation (`o_…`, §19) or person (`m_…`, §24): the
+/// prefixes never collide, so DONOR_* on an org or person id runs the repo path unchanged.
 #[derive(Clone, Debug)]
 struct Repo {
     provider: String,
@@ -150,7 +154,7 @@ struct Repo {
     donors: HashMap<String, Grant>,
     /// subject pseudonym → MEMBER_* grant.
     members: HashMap<String, Grant>,
-    /// Orgs: repo id → ORG_REPO_ADDED / ORG_REPO_REMOVED.
+    /// Orgs, people: repo id → *_REPO_ADDED / *_REPO_REMOVED.
     covers: HashMap<String, Grant>,
 }
 
@@ -224,6 +228,10 @@ pub struct State {
     repos: HashMap<String, Repo>,
     /// repo id → orgs that ever logged ORG_REPO_ADDED for it (activity is checked live).
     orgs_of: HashMap<String, Vec<String>>,
+    /// repo id → people that ever logged PERSON_REPO_ADDED for it.
+    people_of: HashMap<String, Vec<String>>,
+    /// `provider:provider_user_id` → person id (one profile per provider user).
+    person_of: HashMap<String, String>,
     catalogs: HashMap<u64, [u8; 32]>,
     catalog: u64,
     /// owner key id → key.
@@ -331,7 +339,7 @@ impl State {
                 }
                 d.revoked = true;
             }
-            // §19.2: an org claim follows the repo claim rules.
+            // §19.2 / §24.2: org and person claims follow the repo claim rules.
             Body::Claim {
                 repo_id,
                 provider,
@@ -347,7 +355,26 @@ impl State {
                 owner,
                 signer,
                 issued_at_ms,
+            }
+            | Body::PersonClaim {
+                person_id: repo_id,
+                provider,
+                provider_user_id: provider_repo_id,
+                owner,
+                signer,
+                issued_at_ms,
             } => {
+                let person = e.kind == Kind::PersonClaimed;
+                let bind = format!("{provider}:{provider_repo_id}");
+                if person {
+                    // §24.2: never a takeover, one profile per provider user.
+                    if self.repos.get(repo_id).is_some_and(|r| r.owner != owner) {
+                        return Err(Code::AlreadyClaimed);
+                    }
+                    if self.person_of.get(&bind).is_some_and(|m| m != repo_id) {
+                        return Err(Code::RepoBinding);
+                    }
+                }
                 let ctr = self.check_signer(signer, owner, e, check_sigs)?;
                 if let Some(r) = self.repos.get(repo_id) {
                     if r.provider != provider || r.provider_repo_id != provider_repo_id {
@@ -380,6 +407,9 @@ impl State {
                     r.since = issued_at_ms;
                 }
                 r.issued = issued_at_ms;
+                if person {
+                    self.person_of.insert(bind, repo_id.to_owned());
+                }
             }
             Body::Grant {
                 repo_id,
@@ -461,6 +491,36 @@ impl State {
                 let orgs = self.orgs_of.entry(repo_id.to_owned()).or_default();
                 if !orgs.iter().any(|x| x == org_id) {
                     orgs.push(org_id.to_owned());
+                }
+            }
+            Body::PersonRepo {
+                person_id,
+                repo_id,
+                signer,
+                issued_at_ms,
+            } => {
+                let m = self.repos.get(person_id).ok_or(Code::Unclaimed)?;
+                let ctr = self.check_signer(signer, &m.owner, e, check_sigs)?;
+                if issued_at_ms <= m.since
+                    || m.covers
+                        .get(repo_id)
+                        .is_some_and(|g| issued_at_ms <= g.issued)
+                {
+                    return Err(Code::Replay);
+                }
+                self.bump(signer, ctr);
+                let m = self.repos.get_mut(person_id).ok_or(Code::Unclaimed)?;
+                m.covers.insert(
+                    repo_id.to_owned(),
+                    Grant {
+                        active: e.kind == Kind::PersonRepoAdded,
+                        idx,
+                        issued: issued_at_ms,
+                    },
+                );
+                let people = self.people_of.entry(repo_id.to_owned()).or_default();
+                if !people.iter().any(|x| x == person_id) {
+                    people.push(person_id.to_owned());
                 }
             }
             Body::Catalog {
@@ -770,13 +830,13 @@ impl State {
         self.pubs.get(sign_pub).map(String::as_str)
     }
 
-    /// Current owner pseudonym of a claimed repo or org.
+    /// Current owner pseudonym of a claimed repo, org or person.
     #[must_use]
     pub fn owner(&self, repo_id: &str) -> Option<&str> {
         self.repos.get(repo_id).map(|r| r.owner.as_str())
     }
 
-    /// Does the current owner of `target` (a repo `r_…` or an org `o_…`) hold an active
+    /// Does the current owner of `target` (a repo `r_…`, an org `o_…` or a person `m_…`) hold an active
     /// `DONOR_APPROVED` for `pseudonym`? An approval signed by a previous owner never counts
     /// (dropped on the owner change, §19.2). For the node's org donation note (A269).
     #[must_use]
@@ -804,6 +864,29 @@ impl State {
                     .filter(|(rid, c)| {
                         c.active && self.repos.get(*rid).is_some_and(|r| r.owner == pseudonym)
                     })
+                    .map(|(rid, _)| rid.as_str())
+                    .collect();
+                repos.sort_unstable();
+                (id.as_str(), repos)
+            })
+            .collect();
+        out.sort_unstable_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// The people `pseudonym` owns, each with the repos it covers (active PERSON_REPO_ADDED;
+    /// the repo need not be claimed, §24.3), sorted by id. For `moochy person list`.
+    #[must_use]
+    pub fn owned_people(&self, pseudonym: &str) -> Vec<(&str, Vec<&str>)> {
+        let mut out: Vec<(&str, Vec<&str>)> = self
+            .repos
+            .iter()
+            .filter(|(id, m)| id.starts_with("m_") && m.owner == pseudonym)
+            .map(|(id, m)| {
+                let mut repos: Vec<&str> = m
+                    .covers
+                    .iter()
+                    .filter(|(_, c)| c.active)
                     .map(|(rid, _)| rid.as_str())
                     .collect();
                 repos.sort_unstable();
@@ -849,6 +932,23 @@ impl State {
         repo_id: &str,
         now_ms: u64,
     ) -> Result<(&Device, &Repo), Code> {
+        let d = self.usable_device(id, worker, repo_id, now_ms)?;
+        // An org or person id is never a repo.
+        let r = self
+            .repos
+            .get(repo_id)
+            .filter(|_| repo_id.starts_with("r_"));
+        Ok((d, r.ok_or(Code::Unclaimed)?))
+    }
+
+    /// The device checks of every query: logged, unrevoked, unexpired, role, scope.
+    fn usable_device(
+        &self,
+        id: &str,
+        worker: bool,
+        repo_id: &str,
+        now_ms: u64,
+    ) -> Result<&Device, Code> {
         let d = self.devices.get(id).ok_or(Code::UnknownDevice)?;
         if d.revoked {
             return Err(Code::Revoked);
@@ -866,12 +966,83 @@ impl State {
         if d.repo_scope.as_deref().is_some_and(|s| s != repo_id) {
             return Err(Code::Scope);
         }
-        // An org id is never a repo.
-        let r = self
-            .repos
+        Ok(d)
+    }
+
+    /// The person rule alone (§24.4), for a person donation: may a Gateway seal a task
+    /// for `repo_id`, requested by gateway device `gateway`, to `worker`? Both devices
+    /// pass the device checks (worker / gateway role, scope); `repo_id` is an `r_` id
+    /// (`unclaimed` otherwise) but need not be claimed; the gateway's pseudonym owns a
+    /// person M with PERSON_REPO_ADDED(M, repo) active and an active DONOR_APPROVED for
+    /// the worker's pseudonym on M (`not_approved` otherwise: another member of the
+    /// repo, or a device of another account, never spends M's sponsorship).
+    /// `approval_idx` is the smallest such approval. A repo or org approval never
+    /// satisfies it.
+    pub fn person_sealable(
+        &self,
+        worker: &str,
+        repo_id: &str,
+        gateway: &str,
+    ) -> Result<Sealable, Code> {
+        self.person_sealable_at(worker, repo_id, gateway, now_ms())
+    }
+
+    /// [`Self::person_sealable`] at wall-clock time `now_ms` (box expiry).
+    pub fn person_sealable_at(
+        &self,
+        worker: &str,
+        repo_id: &str,
+        gateway: &str,
+        now_ms: u64,
+    ) -> Result<Sealable, Code> {
+        let w = self.usable_device(worker, true, repo_id, now_ms)?;
+        if !repo_id.starts_with("r_") {
+            return Err(Code::Unclaimed);
+        }
+        let g = self.usable_device(gateway, false, repo_id, now_ms)?;
+        let approval_idx = self
+            .people_of
             .get(repo_id)
-            .filter(|_| repo_id.starts_with("r_"));
-        Ok((d, r.ok_or(Code::Unclaimed)?))
+            .into_iter()
+            .flatten()
+            .filter_map(|m| self.repos.get(m))
+            .filter(|m| m.owner == g.pseudonym && m.covers.get(repo_id).is_some_and(|c| c.active))
+            .filter_map(|m| m.donors.get(w.pseudonym.as_str()).filter(|a| a.active))
+            .map(|a| a.idx)
+            .min()
+            .ok_or(Code::NotApproved)?;
+        Ok(Sealable {
+            enc_pub: w.enc_pub,
+            key_idx: w.idx,
+            approval_idx,
+        })
+    }
+
+    /// [`Self::sealable`] when it allows, else [`Self::person_sealable`] (the relay's
+    /// `SealableFor`).
+    pub fn sealable_for(
+        &self,
+        worker: &str,
+        repo_id: &str,
+        gateway: &str,
+    ) -> Result<Sealable, Code> {
+        self.sealable_for_at(worker, repo_id, gateway, now_ms())
+    }
+
+    /// [`Self::sealable_for`] at wall-clock time `now_ms`.
+    pub fn sealable_for_at(
+        &self,
+        worker: &str,
+        repo_id: &str,
+        gateway: &str,
+        now_ms: u64,
+    ) -> Result<Sealable, Code> {
+        match self.sealable_at(worker, repo_id, now_ms) {
+            Err(Code::Unclaimed | Code::NotApproved) => {
+                self.person_sealable_at(worker, repo_id, gateway, now_ms)
+            }
+            r => r,
+        }
     }
 
     /// May a Gateway seal a task for `repo_id` to `worker`? The key must be logged,

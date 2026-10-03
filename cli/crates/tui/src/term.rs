@@ -30,6 +30,12 @@ const INPUT_POLL: Duration = Duration::from_millis(250);
 
 /// Runs the dashboard on the real terminal until `q`, Ctrl-C or a terminating signal.
 pub fn run(source: Box<dyn Source>, events: Option<Receiver<SourceEvent>>, opts: &Options) -> Result<(), String> {
+    run_views(source, events, opts, crate::app::default_views())
+}
+
+/// [`run`] with another set of tabs (tests drive the real loop with their own views).
+#[doc(hidden)]
+pub fn run_views(source: Box<dyn Source>, events: Option<Receiver<SourceEvent>>, opts: &Options, views: Vec<Box<dyn crate::views::View>>) -> Result<(), String> {
     if !stdout().is_terminal() {
         return Err("moochy tui needs an interactive terminal (or use --snapshot COLSxROWS)".into());
     }
@@ -62,7 +68,7 @@ pub fn run(source: Box<dyn Source>, events: Option<Receiver<SourceEvent>>, opts:
 
     let mut guard = Guard::enter().map_err(|e| e.to_string())?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout())).map_err(|e| e.to_string())?;
-    let mut app = App::new(theme, clock());
+    let mut app = App::with_views(views, theme, clock());
     term.draw(|f| app.render(f)).map_err(|e| e.to_string())?;
 
     loop {
@@ -133,9 +139,26 @@ fn worker(mut src: Box<dyn Source>, actions: &Receiver<Action>, tx: &SyncSender<
     if !snap(&mut src) {
         return;
     }
-    while let Ok(a) = actions.recv() {
-        if a != Action::Refresh && tx.send(AppEvent::Result(src.act(a))).is_err() {
-            return;
+    let every = src.tick_every();
+    loop {
+        let next = match every {
+            Some(d) => actions.recv_timeout(d),
+            None => actions.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match next {
+            Ok(a) => {
+                if a != Action::Refresh && tx.send(AppEvent::Result(src.act(a))).is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(t) = src.tick()
+                    && tx.send(AppEvent::Source(SourceEvent::Toast(t))).is_err()
+                {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
         if !snap(&mut src) {
             return;
@@ -232,10 +255,12 @@ fn run_external(args: &[String]) -> ActionResult {
     let mut out = stdout();
     let _ = writeln!(out, "\n▶ moochy {shown}\n");
     let status = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(args).status());
+    // The toast names the command, not its arguments (they were on screen while it ran).
+    let name = clean(args.first().map_or("", String::as_str));
     let r = match status {
-        Ok(s) if s.success() => ActionResult::Done(format!("moochy {shown}: done")),
-        Ok(s) => ActionResult::Refused(format!("moochy {shown}: exited with {}", s.code().unwrap_or(-1))),
-        Err(e) => ActionResult::Refused(format!("moochy {shown}: {e}")),
+        Ok(s) if s.success() => ActionResult::Done(format!("moochy {name}: done")),
+        Ok(s) => ActionResult::Refused(format!("moochy {name}: exited with {}", s.code().unwrap_or(-1))),
+        Err(e) => ActionResult::Refused(format!("moochy {name}: {e}")),
     };
     let _ = write!(out, "\nPress Enter to return to moochy tui… ");
     let _ = out.flush();

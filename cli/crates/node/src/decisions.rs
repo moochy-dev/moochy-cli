@@ -21,7 +21,7 @@ const MAX_REASON: usize = 280;
 
 /// Where the owner decides on the web: the site of the default relay, else the relay itself
 /// (development relays serve the web on the link's port).
-fn web_origin(home: &Home) -> String {
+pub(crate) fn web_origin(home: &Home) -> String {
     let cfg = home.load().unwrap_or_default();
     match cfg.relay.as_deref().map(crate::tls::Origin::parse) {
         Some(Ok(o)) if o.url() != crate::config::DEFAULT_RELAY => o.url(),
@@ -35,7 +35,7 @@ fn valid_id(id: &str) -> bool {
 
 fn decision_json(d: &Donation, origin: &str) -> serde_json::Value {
     let money = |v: i64| fmt_dollars(u64::try_from(v).unwrap_or(0));
-    let mut v = json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "donor": clean(&d.donor), "status": clean(&d.status),
+    let mut v = json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "donor": clean(&d.donor), "status": clean(&d.status),
         "monthly_limit": money(d.budget_uusd), "per_request_limit": money(d.per_task_cap_uusd), "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(),
         "created_at_ms": d.created_at_ms,
         "events": d.events.iter().map(|e| json!({"event": clean(&e.event), "via": clean(&e.via), "at_ms": e.at_ms, "reason": clean(&e.reason), "log_index": e.log_index})).collect::<Vec<_>>()});
@@ -48,8 +48,9 @@ fn decision_json(d: &Donation, origin: &str) -> serde_json::Value {
     v
 }
 
-/// Decisions to show: those of project `slug` (the server filters), or of organisation `org`
-/// (filtered here: the link has no org filter).
+/// Decisions to show: those of project `slug` (the server filters), or of organisation or person
+/// `org` (filtered here: the link has no org filter; GitHub and GitLab share one namespace for
+/// users and orgs, so one path never names both).
 fn fetch(home: &Home, slug: Option<&str>, org: Option<&str>) -> Result<Vec<Donation>> {
     let q = ListDonationsRequest { as_owner: true, repo_slug: slug.unwrap_or_default().into() };
     let b = crate::donations::call(home, "list", q.encode_to_vec())?;
@@ -57,7 +58,7 @@ fn fetch(home: &Home, slug: Option<&str>, org: Option<&str>) -> Result<Vec<Donat
     if !r.as_owner {
         return Err(usage("the Moochy server cannot list donation decisions yet (update pending): decide on the web, Activity → Decisions"));
     }
-    Ok(r.donations.into_iter().filter(|d| org.is_none_or(|o| d.org.eq_ignore_ascii_case(o))).collect())
+    Ok(r.donations.into_iter().filter(|d| org.is_none_or(|o| d.org.eq_ignore_ascii_case(o) || d.person.eq_ignore_ascii_case(o))).collect())
 }
 
 /// `moochy decisions [--repo P | --org github/ORG] [--json]`.

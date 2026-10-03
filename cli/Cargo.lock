@@ -1300,6 +1300,7 @@ dependencies = [
  "moochy-keylog",
  "moochy-proto",
  "moochy-sandbox",
+ "moochy-tui",
  "moochy-worker",
  "prost",
  "ring",

@@ -88,7 +88,7 @@ struct Ctl {
     node: Arc<Node>,
 }
 
-fn link_state(node: &Node) -> String {
+pub(crate) fn link_state(node: &Node) -> String {
     if node.offline {
         return "offline".into();
     }
@@ -110,6 +110,22 @@ fn org_arg(org: &str, repo: &str, with_repo: bool) -> std::result::Result<String
         return Err(Status::invalid_argument(if with_repo { "repo is required" } else { "org and repo do not go together" }));
     }
     Ok(o)
+}
+
+/// CONTRACT §24.6: `person` set names a person profile, `github/LOGIN` or `gitlab/USERNAME`, never
+/// with `org` (`repo` only for PERSON_REPO_*); empty = none. Returns the canonical path.
+fn person_arg(person: &str, org: &str, repo: &str, with_repo: bool) -> std::result::Result<String, Status> {
+    if person.is_empty() {
+        return Ok(String::new());
+    }
+    let p = crate::config::canonical_org(person).filter(|p| p.matches('/').count() == 1).ok_or_else(|| Status::invalid_argument("person must be github/LOGIN or gitlab/USERNAME"))?;
+    if !org.is_empty() {
+        return Err(Status::invalid_argument("person and org do not go together"));
+    }
+    if repo.is_empty() == with_repo {
+        return Err(Status::invalid_argument(if with_repo { "repo is required" } else { "person and repo do not go together" }));
+    }
+    Ok(p)
 }
 
 #[tonic::async_trait]
@@ -144,6 +160,14 @@ impl LocalControl for Ctl {
             provider_keys: u32::try_from(n.secrets.providers.len()).unwrap_or(u32::MAX),
             warm_adapters: u32::try_from(n.adapters.len()).unwrap_or(u32::MAX),
             catalog_version: n.catalog().version,
+            keys: n
+                .secrets
+                .providers
+                .iter()
+                .map(|p| crate::pb::local::ProviderKeyInfo { provider: p.provider.clone(), models: p.models.keys().cloned().collect() })
+                .collect(),
+            locked: n.locked,
+            alerts: n.keylog.as_ref().map(|k| k.alerts.borrow().clone()).unwrap_or_default(),
         }))
     }
 
@@ -182,8 +206,8 @@ impl LocalControl for Ctl {
     async fn approve(&self, r: Request<ApproveRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         let kind = if r.revoke { "DONOR_REVOKED" } else { "DONOR_APPROVED" };
-        let org = org_arg(&r.org, &r.repo, false)?;
-        crate::approve::preview(&self.node, kind, &r.repo, &org, Some(&r.donor), r.dry_run).map(Response::new)
+        let (org, person) = (org_arg(&r.org, &r.repo, false)?, person_arg(&r.person, &r.org, &r.repo, false)?);
+        crate::approve::preview(&self.node, kind, &r.repo, &org, &person, Some(&r.donor), r.dry_run).map(Response::new)
     }
 
     async fn members(&self, r: Request<MembersRequest>) -> std::result::Result<Response<SignResponse>, Status> {
@@ -196,24 +220,27 @@ impl LocalControl for Ctl {
         if r.device && !r.user.starts_with("d_") {
             return Err(Status::invalid_argument("--device expects a device id (d_…)"));
         }
-        crate::approve::preview(&self.node, kind, &r.repo, "", Some(&r.user), r.dry_run).map(Response::new)
+        crate::approve::preview(&self.node, kind, &r.repo, "", "", Some(&r.user), r.dry_run).map(Response::new)
     }
 
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
-        let org = org_arg(&r.org, &r.repo, false)?;
-        let kind = if org.is_empty() { "REPO_CLAIMED" } else { "ORG_CLAIMED" };
-        crate::approve::preview(&self.node, kind, &r.repo, &org, None, r.dry_run).map(Response::new)
+        let (org, person) = (org_arg(&r.org, &r.repo, false)?, person_arg(&r.person, &r.org, &r.repo, false)?);
+        let kind = if !person.is_empty() { "PERSON_CLAIMED" } else if org.is_empty() { "REPO_CLAIMED" } else { "ORG_CLAIMED" };
+        crate::approve::preview(&self.node, kind, &r.repo, &org, &person, None, r.dry_run).map(Response::new)
     }
 
     async fn org_repo(&self, r: Request<OrgRepoRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
-        let org = org_arg(&r.org, &r.repo, true)?;
-        if org.is_empty() {
-            return Err(Status::invalid_argument("org is required"));
-        }
-        let kind = if r.remove { "ORG_REPO_REMOVED" } else { "ORG_REPO_ADDED" };
-        crate::approve::preview(&self.node, kind, &r.repo, &org, None, r.dry_run).map(Response::new)
+        let (org, person) = (org_arg(&r.org, &r.repo, true)?, person_arg(&r.person, &r.org, &r.repo, true)?);
+        let kind = match (org.is_empty(), person.is_empty(), r.remove) {
+            (true, true, _) => return Err(Status::invalid_argument("org or person is required")),
+            (_, true, false) => "ORG_REPO_ADDED",
+            (_, true, true) => "ORG_REPO_REMOVED",
+            (_, false, false) => "PERSON_REPO_ADDED",
+            (_, false, true) => "PERSON_REPO_REMOVED",
+        };
+        crate::approve::preview(&self.node, kind, &r.repo, &org, &person, None, r.dry_run).map(Response::new)
     }
 
     async fn trust_owner_key(&self, r: Request<TrustOwnerKeyRequest>) -> std::result::Result<Response<TrustOwnerKeyResponse>, Status> {
@@ -280,6 +307,14 @@ impl LocalControl for Ctl {
                 }
             }
         });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type WatchStream = ReceiverStream<std::result::Result<crate::pb::local::WatchEvent, Status>>;
+
+    async fn watch(&self, _: Request<crate::pb::local::WatchRequest>) -> std::result::Result<Response<Self::WatchStream>, Status> {
+        let (tx, rx) = mpsc::channel(crate::watch::QUEUE);
+        tokio::spawn(crate::watch::run(self.node.clone(), tx));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 

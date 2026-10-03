@@ -1,0 +1,50 @@
+# activity 80x24 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+╭ Journal · 8 ─────────────────────────────────────────────────────────────────╮
+│   Age  Kind        Entry                                                     │
+│ ▶ 4m   ◉ receipt   Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2… │
+│   11m  ✔ verified  Receipt verified for github/tokio-rs/axum ($0.21)         │
+│   42m  ◆ decision  @grace asked to donate to github/acme/widgets             │
+│   2h   ◆ decision  Accepted @dana for github/acme/widgets (passkey)          │
+│   3h   ◉ donation  Donation to github/rust-lang/rustfmt paused (94% of the … │
+│   6h   ✔ key log   Key log: checkpoint 18,442 consistent with the Git anchor │
+│   1d   ● device    Device garage-tower (4090) came online                    │
+│   2d   ● device    Box box_ci_02 created for github/acme/gadgets (expires i… │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Entry ───────────────────────────────────────────────────────────────────────╮
+│ 2026-10-03 14:01  (4m ago)  ◉ receipt                                        │
+│ Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2k tokens · $0.21     │
+│ Check      ◆ not verified yet                                                │
+│ Verify     moochy verify r_01JB2Y8V9Q3K7M4N5P6R8S0T1X                        │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ g/G newest/oldest  / filter  : commands  q quit  ? help
+# activity 80x24 --ascii
+ (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
++ Journal - 8 -----------------------------------------------------------------+
+|   Age  Kind        Entry                                                     |
+| > 4m   $ receipt   Served claude-sonnet-5-5 for github/tokio-rs/axum - 18.2~ |
+|   11m  + verified  Receipt verified for github/tokio-rs/axum ($0.21)         |
+|   42m  ~ decision  @grace asked to donate to github/acme/widgets             |
+|   2h   ~ decision  Accepted @dana for github/acme/widgets (passkey)          |
+|   3h   $ donation  Donation to github/rust-lang/rustfmt paused (94% of the ~ |
+|   6h   + key log   Key log: checkpoint 18,442 consistent with the Git anchor |
+|   1d   * device    Device garage-tower (4090) came online                    |
+|   2d   * device    Box box_ci_02 created for github/acme/gadgets (expires i~ |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+
++ Entry -----------------------------------------------------------------------+
+| 2026-10-03 14:01  (4m ago)  $ receipt                                        |
+| Served claude-sonnet-5-5 for github/tokio-rs/axum - 18.2k tokens - $0.21     |
+| Check      ~ not verified yet                                                |
+| Verify     moochy verify r_01JB2Y8V9Q3K7M4N5P6R8S0T1X                        |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+
+ g/G newest/oldest  / filter  : commands  q quit  ? help

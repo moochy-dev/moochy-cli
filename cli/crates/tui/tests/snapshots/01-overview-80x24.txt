@@ -1,0 +1,50 @@
+# overview 80x24 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+╭ moochy ──────────────────────╮╭ Donated this month ──╮╭ Used by my projects ─╮
+│   ╭╮     ╭╮   Hi @alice      ││ ◉ $70.17 of $115.00  ││ ◉ $40.15 of $75.00   │
+│  ╭┴┴─────┴┴╮  ◆ 3 to decide  ││           ▄     █▂   ││  ▂    █     ▄  ▂     │
+│ ◖  ^  ᴗ  ^  ◗ ○ 2/3 devices  ││  ▆▁▅█▃ ▁▅██▆▁▅█▃██▄█ ││  █▁▅█ █▇ ▁▅██▃ █▁▅█  │
+│  ╰─────────╯  ↑3 ↓1 live     ││ ▂█████▅█████████████ ││ ▂████▇██▆█████▂████▇ │
+│                              ││ last 30 days         ││ last 30 days         │
+╰──────────────────────────────╯╰──────────────────────╯╰──────────────────────╯
+╭ My donations this month ─────────────────╮╭ Needs you ───────────────────────╮
+│ ✔ tokio-rs/axum ██████░░░░  68%   $27.42 ││ ◆ @grace → acme/widgets 42m      │
+│ ‖ rust-lang/ru… paused            $14.10 ││ ◆ @heidi → acme/widgets 3h       │
+│ ✔ gitlab/inksc… ███░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → … 1d │
+│ ■ sharkdp/bat   stopped           $10.00 ││ ▲ rustfmt donation is at 94% of… │
+│                                          ││ ✖ pi-headless has been offline … │
+╰──────────────────────────────────────────╯╰──────────────────────────────────╯
+╭ Latest requests ─────────────────────────────────────────────────────────────╮
+│  Age      Model                Project                        Tokens    Cost │
+│  now  ↑ ✔ claude-sonnet-5-5    github/tokio-rs/axum             1.5k  <$0.01 │
+│   1m  ↑ ✔ deepseek-v4          github/acme/widgets             12.9k   $0.08 │
+│   3m  ↓ ✔ claude-opus-5-5      github/rust-lang/rustfmt        24.4k   $0.16 │
+│   4m  ↑ ✔ claude-haiku-4-5     github/acme/gadgets             26.9k   $0.10 │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ d donations  v live  n decisions  a activity  / filter  q quit  ? help
+# overview 80x24 --ascii
+ (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
++ moochy ----------------------++ Donated this month --++ Used by my projects -+
+|   ()     ()   Hi @alice      || $ $70.17 of $115.00  || $ $40.15 of $75.00   |
+|  /---------\  ~ 3 to decide  ||           -     #.   ||  .    #     -  .     |
+| (  ^  .  ^  ) o 2/3 devices  ||  =.=#- .=##=.=#-##-# ||  #.=# ## .=##- #.=#  |
+|  \_________/  ^3 v1 live     || .#####=############# || .#######=#####.##### |
+|                              || last 30 days         || last 30 days         |
++------------------------------++----------------------++----------------------+
++ My donations this month -----------------++ Needs you -----------------------+
+| + tokio-rs/axum ######----  68%   $27.42 || ~ @grace -> acme/widgets 42m     |
+| = rust-lang/ru~ paused            $14.10 || ~ @heidi -> acme/widgets 3h      |
+| + gitlab/inksc~ ###-------  31%   $18.65 || ~ github/acme/gadgets-pro -> ~ 1 |
+| # sharkdp/bat   stopped           $10.00 || ! rustfmt donation is at 94% of~ |
+|                                          || x pi-headless has been offline ~ |
++------------------------------------------++----------------------------------+
++ Latest requests -------------------------------------------------------------+
+|  Age      Model                Project                        Tokens    Cost |
+|  now  ^ + claude-sonnet-5-5    github/tokio-rs/axum             1.5k  <$0.01 |
+|   1m  ^ + deepseek-v4          github/acme/widgets             12.9k   $0.08 |
+|   3m  v + claude-opus-5-5      github/rust-lang/rustfmt        24.4k   $0.16 |
+|   4m  ^ + claude-haiku-4-5     github/acme/gadgets             26.9k   $0.10 |
++------------------------------------------------------------------------------+
+ d donations  v live  n decisions  a activity  / filter  q quit  ? help

@@ -1,0 +1,50 @@
+# decisions 80x24 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+╭ Decisions · 11 ──────────────────────────────────────────────────────────────╮
+│   Waiting for you · 3                                                        │
+│ ▶   ◆ waiting     @grace            $25.00/month · claude-sonnet-5-5 · cap … │
+│     ◆ waiting     @heidi            $10.00 one-off · deepseek-v4             │
+│     ◆ waiting     github/acme/gad…  add to the org's covered repos (share c… │
+│   History · 6                                                                │
+│     ✔ accepted    @dana              2h  github/acme/widgets                 │
+│     ✖ refused     @mallory           5h  github/acme/widgets                 │
+│     ✔ accepted    @frank             1d  github/acme/gadgets                 │
+│     ✔ accepted    @eve               3d  github/acme                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Request ─────────────────────────────────────────────────────────────────────╮
+│ Request    req_51e0                                                          │
+│ Kind       donor                                                             │
+│ For        github/acme/widgets                                               │
+│ From       @grace                                                            │
+│ Terms      $25.00/month · claude-sonnet-5-5 · cap $0.50/task                 │
+│ Received   42m ago                                                           │
+│                                                                              │
+│ a accept (owner key, checked with the server)   r refuse                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ a accept  r refuse  / filter  : commands  q quit  ? help
+# decisions 80x24 --ascii
+ (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
++ Decisions - 11 --------------------------------------------------------------+
+|   Waiting for you - 3                                                        |
+| >   ~ waiting     @grace            $25.00/month - claude-sonnet-5-5 - cap ~ |
+|     ~ waiting     @heidi            $10.00 one-off - deepseek-v4             |
+|     ~ waiting     github/acme/gad~  add to the org's covered repos (share c~ |
+|   History - 6                                                                |
+|     + accepted    @dana              2h  github/acme/widgets                 |
+|     x refused     @mallory           5h  github/acme/widgets                 |
+|     + accepted    @frank             1d  github/acme/gadgets                 |
+|     + accepted    @eve               3d  github/acme                         |
++------------------------------------------------------------------------------+
++ Request ---------------------------------------------------------------------+
+| Request    req_51e0                                                          |
+| Kind       donor                                                             |
+| For        github/acme/widgets                                               |
+| From       @grace                                                            |
+| Terms      $25.00/month - claude-sonnet-5-5 - cap $0.50/task                 |
+| Received   42m ago                                                           |
+|                                                                              |
+| a accept (owner key, checked with the server)   r refuse                     |
++------------------------------------------------------------------------------+
+ a accept  r refuse  / filter  : commands  q quit  ? help
