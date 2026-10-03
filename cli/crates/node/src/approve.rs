@@ -87,6 +87,8 @@ fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String>
         signed: false,
         log_index: 0,
         body_to_sign: q.body_to_sign.to_vec(),
+        org_id: clean(&q.org_id).into_owned(),
+        org_path: clean(&q.org_path).into_owned(),
     })
 }
 

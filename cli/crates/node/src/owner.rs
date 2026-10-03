@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 const AAD: &[u8] = b"moochy/owner-key/v1";
 
-fn key_path(home: &Home, relay: Option<&str>) -> std::path::PathBuf {
+pub(crate) fn key_path(home: &Home, relay: Option<&str>) -> std::path::PathBuf {
     home.keystore_path(relay).with_extension("owner")
 }
 
@@ -80,7 +80,7 @@ fn passphrase(new: bool) -> Result<Zeroizing<String>> {
 }
 
 /// Decrypt the owner key (only after the user confirmed).
-fn load(home: &Home, relay: Option<&str>) -> Result<SignKey> {
+pub(crate) fn load(home: &Home, relay: Option<&str>) -> Result<SignKey> {
     let file = std::fs::read(key_path(home, relay)).map_err(|_| usage("no owner key on this device: run `moochy owner init` first"))?;
     let seed = crate::keystore::open(&file, &passphrase(false)?, AAD)?;
     let seed = Zeroizing::new(<[u8; 32]>::try_from(seed.as_slice()).map_err(|_| auth("owner key file is corrupt"))?);
@@ -97,11 +97,11 @@ fn store(home: &Home, relay: Option<&str>, key: &SignKey, pass: &str) -> Result<
     crate::config::write_private(&path, all.as_bytes())
 }
 
-fn rt() -> Result<tokio::runtime::Runtime> {
+pub(crate) fn rt() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().ctx("runtime")
 }
 
-fn status(s: &tonic::Status) -> crate::util::Error {
+pub(crate) fn status(s: &tonic::Status) -> crate::util::Error {
     match s.code() {
         tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => usage(clean(s.message()).into_owned()),
         tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => crate::util::net(clean(s.message()).into_owned()),
@@ -109,14 +109,14 @@ fn status(s: &tonic::Status) -> crate::util::Error {
     }
 }
 
-async fn submit(home: &Home, req: SubmitEntryRequest) -> Result<SignResponse> {
+pub(crate) async fn submit(home: &Home, req: SubmitEntryRequest) -> Result<SignResponse> {
     let mut c = crate::ctl::connect(&home.socket_path()).await?;
     c.submit_entry(req).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
 }
 
 /// Create an owner key, register it in the key log (OWNER_KEY_ADDED, signed by the new key and,
 /// on rotation, by `prev`), and keep it encrypted only once the log accepted it.
-fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -> Result<SignKey> {
+pub(crate) fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&SignKey>) -> Result<SignKey> {
     let cfg = home.load()?;
     let pseudonym = cfg.pseudonym.clone().ok_or_else(|| auth("not logged in: run `moochy login` first"))?;
     let new = SignKey::from_seed(&Zeroizing::new(crate::util::rand_bytes::<32>()?));
@@ -443,7 +443,7 @@ fn emit_signed(done: &SignResponse, b: &Bound) {
 /// A224: sign only with the account's active owner key as the public key log shows it. A first
 /// owner key is trust-on-first-use (the log takes it on the session's word): if the app on this
 /// machine registered a key of its own instead of ours, the log names that one, and this refuses.
-fn check_own_key(home: &Home, cfg: &crate::config::Config, me: Option<&str>, key: &SignKey) -> Result<()> {
+pub(crate) fn check_own_key(home: &Home, cfg: &crate::config::Config, me: Option<&str>, key: &SignKey) -> Result<()> {
     let mine = owner_key_id(&key.public());
     match me.map(|me| crate::keylog::KeyLog::active_owner_key(home, cfg, me)) {
         Some(Some(Some(id))) if id != mine => Err(auth(format!(
@@ -483,12 +483,12 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let preview = rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let r = match words {
-            ["approve", donor] => c.approve(ApproveRequest { repo: slug.into(), donor: (*donor).into(), dry_run: true, revoke }).await,
+            ["approve", donor] => c.approve(ApproveRequest { repo: slug.into(), donor: (*donor).into(), dry_run: true, revoke, ..ApproveRequest::default() }).await,
             ["members", op, user] => {
                 let op = if *op == "add" { Op::Add } else { Op::Remove };
                 c.members(MembersRequest { repo: slug.into(), op: op as i32, user: (*user).into(), cap_uusd_month: cap, device, dry_run: true }).await
             }
-            _ => c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await,
+            _ => c.claim(ClaimRequest { repo: slug.into(), dry_run: true, ..ClaimRequest::default() }).await,
         };
         r.map(tonic::Response::into_inner).map_err(|s| status(&s))
     })?;
@@ -504,7 +504,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let mut claim = (want.kind != Kind::RepoClaimed)
         .then(|| rt.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
-            c.claim(ClaimRequest { repo: slug.into(), dry_run: true }).await.ok().map(tonic::Response::into_inner)
+            c.claim(ClaimRequest { repo: slug.into(), dry_run: true, ..ClaimRequest::default() }).await.ok().map(tonic::Response::into_inner)
         }))
         .flatten()
         .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false, device_owner: None }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));
