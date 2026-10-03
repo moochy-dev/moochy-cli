@@ -358,6 +358,35 @@ mod tests {
     }
 
     #[test]
+    fn donor_views_survive_any_size_and_hostile_values() {
+        use crate::model::{Activity, BoxDevice, Donation, Served, Snapshot};
+        use crate::views::{Ctx, View};
+        let snap = Snapshot {
+            donations: vec![Donation { id: "pl".into(), status: "active".into(), budget_uusd: u64::MAX, spent_uusd: u64::MAX, org: true, per_repo_uusd: vec![("r".into(), u64::MAX)], ..Donation::default() }],
+            served: vec![Served { at_ms: u64::MAX, tokens_in: u64::MAX, cost_uusd: u64::MAX, latency_ms: u64::MAX, ..Served::default() }],
+            boxes: vec![BoxDevice { expires_at_ms: u64::MAX, ..BoxDevice::default() }],
+            activity: vec![Activity { at_ms: 0, text: "x".repeat(10_000) }],
+            ..Snapshot::default()
+        };
+        let mut views: Vec<Box<dyn View>> = vec![
+            Box::new(super::super::donations::DonationsView::default()),
+            Box::new(super::super::served::ServedView::default()),
+            Box::new(super::super::devices::DevicesView::default()),
+            Box::new(super::super::activity::ActivityView::default()),
+        ];
+        for v in &mut views {
+            for (w, h) in [(1, 1), (20, 5), (80, 12), (80, 19), (300, 80)] {
+                for t in test_util::themes() {
+                    test_util::draw(v.as_mut(), &snap, t, "", w, h);
+                    for i in [Input::End, Input::PageDown, Input::Char('-'), Input::Enter, Input::Click { col: 5, row: 4 }] {
+                        let _ = v.on_input(&i, &Ctx { snap: &snap, theme: &t, filter: "", now_ms: 0 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cursor_clicks_and_bounds() {
         let mut c = Cursor::default();
         c.sync(5, Rect::new(0, 0, 40, 10));
