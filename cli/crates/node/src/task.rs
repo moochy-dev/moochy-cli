@@ -95,6 +95,8 @@ pub struct Evidence {
     pub response: Vec<Bytes>,
     pub truncated: bool,
     pub s_resp: [u8; 32],
+    /// What the receipt check concluded: `None` = verified, else the dispute code.
+    pub receipt_check: Option<&'static str>,
 }
 
 /// `moochy verify <receipt_ref>`: check a public receipt (projection) of a task this Gateway
@@ -157,23 +159,38 @@ fn clip(parts: &[Bytes]) -> Vec<u8> {
 }
 
 fn journal(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64) {
-    journal_text(node, task, slug, model, status, cost, t0, None, (0, 0));
+    journal_text(node, task, slug, model, status, cost, t0, None, ReceiptFacts::default());
 }
 
-/// Tokens in (input, cache reads and writes) and out, as the verified receipt of `e` says.
-/// ponytail: re-opens the receipt once per finished task (off the data path); keep the usage from
-/// `check_receipt` if this ever shows up in a profile.
-fn receipt_tokens(e: &Evidence) -> (u64, u64) {
-    let rc = e.worker_sign_pub.zip(<[u8; 64]>::try_from(e.receipt.donor_sig.as_ref()).ok()).and_then(|(pk, sig)| crypto::open_receipt(&pk, &e.receipt.receipt, &sig).ok());
-    rc.map_or((0, 0), |rc| {
+/// What the journal says about the receipt of `e` (CONTRACT §20): tokens in (input, cache reads
+/// and writes) and out, the public reference (`moochy verify`), and the check: "verified" or
+/// "failed: <dispute code>". ponytail: re-opens the receipt once per finished task (off the data
+/// path); keep the usage from `check_receipt` if this ever shows up in a profile.
+fn receipt_facts(e: &Evidence) -> ReceiptFacts {
+    let pk = e.worker_sign_pub;
+    let rc = pk.zip(<[u8; 64]>::try_from(e.receipt.donor_sig.as_ref()).ok()).and_then(|(pk, sig)| crypto::open_receipt(&pk, &e.receipt.receipt, &sig).ok());
+    let tokens = rc.map_or((0, 0), |rc| {
         let u = &rc.usage;
         (u.input.saturating_add(u.cache_read).saturating_add(u.cache_write_5m).saturating_add(u.cache_write_1h), u.output)
-    })
+    });
+    let p = pk.zip(<[u8; 64]>::try_from(e.receipt.projection_sig.as_ref()).ok()).and_then(|(pk, sig)| crypto::open_projection(&pk, &e.receipt.projection, &sig).ok());
+    ReceiptFacts {
+        tokens,
+        receipt_ref: p.map(|p| crate::util::b64e(&p.receipt_ref.0)).unwrap_or_default(),
+        check: e.receipt_check.map_or_else(|| "verified".to_owned(), |c| format!("failed: {c}")),
+    }
+}
+
+#[derive(Default)]
+struct ReceiptFacts {
+    tokens: (u64, u64),
+    receipt_ref: String,
+    check: String,
 }
 
 /// Journal entry; `text` = (request, response) only when `journal_full_text` is on (opt-in).
 #[allow(clippy::too_many_arguments)]
-fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64, text: Option<(&Bytes, &[Bytes])>, tokens: (u64, u64)) {
+fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, cost: Option<u64>, t0: u64, text: Option<(&Bytes, &[Bytes])>, f: ReceiptFacts) {
     let (request, response) = match text.filter(|_| node.cfg.journal_full_text) {
         Some((rq, rs)) => (clip(std::slice::from_ref(rq)), clip(rs)),
         None => (Vec::new(), Vec::new()),
@@ -189,8 +206,11 @@ fn journal_text(node: &Node, task: &str, slug: &str, model: &str, status: &str, 
         status: status.into(),
         cost_uusd: cost.and_then(|c| i64::try_from(c).ok()).unwrap_or(0),
         ms: u32::try_from(now_ms().saturating_sub(t0)).unwrap_or(u32::MAX),
-        tokens_in: tokens.0,
-        tokens_out: tokens.1,
+        tokens_in: f.tokens.0,
+        tokens_out: f.tokens.1,
+        receipt_ref: f.receipt_ref,
+        receipt_check: f.check,
+        pledge_id: String::new(),
     });
 }
 
@@ -354,6 +374,7 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         truncated: false,
         checkpoints: Vec::new(),
         receipt: None,
+        receipt_code: None,
         resend,
         session,
         entry: req.entry.clone(),
@@ -370,8 +391,8 @@ async fn run_relay(node: &Arc<Node>, req: TaskReq, pool: RepoPool) -> Result<mps
         if status != "ok" {
             log("warn", "task failed", &json!({"task": task_id, "code": status}));
         }
-        let tokens = ev.as_ref().map_or((0, 0), receipt_tokens);
-        journal_text(&node, &task_id, &slug, &model, &status, cost, t0, Some((&req_body, ev.as_ref().map_or(&[][..], |e| e.response.as_slice()))), tokens);
+        let facts = ev.as_ref().map(receipt_facts).unwrap_or_default();
+        journal_text(&node, &task_id, &slug, &model, &status, cost, t0, Some((&req_body, ev.as_ref().map_or(&[][..], |e| e.response.as_slice()))), facts);
         if let Some(e) = ev {
             node.keep_evidence(e);
         }
@@ -418,6 +439,8 @@ struct Driver {
     truncated: bool,
     checkpoints: Vec<pb::Checkpoint>,
     receipt: Option<pb::SignedReceipt>,
+    /// The dispute code of the receipt check (`None` = verified or no receipt yet).
+    receipt_code: Option<&'static str>,
     /// The Submit messages, until the provider starts (resubmission after a link loss).
     resend: Vec<SubmitUp>,
     /// Relay session the current Submit stream belongs to.
@@ -507,6 +530,7 @@ impl Driver {
             response: std::mem::take(&mut self.resp),
             truncated: self.truncated,
             s_resp,
+            receipt_check: self.receipt_code,
         })
     }
 
@@ -760,6 +784,7 @@ impl Driver {
             }
             Err(code) => Some(code),
         };
+        self.receipt_code = code;
         if let Some(code) = code {
             self.dispute(r.attempt, code);
         }

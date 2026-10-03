@@ -142,6 +142,7 @@ impl LocalControl for Ctl {
             })
             .collect();
         let url = n.gateway_url();
+        let (lockdown, lockdown_detail) = crate::lockdown::state(&n.home, n.locked);
         Ok(Response::new(StatusResponse {
             version: env!("CARGO_PKG_VERSION").into(),
             device_id: n.device_id().unwrap_or_default().into(),
@@ -167,6 +168,8 @@ impl LocalControl for Ctl {
                 .map(|p| crate::pb::local::ProviderKeyInfo { provider: p.provider.clone(), models: p.models.keys().cloned().collect() })
                 .collect(),
             locked: n.locked,
+            lockdown: lockdown.into(),
+            lockdown_detail,
             alerts: n.keylog.as_ref().map(|k| k.alerts.borrow().clone()).unwrap_or_default(),
         }))
     }
