@@ -425,6 +425,10 @@ id prefix tells the target. Existing logs and vectors verify unchanged. Vectors:
   max(now, issued_at of the current claim + 1)`: the claim's `issued_at` comes from the owner's
   clock (up to `MaxSkew` ahead of the relay's), and a body built in the same millisecond is refused.
   `klog.OwnerSinceMs(id)` returns that `issued_at`. Nodes need nothing: `State::apply` enforces it.
+- **A269 note: is the donor really approved on the org?** `view.state(|s| s.donor_approved(org_id,
+  &donor_pseudonym))` (also works on an `r_…` id): `true` only for an active `DONOR_APPROVED` signed
+  by the target's **current** owner; one from before a takeover, a revoked one, or an unclaimed
+  target answers `false`. Go: `klog.DonorApproved(target, ps)`.
 - **`moochy owner status`: the orgs I own.** `view.state(|s| s.owned_orgs(&me))` →
   `Vec<(org_id, Vec<repo_id>)>`, sorted by id: each org this account owns and the repos it covers
   (active `ORG_REPO_ADDED`, repo claimed by the same owner: exactly the repos its donations serve).
