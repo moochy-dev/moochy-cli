@@ -71,7 +71,8 @@ if [[ -n $against ]]; then
 	ref=$against
 	if [[ $against == *.tar.xz ]]; then
 		mkdir -p "$work/ref" && tar -xJf "$against" -C "$work/ref"
-		ref=$(find "$work/ref" -type f -name moochy | head -n1)
+		# the executable: archives also carry the AppArmor profile apparmor/moochy
+		ref=$(find "$work/ref" -type f -name moochy -perm -u+x | head -n1)
 	fi
 	[[ -f $ref ]] || { echo "no moochy binary in $against" >&2; exit 1; }
 	sum_b=$(sha256sum "$ref" | cut -d' ' -f1)

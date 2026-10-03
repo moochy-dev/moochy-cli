@@ -35,8 +35,12 @@ jobs:
       - run: rustup target add "${{ matrix.target }}" # in cli/: the pinned toolchain
         working-directory: cli
       - run: gh release download "$TAG" --pattern "moochy-${{ matrix.target }}.tar.xz" --dir "$RUNNER_TEMP"
+      # The checker comes from this workflow's commit, the sources from the tag,
+      # so a fixed checker also verifies releases tagged before the fix.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: "${{ github.sha }}", path: .checker, persist-credentials: false }
       - name: Independent rebuild must equal the release
-        run: deploy/client/scripts/repro-check.sh --target "${{ matrix.target }}" --against "$RUNNER_TEMP/moochy-${{ matrix.target }}.tar.xz"
+        run: .checker/deploy/client/scripts/repro-check.sh --target "${{ matrix.target }}" --against "$RUNNER_TEMP/moochy-${{ matrix.target }}.tar.xz"
 
   sign:
     needs: rebuild
