@@ -251,6 +251,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
                 members: Vec::new(),
                 funded_by: t.funded_by.clone(),
                 paused_since_ms: ms(t.paused_since_ms),
+                per_day_uusd: relay_series(&t.per_day_uusd).unwrap_or_default(),
             })
             .collect();
         // Organisations and person profiles (§24: `m_`, shown as `person github/login`).
