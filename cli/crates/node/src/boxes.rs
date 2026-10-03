@@ -167,6 +167,9 @@ pub async fn link_call(node: &Node, r: LinkCallRequest) -> std::result::Result<L
             "create_box_token" => c.create_box_token(crate::link::with_session(&link, CreateBoxTokenRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
             "list_boxes" => c.list_boxes(crate::link::with_session(&link, ListBoxesRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
             "revoke_box" => c.revoke_box(crate::link::with_session(&link, RevokeBoxRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            // CONTRACT §20 (the TUI): read-only views of the session's own account.
+            "list_devices" => c.list_devices(crate::link::with_session(&link, crate::pb::link::ListDevicesRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            "list_owned" => c.list_owned(crate::link::with_session(&link, crate::pb::link::ListOwnedRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
             _ => return Err(Status::invalid_argument("unknown op")),
         })
     };

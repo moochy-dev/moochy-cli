@@ -4,7 +4,9 @@
 //! boxes) are left empty when the relay does not answer: only a missing node is an error.
 
 use crate::config::Home;
-use crate::pb::link::{Donation, DonationActionRequest, ListBoxesRequest, ListBoxesResponse, ListDonationsRequest, ListDonationsResponse, RevokeBoxRequest};
+use crate::pb::link::{
+    Donation, DonationActionRequest, ListBoxesRequest, ListBoxesResponse, ListDevicesRequest, ListDevicesResponse, ListDonationsRequest, ListDonationsResponse, ListOwnedRequest, ListOwnedResponse, RevokeBoxRequest,
+};
 use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::{DonationsRequest, JournalEntry, JournalRequest, LinkCallRequest, PendingRequest, StatusRequest, WatchRequest};
 use moochy_tui::model::{self, Snapshot};
@@ -59,6 +61,13 @@ async fn donations(c: &mut Client, as_owner: bool) -> Vec<Donation> {
     ListDonationsResponse::decode(r.response.as_slice()).map(|l| l.donations).unwrap_or_default()
 }
 
+/// One relay read through the node's session (`LinkCall`); `None` when the relay or the node
+/// does not answer (an older relay without the RPC included).
+async fn link_call<Q: prost::Message, A: prost::Message + Default>(c: &mut Client, op: &str, q: Q) -> Option<A> {
+    let r = bounded(c.link_call(LinkCallRequest { op: op.into(), request: q.encode_to_vec() })).await.ok()?;
+    A::decode(r.response.as_slice()).ok()
+}
+
 async fn journal(c: &mut Client) -> Vec<JournalEntry> {
     let Ok(mut s) = bounded(c.journal(JournalRequest { follow: false })).await else { return Vec::new() };
     let mut v = Vec::new();
@@ -86,17 +95,18 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
     let st = bounded(c.status(StatusRequest {})).await?;
     let pending = bounded(c.pending(PendingRequest {})).await.unwrap_or_default();
     // Relay-backed parts only while the link is up (else each would wait for it), in parallel.
-    let (mine, owned, boxes) = if st.link_state == "up" {
-        let (mut c1, mut c2, mut c3) = (c.clone(), c.clone(), c.clone());
-        let boxes = async move {
-            match bounded(c3.link_call(LinkCallRequest { op: "list_boxes".into(), request: ListBoxesRequest::default().encode_to_vec() })).await {
-                Ok(r) => ListBoxesResponse::decode(r.response.as_slice()).map(|l| l.boxes).unwrap_or_default(),
-                Err(_) => Vec::new(),
-            }
-        };
-        tokio::join!(donations(&mut c1, false), donations(&mut c2, true), boxes)
+    let (mine, owned, boxes, devices, targets) = if st.link_state == "up" {
+        let (mut c1, mut c2, mut c3, mut c4, mut c5) = (c.clone(), c.clone(), c.clone(), c.clone(), c.clone());
+        let (m, o, b, d, t) = tokio::join!(
+            donations(&mut c1, false),
+            donations(&mut c2, true),
+            link_call::<_, ListBoxesResponse>(&mut c3, "list_boxes", ListBoxesRequest::default()),
+            link_call::<_, ListDevicesResponse>(&mut c4, "list_devices", ListDevicesRequest::default()),
+            link_call::<_, ListOwnedResponse>(&mut c5, "list_owned", ListOwnedRequest::default())
+        );
+        (m, o, b.map(|l| l.boxes).unwrap_or_default(), d.map(|l| l.devices).unwrap_or_default(), t.map(|l| l.owned))
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
     };
     let entries = journal(c).await;
     let now = crate::util::now_ms();
@@ -126,7 +136,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             schedule: d.schedule.clone(),
             models: d.models.clone(),
             // ponytail: the link's Donation has no per-project split yet (integrator request).
-            per_repo_uusd: Vec::new(),
+            per_repo_uusd: d.per_repo.iter().map(|r| (r.repo_slug.clone(), uusd(r.spent_uusd))).collect(),
         })
         .collect();
     // Decisions: the trail of every donation to my projects; projects: grouped from the same list.
@@ -149,6 +159,37 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
         }
     }
     s.decisions.sort_by_key(|d| std::cmp::Reverse(d.at_ms));
+    // What I own, as the relay counts it (§20): replaces the projects grouped above when answered.
+    // ponytail: person profiles (m_) have no tab in the model yet; listed once mo-tui adds one.
+    if let Some(targets) = targets {
+        s.projects = targets
+            .iter()
+            .filter(|t| t.id.starts_with("r_"))
+            .map(|t| model::Project {
+                id: t.id.clone(),
+                slug: t.path.clone(),
+                donors: u32::try_from(t.donors).unwrap_or(0),
+                pending: u32::try_from(t.pending).unwrap_or(0),
+                month_uusd: uusd(t.month_uusd),
+                goal_uusd: uusd(t.goal_uusd),
+                members: Vec::new(),
+                funded_by: t.funded_by.clone(),
+                paused_since_ms: ms(t.paused_since_ms),
+            })
+            .collect();
+        s.orgs = targets
+            .iter()
+            .filter(|t| t.id.starts_with("o_"))
+            .map(|t| model::Org {
+                id: t.id.clone(),
+                path: t.path.clone(),
+                covered: t.covered.iter().map(|r| model::CoveredRepo { slug: r.repo_slug.clone(), used_uusd: uusd(r.used_uusd), share_cap_uusd: uusd(r.share_cap_uusd) }).collect(),
+                donors: u32::try_from(t.donors).unwrap_or(0),
+                month_uusd: uusd(t.month_uusd),
+                paused_since_ms: ms(t.paused_since_ms),
+            })
+            .collect();
+    }
     for c in &pending.claims {
         if let Some(p) = s.projects.iter_mut().find(|p| p.slug == c.path) {
             p.paused_since_ms = ms(c.paused_since_ms);
@@ -182,7 +223,14 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
     }
     s.config.push(("gateway_url".into(), st.gateway_url.clone()));
     s.config.push(("mcp_url".into(), st.mcp_url.clone()));
-    s.devices = vec![model::Device { id: st.device_id.clone(), name: "this device".into(), roles: st.roles.clone(), online: true, this_device: true }];
+    s.devices = devices
+        .iter()
+        .map(|d| model::Device { id: d.device_id.clone(), name: d.name.clone(), roles: d.roles.clone(), online: d.online || d.device_id == st.device_id, this_device: d.device_id == st.device_id })
+        .collect();
+    // An older relay (or none): at least this device.
+    if !s.devices.iter().any(|d| d.this_device) {
+        s.devices.push(model::Device { id: st.device_id.clone(), name: "this device".into(), roles: st.roles.clone(), online: true, this_device: true });
+    }
     s.boxes = boxes
         .iter()
         .filter(|b| !b.revoked)
@@ -211,8 +259,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             direction: if e.role == "worker" { "served".into() } else { "used".into() },
             project: e.repo.clone(),
             model: e.model.clone(),
-            tokens_in: 0,
-            tokens_out: 0,
+            tokens_in: e.tokens_in,
+            tokens_out: e.tokens_out,
             cost_uusd: uusd(e.cost_uusd),
             latency_ms: u64::from(e.ms),
             outcome: e.status.clone(),

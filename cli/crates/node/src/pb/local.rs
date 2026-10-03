@@ -324,6 +324,11 @@ pub struct JournalEntry {
     /// only with `journal_full_text` (opt-in), bounded
     #[prost(bytes = "vec", tag = "10")]
     pub response: ::prost::alloc::vec::Vec<u8>,
+    /// CONTRACT §20: from the usage the node saw (0 = unknown)
+    #[prost(uint64, tag = "11")]
+    pub tokens_in: u64,
+    #[prost(uint64, tag = "12")]
+    pub tokens_out: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct McpOpen {
@@ -968,7 +973,7 @@ pub mod local_control_client {
         }
         /// Owner and member calls relayed as-is on the node's session (like Donations): `op` names the
         /// NodeLink RPC; `request`/`response` are its link.proto messages' bytes. Ops: set_device_cap,
-        /// create_box_token, list_boxes, revoke_box.
+        /// create_box_token, list_boxes, revoke_box, list_devices, list_owned (§20).
         pub async fn link_call(
             &mut self,
             request: impl tonic::IntoRequest<super::LinkCallRequest>,
@@ -1156,7 +1161,7 @@ pub mod local_control_server {
         ) -> std::result::Result<tonic::Response<super::ReportResponse>, tonic::Status>;
         /// Owner and member calls relayed as-is on the node's session (like Donations): `op` names the
         /// NodeLink RPC; `request`/`response` are its link.proto messages' bytes. Ops: set_device_cap,
-        /// create_box_token, list_boxes, revoke_box.
+        /// create_box_token, list_boxes, revoke_box, list_devices, list_owned (§20).
         async fn link_call(
             &self,
             request: tonic::Request<super::LinkCallRequest>,

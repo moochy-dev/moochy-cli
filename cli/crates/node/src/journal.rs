@@ -67,7 +67,7 @@ pub fn append(e: &JournalEntry) {
 }
 
 fn encode(e: &JournalEntry) -> Value {
-    let mut v = json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms});
+    let mut v = json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms, "tokens_in": e.tokens_in, "tokens_out": e.tokens_out});
     if let Some(o) = v.as_object_mut() {
         if !e.request.is_empty() {
             o.insert("request_b64".into(), json!(b64e(&e.request)));
@@ -94,6 +94,8 @@ fn decode(line: &str) -> Option<JournalEntry> {
         ms: v.get("ms").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
         request: b("request_b64"),
         response: b("response_b64"),
+        tokens_in: v.get("tokens_in").and_then(Value::as_u64).unwrap_or(0),
+        tokens_out: v.get("tokens_out").and_then(Value::as_u64).unwrap_or(0),
     })
 }
 
