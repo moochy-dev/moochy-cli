@@ -99,6 +99,19 @@ fn link_state(node: &Node) -> String {
     }
 }
 
+/// CONTRACT §19.6: `org` set names an organisation (canonical form; `repo` only for ORG_REPO_*),
+/// empty = a project request. Returns the canonical org, `""` for none.
+fn org_arg(org: &str, repo: &str, with_repo: bool) -> std::result::Result<String, Status> {
+    if org.is_empty() {
+        return Ok(String::new());
+    }
+    let o = crate::config::canonical_org(org).ok_or_else(|| Status::invalid_argument("org must be github/ORG or gitlab/GROUP[/SUB…]"))?;
+    if repo.is_empty() == with_repo {
+        return Err(Status::invalid_argument(if with_repo { "repo is required" } else { "org and repo do not go together" }));
+    }
+    Ok(o)
+}
+
 #[tonic::async_trait]
 impl LocalControl for Ctl {
     async fn status(&self, _: Request<StatusRequest>) -> std::result::Result<Response<StatusResponse>, Status> {
@@ -169,7 +182,8 @@ impl LocalControl for Ctl {
     async fn approve(&self, r: Request<ApproveRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
         let kind = if r.revoke { "DONOR_REVOKED" } else { "DONOR_APPROVED" };
-        crate::approve::preview(&self.node, kind, &r.repo, Some(&r.donor), r.dry_run).map(Response::new)
+        let org = org_arg(&r.org, &r.repo, false)?;
+        crate::approve::preview(&self.node, kind, &r.repo, &org, Some(&r.donor), r.dry_run).map(Response::new)
     }
 
     async fn members(&self, r: Request<MembersRequest>) -> std::result::Result<Response<SignResponse>, Status> {
@@ -182,17 +196,24 @@ impl LocalControl for Ctl {
         if r.device && !r.user.starts_with("d_") {
             return Err(Status::invalid_argument("--device expects a device id (d_…)"));
         }
-        crate::approve::preview(&self.node, kind, &r.repo, Some(&r.user), r.dry_run).map(Response::new)
+        crate::approve::preview(&self.node, kind, &r.repo, "", Some(&r.user), r.dry_run).map(Response::new)
     }
 
     async fn claim(&self, r: Request<ClaimRequest>) -> std::result::Result<Response<SignResponse>, Status> {
         let r = r.into_inner();
-        crate::approve::preview(&self.node, "REPO_CLAIMED", &r.repo, None, r.dry_run).map(Response::new)
+        let org = org_arg(&r.org, &r.repo, false)?;
+        let kind = if org.is_empty() { "REPO_CLAIMED" } else { "ORG_CLAIMED" };
+        crate::approve::preview(&self.node, kind, &r.repo, &org, None, r.dry_run).map(Response::new)
     }
 
-    // mo-donor replaces this with the ORG_REPO_* preview (CONTRACT §19.3).
-    async fn org_repo(&self, _r: Request<OrgRepoRequest>) -> std::result::Result<Response<SignResponse>, Status> {
-        Err(Status::unimplemented("this moochy app cannot prepare organisation entries yet; update moochy"))
+    async fn org_repo(&self, r: Request<OrgRepoRequest>) -> std::result::Result<Response<SignResponse>, Status> {
+        let r = r.into_inner();
+        let org = org_arg(&r.org, &r.repo, true)?;
+        if org.is_empty() {
+            return Err(Status::invalid_argument("org is required"));
+        }
+        let kind = if r.remove { "ORG_REPO_REMOVED" } else { "ORG_REPO_ADDED" };
+        crate::approve::preview(&self.node, kind, &r.repo, &org, None, r.dry_run).map(Response::new)
     }
 
     async fn trust_owner_key(&self, r: Request<TrustOwnerKeyRequest>) -> std::result::Result<Response<TrustOwnerKeyResponse>, Status> {
