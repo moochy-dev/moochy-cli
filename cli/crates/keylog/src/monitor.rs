@@ -138,10 +138,12 @@ impl Event {
     }
 }
 
-/// "repo" or "organisation" (§19), from the id prefix.
+/// "repo", "organisation" (§19) or "person profile" (§24), from the id prefix.
 fn target(id: &str) -> &'static str {
     if id.starts_with("o_") {
         "organisation"
+    } else if id.starts_with("m_") {
+        "person profile"
     } else {
         "repo"
     }
