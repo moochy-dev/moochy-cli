@@ -351,10 +351,20 @@ async fn receive(task: &str, attempt: u32, down: &mut tonic::Streaming<ServeDown
     (got == Ok(true)).then_some((assign, body))
 }
 
-/// Hook for the key-log mirror (moochy-keylog): the signing key of a Gateway device whose user is
-/// an owner-signed member of `repo_id`. `None` until the mirror is wired.
-fn gateway_key(node: &Node, device: &str, repo_id: &str) -> Option<[u8; 32]> {
-    node.keylog.as_ref().and_then(|l| l.gateway_key(device, repo_id))
+/// The logged signing key of the requesting Gateway `device` (03 §7.2 1–2). A repo/org pledge: its
+/// user is the repo's owner or an owner-signed member. A person pledge (CONTRACT §24.4): it is a
+/// device of the sponsored person's owner, the person covers `repo_id` and approved this donor;
+/// otherwise `Err` (`not_approved`, never the member rule, so another member of the repo never
+/// spends the sponsorship). `Ok(None)`: no verified key log (the caller refuses outside D14).
+fn requester_key(node: &Node, person: bool, device: &str, repo_id: &str) -> Result<Option<[u8; 32]>, String> {
+    let Some(l) = node.keylog.as_ref().filter(|l| l.verified()) else { return Ok(None) };
+    if !person {
+        return Ok(l.gateway_key(device, repo_id));
+    }
+    match l.person_gateway_key(node.device_id().unwrap_or_default(), device, repo_id) {
+        Ok(pk) => Ok(Some(pk)),
+        Err(c) => Err(format!("{}: this person sponsorship does not cover this request (key log)", c.as_str())),
+    }
 }
 
 /// A donation turns active when its owner approves it: re-list soon, but never more than 4×/s.
@@ -362,23 +372,27 @@ const OWN_PLEDGES_REFRESH_MS: u64 = 250;
 
 /// T-03-088: the relay's pledge/repo assignment is never trusted alone. The pledge must be one of
 /// this donor's own active donations (listed on our own authenticated session), and with a
-/// verified key log this device must hold an owner-signed DONOR_APPROVED for the repo.
-async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<(), &'static str> {
-    if let Some(l) = &node.keylog
+/// verified key log this device must hold an owner-signed DONOR_APPROVED for the repo, unless the
+/// pledge targets a person: that route is checked with the signed request's gateway device
+/// (CONTRACT §24.4, [`requester_key`]). Returns whether the pledge targets a person.
+async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<bool, &'static str> {
+    let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|(s, person)| (s == "active", *person));
+    if known(node).map(|k| k.0) != Some(true) {
+        refresh_own_pledges(node, pledge).await?;
+    }
+    let person = match known(node) {
+        Some((true, person)) => person,
+        Some((false, _)) => return Err("this donation is not active"),
+        None => return Err("not one of this donor's donations"),
+    };
+    if !person
+        && let Some(l) = &node.keylog
         && l.verified()
         && !l.donor_approved(node.device_id().unwrap_or_default(), repo_id)
     {
         return Err("this project has not approved this donor (key log)");
     }
-    let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|s| s == "active");
-    if known(node) != Some(true) {
-        refresh_own_pledges(node, pledge).await?;
-    }
-    match known(node) {
-        Some(true) => Ok(()),
-        Some(false) => Err("this donation is not active"),
-        None => Err("not one of this donor's donations"),
-    }
+    Ok(person)
 }
 
 /// Refresh this donor's own donations (`ListDonations` on our own session), at most every 250 ms.
@@ -389,7 +403,7 @@ async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<(
 /// "relay-asserted, dev": a relay without the donation RPCs under `MOOCHY_INSECURE_DEV` (the
 /// caller then accepts).
 async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'static str> {
-    let active = |n: &Node| !want.is_empty() && lock(&n.own_pledges).get(want).is_some_and(|s| s == "active");
+    let active = |n: &Node| !want.is_empty() && lock(&n.own_pledges).get(want).is_some_and(|(s, _)| s == "active");
     let mut last = node.pledge_refresh.lock().await;
     if active(node) {
         return Ok(());
@@ -413,10 +427,10 @@ async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'stati
     match timeout(Duration::from_secs(5), c.list_donations(crate::link::with_session(&l, pb::ListDonationsRequest::default()))).await {
         Ok(Ok(r)) => {
             *last = now_ms();
-            *lock(&node.own_pledges) = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, d.status)).collect();
+            *lock(&node.own_pledges) = r.into_inner().donations.into_iter().take(10_000).map(|d| (d.pledge_id, (d.status, !d.person.is_empty()))).collect();
         }
         Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => {
-            lock(&node.own_pledges).insert(want.to_owned(), "active".into());
+            lock(&node.own_pledges).insert(want.to_owned(), ("active".into(), false));
         }
         _ => *last = 0, // failed: retry at the next task
     }
@@ -504,7 +518,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("unauthorized_task", false, Some("task id outside the freshness window".into())));
     }
     let pledge: PledgeId = assign.pledge_id.parse().map_err(|_| with_ck("unauthorized_task", false, Some("no donation".into())))?;
-    own_donation(node, &assign.pledge_id, &assign.repo_id).await.map_err(|d| with_ck("unauthorized_task", false, Some(d.into())))?;
+    let person = own_donation(node, &assign.pledge_id, &assign.repo_id).await.map_err(|d| with_ck("unauthorized_task", false, Some(d.into())))?;
     // 2. Adapter + catalog entry, pledge policy, route expectations for the validator.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
     let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
@@ -576,7 +590,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("bad_envelope", false, Some("the relay named another requesting device than the signed request".into())));
     }
     let ctx = crypto::TaskContext { task: &task, repo: &route.repo_id, route: &assign.route };
-    match gateway_key(node, &inner.gateway_device.text(), &assign.repo_id) {
+    match requester_key(node, person, &inner.gateway_device.text(), &assign.repo_id).map_err(|d| with_ck("unauthorized_task", false, Some(d)))? {
         Some(pk) => inner.verify(&ctx, &pk).map_err(|_| with_ck("unauthorized_task", false, Some("task signature".into())))?,
         // D14: relay-asserted membership only without a verified key log and in insecure dev
         // mode; the body hash still binds.
