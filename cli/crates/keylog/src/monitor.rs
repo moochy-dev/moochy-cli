@@ -138,6 +138,15 @@ impl Event {
     }
 }
 
+/// "repo" or "organisation" (§19), from the id prefix.
+fn target(id: &str) -> &'static str {
+    if id.starts_with("o_") {
+        "organisation"
+    } else {
+        "repo"
+    }
+}
+
 fn alert_message(a: &Alert) -> String {
     match a {
         Alert::UnknownKey { idx, device_id } => format!(
@@ -156,8 +165,9 @@ fn alert_message(a: &Alert) -> String {
             repo_id,
             signer,
         } => format!(
-            "keylog: SECURITY: unsigned {} for your repo {repo_id}: signed by device {signer}, which is not one of your devices (log #{idx})",
-            kind.name()
+            "keylog: SECURITY: unsigned {} for your {} {repo_id}: signed by owner key {signer}, which is not one of yours (log #{idx})",
+            kind.name(),
+            target(repo_id)
         ),
         Alert::RepoClaimedByOther {
             idx,
@@ -165,7 +175,8 @@ fn alert_message(a: &Alert) -> String {
             owner,
         } => {
             format!(
-                "keylog: SECURITY: your repo {repo_id} was claimed by another account {owner} (log #{idx})"
+                "keylog: SECURITY: your {} {repo_id} was claimed by another account {owner} (log #{idx})",
+                target(repo_id)
             )
         }
         Alert::Rejected { idx, kind, code } => format!(

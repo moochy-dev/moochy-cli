@@ -135,6 +135,8 @@ struct Grant {
     issued: u64,
 }
 
+/// A claimed repo (`r_…`) or organisation (`o_…`, §19): the prefixes never collide, so
+/// DONOR_* on an org id runs the repo path unchanged.
 #[derive(Clone, Debug)]
 struct Repo {
     provider: String,
@@ -145,6 +147,8 @@ struct Repo {
     donors: HashMap<String, Grant>,
     /// subject pseudonym → MEMBER_* grant.
     members: HashMap<String, Grant>,
+    /// Orgs: repo id → ORG_REPO_ADDED / ORG_REPO_REMOVED.
+    covers: HashMap<String, Grant>,
 }
 
 /// A logged owner key (CONTRACT §15.4).
@@ -215,6 +219,8 @@ pub struct State {
     devices: HashMap<String, Device>,
     pubs: HashMap<[u8; 32], String>,
     repos: HashMap<String, Repo>,
+    /// repo id → orgs that ever logged ORG_REPO_ADDED for it (activity is checked live).
+    orgs_of: HashMap<String, Vec<String>>,
     catalogs: HashMap<u64, [u8; 32]>,
     catalog: u64,
     /// owner key id → key.
@@ -322,10 +328,19 @@ impl State {
                 }
                 d.revoked = true;
             }
+            // §19.2: an org claim follows the repo claim rules.
             Body::Claim {
                 repo_id,
                 provider,
                 provider_repo_id,
+                owner,
+                signer,
+                issued_at_ms,
+            }
+            | Body::OrgClaim {
+                org_id: repo_id,
+                provider,
+                provider_org_id: provider_repo_id,
                 owner,
                 signer,
                 issued_at_ms,
@@ -350,11 +365,13 @@ impl State {
                         issued: 0,
                         donors: HashMap::new(),
                         members: HashMap::new(),
+                        covers: HashMap::new(),
                     });
                 if r.owner != owner {
-                    // New owner: every approval and membership must be re-signed.
+                    // New owner: every approval, membership and covered repo must be re-signed.
                     r.donors.clear();
                     r.members.clear();
+                    r.covers.clear();
                     owner.clone_into(&mut r.owner);
                 }
                 r.issued = issued_at_ms;
@@ -397,6 +414,42 @@ impl State {
                         issued: issued_at_ms,
                     },
                 );
+            }
+            Body::OrgRepo {
+                org_id,
+                repo_id,
+                signer,
+                issued_at_ms,
+            } => {
+                let o = self.repos.get(org_id).ok_or(Code::Unclaimed)?;
+                let ctr = self.check_signer(signer, &o.owner, e, check_sigs)?;
+                if e.kind == Kind::OrgRepoAdded {
+                    // §19.3: never a repo claimed by another account.
+                    let r = self.repos.get(repo_id).ok_or(Code::Unclaimed)?;
+                    if r.owner != o.owner {
+                        return Err(Code::NotOwner);
+                    }
+                }
+                if o.covers
+                    .get(repo_id)
+                    .is_some_and(|g| issued_at_ms <= g.issued)
+                {
+                    return Err(Code::Replay);
+                }
+                self.bump(signer, ctr);
+                let o = self.repos.get_mut(org_id).ok_or(Code::Unclaimed)?;
+                o.covers.insert(
+                    repo_id.to_owned(),
+                    Grant {
+                        active: e.kind == Kind::OrgRepoAdded,
+                        idx,
+                        issued: issued_at_ms,
+                    },
+                );
+                let orgs = self.orgs_of.entry(repo_id.to_owned()).or_default();
+                if !orgs.iter().any(|x| x == org_id) {
+                    orgs.push(org_id.to_owned());
+                }
             }
             Body::Catalog {
                 version, sha256, ..
@@ -705,7 +758,7 @@ impl State {
         self.pubs.get(sign_pub).map(String::as_str)
     }
 
-    /// Current owner pseudonym of a claimed repo.
+    /// Current owner pseudonym of a claimed repo or org.
     #[must_use]
     pub fn owner(&self, repo_id: &str) -> Option<&str> {
         self.repos.get(repo_id).map(|r| r.owner.as_str())
@@ -763,12 +816,19 @@ impl State {
         if d.repo_scope.as_deref().is_some_and(|s| s != repo_id) {
             return Err(Code::Scope);
         }
-        Ok((d, self.repos.get(repo_id).ok_or(Code::Unclaimed)?))
+        // An org id is never a repo.
+        let r = self
+            .repos
+            .get(repo_id)
+            .filter(|_| repo_id.starts_with("r_"));
+        Ok((d, r.ok_or(Code::Unclaimed)?))
     }
 
     /// May a Gateway seal a task for `repo_id` to `worker`? The key must be logged,
     /// unrevoked, have the worker role and scope, and its user must hold an active
-    /// owner-signed DONOR_APPROVED for the repo.
+    /// owner-signed DONOR_APPROVED for the repo, or for an org claimed by the repo's
+    /// owner whose ORG_REPO_ADDED for the repo is active (§19.4). `approval_idx` is the
+    /// repo's own approval, else the smallest covering org approval.
     pub fn sealable(&self, worker: &str, repo_id: &str) -> Result<Sealable, Code> {
         self.sealable_at(worker, repo_id, now_ms())
     }
@@ -776,14 +836,27 @@ impl State {
     /// [`Self::sealable`] at wall-clock time `now_ms` (box expiry).
     pub fn sealable_at(&self, worker: &str, repo_id: &str, now_ms: u64) -> Result<Sealable, Code> {
         let (d, r) = self.usable(worker, true, repo_id, now_ms)?;
-        match r.donors.get(d.pseudonym.as_str()) {
-            Some(g) if g.active => Ok(Sealable {
-                enc_pub: d.enc_pub,
-                key_idx: d.idx,
-                approval_idx: g.idx,
-            }),
-            _ => Err(Code::NotApproved),
-        }
+        let active = |g: &&Grant| g.active;
+        let approval = r.donors.get(d.pseudonym.as_str()).filter(active);
+        let approval_idx = match approval {
+            Some(g) => g.idx,
+            None => self
+                .orgs_of
+                .get(repo_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|o| self.repos.get(o))
+                .filter(|o| o.owner == r.owner && o.covers.get(repo_id).is_some_and(|c| c.active))
+                .filter_map(|o| o.donors.get(d.pseudonym.as_str()).filter(active))
+                .map(|g| g.idx)
+                .min()
+                .ok_or(Code::NotApproved)?,
+        };
+        Ok(Sealable {
+            enc_pub: d.enc_pub,
+            key_idx: d.idx,
+            approval_idx,
+        })
     }
 
     /// May `gateway` submit tasks for `repo_id`? The key must be logged, unrevoked, have
