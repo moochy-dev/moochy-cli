@@ -133,6 +133,8 @@ pub struct Node {
     pub store: Option<Arc<Mutex<Store>>>,
     /// Owner: requests waiting for this device's signature (pushed by the relay).
     pub approvals: Mutex<Vec<ApprovalRequest>>,
+    /// Owner (§19.2a): claims paused or close to it, as last pushed (display only).
+    pub claims: Mutex<Vec<crate::pb::link::ClaimStatus>>,
     pub log_acks: Mutex<HashMap<String, oneshot::Sender<LogEntryAck>>>,
     pub link: Mutex<Option<LinkHandle>>,
     pub link_state: watch::Sender<LinkState>,
@@ -196,6 +198,7 @@ impl Node {
             pledge_refresh: tokio::sync::Mutex::new(0),
             own_pledges: Mutex::new(HashMap::new()),
             approvals: Mutex::new(Vec::new()),
+            claims: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
             link_state: watch::channel(LinkState::Down).0,

@@ -46,6 +46,9 @@ pub fn on_requests(node: &Node, r: ApprovalRequests) {
     }
     log("info", "requests waiting for your signature (moochy pending)", &json!({"count": reqs.len()}));
     *lock(&node.approvals) = reqs;
+    let mut claims = r.claims;
+    claims.truncate(MAX_PENDING);
+    *lock(&node.claims) = claims;
 }
 
 pub fn on_ack(node: &Node, a: LogEntryAck) {

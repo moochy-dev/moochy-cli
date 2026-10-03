@@ -179,6 +179,25 @@ pub struct PendingRequest {}
 pub struct PendingResponse {
     #[prost(message, repeated, tag = "1")]
     pub requests: ::prost::alloc::vec::Vec<SignResponse>,
+    /// CONTRACT §19.2a: this owner's claims paused (or close to it), as the relay last pushed them.
+    #[prost(message, repeated, tag = "2")]
+    pub claims: ::prost::alloc::vec::Vec<ClaimState>,
+}
+/// Link `ClaimStatus`, display only.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClaimState {
+    /// "r\_…" or "o\_…"
+    #[prost(string, tag = "1")]
+    pub target_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub verified_at_ms: i64,
+    /// 0 = not paused (reminder window only)
+    #[prost(int64, tag = "4")]
+    pub paused_since_ms: i64,
+    #[prost(int64, tag = "5")]
+    pub releases_at_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MembersRequest {

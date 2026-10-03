@@ -245,7 +245,11 @@ impl LocalControl for Ctl {
     }
 
     async fn pending(&self, _: Request<PendingRequest>) -> std::result::Result<Response<PendingResponse>, Status> {
-        Ok(Response::new(PendingResponse { requests: crate::approve::pending(&self.node) }))
+        let claims = lock(&self.node.claims)
+            .iter()
+            .map(|c| crate::pb::local::ClaimState { target_id: c.target_id.clone(), path: c.path.clone(), verified_at_ms: c.verified_at_ms, paused_since_ms: c.paused_since_ms, releases_at_ms: c.releases_at_ms })
+            .collect();
+        Ok(Response::new(PendingResponse { requests: crate::approve::pending(&self.node), claims }))
     }
 
     type JournalStream = ReceiverStream<std::result::Result<JournalEntry, Status>>;

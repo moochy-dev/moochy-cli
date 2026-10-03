@@ -234,9 +234,24 @@ pub fn show_status(home: &Home) -> Result<()> {
         eprintln!("{l}");
     }
     let orgs_json: Vec<_> = orgs.iter().map(|(o, r)| json!({"org_id": o, "repos": r})).collect();
+    // §19.2a: as the relay last pushed them to the running app (none when it is not running).
+    let claims = rt()?
+        .block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
+            c.pending(crate::pb::local::PendingRequest {}).await.ok()
+        })
+        .map(|r| r.into_inner().claims)
+        .unwrap_or_default();
+    for l in claim_lines(&claims) {
+        eprintln!("{l}");
+    }
+    let claims_json: Vec<_> = claims
+        .iter()
+        .map(|c| json!({"target_id": c.target_id, "path": c.path, "verified_at_ms": c.verified_at_ms, "paused_since_ms": c.paused_since_ms, "releases_at_ms": c.releases_at_ms}))
+        .collect();
     let Some(id) = active else {
         eprintln!("No CLI owner key in the public key log for your account{}.", if here { " (this device has a key file the log does not list: run `moochy owner init` after removing it, or check the log)" } else { "" });
-        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here, "orgs": orgs_json}));
+        crate::util::emit(&json!({"event": "owner_status", "owner_key": null, "key_here": here, "orgs": orgs_json, "claims": claims_json}));
         return Ok(());
     };
     let row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &me, &id).flatten();
@@ -245,8 +260,26 @@ pub fn show_status(home: &Home) -> Result<()> {
         None => eprintln!("Owner key {id}."),
     }
     eprintln!("It {SIGNS}.");
-    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here, "orgs": orgs_json}));
+    crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here, "orgs": orgs_json, "claims": claims_json}));
     Ok(())
+}
+
+/// `owner status` (§19.2a): claims not re-verified at the provider for a while. Paused: no new
+/// request reaches their donations until the next web sign-in; released if still not re-verified.
+fn claim_lines(claims: &[crate::pb::local::ClaimState]) -> Vec<String> {
+    let day = |ms: i64| crate::worker::utc_day(u64::try_from(ms).unwrap_or(0));
+    claims
+        .iter()
+        .map(|c| {
+            let what = format!("{} ({})", clean(&c.path), clean(&c.target_id));
+            let release = if c.releases_at_ms > 0 { format!(", or it is released on {}", day(c.releases_at_ms)) } else { String::new() };
+            if c.paused_since_ms > 0 {
+                format!("Claim {what} PAUSED since {}: no new request reaches its donations. Sign in on the web to re-verify it{release}.", day(c.paused_since_ms))
+            } else {
+                format!("Claim {what} last verified {}: sign in on the web to re-verify it before it pauses{release}.", day(c.verified_at_ms))
+            }
+        })
+        .collect()
 }
 
 /// `owner status` (§19): the organisations this account owns in the verified key log, each with
@@ -716,6 +749,14 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paused_claims_say_how_to_resume_and_when_they_go() {
+        let c = |paused| crate::pb::local::ClaimState { target_id: "o_x".into(), path: "github/acme".into(), verified_at_ms: 1_700_000_000_000, paused_since_ms: paused, releases_at_ms: 1_707_776_000_000 };
+        let l = claim_lines(&[c(1_702_592_000_000), c(0)]);
+        assert_eq!(l[0], "Claim github/acme (o_x) PAUSED since 2023-12-14: no new request reaches its donations. Sign in on the web to re-verify it, or it is released on 2024-02-12.");
+        assert!(l[1].starts_with("Claim github/acme (o_x) last verified 2023-11-14: sign in on the web"));
+    }
 
     const R: &str = "r_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const ALICE: &str = "ps_aaaaaaaaaaaaaaaa";
