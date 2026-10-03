@@ -144,6 +144,10 @@ jobs:
             printf 'CC_x86_64_unknown_linux_musl=musl-gcc\nCC_aarch64_unknown_linux_musl=musl-gcc\n' >> "$GITHUB_ENV"
           fi
         shell: "bash"
+      - name: "Musl std for the pinned toolchain"
+        if: "runner.os == 'Linux'"
+        run: "rustup target add \"$(uname -m)-unknown-linux-musl\""
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

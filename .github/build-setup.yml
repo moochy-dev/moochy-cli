@@ -14,3 +14,10 @@
     if command -v musl-gcc >/dev/null; then
       printf 'CC_x86_64_unknown_linux_musl=musl-gcc\nCC_aarch64_unknown_linux_musl=musl-gcc\n' >> "$GITHUB_ENV"
     fi
+# The build runs with the toolchain pinned in cli/rust-toolchain.toml; dist adds
+# targets to the default one, so give the pinned toolchain its musl std here.
+- name: Musl std for the pinned toolchain
+  if: runner.os == 'Linux'
+  shell: bash
+  working-directory: cli
+  run: rustup target add "$(uname -m)-unknown-linux-musl"
