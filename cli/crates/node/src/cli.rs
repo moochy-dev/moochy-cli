@@ -747,6 +747,9 @@ fn doctor(home: &Home) -> Result<()> {
                 println!("ok   local     remote, vetted {}, trust: {}", clean(p.remote_host.as_deref().unwrap_or("")), crate::keycheck::trust_name(p));
             }
             line(true, "keystore", format!("opens ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" }));
+            for p in &s.providers {
+                println!("ok   key       {}: stored in {}, never sent to Moochy", clean(&p.provider), clean(&key_store_place(home, &cfg)));
+            }
         }
         Ok(None) => line(false, "keystore", "no keystore: run `moochy login`".into()),
         Err(e) => line(false, "keystore", e.msg),
@@ -946,9 +949,11 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
         let vetted = moochy_worker::provider::remote_host_key(url).ok();
         if let Some(host) = vetted.clone().or_else(|| pinned.then(|| crate::keycheck::origin_host(url)).flatten()) {
             let r = crate::keycheck::Remote { host, vetted: vetted.is_some(), ca_file: o.ca_file.clone(), cert_sha256: o.cert_sha256.clone(), auth_header: o.auth_header.clone(), confirm_host: o.confirm_host.clone() };
-            return crate::keycheck::add_remote(home, url, &r, o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
+            crate::keycheck::add_remote(home, url, &r, o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models)?;
+            return stored_where(home);
         }
-        return crate::keycheck::add_local(home, o.base_url.as_deref(), o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models);
+        crate::keycheck::add_local(home, o.base_url.as_deref(), o.has("key-stdin"), o.has("allow-unvetted-host"), &o.models)?;
+        return stored_where(home);
     }
     if !crate::keycheck::PROVIDERS.contains(&provider) {
         return Err(usage(format!("provider must be one of: {}", crate::keycheck::PROVIDERS.join(", "))));
@@ -978,7 +983,24 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     sec.providers.push(ProviderKey { provider: provider.into(), key: key.to_string(), base_url: o.base_url.clone(), allow_unvetted_host: false, models: std::collections::BTreeMap::new(), served_ids: Vec::new(), remote_host: None, trust: None, auth_header: None });
     keystore::save(home, &cfg, &sec)?;
     emit(&json!({"event": "key_added", "provider": provider}));
+    stored_where(home)?;
     safety(home, o, Some(provider))
+}
+
+/// Where the keystore keeps provider keys on this machine (CONTRACT §23), for humans: never a value.
+fn key_store_place(home: &Home, cfg: &crate::config::Config) -> String {
+    if cfg.keystore.as_deref() == Some("keychain") {
+        "your keychain on this machine".into()
+    } else {
+        format!("the encrypted key file {} on this machine", home.keystore_path(cfg.relay.as_deref()).display())
+    }
+}
+
+/// The §23.1 line after `keys add`, on stderr: stdout keeps only the JSON event.
+fn stored_where(home: &Home) -> Result<()> {
+    let cfg = home.load()?;
+    eprintln!("Stored in {}. Never sent to Moochy.", clean(&key_store_place(home, &cfg)));
+    Ok(())
 }
 
 /// Where each provider sets a spend limit (07 §8.1 step 4 deep links).

@@ -1,6 +1,8 @@
 # Moochy
 
-Donate tokens to open-source projects from your own LLM API account, with a monthly limit you choose. Maintainers use those tokens from any MCP client, or from any tool that lets them set a provider base URL. Your key never leaves your machine. Every request is end-to-end encrypted, and the relay only sees encrypted bytes.
+Donate tokens to open-source projects from your own LLM API account, with a monthly limit you choose. Maintainers use those tokens from any MCP client, or from any tool that lets them set a provider base URL. Your API keys stay on your machine. Every request is end-to-end encrypted, and the relay only sees encrypted bytes.
+
+**Your API keys stay on your machine.** Moochy never stores your API keys online. They stay in your machine's keychain, used only by the Moochy app on that machine, and are never sent to Moochy's servers, not even encrypted. `moochy keys add` puts a key in your keychain, only the Moochy app on that machine uses it, and requests are encrypted end to end, so Moochy's servers see neither keys nor prompts.
 
 Donors can use Anthropic, OpenAI, OpenRouter, DeepSeek, or xAI (Grok) API keys, or a model on their own GPU (Ollama, LM Studio, vLLM, llama.cpp).
 
