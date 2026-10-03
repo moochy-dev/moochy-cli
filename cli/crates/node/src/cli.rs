@@ -24,6 +24,8 @@ PROJECT: owner/name or github/owner/name (GitHub), gitlab/group[/subgroup…]/na
          default: the github.com or gitlab.com `origin` remote of the current directory
 
 COMMANDS:
+  tui [--demo] [--snapshot COLSxROWS [--keys K] [--ansi]] [--theme light|dark] [--ascii]
+                                  The dashboard in your terminal (also: `moochy` alone)
   login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless]
                                   Add this device to your account. Roles: gateway uses donated
                                   tokens, worker donates yours. Only the default server unless
@@ -68,6 +70,11 @@ COMMANDS:
   button [--repo P] [--provider github|gitlab] [--style mascot|text|compact] [--theme light|dark|auto]
          [--size s|m|l] [--label TEXT] [--format markdown|html|rst]
                                   The README Donate tokens button for this repository
+  button --chart [--repo P|--org ORG] [--metric tokens|dollars] [--series both|donated|used]
+         [--kind area|bars|line|sparkline] [--period 7d|30d|90d|12m] [--theme light|dark|auto]
+         [--size s|m|l] [--label TEXT] [--goal] [--total] [--format markdown|html|rst|iframe]
+                                  A live chart of the tokens donated to and used by the
+                                  project or organisation (README image or website card)
   audit --provider [--from-file usage.csv]
                                   What this device served (90 days), checked against the
                                   provider's usage export (date,model,cost_usd)
@@ -229,6 +236,12 @@ fn parse() -> Result<Opts> {
             Long("theme") => o.button.theme = Some(s(p.value().map_err(err)?)?),
             Long("size") => o.button.size = Some(s(p.value().map_err(err)?)?),
             Long("format") => o.button.format = Some(s(p.value().map_err(err)?)?),
+            Long("metric") => o.button.metric = Some(s(p.value().map_err(err)?)?),
+            Long("series") => o.button.series = Some(s(p.value().map_err(err)?)?),
+            Long("kind") => o.button.kind = Some(s(p.value().map_err(err)?)?),
+            Long("period") => o.button.period = Some(s(p.value().map_err(err)?)?),
+            Long("goal") => o.button.goal = true,
+            Long("total") => o.button.total = true,
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
@@ -249,7 +262,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -262,7 +275,56 @@ fn parse() -> Result<Opts> {
     Ok(o)
 }
 
+/// `moochy [--home DIR] tui [TUI OPTIONS]`: the TUI's own flags (CONTRACT §20.4) go to
+/// `moochy-tui` unparsed. `None` when the command is not `tui`.
+fn tui_argv() -> Option<(Option<PathBuf>, Vec<String>)> {
+    let mut a = std::env::args_os().skip(1);
+    let mut home = None;
+    loop {
+        let w = a.next()?.into_string().ok()?;
+        match w.as_str() {
+            "--home" => home = Some(PathBuf::from(a.next()?)),
+            "tui" => break,
+            _ => return None,
+        }
+    }
+    let mut rest = Vec::new();
+    while let Some(w) = a.next() {
+        let w = w.into_string().ok()?;
+        if w == "--home" {
+            home = Some(PathBuf::from(a.next()?));
+        } else {
+            rest.push(w);
+        }
+    }
+    Some((home, rest))
+}
+
+/// CONTRACT §20: the dashboard, over `node.sock` (or the demo fixtures, which need no node).
+fn tui(home: Option<PathBuf>, args: &[String]) -> Result<()> {
+    let opts = moochy_tui::Options::parse(args).map_err(usage)?;
+    if opts.demo || opts.hostile {
+        let mut src = moochy_tui::fixture_source(&opts);
+        if opts.snapshot.is_some() {
+            print!("{}", moochy_tui::snapshot(&mut src, &opts).map_err(internal)?);
+            return Ok(());
+        }
+        return moochy_tui::run(Box::new(src), None, &opts).map_err(internal);
+    }
+    let mut src = crate::tuisrc::NodeSource::new(Home::resolve(home)?).map_err(internal)?;
+    if opts.snapshot.is_some() {
+        print!("{}", moochy_tui::snapshot(&mut src, &opts).map_err(internal)?);
+        return Ok(());
+    }
+    let events = src.events();
+    moochy_tui::run(Box::new(src), Some(events), &opts).map_err(internal)
+}
+
+#[allow(clippy::too_many_lines, reason = "the command dispatch table")]
 fn run() -> Result<()> {
+    if let Some((home, args)) = tui_argv() {
+        return tui(home, &args);
+    }
     let o = parse()?;
     if o.has("version") {
         println!("moochy {}", env!("CARGO_PKG_VERSION"));
@@ -273,6 +335,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if o.words.is_empty() {
+        use std::io::IsTerminal as _;
+        // CONTRACT §20.1: `moochy` alone on an interactive terminal opens the dashboard.
+        if o.flags.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return tui(o.home.clone(), &[]);
+        }
         eprint!("{HELP}");
         return Err(usage("missing command"));
     }
@@ -1022,11 +1089,20 @@ fn spend_limit_page(provider: &str) -> &'static str {
 /// `moochy button [--repo P] [--provider github|gitlab] [--style …] [--theme …] [--size …]
 /// [--label …] [--format markdown|html|rst]` (docs/guides/donate-button.md steps 1–3, offline).
 fn button(o: &Opts, rest: &[&str]) -> Result<()> {
+    // CONTRACT §21.3: an organisation's chart (no project to detect).
+    if let Some(org) = &o.org {
+        if !o.has("chart") || o.repo.is_some() || o.has("provider") || !rest.is_empty() {
+            return Err(usage("button --chart --org github/ORG|gitlab/GROUP[/SUB…] (not with --repo or --provider)"));
+        }
+        let (base, act) = crate::button::org_base(org)?;
+        println!("{}", crate::button::chart(&base, act, &o.button)?);
+        return Ok(());
+    }
     let provider = match (o.has("provider"), rest) {
         (true, ["github"]) => Some("github"),
         (true, ["gitlab"]) => Some("gitlab"),
         (false, []) => None,
-        _ => return Err(usage("button [--repo PROJECT] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
+        _ => return Err(usage("button [--chart] [--repo PROJECT|--org ORG] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst|iframe]")),
     };
     let project = if let Some(r) = &o.repo {
         // `--provider gitlab --repo group/name`, or a provider-qualified `--repo`.
@@ -1053,7 +1129,8 @@ fn button(o: &Opts, rest: &[&str]) -> Result<()> {
             p
         }
     };
-    println!("{}", crate::button::snippet(&project, &o.button)?);
+    let out = if o.has("chart") { crate::button::project_chart(&project, &o.button)? } else { crate::button::snippet(&project, &o.button)? };
+    println!("{out}");
     Ok(())
 }
 

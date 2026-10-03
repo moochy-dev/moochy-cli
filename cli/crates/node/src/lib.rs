@@ -41,8 +41,10 @@ pub mod scrub;
 pub mod service;
 pub mod task;
 pub mod tls;
+pub mod tuisrc;
 pub mod util;
 pub mod validator;
+pub mod watch;
 pub mod worker;
 #[cfg(test)]
 mod voice;

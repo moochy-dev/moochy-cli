@@ -206,7 +206,7 @@ pub fn sign(home: &Home, org: &str, op: Op<'_>, yes: bool) -> Result<()> {
         let org = org.to_owned();
         let r = match op {
             Op::Claim => c.claim(ClaimRequest { org, dry_run: true, ..ClaimRequest::default() }).await,
-            Op::Repo { repo, remove } => c.org_repo(OrgRepoRequest { org, repo: repo.into(), remove, dry_run: true }).await,
+            Op::Repo { repo, remove } => c.org_repo(OrgRepoRequest { org, repo: repo.into(), remove, dry_run: true, person: String::new() }).await,
             Op::Donor { donor, revoke } => c.approve(ApproveRequest { org, donor: donor.into(), revoke, dry_run: true, ..ApproveRequest::default() }).await,
         };
         r.map(tonic::Response::into_inner).map_err(|s| if s.code() == tonic::Code::Unimplemented { usage(clean(s.message()).into_owned()) } else { status(&s) })

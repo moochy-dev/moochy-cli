@@ -63,7 +63,12 @@ pub struct KeyLog {
     state: std::path::PathBuf,
     /// Newest checkpoint note served by the relay (latest wins).
     notes: watch::Sender<Option<Vec<u8>>>,
+    /// The last [`MAX_ALERTS`] monitor alerts (error-level events, their log fields as JSON),
+    /// oldest first: `Status.alerts` and the dashboard's `Watch` (CONTRACT §20).
+    pub alerts: watch::Sender<Vec<String>>,
 }
+
+pub const MAX_ALERTS: usize = 16;
 
 /// Own keys created while the node runs (`<state>/owner_keys`, `<state>/device_keys`): one
 /// base64url key per line, deduplicated.
@@ -155,6 +160,7 @@ impl KeyLog {
                 monitor: Mutex::new(Some(m)),
                 state,
                 notes: watch::channel(None).0,
+                alerts: watch::channel(Vec::new()).0,
             })),
             Err(e) => {
                 log("error", "key log disabled: mirror cannot be opened", &json!({"error": e.to_string()}));
@@ -267,11 +273,20 @@ impl KeyLog {
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
         let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now() };
+        let alerts = self.alerts.clone();
         tokio::spawn(async move {
             m.run(&mut link, |e| {
                 let (level, msg, mut fields) = event_fields(e);
                 if let Some(o) = fields.as_object_mut() {
                     o.insert("keylog".into(), json!(e.message()));
+                }
+                if level == "error" {
+                    alerts.send_modify(|v| {
+                        if v.len() >= MAX_ALERTS {
+                            v.remove(0);
+                        }
+                        v.push(json!({"message": &msg, "fields": &fields}).to_string());
+                    });
                 }
                 log(level, &msg, &fields);
             })
