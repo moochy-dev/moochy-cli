@@ -5,7 +5,8 @@ description = "Moochy sandbox: maintainer-side `moochy run` jail (Linux namespac
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
+repository.workspace = true
+homepage.workspace = true
 
 [lib]
 name = "moochy_sandbox"

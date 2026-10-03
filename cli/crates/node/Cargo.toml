@@ -5,9 +5,8 @@ description = "Moochy node: gateway (API + MCP doors), worker, relay link"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
-repository = "https://github.com/moochy-dev/moochy-cli"
-homepage = "https://moochy.dev"
+repository.workspace = true
+homepage.workspace = true
 
 # cargo-dist ships this binary (dist-workspace.toml); archives carry the AppArmor
 # profile for `moochy run` on Ubuntu 23.10+ (deploy/client/README.md).
@@ -31,15 +30,15 @@ keychain = ["dep:keyring"]
 
 [dependencies]
 # Wire types, envelopes, signatures, money math, generated link.proto code (open, same workspace).
-moochy-proto = { path = "../proto" }
+moochy-proto = { path = "../proto", version = "0.1.0" }
 # Firewall, provider adapters, stream parsers, tool-call inspection, outbox store.
-moochy-worker = { path = "../worker" }
+moochy-worker = { path = "../worker", version = "0.1.0" }
 # Key-log verifier/mirror (spec/KEYLOG.md): KEY_ADDED proof of possession, sealable/gateway_allowed.
-moochy-keylog = { path = "../keylog", features = ["http"] }
+moochy-keylog = { path = "../keylog", version = "0.1.0", features = ["http"] }
 # CONTRACT §15: `moochy run` jail (15.1), lockdown_self + validator jail of the background process (15.2).
-moochy-sandbox = { path = "../sandbox" }
+moochy-sandbox = { path = "../sandbox", version = "0.1.0" }
 # CONTRACT §20: `moochy tui` (ratatui + crossterm, the only UI crates); NodeSource lives here.
-moochy-tui = { path = "../tui" }
+moochy-tui = { path = "../tui", version = "0.1.0" }
 # K_det for sealed refusal details (CONTRACT §3); same version moochy-proto already links.
 hkdf = { version = "0.12", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal", "process", "fs"] }

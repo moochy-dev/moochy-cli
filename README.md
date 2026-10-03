@@ -9,10 +9,10 @@ Open-source client (Apache-2.0) · 100% free. No fees, no commission, no paid ti
 ## Install
 
 ```sh
-brew install moochy-dev/tap/moochy
+cargo install moochy --locked        # from crates.io
 ```
 
-Each release also publishes signed archives for macOS, Linux and Windows, shell and PowerShell installers, and the npm package `moochy`. To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
+Each release also publishes signed archives for macOS, Linux and Windows (arm64 and x86_64), shell and PowerShell installers, a Homebrew formula and an npm package. To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
 
 ## Build and test
 
@@ -32,7 +32,7 @@ cargo clippy --all-targets -- -D warnings
 | `cli/` | Rust workspace: `proto` (wire format, crypto), `worker` (provider calls, safety checks), `sandbox` (`moochy run`), `node` (the `moochy` binary), `keylog` (public key log verifier), `tui` |
 | `deploy/client/` | Release and supply-chain tooling, service units, containers, cloud boxes ([README](deploy/client/README.md)) |
 | `spec/proto/`, `spec/vectors/` | Protocol buffers and golden test vectors used by the build and the tests |
-| `docs/guides/integrations.md`, `docs/guides/donate-button.md` | Guides compiled into the app (`moochy connect`) or checked by its tests |
+| `cli/crates/node/assets/` | Files compiled into the app: the integrations guide (`moochy connect`), the service units (`moochy service install`); the donate-button guide its tests check |
 | `dist-workspace.toml`, `.github/` | cargo-dist release configuration and CI |
 
 ## Files shared with moochy-docs
@@ -40,9 +40,18 @@ cargo clippy --all-targets -- -D warnings
 [moochy-docs](https://github.com/moochy-dev/moochy-docs) holds the guides, the protocol specification and the design. This repository keeps byte-identical copies of the files the build needs:
 
 - `spec/proto/` and `spec/vectors/` are produced here (the vectors by `cargo run -p moochy-proto --example vecgen -- ../spec/vectors` from `cli/`). Copy them to moochy-docs after a change.
-- `docs/guides/integrations.md` and `docs/guides/donate-button.md` are written in moochy-docs. Copy them here after a change.
+- `docs/guides/integrations.md` and `docs/guides/donate-button.md` are written in moochy-docs. Copy them to `cli/crates/node/assets/` after a change.
 
-Relative links inside the two guide copies point to guides that live in moochy-docs.
+Relative links inside the two guide copies point to guides that live in moochy-docs. `cli/crates/node/assets/service/` copies `deploy/client/service/`; a test fails when they differ.
+
+## Release
+
+All crates share one version.
+
+1. Bump `version` in every `cli/crates/*/Cargo.toml` (and the `version = "…"` of the path dependencies in `cli/crates/node/Cargo.toml`), run `cargo check` in `cli/` to update `Cargo.lock`, commit.
+2. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+`.github/workflows/release.yml` (cargo-dist) builds the 8 targets, signs and attests them, creates the GitHub release and publishes the crates to crates.io (`publish-crates.yml`, secret `CARGO_REGISTRY_TOKEN`).
 
 ## Related repositories
 

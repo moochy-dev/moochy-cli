@@ -8,7 +8,7 @@
 //! `anthropic/claude-sonnet-5`); `MOOCHY_TOKEN` stays an environment reference.
 
 /// The integrations guide (open source, like this crate).
-const GUIDE: &str = include_str!("../../../../docs/guides/integrations.md");
+const GUIDE: &str = include_str!("../assets/integrations.md");
 
 /// Agents whose preset is their section of the guide (CONTRACT §18.1).
 pub const GUIDE_CLIENTS: &[&str] = &["codex", "copilot-cli", "gemini-cli", "amp", "antigravity", "openclaw", "droid", "kilo-code", "kiro-cli", "hermes", "roo-code", "trae"];

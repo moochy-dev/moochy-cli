@@ -12,9 +12,9 @@ use crate::util::{Ctx as _, Result, emit, internal, usage};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
-const USER_UNIT: &str = include_str!("../../../../deploy/client/service/moochy.user.service");
-const SYSTEM_UNIT: &str = include_str!("../../../../deploy/client/service/moochy.system.service");
-const AGENT_PLIST: &str = include_str!("../../../../deploy/client/service/dev.moochy.agent.plist");
+const USER_UNIT: &str = include_str!("../assets/service/moochy.user.service");
+const SYSTEM_UNIT: &str = include_str!("../assets/service/moochy.system.service");
+const AGENT_PLIST: &str = include_str!("../assets/service/dev.moochy.agent.plist");
 const UNIT: &str = "moochy.service";
 const LABEL: &str = "dev.moochy.agent";
 
@@ -164,6 +164,20 @@ pub fn uninstall(system: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_units_match_deploy_client() {
+        // The crate embeds copies (crates.io packages only the crate directory);
+        // deploy/client/service/ stays the reviewed source.
+        let pairs = [
+            (USER_UNIT, include_str!("../../../../deploy/client/service/moochy.user.service")),
+            (SYSTEM_UNIT, include_str!("../../../../deploy/client/service/moochy.system.service")),
+            (AGENT_PLIST, include_str!("../../../../deploy/client/service/dev.moochy.agent.plist")),
+        ];
+        for (embedded, source) in pairs {
+            assert_eq!(embedded, source, "cp deploy/client/service/* cli/crates/node/assets/service/");
+        }
+    }
 
     #[test]
     fn units_are_the_reviewed_files_with_substitutions() {

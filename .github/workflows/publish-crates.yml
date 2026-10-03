@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Custom cargo-dist publish job (dist-workspace.toml `publish-jobs`): every
+# release tag publishes the workspace crates to crates.io, in dependency order.
+name: publish-crates
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  crates-io:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: cargo publish --workspace
+        working-directory: cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --workspace --locked

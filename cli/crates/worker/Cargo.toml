@@ -5,7 +5,8 @@ description = "Moochy worker: provider firewall, safe mutations, adapters, SSE/u
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
+repository.workspace = true
+homepage.workspace = true
 
 # No serde, no regex, no hyper-util client pool: the strict JSON tape, the
 # firewall tables and the h2 connection holder are all in-crate.

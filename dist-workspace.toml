@@ -24,7 +24,10 @@ targets = [
 npm-package = "moochy"
 tap = "moochy-dev/homebrew-tap"
 formula = "moochy"
-publish-jobs = ["homebrew", "npm"]
+# crates.io on every tag (.github/workflows/publish-crates.yml, secret CARGO_REGISTRY_TOKEN).
+# Add "homebrew" (secret HOMEBREW_TAP_TOKEN) and "npm" (secret NPM_TOKEN) once those
+# secrets exist, then run `dist generate`; until then their files ship on the release.
+publish-jobs = ["./publish-crates"]
 # Sigstore-signed SLSA build provenance for every artifact (actions/attest-build-provenance);
 # users verify externally: `gh attestation verify <file> --repo moochy-dev/moochy-cli`.
 github-attestations = true

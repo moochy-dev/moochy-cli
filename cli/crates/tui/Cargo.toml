@@ -4,8 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "moochy tui: the terminal dashboard (CONTRACT §20)"
-publish = false
 
 [dependencies]
 # CONTRACT §20.4 / AGENTS.md: the only UI crates. ratatui 0.30 with its crossterm backend, no

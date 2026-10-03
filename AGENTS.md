@@ -1,6 +1,6 @@
 # Rules for every agent working on the Moochy client
 
-This repository is the open-source Moochy client (Apache-2.0): the `moochy` app in `cli/`, its release tooling in `deploy/client/`, and copies of the protocol files it builds and tests against (`spec/proto`, `spec/vectors`, two guides in `docs/guides/`). The design and the normative contract live in [moochy-docs](https://github.com/moochy-dev/moochy-docs): read [`spec/CONTRACT.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/CONTRACT.md) first, then the plan docs it points to. Open code never depends on closed code (CONTRACT §0a). Public wording: "Open-source client (Apache-2.0) · 100% free".
+This repository is the open-source Moochy client (Apache-2.0): the `moochy` app in `cli/`, its release tooling in `deploy/client/`, and copies of the files it builds and tests against (`spec/proto`, `spec/vectors`, two guides in `cli/crates/node/assets/`). Every crate is published on crates.io: a file the build needs must live inside its crate. The design and the normative contract live in [moochy-docs](https://github.com/moochy-dev/moochy-docs): read [`spec/CONTRACT.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/CONTRACT.md) first, then the plan docs it points to. Open code never depends on closed code (CONTRACT §0a). Public wording: "Open-source client (Apache-2.0) · 100% free".
 
 ## 1. Scope and git discipline
 

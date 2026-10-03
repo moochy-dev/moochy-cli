@@ -22,6 +22,7 @@ Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release
 
 - archives for macOS (arm64, x86_64), Linux (arm64, x86_64; glibc and musl), Windows (arm64, x86_64), each with a `.sha256`;
 - shell and PowerShell installers, a Homebrew formula (`moochy-dev/homebrew-tap`), and the npm package `moochy` (`npx -y moochy mcp`);
+- the crates on crates.io (`cargo install moochy --locked`), through the custom publish job `.github/workflows/publish-crates.yml`;
 - no auto-updater (`install-updater = false`): `moochy update` verifies signatures itself (06 §12).
 
 `.github/workflows/release.yml` is **generated** by `dist generate` (cargo-dist 0.33.0); never edit it by hand.

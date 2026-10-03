@@ -283,7 +283,7 @@ pub fn snippet(p: &Project, o: &Options) -> Result<String> {
 mod tests {
     use super::*;
 
-    const GUIDE: &str = include_str!("../../../../docs/guides/donate-button.md");
+    const GUIDE: &str = include_str!("../assets/donate-button.md");
 
     /// Fenced blocks of the guide's step 3, by language.
     fn guide_blocks(lang: &str) -> Vec<String> {
