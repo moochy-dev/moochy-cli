@@ -3,7 +3,7 @@
 //! status and a doctor summary; revoke a box behind a confirmation. Owner: mo-tui-donor.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
@@ -16,6 +16,8 @@ use crate::source::Action;
 use crate::theme::Theme;
 
 const DAY_MS: u64 = 86_400_000;
+/// CONTRACT §23.1: said above the key list, word for word.
+pub const KEYS_PROMISE: &str = "Keys stay on this machine. Moochy never stores them online.";
 
 #[derive(Default)]
 pub struct DevicesView {
@@ -113,6 +115,9 @@ impl View for DevicesView {
         let t = *ctx.theme;
         let items = items(ctx);
         let (list, side) = k::split(area, 10);
+        let promise_rows = u16::try_from(KEYS_PROMISE.len()).unwrap_or(u16::MAX).div_ceil(list.width.max(1)).min(3);
+        let [promise, list] = Layout::vertical([Constraint::Length(promise_rows), Constraint::Min(0)]).areas(list);
+        f.render_widget(Paragraph::new(Span::styled(KEYS_PROMISE, k::tone(t, Tone::Good))).wrap(Wrap { trim: true }), promise);
         self.cur.sync(items.len(), list);
         if items.is_empty() {
             let lines = vec![Line::raw(format!("Nothing matches /{}", clean(ctx.filter))), Line::from(k::dim("Esc clears the filter"))];
@@ -237,6 +242,22 @@ mod tests {
         s.me.lockdown = "UNSAFE: not locked down".into();
         assert_eq!(lockdown(themes()[0], &s.me.lockdown).0, Tone::Bad);
         assert_eq!(lockdown(themes()[0], "  ").0, Tone::Warn);
+    }
+
+    #[test]
+    fn keys_promise_is_always_on_screen() {
+        let s = snap();
+        for t in themes() {
+            for (w, h) in [(80, 24), (160, 48)] {
+                for snap in [&s, &Snapshot::default()] {
+                    let mut v = DevicesView::default();
+                    let out = draw(&mut v, snap, t, "", w, h);
+                    assert!(out.contains(KEYS_PROMISE), "{out}");
+                    let promise = out.find(KEYS_PROMISE).unwrap();
+                    assert!(promise < out.find("Provider keys").unwrap(), "above the key list:\n{out}");
+                }
+            }
+        }
     }
 
     #[test]
