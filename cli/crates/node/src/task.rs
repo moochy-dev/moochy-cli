@@ -66,7 +66,11 @@ pub fn now_us() -> u64 {
 pub async fn submit(node: &Arc<Node>, req: TaskReq) -> Result<mpsc::Receiver<TaskEv>, Failure> {
     let offered = |p: &RepoPool| p.models().iter().any(|(m, ds)| *m == req.entry.model && ds.iter().any(|d| d == req.dialect.wire()));
     node.settle_pool(&req.slug, offered).await;
-    let pool = node.pool_for(&req.slug);
+    let mut pool = node.pool_for(&req.slug);
+    if !node.offline && !pool.as_ref().is_some_and(offered) {
+        pool_grace(node, &req.slug, offered).await;
+        pool = node.pool_for(&req.slug);
+    }
     if let Some(p) = &pool
         && !p.models().iter().any(|(m, ds)| *m == req.entry.model && ds.iter().any(|d| d == req.dialect.wire()))
     {
@@ -78,6 +82,30 @@ pub async fn submit(node: &Arc<Node>, req: TaskReq) -> Result<mpsc::Receiver<Tas
     let pool = pool.ok_or_else(|| Failure::new("no_pool", true, format!("moochy: no donations loaded yet for {}; retry in a moment", req.slug)))?;
     run_relay(node, req, pool).await
 }
+
+/// A pool can be briefly empty while the relay re-routes donors (a project revoke leaves the
+/// donor served through an organisation, E115: a full pool sync with no worker, then the
+/// re-route): when the pool does not offer the model, wait for the next sync, at most
+/// [`POOL_GRACE`], before refusing. ponytail: a model nobody donates waits the grace before its
+/// error; a relay that sends the re-route atomically removes the need.
+async fn pool_grace(node: &Node, slug: &str, offered: impl Fn(&RepoPool) -> bool) {
+    let ready = || node.pool_for(slug).is_some_and(|p| offered(&p));
+    let mut rx = node.pool_gen.subscribe();
+    let _ = tokio::time::timeout(POOL_GRACE, async {
+        loop {
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { return },
+                () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+            if ready() {
+                return;
+            }
+        }
+    })
+    .await;
+}
+
+const POOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Bound on the plaintext kept per task (evidence bundle, opt-in journal text).
 const MAX_EVIDENCE: usize = 1 << 20;

@@ -487,10 +487,12 @@ fn confirm(b: &Bound, signer: &str, extra: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the owner-signed body from the BOUND fields only and hand it to the Node.
-fn sign_one(home: &Home, rt: &tokio::runtime::Runtime, key: &SignKey, b: &Bound, p: &SignResponse) -> Result<SignResponse> {
+/// Build the owner-signed body from the BOUND fields only and hand it to the Node. `after`: the
+/// time of an entry just signed for the same project (the claim before its first approval): the
+/// log refuses an entry not issued after it (`replay`), even within the same millisecond.
+fn sign_one(home: &Home, rt: &tokio::runtime::Runtime, key: &SignKey, b: &Bound, p: &SignResponse, after: u64) -> Result<SignResponse> {
     let signer = owner_key_id(&key.public());
-    let now = now_ms();
+    let now = now_ms().max(after.saturating_add(1));
     let body = match &b.claim {
         Some((provider, provider_repo_id)) => claim_body(&b.repo_id, provider, provider_repo_id, &b.subject, &signer, now),
         None => grant_body(&b.repo_id, &b.subject, &signer, now),
@@ -666,10 +668,13 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
     }
     let extra = if want.kind == Kind::MemberAdded && cap > 0 { format!("; monthly limit {} (a project setting, not signed)", crate::util::fmt_dollars(u64::try_from(cap).unwrap_or(0))) } else { String::new() };
     confirm(&main, &signer, &extra, yes)?;
+    let mut after = 0;
     if let Some((b, p)) = &claim {
-        emit_signed(&sign_one(home, &rt, &key, b, p)?, b);
+        let d = sign_one(home, &rt, &key, b, p, 0)?;
+        after = u64::try_from(d.issued_at_ms).unwrap_or(0);
+        emit_signed(&d, b);
     }
-    let done = sign_one(home, &rt, &key, &main, &preview)?;
+    let done = sign_one(home, &rt, &key, &main, &preview, after)?;
     drop(key);
     emit_signed(&done, &main);
     Ok(())

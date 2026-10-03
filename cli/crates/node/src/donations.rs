@@ -33,7 +33,14 @@ pub async fn relay(node: &Node, r: DonationsRequest) -> std::result::Result<Dona
             }
             "action" => {
                 let q = DonationActionRequest::decode(r.request.as_slice()).map_err(bad)?;
-                c.donation_action(crate::link::with_session(&link, q)).await?.into_inner().encode_to_vec()
+                let refused = (q.action == "refuse").then(|| q.pledge_id.clone());
+                let out = c.donation_action(crate::link::with_session(&link, q)).await?.into_inner().encode_to_vec();
+                // A refused request is decided: withdraw the signature request the relay pushed for
+                // it now (`pending`, the TUI's Decisions), not at the relay's next push.
+                if let Some(id) = refused.filter(|id| !id.is_empty()) {
+                    crate::node::lock(&node.approvals).retain(|a| a.pledge_id != id && a.request_id != id);
+                }
+                out
             }
             _ => return Err(Status::invalid_argument("unknown donations op")),
         })
