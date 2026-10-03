@@ -9,43 +9,26 @@ pub const MAX_CHARS: usize = 2048;
 const MAX_MARKS: usize = 2;
 
 /// Cleans `s` for display:
-/// - a whole escape sequence (CSI, OSC, DCS/SOS/PM/APC, their C1 forms, or ESC + one char)
-///   becomes one U+FFFD, so nothing of its payload is left to read as text;
-/// - any other control character (C0, DEL, C1, U+2028/2029) becomes U+FFFD;
+/// - every control character (C0, DEL, C1, U+2028/2029) becomes U+FFFD, so an escape sequence
+///   can never start: ESC, CSI (U+009B), OSC (U+009D)… are gone and what followed them is plain,
+///   inert text (`�]52;c;…` shows that a peer tried, which is worth seeing);
 /// - format characters (Unicode Cf: bidi overrides and isolates, zero-width, soft hyphen,
-///   tags…) are dropped, as are variation selectors after the first and combining marks after
-///   the second on one base;
+///   tags…) and Hangul fillers are dropped, as are variation selectors after the first and
+///   combining marks after the second on one base;
 /// - the result is at most [`MAX_CHARS`] characters.
 #[must_use]
 pub fn clean(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_CHARS));
-    let mut it = s.chars().peekable();
     let (mut n, mut marks, mut vs) = (0usize, 0usize, 0usize);
-    while let Some(c) = it.next() {
+    for c in s.chars() {
         if n >= MAX_CHARS {
             out.pop();
             out.push('…');
             break;
         }
         let kept = match c {
-            '\u{1b}' => {
-                match it.next() {
-                    Some('[') => skip_csi(&mut it),
-                    Some(']' | 'P' | 'X' | '^' | '_') => skip_string(&mut it),
-                    _ => {}
-                }
-                Some('\u{FFFD}')
-            }
-            '\u{9b}' => {
-                skip_csi(&mut it);
-                Some('\u{FFFD}')
-            }
-            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => {
-                skip_string(&mut it);
-                Some('\u{FFFD}')
-            }
             c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => Some('\u{FFFD}'),
-            c if is_format(c) => None,
+            c if is_format(c) || is_filler(c) => None,
             c if is_variation_selector(c) => {
                 vs = vs.saturating_add(1);
                 (vs == 1).then_some(c)
@@ -68,29 +51,9 @@ pub fn clean(s: &str) -> String {
     out
 }
 
-/// CSI: parameters and intermediates up to the final byte (0x40–0x7E).
-fn skip_csi(it: &mut std::iter::Peekable<std::str::Chars>) {
-    for c in it.by_ref() {
-        if ('\u{40}'..='\u{7e}').contains(&c) {
-            break;
-        }
-    }
-}
-
-/// OSC/DCS/SOS/PM/APC: up to BEL, ST (ESC \) or the C1 ST.
-fn skip_string(it: &mut std::iter::Peekable<std::str::Chars>) {
-    while let Some(c) = it.next() {
-        match c {
-            '\u{7}' | '\u{9c}' => break,
-            '\u{1b}' => {
-                if it.peek() == Some(&'\\') {
-                    it.next();
-                }
-                break;
-            }
-            _ => {}
-        }
-    }
+/// Hangul fillers: blank-looking letters that pad or forge names.
+fn is_filler(c: char) -> bool {
+    matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
 }
 
 /// Unicode general category Cf (format), plus the invisible operators.
@@ -116,16 +79,15 @@ mod tests {
 
     #[test]
     fn escapes_are_inert() {
-        assert_eq!(clean("a\u{1b}[2Jb"), "a\u{FFFD}b");
-        assert_eq!(clean("x\u{1b}]52;c;Zm9v\u{7}y"), "x\u{FFFD}y");
-        assert_eq!(clean("x\u{1b}]8;;https://evil\u{1b}\\link"), "x\u{FFFD}link");
-        assert_eq!(clean("c1\u{9b}31mz"), "c1\u{FFFD}z");
-        assert_eq!(clean("dcs\u{1b}Pq#0\u{1b}\\end"), "dcs\u{FFFD}end");
-        assert_eq!(clean("esc\u{1b}c!"), "esc\u{FFFD}!");
-        assert_eq!(clean("unterminated\u{1b}]0;title"), "unterminated\u{FFFD}");
+        assert_eq!(clean("a\u{1b}[2Jb"), "a\u{FFFD}[2Jb");
+        assert_eq!(clean("x\u{1b}]52;c;Zm9v\u{7}y"), "x\u{FFFD}]52;c;Zm9v\u{FFFD}y");
+        assert_eq!(clean("c1\u{9b}31m"), "c1\u{FFFD}31m");
+        assert_eq!(clean("osc\u{9d}0;t\u{9c}"), "osc\u{FFFD}0;t\u{FFFD}");
         assert_eq!(clean("tab\there\nnl"), "tab\u{FFFD}here\u{FFFD}nl");
         assert_eq!(clean("ls\u{2028}ps\u{2029}"), "ls\u{FFFD}ps\u{FFFD}");
         assert_eq!(clean("plain @alice"), "plain @alice");
+        // No escape can survive: every ESC/C1 is gone.
+        assert!(!clean("\u{1b}\u{9b}\u{9d}\u{90}").chars().any(char::is_control));
     }
 
     #[test]
@@ -133,6 +95,7 @@ mod tests {
         assert_eq!(clean("ab\u{202E}cd\u{2066}e"), "abcde");
         assert_eq!(clean("in\u{200B}vis\u{00AD}ible\u{2060}"), "invisible");
         assert_eq!(clean("tag\u{E0041}\u{E0042}s"), "tags");
+        assert_eq!(clean("a\u{3164}b\u{115F}c"), "abc");
         assert_eq!(clean("e\u{0301}\u{0301}\u{0301}\u{0301}x"), "e\u{0301}\u{0301}x");
         assert_eq!(clean("\u{2764}\u{FE0F}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
         assert_eq!(clean("café naïve 日本"), "café naïve 日本");

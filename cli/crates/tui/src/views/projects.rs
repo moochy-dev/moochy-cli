@@ -33,7 +33,7 @@ fn rows(ctx: &Ctx) -> Vec<TreeRow<K>> {
         if !w::matches(ctx.filter, &[&slug]) && !waiting.iter().any(|(_, r)| w::matches(ctx.filter, &[&clean(&r.subject)])) {
             continue;
         }
-        let status = if p.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "active") };
+        let status = if p.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Online), "active") };
         let mut spans = vec![w::col(&status, pending::STATUS_W.saturating_add(2)), w::col(&w::bold(slug), name_w)];
         spans.push(Span::styled(format!("{:>9}", w::dollars(p.month_uusd)), t.money()));
         if p.goal_uusd > 0 {
@@ -181,7 +181,7 @@ mod tests {
         let mut v = ProjectsView::default();
         let c = ctx(&snap, &t, "tool");
         let s = draw(&mut v, &c, 80, 24);
-        assert!(s.contains("\u{FFFD}tool") && !s.contains("evil") && !s.contains("widget"), "{s}");
+        assert!(s.contains("evil") && s.contains("tool") && !s.contains('\u{1b}') && !s.contains("widget"), "{s}");
         let c = ctx(&snap, &t, "");
         draw(&mut v, &c, 80, 24);
         assert_eq!(v.on_input(&Input::Click { col: 5, row: 2 }, &c), Outcome::Redraw);

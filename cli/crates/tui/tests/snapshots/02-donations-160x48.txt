@@ -2,10 +2,10 @@
  ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 ╭ Donations · 4 · $70.17 spent this month ──────────────────────────────────────────────────╮╭ project github/tokio-rs/axum ───────────────────────────────────╮
-│   Status          Donating to                           Spent / limit     Used            ││ Status     ✔ active  your devices serve it, up to the limit     │
-│ ▶ ✔ active        github/tokio-rs/axum                  $27.42 / $40.00   ██████░░░  68%  ││ Limit      $40.00 a month · $0.50 per task                      │
+│   Status          Donating to                           Spent / limit     Used            ││ Status     ● active  your devices serve it, up to the limit     │
+│ ▶ ● active        github/tokio-rs/axum                  $27.42 / $40.00   ██████░░░  68%  ││ Limit      $40.00 a month · $0.50 per task                      │
 │   ‖ paused        github/rust-lang/rustfmt              $14.10 / $15.00   ████████░  94%  ││ Spent      $27.42   ██████████░░░░░░  68%                       │
-│   ✔ active        org gitlab/inkscape                   $18.65 / $60.00   ██░░░░░░░  31%  ││ Left       $12.58                                               │
+│   ● active        org gitlab/inkscape                   $18.65 / $60.00   ██░░░░░░░  31%  ││ Left       $12.58                                               │
 │   ■ stopped       github/sharkdp/bat                    $10.00 / $10.00   █████████ 100%  ││ 30 days    ▃▆▁▃▆▁▃▆▁▄▆▁▄▇▁▄▇▂▄▇▂▄▇▂▅▇▂▅█▂                       │
 │                                                                                           ││ Renews     2026-11-01 (in 28d)                                  │
 │                                                                                           ││ Schedule   monthly, renews 1 Nov                                │
@@ -51,10 +51,10 @@
  (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 + Donations - 4 - $70.17 spent this month --------------------------------------------------++ project github/tokio-rs/axum -----------------------------------+
-|   Status          Donating to                           Spent / limit     Used            || Status     + active  your devices serve it, up to the limit     |
-| > + active        github/tokio-rs/axum                  $27.42 / $40.00   ######---  68%  || Limit      $40.00 a month - $0.50 per task                      |
+|   Status          Donating to                           Spent / limit     Used            || Status     * active  your devices serve it, up to the limit     |
+| > * active        github/tokio-rs/axum                  $27.42 / $40.00   ######---  68%  || Limit      $40.00 a month - $0.50 per task                      |
 |   = paused        github/rust-lang/rustfmt              $14.10 / $15.00   ########-  94%  || Spent      $27.42   ##########------  68%                       |
-|   + active        org gitlab/inkscape                   $18.65 / $60.00   ##-------  31%  || Left       $12.58                                               |
+|   * active        org gitlab/inkscape                   $18.65 / $60.00   ##-------  31%  || Left       $12.58                                               |
 |   # stopped       github/sharkdp/bat                    $10.00 / $10.00   ######### 100%  || 30 days    _=._=._=.-=.-#.-#.-#.-#.-#.-#.                       |
 |                                                                                           || Renews     2026-11-01 (in 28d)                                  |
 |                                                                                           || Schedule   monthly, renews 1 Nov                                |

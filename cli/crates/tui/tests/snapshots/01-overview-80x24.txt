@@ -1,6 +1,6 @@
 # overview 80x24 dark (light: same text)
  ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+ 1 Overview 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
 ╭ moochy ──────────────────────╮╭ Donated this month ──╮╭ Used by my projects ─╮
 │   ╭╮     ╭╮   Hi @alice      ││ ◉ $70.17 of $115.00  ││ ◉ $40.15 of $75.00   │
 │  ╭┴┴─────┴┴╮  ◆ 3 to decide  ││           ▄     █▂   ││  ▂    █     ▄  ▂     │
@@ -9,9 +9,9 @@
 │                              ││ last 30 days         ││ last 30 days         │
 ╰──────────────────────────────╯╰──────────────────────╯╰──────────────────────╯
 ╭ My donations this month ─────────────────╮╭ Needs you ───────────────────────╮
-│ ✔ tokio-rs/axum ██████░░░░  68%   $27.42 ││ ◆ @grace → acme/widgets 42m      │
+│ ● tokio-rs/axum ██████░░░░  68%   $27.42 ││ ◆ @grace → acme/widgets 42m      │
 │ ‖ rust-lang/ru… paused            $14.10 ││ ◆ @heidi → acme/widgets 3h       │
-│ ✔ gitlab/inksc… ███░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → … 1d │
+│ ● gitlab/inksc… ███░░░░░░░  31%   $18.65 ││ ◆ github/acme/gadgets-pro → … 1d │
 │ ■ sharkdp/bat   stopped           $10.00 ││ ▲ rustfmt donation is at 94% of… │
 │                                          ││ ✖ pi-headless has been offline … │
 ╰──────────────────────────────────────────╯╰──────────────────────────────────╯
@@ -25,7 +25,7 @@
  d donations  v live  n decisions  a activity  / filter  q quit  ? help
 # overview 80x24 --ascii
  (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+ 1 Overview 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Prefs
 + moochy ----------------------++ Donated this month --++ Used by my projects -+
 |   ()     ()   Hi @alice      || $ $70.17 of $115.00  || $ $40.15 of $75.00   |
 |  /---------\  ~ 3 to decide  ||           -     #.   ||  .    #     -  .     |
@@ -34,9 +34,9 @@
 |                              || last 30 days         || last 30 days         |
 +------------------------------++----------------------++----------------------+
 + My donations this month -----------------++ Needs you -----------------------+
-| + tokio-rs/axum ######----  68%   $27.42 || ~ @grace -> acme/widgets 42m     |
+| * tokio-rs/axum ######----  68%   $27.42 || ~ @grace -> acme/widgets 42m     |
 | = rust-lang/ru~ paused            $14.10 || ~ @heidi -> acme/widgets 3h      |
-| + gitlab/inksc~ ###-------  31%   $18.65 || ~ github/acme/gadgets-pro -> ~ 1 |
+| * gitlab/inksc~ ###-------  31%   $18.65 || ~ github/acme/gadgets-pro -> ~ 1 |
 | # sharkdp/bat   stopped           $10.00 || ! rustfmt donation is at 94% of~ |
 |                                          || x pi-headless has been offline ~ |
 +------------------------------------------++----------------------------------+

@@ -1,20 +1,20 @@
 # orgs 80x24 dark (light: same text)
  ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+ 1 Home 2 Given 3 Served 4 Repos 5 Organisations 6 Decide 7 Keys 8 Log 9 Prefs
 ╭ Organisations · 7 ───────────────────────────────────────────────────────────╮
-│ ▶ ✔ active        github/acme           $28.30  4 donors                     │
+│ ▶ ● active        github/acme           $28.30  4 donors                     │
 │     ✔ covered     github/acme/widgets   $21.00 of $30.00 cap                 │
 │     ✔ covered     github/acme/gadgets    $6.40  no cap                       │
 │     ✔ covered     github/acme/docs       $0.90 of $5.00 cap                  │
 │     ◆ waiting     github/acme/gadget…  add to the org's covered repos (shar… │
-│   ✔ active        person github/alice    $1.20  2 donors                     │
+│   ● active        person github/alice    $1.20  2 donors                     │
 │     ✔ covered     gitlab/alice/notes     $1.20  no cap                       │
 │                                                                              │
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ github/acme ─────────────────────────────────────────────────────────────────╮
 │ Id         org_acme                                                          │
-│ Status     ✔ active                                                          │
+│ Status     ● active                                                          │
 │ Donors     4 approved                                                        │
 │ This month $28.30 across 3 covered repos                                     │
 │ 30 days    ▃▆▃▆▂▅▂▄▁▄▇▃▆▃▅▂▅▁▄▇▄▆▃▆▂▅▂▅█▄                                    │
@@ -25,21 +25,21 @@
  a add/accept  x remove  r refuse  / filter  : commands  q quit  ? help
 # orgs 80x24 --ascii
  (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
- 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+ 1 Home 2 Given 3 Served 4 Repos 5 Organisations 6 Decide 7 Keys 8 Log 9 Prefs
 + Organisations - 7 -----------------------------------------------------------+
-| > + active        github/acme           $28.30  4 donors                     |
+| > * active        github/acme           $28.30  4 donors                     |
 |     + covered     github/acme/widgets   $21.00 of $30.00 cap                 |
 |     + covered     github/acme/gadgets    $6.40  no cap                       |
 |     + covered     github/acme/docs       $0.90 of $5.00 cap                  |
 |     ~ waiting     github/acme/gadget~  add to the org's covered repos (shar~ |
-|   + active        person github/alice    $1.20  2 donors                     |
+|   * active        person github/alice    $1.20  2 donors                     |
 |     + covered     gitlab/alice/notes     $1.20  no cap                       |
 |                                                                              |
 |                                                                              |
 +------------------------------------------------------------------------------+
 + github/acme -----------------------------------------------------------------+
 | Id         org_acme                                                          |
-| Status     + active                                                          |
+| Status     * active                                                          |
 | Donors     4 approved                                                        |
 | This month $28.30 across 3 covered repos                                     |
 | 30 days    _=_=.-.-.-#_=_-.-.-#-=_=.-.-#-                                    |

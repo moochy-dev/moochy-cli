@@ -54,6 +54,7 @@ const FOOTER_GLOBAL: &[(&str, &str)] = &[("/", "filter"), (":", "commands"), ("?
 const TOAST_MS: u64 = 4_000;
 const MAX_TOASTS: usize = 3;
 const MAX_INPUT: usize = 64;
+const MAX_EARLY_KEYS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Conn {
@@ -103,6 +104,8 @@ pub struct App {
     /// Last served/used count, to make the hamster happy when a new request shows up.
     last_served: usize,
     happy_until_ms: u64,
+    /// Keys typed before the first snapshot (bounded): replayed once there is data to act on.
+    early: Vec<KeyEvent>,
     tab_hits: Vec<(u16, u16, usize)>,
     tab_row: u16,
     main: Rect,
@@ -150,6 +153,7 @@ impl App {
             now_ms,
             last_served: 0,
             happy_until_ms: 0,
+            early: Vec::new(),
             tab_hits: Vec::new(),
             tab_row: 1,
             main: Rect::default(),
@@ -195,7 +199,14 @@ impl App {
     /// Feeds one event; true when the screen must be redrawn.
     pub fn on_event(&mut self, ev: AppEvent) -> bool {
         match ev {
-            AppEvent::Term(Event::Key(k)) if k.kind != KeyEventKind::Release => self.on_key(k),
+            AppEvent::Term(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                let quit = k.code == KeyCode::Char('q') || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
+                if self.conn == Conn::Connecting && !quit && self.early.len() < MAX_EARLY_KEYS {
+                    self.early.push(k);
+                    return false;
+                }
+                self.on_key(k)
+            }
             AppEvent::Term(Event::Mouse(m)) => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.on_click(m.column, m.row),
                 MouseEventKind::ScrollUp => self.on_input(&Input::ScrollUp),
@@ -213,6 +224,7 @@ impl App {
                 self.last_served = served;
                 self.snap = *s;
                 self.conn = Conn::Live;
+                self.replay_early();
                 true
             }
             AppEvent::Source(SourceEvent::Toast(t)) => {
@@ -223,6 +235,7 @@ impl App {
                 let why = clean(&why);
                 self.toast(Glyph::Error, &format!("node offline: {why}"));
                 self.conn = Conn::Offline(why);
+                self.replay_early();
                 true
             }
             AppEvent::Result(ActionResult::Done(t)) => {
@@ -245,6 +258,12 @@ impl App {
                 self.suspend = true;
                 false
             }
+        }
+    }
+
+    fn replay_early(&mut self) {
+        for k in std::mem::take(&mut self.early) {
+            self.on_key(k);
         }
     }
 
@@ -680,31 +699,32 @@ impl App {
         let filter = self.filters.get(self.active).filter(|f| !f.is_empty()).map(|f| format!(" /{} ", clean(f)));
         let fw = filter.as_ref().map_or(0, |f| Line::raw(f.as_str()).width() as u16);
         let avail = area.width.saturating_sub(fw);
-        // Every tab at the same level, whichever is active (the bar never jumps): full titles,
-        // then the designed medium labels, then the short ones, then numbers only.
-        let mut chosen = Vec::new();
-        for level in 0..4u8 {
-            chosen = self
-                .views
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let (medium, short) = v.labels();
-                    let name = match level {
-                        0 => v.title(),
-                        1 => medium,
-                        2 => short,
-                        _ => "",
-                    };
-                    let num = TAB_KEYS.get(i).copied().unwrap_or("");
-                    if name.is_empty() { format!(" {num} ") } else { format!(" {num} {name}") }
-                })
-                .collect();
-            let w: usize = chosen.iter().map(|s: &String| Line::raw(s.as_str()).width()).sum();
-            if w <= usize::from(avail) {
+        // The active tab always shows its full title; the others use one label level for all.
+        // The level is the first that fits even when the widest title is the active one, so it
+        // never changes when you switch tabs (the bar does not jump): full titles, the designed
+        // medium labels, the short ones, numbers only.
+        let label = |i: usize, v: &dyn View, level: u8| -> String {
+            let (medium, short) = v.labels();
+            let name = match level {
+                0 => v.title(),
+                1 => medium,
+                2 => short,
+                _ => "",
+            };
+            let num = TAB_KEYS.get(i).copied().unwrap_or("");
+            if name.is_empty() { format!(" {num}") } else { format!(" {num} {name}") }
+        };
+        let wid = |s: &str| Line::raw(s).width();
+        let mut level = 3u8;
+        for l in 0..4u8 {
+            let base: usize = self.views.iter().enumerate().map(|(i, v)| wid(&label(i, v.as_ref(), l))).sum();
+            let grow = self.views.iter().enumerate().map(|(i, v)| wid(&label(i, v.as_ref(), 0)).saturating_sub(wid(&label(i, v.as_ref(), l)))).max().unwrap_or(0);
+            if base.saturating_add(grow) <= usize::from(avail) {
+                level = l;
                 break;
             }
         }
+        let chosen: Vec<String> = self.views.iter().enumerate().map(|(i, v)| label(i, v.as_ref(), if i == self.active { 0 } else { level })).collect();
         let mut spans = Vec::new();
         self.tab_hits.clear();
         let mut x = area.x;

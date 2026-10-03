@@ -191,7 +191,9 @@ pub fn short_slug(s: &str, n: usize) -> String {
 #[must_use]
 pub fn status_glyph(status: &str) -> Glyph {
     match status.to_ascii_lowercase().as_str() {
-        "active" | "online" | "ok" | "done" | "accepted" | "approved" | "served" | "verified" | "present" | "live" | "added" => Glyph::Ok,
+        // Running now: ●. Done / checked: ✔.
+        "active" | "online" | "live" => Glyph::Online,
+        "ok" | "done" | "accepted" | "approved" | "served" | "verified" | "present" | "added" => Glyph::Ok,
         "paused" | "draining" => Glyph::Paused,
         "pending" | "waiting" | "requested" | "scheduled" | "running" => Glyph::Pending,
         "stopped" | "revoked" | "removed" | "expired" | "absent" | "ended" => Glyph::Stopped,
@@ -416,7 +418,8 @@ mod tests {
 
     #[test]
     fn statuses_have_distinct_glyphs() {
-        assert_eq!(status_glyph("Active"), Glyph::Ok);
+        assert_eq!(status_glyph("Active"), Glyph::Online);
+        assert_eq!(status_glyph("verified"), Glyph::Ok);
         assert_eq!(status_glyph("paused"), Glyph::Paused);
         assert_eq!(status_glyph("stopped"), Glyph::Stopped);
         assert_eq!(status_glyph("whatever"), Glyph::Warn);

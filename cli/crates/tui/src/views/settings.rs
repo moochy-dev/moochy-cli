@@ -25,6 +25,10 @@ impl View for SettingsView {
         "Settings"
     }
 
+    fn labels(&self) -> (&'static str, &'static str) {
+        ("Settings", "Prefs")
+    }
+
     fn hints(&self) -> &'static [(&'static str, &'static str)] {
         &[("enter", "change"), ("t", "light/dark"), ("c", "colours"), ("a", "ascii")]
     }

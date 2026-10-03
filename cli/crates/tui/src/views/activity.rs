@@ -163,7 +163,7 @@ mod tests {
                 assert!(pos[0] < pos[1] && pos[1] < pos[2], "{out}");
                 assert!(out.contains("receipt") && out.contains("moochy verify r_01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{out}");
                 assert!(out.contains("mismatch"), "{out}");
-                assert!(out.contains("tower went offline") && !out.contains("pwned"), "{out}");
+                assert!(out.contains("tower went offline") && !out.contains('\u{1b}'), "{out}");
             }
         }
         let mut v = ActivityView::default();

@@ -2,10 +2,10 @@
  ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 ╭ Projects · 5 ─────────────────────────────────────────────────────────────────────────────╮╭ github/acme/widgets ────────────────────────────────────────────╮
-│ ▶ ✔ active        github/acme/widgets   $31.25 of $50.00                                  ││ Id         prj_widgets                                          │
-│     ◆ waiting     @grace               $25.00/month · claude-sonnet-5-5 · cap $0.50/task  ││ Status     ✔ active                                             │
+│ ▶ ● active        github/acme/widgets   $31.25 of $50.00                                  ││ Id         prj_widgets                                          │
+│     ◆ waiting     @grace               $25.00/month · claude-sonnet-5-5 · cap $0.50/task  ││ Status     ● active                                             │
 │     ◆ waiting     @heidi               $10.00 one-off · deepseek-v4                       ││ This month $31.25 of $50.00 goal                                │
-│   ✔ active        github/acme/gadgets    $8.90 of $20.00                                  ││            ████████████░░░░░░░░  62%                            │
+│   ● active        github/acme/gadgets    $8.90 of $20.00                                  ││            ████████████░░░░░░░░  62%                            │
 │   ‖ paused        gitlab/alice/notes     $0.00 of $5.00                                   ││ Donors     7 active · 2 waiting                                 │
 │                                                                                           ││ Members    alice, bob, chen                                     │
 │                                                                                           ││ Funded by  @dana, @eve, org:acme                                │
@@ -51,10 +51,10 @@
  (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 + Projects - 5 -----------------------------------------------------------------------------++ github/acme/widgets --------------------------------------------+
-| > + active        github/acme/widgets   $31.25 of $50.00                                  || Id         prj_widgets                                          |
-|     ~ waiting     @grace               $25.00/month - claude-sonnet-5-5 - cap $0.50/task  || Status     + active                                             |
+| > * active        github/acme/widgets   $31.25 of $50.00                                  || Id         prj_widgets                                          |
+|     ~ waiting     @grace               $25.00/month - claude-sonnet-5-5 - cap $0.50/task  || Status     * active                                             |
 |     ~ waiting     @heidi               $10.00 one-off - deepseek-v4                       || This month $31.25 of $50.00 goal                                |
-|   + active        github/acme/gadgets    $8.90 of $20.00                                  ||            ############--------  62%                            |
+|   * active        github/acme/gadgets    $8.90 of $20.00                                  ||            ############--------  62%                            |
 |   = paused        gitlab/alice/notes     $0.00 of $5.00                                   || Donors     7 active - 2 waiting                                 |
 |                                                                                           || Members    alice, bob, chen                                     |
 |                                                                                           || Funded by  @dana, @eve, org:acme                                |
