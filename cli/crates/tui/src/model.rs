@@ -114,6 +114,9 @@ pub struct Org {
     pub paused_since_ms: u64,
     /// Use per day across covered repos for the last 30 days (oldest first).
     pub per_day_uusd: Vec<u64>,
+    /// A person profile (§24, `path` = `github/login`): donors sponsor this maintainer's own
+    /// tokens for the repos it covers, instead of an organisation's.
+    pub person: bool,
 }
 
 #[derive(Clone, Debug, Default)]

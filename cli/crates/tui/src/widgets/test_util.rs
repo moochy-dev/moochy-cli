@@ -61,7 +61,7 @@ pub fn maint_fixture() -> Snapshot {
             Project { id: "r_2".into(), slug: "github/acme/gadget".into(), donors: 0, pending: 0, month_uusd: 0, goal_uusd: 0, members: vec![], funded_by: vec![], paused_since_ms: NOW - 31 * DAY },
             Project { id: "r_3".into(), slug: "github/acme/\u{1b}]52;c;evil\u{7}tool".into(), ..Project::default() },
         ],
-        orgs: vec![Org { id: "o_1".into(), path: "github/acme".into(), covered: vec![CoveredRepo { slug: "github/acme/widget".into(), used_uusd: 3_000_000, share_cap_uusd: 10_000_000 }], donors: 2, month_uusd: 3_000_000, paused_since_ms: 0, per_day_uusd: vec![0, 1_000_000, 2_000_000] }],
+        orgs: vec![Org { id: "o_1".into(), path: "github/acme".into(), covered: vec![CoveredRepo { slug: "github/acme/widget".into(), used_uusd: 3_000_000, share_cap_uusd: 10_000_000 }], donors: 2, month_uusd: 3_000_000, paused_since_ms: 0, per_day_uusd: vec![0, 1_000_000, 2_000_000], person: false }],
         pending: vec![
             Pending { request_id: "pl_01J".into(), kind: "donor".into(), target: "github/acme/widget".into(), subject: "\u{1b}[31malice".into(), summary: "$20.00/month, ≤ $0.50/request, claude-sonnet".into(), created_at_ms: NOW - 3 * 3_600_000, decide_url: String::new() },
             Pending { request_id: "pl_02K".into(), kind: "donor".into(), target: "github/acme".into(), subject: "carol".into(), summary: "$100.00/month".into(), created_at_ms: NOW - DAY, decide_url: String::new() },

@@ -44,7 +44,7 @@ fn rows(ctx: &Ctx) -> Vec<TreeRow<K>> {
         let status = if o.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "active") };
         let spans = vec![
             w::col(&status, pending::STATUS_W.saturating_add(2)),
-            w::col(&w::bold(path), name_w),
+            w::col(&w::bold(if o.person { format!("person {path}") } else { path }), name_w),
             Span::styled(format!("{:>9}", w::dollars(o.month_uusd)), t.money()),
             w::muted(t, format!("  {} donors", o.donors)),
         ];
@@ -86,7 +86,7 @@ fn org_detail(t: Theme, ctx: &Ctx, o: &Org) -> Vec<Line<'static>> {
     if o.per_day_uusd.iter().any(|&v| v > 0) {
         out.push(Line::from(vec![w::muted(t, format!("{:<10} ", "30 days")), charts::spark_text(t, &o.per_day_uusd, 30, t.money())]));
     }
-    out.push(w::kv(t, "Page", format!("{}/org/{}", w::web_origin(&ctx.snap.me.web), clean(&o.path))));
+    out.push(w::kv(t, "Page", format!("{}/{}/{}", w::web_origin(&ctx.snap.me.web), if o.person { "people" } else { "org" }, clean(&o.path))));
     if o.covered.is_empty() {
         out.push(Line::default());
         out.push(Line::from(w::muted(t, format!("No repo covered yet: select a “+ not covered” repo and press a, or run `moochy org add <repo> --org {}`.", clean(&o.path)))));
@@ -112,7 +112,7 @@ fn org_detail(t: Theme, ctx: &Ctx, o: &Org) -> Vec<Line<'static>> {
 fn detail(ctx: &Ctx, key: K) -> (String, Vec<Line<'static>>) {
     let (snap, t) = (ctx.snap, *ctx.theme);
     match key {
-        K::Org(i) => snap.orgs.get(i).map(|o| (clean(&o.path), org_detail(t, ctx, o))).unwrap_or_default(),
+        K::Org(i) => snap.orgs.get(i).map(|o| (format!("{}{}", if o.person { "person " } else { "" }, clean(&o.path)), org_detail(t, ctx, o))).unwrap_or_default(),
         K::Covered(i, j) => {
             let Some((o, c)) = snap.orgs.get(i).and_then(|o| o.covered.get(j).map(|c| (o, c))) else { return Default::default() };
             let mut out = vec![w::kv(t, "Org", clean(&o.path)), w::kv(t, "Used", format!("{} this month from the org's donations", w::dollars(c.used_uusd)))];
@@ -164,6 +164,8 @@ impl View for OrgsView {
     fn title(&self) -> &'static str {
         "Organisations"
     }
+
+    // Also lists the user's person profiles (§24): sponsorship of a maintainer works like an org.
 
     fn labels(&self) -> (&'static str, &'static str) {
         ("Orgs", "Orgs")

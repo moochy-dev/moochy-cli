@@ -182,6 +182,16 @@ pub fn demo() -> Snapshot {
             month_uusd: 28_300_000,
             paused_since_ms: 0,
             per_day_uusd: trend(13),
+            person: false,
+        }, Org {
+            id: s("m_alice"),
+            path: s("github/alice"),
+            covered: vec![CoveredRepo { slug: s("gitlab/alice/notes"), used_uusd: 1_200_000, share_cap_uusd: 0 }],
+            donors: 2,
+            month_uusd: 1_200_000,
+            paused_since_ms: 0,
+            per_day_uusd: trend(17),
+            person: true,
         }],
         pending: vec![
             Pending {
