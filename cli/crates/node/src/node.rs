@@ -120,6 +120,9 @@ pub struct Node {
     /// `ListDonations` on our own session, and when they were fetched (ms). The relay's pledge
     /// assignment is never trusted alone (T-03-088).
     pub own_pledges: Mutex<HashMap<String, (String, bool)>>,
+    /// Worker: the sponsored profile (`m_…`, `Donation.person_id`) of each own person pledge whose
+    /// listing names it (CONTRACT §24.4), refreshed with `own_pledges`.
+    pub own_people: Mutex<HashMap<String, String>>,
     /// Worker: local model server mapping, public slug → server model id, and the ids it lists.
     pub local_models: HashMap<String, String>,
     pub local_served: std::collections::HashSet<String>,
@@ -197,6 +200,7 @@ impl Node {
             local_served: w.local_served,
             pledge_refresh: tokio::sync::Mutex::new(0),
             own_pledges: Mutex::new(HashMap::new()),
+            own_people: Mutex::new(HashMap::new()),
             approvals: Mutex::new(Vec::new()),
             claims: Mutex::new(Vec::new()),
             log_acks: Mutex::new(HashMap::new()),
