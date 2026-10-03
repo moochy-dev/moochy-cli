@@ -24,6 +24,8 @@ PROJECT: owner/name or github/owner/name (GitHub), gitlab/group[/subgroup…]/na
          default: the github.com or gitlab.com `origin` remote of the current directory
 
 COMMANDS:
+  tui [--demo] [--snapshot COLSxROWS [--keys K] [--ansi]] [--theme light|dark] [--ascii]
+                                  The dashboard in your terminal (also: `moochy` alone)
   login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless]
                                   Add this device to your account. Roles: gateway uses donated
                                   tokens, worker donates yours. Only the default server unless
@@ -273,7 +275,56 @@ fn parse() -> Result<Opts> {
     Ok(o)
 }
 
+/// `moochy [--home DIR] tui [TUI OPTIONS]`: the TUI's own flags (CONTRACT §20.4) go to
+/// `moochy-tui` unparsed. `None` when the command is not `tui`.
+fn tui_argv() -> Option<(Option<PathBuf>, Vec<String>)> {
+    let mut a = std::env::args_os().skip(1);
+    let mut home = None;
+    loop {
+        let w = a.next()?.into_string().ok()?;
+        match w.as_str() {
+            "--home" => home = Some(PathBuf::from(a.next()?)),
+            "tui" => break,
+            _ => return None,
+        }
+    }
+    let mut rest = Vec::new();
+    while let Some(w) = a.next() {
+        let w = w.into_string().ok()?;
+        if w == "--home" {
+            home = Some(PathBuf::from(a.next()?));
+        } else {
+            rest.push(w);
+        }
+    }
+    Some((home, rest))
+}
+
+/// CONTRACT §20: the dashboard, over `node.sock` (or the demo fixtures, which need no node).
+fn tui(home: Option<PathBuf>, args: &[String]) -> Result<()> {
+    let opts = moochy_tui::Options::parse(args).map_err(usage)?;
+    if opts.demo {
+        let mut src = moochy_tui::demo_source();
+        if opts.snapshot.is_some() {
+            print!("{}", moochy_tui::snapshot(&mut src, &opts).map_err(internal)?);
+            return Ok(());
+        }
+        return moochy_tui::run(Box::new(src), None, &opts).map_err(internal);
+    }
+    let mut src = crate::tuisrc::NodeSource::new(Home::resolve(home)?).map_err(internal)?;
+    if opts.snapshot.is_some() {
+        print!("{}", moochy_tui::snapshot(&mut src, &opts).map_err(internal)?);
+        return Ok(());
+    }
+    let events = src.events();
+    moochy_tui::run(Box::new(src), Some(events), &opts).map_err(internal)
+}
+
+#[allow(clippy::too_many_lines, reason = "the command dispatch table")]
 fn run() -> Result<()> {
+    if let Some((home, args)) = tui_argv() {
+        return tui(home, &args);
+    }
     let o = parse()?;
     if o.has("version") {
         println!("moochy {}", env!("CARGO_PKG_VERSION"));
@@ -284,6 +335,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if o.words.is_empty() {
+        use std::io::IsTerminal as _;
+        // CONTRACT §20.1: `moochy` alone on an interactive terminal opens the dashboard.
+        if o.flags.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return tui(o.home.clone(), &[]);
+        }
         eprint!("{HELP}");
         return Err(usage("missing command"));
     }

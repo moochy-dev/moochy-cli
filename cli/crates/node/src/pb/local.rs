@@ -442,7 +442,7 @@ pub struct WatchEvent {
     /// pending:  the requests waiting for my signature or my claims' state changed (re-read Pending).
     /// donation: a donation's status changed (re-read Donations).
     /// alert:    a key-log monitor alert (`detail` = the alert JSON, as Status.alerts).
-    /// link:     the relay link changed (`detail` = Status.link_state); also sent on pause/resume.
+    /// link:     the relay link changed (`detail` = Status.link_state), or pause (`paused`) / resume.
     #[prost(string, tag = "2")]
     pub kind: ::prost::alloc::string::String,
     /// kind = served, without request/response bytes

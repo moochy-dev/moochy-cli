@@ -87,7 +87,7 @@ pub async fn run(node: Arc<Node>, tx: mpsc::Sender<Result<WatchEvent, Status>>) 
                     out.push(ev("donation", String::new(), None));
                 }
                 if f.2 != last.2 {
-                    out.push(ev("link", crate::ctl::link_state(&node), None));
+                    out.push(ev("link", if f.2 { "paused".into() } else { crate::ctl::link_state(&node) }, None));
                 }
                 last = f;
                 if dirty && tx.try_send(Ok(ev("snapshot", String::new(), None))).is_ok() {
