@@ -4,7 +4,8 @@
 //! `owner::sign` (A217/A218): the app on `node.sock` only proposes; the CLI binds the decoded body to
 //! the command, checks every id and handle with the server's `Lookup` (dialed directly; an org is
 //! looked up as `org:<path>`, a namespace no project slug can reach), shows what it signs, and
-//! rebuilds the body with its own signer and time. `moochy org list` reads the public orgs API.
+//! rebuilds the body with its own signer and time. `moochy org list` reads the owner's covered
+//! projects from the requests pushed over the link (else the public orgs API).
 
 use crate::config::Home;
 use crate::owner::{check_own_key, key_path, load, register, rt, status, submit};
@@ -267,10 +268,67 @@ struct Covered {
     slug: String,
 }
 
-/// `moochy org list --org ORG`: the projects the org's donations fund, from the server's public
-/// orgs API (`GET /api/v1/orgs/{provider}/{path…}`, CONTRACT §19.6).
+/// `moochy org list --org ORG`: the projects the org's donations fund. The owner's view comes over
+/// the link (WIRING §4: the dedicated link port is gRPC only): exactly the ORG_REPO_REMOVED requests
+/// the relay pushes, each checked against the verified key log. Anyone else, or a node without a
+/// key log, reads the server's public orgs API (`GET /api/v1/orgs/{provider}/{path…}`, §19.6).
 pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
     let cfg = home.load()?;
+    let info = match owned(home, &cfg, org) {
+        Ok(Some(i)) => i,
+        // The server does not know the org: the public API would not either.
+        Err(e) if e.exit == crate::util::Exit::Usage => return Err(e),
+        _ => public(&cfg, org)?,
+    };
+    if json_out {
+        crate::util::emit(&json!({"org": info.path, "org_id": info.org_id, "repos": info.repos}));
+    } else if info.repos.is_empty() {
+        println!("{} ({}) funds none of your projects yet: moochy org add <PROJECT> --org {}", clean(&info.path), clean(&info.org_id), clean(&info.path));
+    } else {
+        println!("Donations to {} ({}) fund:", clean(&info.path), clean(&info.org_id));
+        for r in &info.repos {
+            println!("  {} ({})", clean(&r.slug), clean(&r.repo_id));
+        }
+    }
+    Ok(())
+}
+
+/// The owner's view (WIRING §4). `Ok(None)`: not this account's org in the key log.
+fn owned(home: &Home, cfg: &crate::config::Config, org: &str) -> Result<Option<OrgInfo>> {
+    let Some(me) = cfg.pseudonym.as_deref() else { return Ok(None) };
+    let rt = rt()?;
+    let pushed = rt.block_on(async {
+        let mut c = crate::ctl::connect(&home.socket_path()).await?;
+        c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
+    })?;
+    // The org id from the server (dialed directly), never from the app's list.
+    let l = lookup(cfg, &rt, &format!("org:{org}"), None).map_err(|e| if e.exit == crate::util::Exit::Usage { usage(format!("the server knows no claimed organisation {}", clean(org))) } else { e })?;
+    let path = l.repo_slug.strip_prefix("org:").unwrap_or_default();
+    if !is_id(&l.repo_id, "o_") || !path.eq_ignore_ascii_case(org) {
+        return Err(internal("the server answered for another organisation"));
+    }
+    let rows: Vec<&SignResponse> = pushed.requests.iter().filter(|q| q.kind == Kind::OrgRepoRemoved.name() && q.org_id == l.repo_id && is_id(&q.repo_id, "r_")).collect();
+    let ids: Vec<&str> = std::iter::once(l.repo_id.as_str()).chain(rows.iter().map(|q| q.repo_id.as_str())).collect();
+    let Some(owners) = crate::keylog::KeyLog::owners(home, cfg, &ids) else { return Ok(None) };
+    let mut owners = owners.into_iter();
+    if owners.next().flatten().as_deref() != Some(me) {
+        return Ok(None);
+    }
+    // ponytail: checks both claims name this account; that ORG_REPO_ADDED is still active needs a
+    // coverage query in moochy-keylog (requested), until then the relay's push is trusted for it.
+    let mut repos = Vec::new();
+    for (q, owner) in rows.into_iter().zip(owners) {
+        if owner.as_deref() == Some(me) {
+            repos.push(Covered { repo_id: q.repo_id.clone(), slug: q.repo_slug.clone() });
+        } else {
+            eprintln!("warning: the server lists {} ({}) as funded by {}, but your key log does not show it as your project: not listed", clean(&q.repo_slug), clean(&q.repo_id), clean(path));
+        }
+    }
+    Ok(Some(OrgInfo { org_id: l.repo_id.clone(), path: path.to_owned(), repos }))
+}
+
+/// Anyone's view: the server's public orgs API, on an origin that serves HTTP.
+fn public(cfg: &crate::config::Config, org: &str) -> Result<OrgInfo> {
     let relay = crate::tls::Origin::parse(cfg.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY))?;
     let f = moochy_keylog::fetch::Fetcher::with_roots(&format!("{}/api/v1/orgs/", relay.url()), std::time::Duration::from_secs(20), crate::tls::roots(cfg.ca_file.as_deref())?)
         .map_err(|e| internal(format!("orgs API: {e}")))?;
@@ -286,17 +344,7 @@ pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
     if !is_id(&info.org_id, "o_") || !info.path.eq_ignore_ascii_case(org) || info.repos.iter().any(|r| !is_id(&r.repo_id, "r_")) {
         return Err(internal("the server answered for another organisation"));
     }
-    if json_out {
-        crate::util::emit(&json!({"org": info.path, "org_id": info.org_id, "repos": info.repos}));
-    } else if info.repos.is_empty() {
-        println!("{} ({}) funds none of your projects yet: moochy org add <PROJECT> --org {}", clean(&info.path), clean(&info.org_id), clean(&info.path));
-    } else {
-        println!("Donations to {} ({}) fund:", clean(&info.path), clean(&info.org_id));
-        for r in &info.repos {
-            println!("  {} ({})", clean(&r.slug), clean(&r.repo_id));
-        }
-    }
-    Ok(())
+    Ok(info)
 }
 
 #[cfg(test)]
