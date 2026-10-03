@@ -870,6 +870,9 @@ pub struct Donation {
     /// CONTRACT §24: the sponsored profile ("m\_…"), so the donor's node binds the pledge to exactly one person
     #[prost(string, tag = "20")]
     pub person_id: ::prost::alloc::string::String,
+    /// spend of this donation, last 30 UTC days, oldest first, zero-filled (§20 TUI)
+    #[prost(int64, repeated, tag = "21")]
+    pub per_day_uusd: ::prost::alloc::vec::Vec<i64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RepoSpend {
@@ -944,6 +947,9 @@ pub struct OwnedTarget {
     /// projects only: orgs whose donations also serve it
     #[prost(string, repeated, tag = "9")]
     pub funded_by: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// use, last 30 UTC days, oldest first, zero-filled (§20 TUI)
+    #[prost(int64, repeated, tag = "10")]
+    pub per_day_uusd: ::prost::alloc::vec::Vec<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListOwnedResponse {
