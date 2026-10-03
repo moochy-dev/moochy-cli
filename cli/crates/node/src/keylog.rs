@@ -188,6 +188,12 @@ impl KeyLog {
         Some(Self::mirror(home, cfg)?.state(|s| s.device(device).filter(|d| !d.revoked).map(|d| d.pseudonym.clone())).ok().flatten())
     }
 
+    /// `moochy org list` (WIRING §4): the current owner of each claimed project / org id in the
+    /// mirror, in order. `None`: no key log on this node.
+    pub fn owners(home: &Home, cfg: &Config, ids: &[&str]) -> Option<Vec<Option<String>>> {
+        Self::mirror(home, cfg)?.state(|s| ids.iter().map(|id| s.owner(id).map(str::to_owned)).collect()).ok()
+    }
+
     /// Owner commands (A224): the account's active Ed25519 owner key id in the mirror. Outer
     /// `None`: no key log on this node; inner `None`: none logged (yet).
     pub fn active_owner_key(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Option<String>> {
