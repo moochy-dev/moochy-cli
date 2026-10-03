@@ -25,24 +25,22 @@ enum K {
 fn rows(ctx: &Ctx) -> Vec<TreeRow<K>> {
     let t = *ctx.theme;
     let mut out = Vec::new();
+    // Columns: status, name (as wide as the longest, at most 34), money right-aligned.
+    let name_w = ctx.snap.projects.iter().map(|p| clean(&p.slug).chars().count()).max().unwrap_or(0).clamp(12, 34);
     for (i, p) in ctx.snap.projects.iter().enumerate() {
         let slug = clean(&p.slug);
         let waiting: Vec<_> = ctx.snap.pending.iter().enumerate().filter(|(_, r)| r.target == p.slug || r.target == p.id).collect();
         if !w::matches(ctx.filter, &[&slug]) && !waiting.iter().any(|(_, r)| w::matches(ctx.filter, &[&clean(&r.subject)])) {
             continue;
         }
-        let mut spans = if p.paused_since_ms > 0 {
-            vec![w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused"), Span::raw("  ")]
-        } else {
-            vec![Span::styled(format!("{} ", t.glyph(Glyph::Ok)), t.ok())]
-        };
-        spans.push(w::bold(slug));
-        spans.push(Span::styled(format!("  {}", w::dollars(p.month_uusd)), t.money()));
+        let status = if p.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "active") };
+        let mut spans = vec![w::col(&status, pending::STATUS_W.saturating_add(2)), w::col(&w::bold(slug), name_w)];
+        spans.push(Span::styled(format!("{:>9}", w::dollars(p.month_uusd)), t.money()));
         if p.goal_uusd > 0 {
             spans.push(w::muted(t, format!(" of {}", w::dollars(p.goal_uusd))));
         }
-        out.push(TreeRow { depth: 0, line: Line::from(spans), key: K::Project(i) });
-        out.extend(waiting.into_iter().map(|(j, r)| TreeRow { depth: 1, line: pending::line(t, r), key: K::Pending(j) }));
+        out.push(TreeRow { header: false, depth: 0, line: Line::from(spans), key: K::Project(i) });
+        out.extend(waiting.into_iter().map(|(j, r)| TreeRow { header: false, depth: 1, line: pending::line(t, r, name_w), key: K::Pending(j) }));
     }
     out
 }
@@ -115,10 +113,15 @@ impl View for ProjectsView {
 
     fn on_input(&mut self, input: &Input, ctx: &Ctx) -> Outcome {
         let rows = rows(ctx);
-        if self.cur.input(input, rows.len()) {
+        if self.cur.input(input, &rows) {
             return Outcome::Redraw;
         }
-        let Some(K::Pending(j)) = self.cur.pick(&rows).map(|r| r.key) else { return Outcome::Ignored };
+        let Some(K::Pending(j)) = self.cur.pick(&rows).map(|r| r.key) else {
+            return match input {
+                Input::Char('a' | 'r') => Outcome::Toast("Select a waiting request first (◆ waiting)".into()),
+                _ => Outcome::Ignored,
+            };
+        };
         let Some(p) = ctx.snap.pending.get(j) else { return Outcome::Ignored };
         match input {
             Input::Char('a') => pending::confirm_accept(*ctx.theme, p, &ctx.snap.me.web, ctx.now_ms),
@@ -163,7 +166,7 @@ mod tests {
         let c = ctx(&snap, &t, "");
         let mut v = ProjectsView::default();
         draw(&mut v, &c, 80, 24);
-        assert_eq!(v.on_input(&Input::Char('a'), &c), Outcome::Ignored, "a project row is not a request");
+        assert!(matches!(v.on_input(&Input::Char('a'), &c), Outcome::Toast(_)), "a project row is not a request");
         v.on_input(&Input::Down, &c);
         let Outcome::Confirm { action, body, .. } = v.on_input(&Input::Char('a'), &c) else { panic!() };
         assert_eq!(action, Action::Accept { request_id: "pl_01J".into() });
@@ -178,7 +181,7 @@ mod tests {
         let mut v = ProjectsView::default();
         let c = ctx(&snap, &t, "tool");
         let s = draw(&mut v, &c, 80, 24);
-        assert!(s.contains("evil") && !s.contains("widget"), "{s}");
+        assert!(s.contains("\u{FFFD}tool") && !s.contains("evil") && !s.contains("widget"), "{s}");
         let c = ctx(&snap, &t, "");
         draw(&mut v, &c, 80, 24);
         assert_eq!(v.on_input(&Input::Click { col: 5, row: 2 }, &c), Outcome::Redraw);

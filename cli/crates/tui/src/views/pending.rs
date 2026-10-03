@@ -11,13 +11,16 @@ use crate::theme::{Glyph, Theme};
 use crate::views::{Outcome, Prompt, Then};
 use crate::widgets::{self as w, Tone};
 
-/// A waiting request as a list row.
+/// The status column of the maintainer lists, in cells.
+pub const STATUS_W: usize = 14;
+
+/// A waiting request as a list row: status column, who (`name_w` cells), the terms.
 #[must_use]
-pub fn line(t: Theme, p: &Pending) -> Line<'static> {
+pub fn line(t: Theme, p: &Pending, name_w: usize) -> Line<'static> {
     Line::from(vec![
-        w::badge(t, Tone::Warn, t.glyph(Glyph::Pending), "waiting"),
-        Span::raw(format!("  {}  ", clean(&p.subject))),
-        w::muted(t, clean(&p.summary)),
+        w::col(&w::badge(t, Tone::Warn, t.glyph(Glyph::Pending), "waiting"), STATUS_W),
+        w::col(&Span::raw(clean(&p.subject)), name_w),
+        w::muted(t, format!("  {}", clean(&p.summary))),
     ])
 }
 

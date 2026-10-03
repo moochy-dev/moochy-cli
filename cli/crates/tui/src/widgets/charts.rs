@@ -69,6 +69,25 @@ pub fn hbar(t: Theme, value: u64, max: u64, width: u16, style: Style) -> Span<'s
     Span::styled(if t.ascii { "#" } else { "▇" }.repeat(n), style)
 }
 
+/// `data` (a fixed period, oldest first) spread over exactly `width` columns, so a chart always
+/// covers the same period whatever the terminal width: wider → each value spans several
+/// columns; narrower → columns average several values.
+#[must_use]
+pub fn resample(data: &[u64], width: usize) -> Vec<u64> {
+    let n = data.len();
+    if n == 0 || width == 0 {
+        return Vec::new();
+    }
+    (0..width)
+        .map(|c| {
+            let a = c.saturating_mul(n).checked_div(width).unwrap_or(0);
+            let b = c.saturating_add(1).saturating_mul(n).checked_div(width).unwrap_or(0).max(a.saturating_add(1)).min(n);
+            let s = data.get(a..b).unwrap_or_default();
+            s.iter().fold(0u64, |x, &v| x.saturating_add(v)).checked_div(s.len() as u64).unwrap_or(0)
+        })
+        .collect()
+}
+
 /// A one-row sparkline as text (fits inside a paragraph): the last `width` values, scaled to the
 /// largest, `▁▂▃▄▅▆▇█` (`._-=#` in ASCII).
 #[must_use]
@@ -97,6 +116,9 @@ mod tests {
         assert_eq!(bar(t, 30, 10, 4, Style::default()).to_string(), "####");
         assert_eq!(bar(t, 3, 0, 4, Style::default()).to_string(), "----");
         assert_eq!(spark_text(t, &[0, 1, 2, 4, 8], 4, Style::default()).content, "..-#");
+        assert_eq!(resample(&[1, 2, 3], 6), vec![1, 1, 2, 2, 3, 3]);
+        assert_eq!(resample(&[1, 3, 5, 7], 2), vec![2, 6]);
+        assert_eq!(resample(&[], 5), Vec::<u64>::new());
         assert_eq!(permille(5, 0), 0);
         assert_eq!(permille(500, 100), 1000);
     }

@@ -200,9 +200,10 @@ impl View for DonationsView {
             return w::empty(f, area, t, self.title(), lines);
         }
         let rows = visible(ctx);
-        let (list_a, detail) = w::split(area, 14);
+        let (list_a, detail) = if rows.is_empty() { (area, None) } else { w::split(area, 14) };
         self.cur.sync(rows.len(), list_a);
-        let total: u64 = rows.iter().map(|d| d.spent_uusd).fold(0, u64::saturating_add);
+        // The month's total is always all donations, filtered or not.
+        let total: u64 = ctx.snap.donations.iter().map(|d| d.spent_uusd).fold(0, u64::saturating_add);
         let title = format!("{}{}{} spent this month", w::counted("Donations", rows.len(), ctx.snap.donations.len()), w::dot(t), w::dollars(total));
         if rows.is_empty() {
             w::empty(f, list_a, t, &title, w::no_match(t, ctx.filter));
@@ -385,8 +386,8 @@ mod tests {
         draw(&mut v, &c, 160, 48);
         v.cur.select(3);
         let out = draw(&mut v, &c, 160, 48);
-        assert!(out.contains("Projects funded this month") && out.contains("[31mb") && !out.contains('\u{1b}'), "{out}");
-        let big = out.find("[31mb").unwrap();
+        assert!(out.contains("Projects funded this month") && out.contains("acme/\u{FFFD}b") && !out.contains("[31m"), "{out}");
+        let big = out.find("acme/\u{FFFD}b").unwrap();
         assert!(big < out.find("acme/a\n").or_else(|| out.find("acme/a ")).unwrap_or(usize::MAX), "biggest spender first");
     }
 

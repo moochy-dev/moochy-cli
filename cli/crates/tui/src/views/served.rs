@@ -14,8 +14,8 @@ use crate::theme::{Glyph, Theme};
 use crate::widgets::{self as w, TableCursor, Tone, charts, list};
 
 const MINUTE_MS: u64 = 60_000;
-/// The sparkline covers at most this many minutes (one column each).
-const MAX_MINUTES: u16 = 60;
+/// The chart always covers the last hour, resampled into the width it gets.
+const MINUTES: u16 = 60;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Sort {
@@ -115,7 +115,7 @@ impl ServedView {
                 dot(),
                 w::badge(t, Tone::Info, t.glyph(Glyph::Used), &format!("{used} used")),
                 dot(),
-                Span::styled(w::cost(uusd), t.money()),
+                Span::styled(w::dollars(uusd), t.money()),
                 dot(),
                 Span::raw(format!("p50 {}", w::latency(p50))),
             ];
@@ -176,19 +176,20 @@ impl View for ServedView {
         {
             self.cur.select(i);
         }
-        let [top, rest] = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
-        let minutes = top.width.saturating_sub(2).clamp(1, MAX_MINUTES);
-        let (line, buckets) = Self::summary(t, &rows, ctx.now_ms, minutes);
-        let spark_block = w::block(t, format!("Last {minutes} min"));
+        let [top, rest] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        let (line, buckets) = Self::summary(t, &rows, ctx.now_ms, MINUTES);
+        let spark_block = w::block(t, "Last 60 min");
         let inner = spark_block.inner(top);
         f.render_widget(spark_block, top);
-        let [l1, l2] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        let [l1, l2, l3] = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(inner);
         f.render_widget(Paragraph::new(list::fit(line, usize::from(l1.width))), l1);
-        // Right-aligned: the last column is the current minute.
-        let wd = minutes.min(l2.width);
-        f.render_widget(charts::sparkline(t, &buckets, t.money()), Rect { x: l2.x.saturating_add(l2.width.saturating_sub(wd)), width: wd, ..l2 });
+        // The whole hour across the whole width: the left edge is 60 minutes ago, the right is now.
+        let data = charts::resample(&buckets, usize::from(l2.width));
+        f.render_widget(charts::sparkline(t, &data, t.money()), l2);
+        let gap = usize::from(l3.width).saturating_sub(13);
+        f.render_widget(Paragraph::new(Line::from(w::muted(t, format!("60m ago{:gap$}now", ""))) ), l3);
 
-        let (list_a, detail) = w::split(rest, 10);
+        let (list_a, detail) = if rows.is_empty() { (rest, None) } else { w::split(rest, 10) };
         self.cur.sync(rows.len(), list_a);
         let mode = match (self.sort, self.anchor) {
             (Sort::Newest, None) => "live".to_string(),
@@ -226,7 +227,7 @@ impl View for ServedView {
             if wide {
                 cells.push(Cell::from(format!("{} {} {}", w::tokens(s.tokens_in), if t.ascii { ">" } else { "→" }, w::tokens(s.tokens_out))));
             }
-            cells.push(Cell::from(Span::styled(w::cost(s.cost_uusd), t.money())));
+            cells.push(Cell::from(Span::styled(w::dollars(s.cost_uusd), t.money())));
             if wide {
                 cells.push(Cell::from(w::latency(s.latency_ms)));
             }

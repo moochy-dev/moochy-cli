@@ -34,7 +34,7 @@ fn trend(seed: u64) -> Vec<u64> {
 /// The demo source (`moochy tui --demo`).
 #[must_use]
 pub fn demo_source() -> FakeSource {
-    FakeSource { state: demo(), now_ms: DEMO_NOW_MS }
+    FakeSource::new(demo(), DEMO_NOW_MS)
 }
 
 #[must_use]
@@ -304,5 +304,5 @@ pub fn hostile() -> FakeSource {
     for (_, v) in &mut st.config {
         *v = evil(v);
     }
-    FakeSource { state: st, now_ms: DEMO_NOW_MS }
+    FakeSource::new(st, DEMO_NOW_MS)
 }

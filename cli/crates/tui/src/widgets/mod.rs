@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 use crate::sanitize::clean;
 use crate::theme::{Glyph, Theme};
@@ -30,7 +30,7 @@ pub const WIDE: u16 = 110;
 #[must_use]
 pub fn block<'a>(t: Theme, title: impl Into<String>) -> Block<'a> {
     let title: String = title.into();
-    let b = Block::default().borders(Borders::ALL).border_set(t.border_set()).border_style(t.border());
+    let b = Block::default().borders(Borders::ALL).border_set(t.border_set()).border_style(t.border()).padding(Padding::horizontal(1));
     if title.is_empty() { b } else { b.title(Span::styled(format!(" {title} "), t.bold())) }
 }
 
@@ -38,11 +38,13 @@ pub fn block<'a>(t: Theme, title: impl Into<String>) -> Block<'a> {
 #[must_use]
 pub fn block_focus<'a>(t: Theme, title: impl Into<String>) -> Block<'a> {
     let title: String = title.into();
+    let title = if title.is_empty() { String::new() } else { format!(" {title} ") };
     Block::default()
         .borders(Borders::ALL)
         .border_set(t.border_set())
         .border_style(t.border_focus())
-        .title(Span::styled(format!(" {title} "), t.accent()))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(title, t.accent()))
 }
 
 /// A list title with its count: `Donations · 4`, or `Donations · 2/4` while filtered.
@@ -113,6 +115,14 @@ pub fn tone(t: Theme, tone: Tone) -> Style {
 #[must_use]
 pub fn badge(t: Theme, tn: Tone, glyph: &str, label: &str) -> Span<'static> {
     Span::styled(format!("{glyph} {label}"), tone(t, tn))
+}
+
+/// `span` padded (or cut with `…`) to exactly `width` cells: a column in a list of lines.
+#[must_use]
+pub fn col(span: &Span<'static>, width: usize) -> Span<'static> {
+    let text = trunc(span.content.as_ref(), width);
+    let pad = width.saturating_sub(Line::raw(text.as_str()).width());
+    Span::styled(format!("{text}{:pad$}", ""), span.style)
 }
 
 #[must_use]

@@ -50,6 +50,8 @@ pub enum Command {
     Quit,
     /// Replay a key to the focused view (palette entries made from [`View::hints`]).
     Key(Input),
+    /// Open a tab, then replay a key to it (palette entries of other tabs).
+    TabKey(usize, Input),
 }
 
 /// A key or mouse input already decoded by the shell.
@@ -84,6 +86,8 @@ pub enum Outcome {
     Command(Command),
     /// Ask the user for a line of text (a refuse reason, a new limit), then act on it.
     Prompt(Prompt),
+    /// Tell the user why a key did nothing here ("Select a waiting request to accept").
+    Toast(String),
 }
 
 /// A one-line text dialog. Typed and pasted text is sanitized and bounded to `max_len`.

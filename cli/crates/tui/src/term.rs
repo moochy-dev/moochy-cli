@@ -133,9 +133,26 @@ fn worker(mut src: Box<dyn Source>, actions: &Receiver<Action>, tx: &SyncSender<
     if !snap(&mut src) {
         return;
     }
-    while let Ok(a) = actions.recv() {
-        if a != Action::Refresh && tx.send(AppEvent::Result(src.act(a))).is_err() {
-            return;
+    let every = src.tick_every();
+    loop {
+        let next = match every {
+            Some(d) => actions.recv_timeout(d),
+            None => actions.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match next {
+            Ok(a) => {
+                if a != Action::Refresh && tx.send(AppEvent::Result(src.act(a))).is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(t) = src.tick()
+                    && tx.send(AppEvent::Source(SourceEvent::Toast(t))).is_err()
+                {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
         if !snap(&mut src) {
             return;

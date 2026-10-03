@@ -17,11 +17,11 @@ pub fn marker(t: Theme) -> String {
     format!("{} ", t.glyph(Glyph::Selected))
 }
 
-/// The cell widths a `Table` with `widths`, spacing 1 and a selection marker gets inside a bordered
-/// `area` — so cells can be cut with `…` before they reach it (nothing silently clipped).
+/// The cell widths a `Table` with `widths`, spacing 1 and a selection marker gets inside a padded
+/// panel (`area`) — so cells can be cut with `…` before they reach it (nothing silently clipped).
 #[must_use]
 pub fn table_widths(area: Rect, widths: &[Constraint]) -> Vec<usize> {
-    let inner = area.width.saturating_sub(2).saturating_sub(2);
+    let inner = area.width.saturating_sub(4).saturating_sub(2);
     Layout::horizontal(widths.iter().copied())
         .spacing(1)
         .flex(Flex::Start)
@@ -72,14 +72,33 @@ pub struct TableCursor {
     pub state: TableState,
     body: Rect,
     len: usize,
+    /// Rows the cursor never rests on (section headers); empty = all selectable.
+    skip: Vec<bool>,
+}
+
+/// The selectable index nearest to `want` in the direction of travel (then the other way).
+fn nearest(want: usize, len: usize, forward: bool, ok: impl Fn(usize) -> bool) -> Option<usize> {
+    let want = want.min(len.saturating_sub(1));
+    let fwd = (want..len).find(|&i| ok(i));
+    let back = (0..=want).rev().find(|&i| ok(i));
+    if forward { fwd.or(back) } else { back.or(fwd) }
 }
 
 impl TableCursor {
+    /// Marks the rows the cursor skips (section headers); call before [`TableCursor::sync`].
+    pub fn set_headers(&mut self, headers: Vec<bool>) {
+        self.skip = headers;
+    }
+
+    fn ok(&self, i: usize) -> bool {
+        !self.skip.get(i).copied().unwrap_or(false)
+    }
+
     /// Clamps the selection to `len` rows drawn in the bordered `area` (call before rendering).
     pub fn sync(&mut self, len: usize, area: Rect) {
         self.len = len;
         self.body = Rect { x: area.x.saturating_add(1), y: area.y.saturating_add(2), width: area.width.saturating_sub(2), height: area.height.saturating_sub(3) };
-        let sel = if len == 0 { None } else { Some(self.state.selected().unwrap_or(0).min(len.saturating_sub(1))) };
+        let sel = if len == 0 { None } else { nearest(self.state.selected().unwrap_or(0), len, true, |i| self.ok(i)) };
         self.state.select(sel);
     }
 
@@ -90,7 +109,10 @@ impl TableCursor {
 
     pub fn select(&mut self, i: usize) {
         if self.len > 0 {
-            self.state.select(Some(i.min(self.len.saturating_sub(1))));
+            let forward = i >= self.state.selected().unwrap_or(0);
+            if let Some(n) = nearest(i, self.len, forward, |j| self.ok(j)) {
+                self.state.select(Some(n));
+            }
         }
     }
 
@@ -127,6 +149,8 @@ impl TableCursor {
 
 /// One line of a [`TreeList`]; `key` says what the cursor points at.
 pub struct TreeRow<K> {
+    /// A section header: shown, never selected.
+    pub header: bool,
     pub depth: u8,
     pub line: Line<'static>,
     pub key: K,
@@ -141,14 +165,15 @@ pub struct TreeList {
 }
 
 impl TreeList {
-    /// The selected row, clamped to the list.
+    /// The selected row, clamped to the list and off any header.
     pub fn pick<'r, K>(&mut self, rows: &'r [TreeRow<K>]) -> Option<&'r TreeRow<K>> {
-        self.sel = self.sel.min(rows.len().saturating_sub(1));
-        rows.get(self.sel)
+        self.sel = nearest(self.sel, rows.len(), true, |i| rows.get(i).is_some_and(|r| !r.header)).unwrap_or(0);
+        rows.get(self.sel).filter(|r| !r.header)
     }
 
-    /// Moves on navigation input (keys, wheel, click); `true` if it was one.
-    pub fn input(&mut self, input: &Input, len: usize) -> bool {
+    /// Moves on navigation input (keys, wheel, click), skipping headers; `true` if it was one.
+    pub fn input<K>(&mut self, input: &Input, rows: &[TreeRow<K>]) -> bool {
+        let len = rows.len();
         let last = len.saturating_sub(1);
         let page = usize::from(self.list.height.saturating_sub(3)).max(1);
         let sel = match input {
@@ -167,7 +192,8 @@ impl TreeList {
             }
             _ => return false,
         };
-        self.sel = sel.min(last);
+        let forward = sel >= self.sel;
+        self.sel = nearest(sel.min(last), len, forward, |i| rows.get(i).is_some_and(|r| !r.header)).unwrap_or(self.sel);
         true
     }
 
@@ -190,9 +216,9 @@ impl TreeList {
         }
         let (list_a, det_a) = split(area, area.height / 2);
         self.list = list_a;
-        self.sel = self.sel.min(rows.len().saturating_sub(1));
+        self.pick(rows);
         self.state.select(Some(self.sel));
-        let w = usize::from(list_a.width.saturating_sub(4));
+        let w = usize::from(list_a.width.saturating_sub(6));
         let items = rows.iter().map(|r| {
             let mut spans = vec![Span::raw("  ".repeat(usize::from(r.depth)))];
             spans.extend(r.line.spans.iter().cloned());
@@ -234,6 +260,6 @@ mod tests {
         assert_eq!(fit(l.clone(), 5).to_string(), "abcd…");
         assert_eq!(fit(l.clone(), 8).to_string(), "abcdefgh");
         assert_eq!(fit(l, 3).to_string(), "ab…");
-        assert_eq!(table_widths(Rect::new(0, 0, 30, 5), &[Constraint::Length(5), Constraint::Min(3)]), vec![5, 20]);
+        assert_eq!(table_widths(Rect::new(0, 0, 30, 5), &[Constraint::Length(5), Constraint::Min(3)]), vec![5, 18]);
     }
 }

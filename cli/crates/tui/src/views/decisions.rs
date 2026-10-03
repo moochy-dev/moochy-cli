@@ -49,15 +49,20 @@ fn rows(ctx: &Ctx) -> Vec<TreeRow<K>> {
         return Vec::new();
     }
     history.sort_by_key(|(_, d)| std::cmp::Reverse(d.at_ms));
-    let mut out = vec![TreeRow { depth: 0, line: Line::from(w::bold(format!("Waiting for you · {}", pending.len()))), key: K::Waiting }];
-    out.extend(pending.into_iter().map(|(i, p)| TreeRow { depth: 1, line: pending::line(t, p), key: K::Pending(i) }));
-    out.push(TreeRow { depth: 0, line: Line::from(w::bold(format!("History · {}", history.len()))), key: K::History });
-    out.extend(history.into_iter().map(|(i, d)| TreeRow { depth: 1, line: decision_line(t, d, ctx.now_ms), key: K::Decision(i) }));
+    let mut out = vec![TreeRow { header: true, depth: 0, line: Line::from(w::bold(format!("Waiting for you · {}", pending.len()))), key: K::Waiting }];
+    out.extend(pending.into_iter().map(|(i, p)| TreeRow { header: false, depth: 1, line: pending::line(t, p, 16), key: K::Pending(i) }));
+    out.push(TreeRow { header: true, depth: 0, line: Line::from(w::bold(format!("History · {}", history.len()))), key: K::History });
+    out.extend(history.into_iter().map(|(i, d)| TreeRow { header: false, depth: 1, line: decision_line(t, d, ctx.now_ms), key: K::Decision(i) }));
     out
 }
 
 fn decision_line(t: Theme, d: &Decision, now_ms: u64) -> Line<'static> {
-    Line::from(vec![event(t, d), Span::raw(format!("  {} → {}  ", clean(&d.donor), clean(&d.target))), w::muted(t, w::ago(now_ms, d.at_ms))])
+    Line::from(vec![
+        w::col(&event(t, d), pending::STATUS_W),
+        w::col(&Span::raw(clean(&d.donor)), 16),
+        w::muted(t, format!("{:>5}  ", w::ago(now_ms, d.at_ms))),
+        Span::raw(clean(&d.target)),
+    ])
 }
 
 fn detail(ctx: &Ctx, key: K) -> (String, Vec<Line<'static>>) {
@@ -125,10 +130,15 @@ impl View for DecisionsView {
 
     fn on_input(&mut self, input: &Input, ctx: &Ctx) -> Outcome {
         let rows = rows(ctx);
-        if self.cur.input(input, rows.len()) {
+        if self.cur.input(input, &rows) {
             return Outcome::Redraw;
         }
-        let Some(K::Pending(i)) = self.cur.pick(&rows).map(|r| r.key) else { return Outcome::Ignored };
+        let Some(K::Pending(i)) = self.cur.pick(&rows).map(|r| r.key) else {
+            return match input {
+                Input::Char('a' | 'r') => Outcome::Toast("Select a waiting request first (◆ waiting)".into()),
+                _ => Outcome::Ignored,
+            };
+        };
         let Some(p) = ctx.snap.pending.get(i) else { return Outcome::Ignored };
         match input {
             Input::Char('a') => pending::confirm_accept(*ctx.theme, p, &ctx.snap.me.web, ctx.now_ms),
@@ -158,13 +168,13 @@ mod tests {
             assert!(eve < dave, "newest first: {s}");
             assert!(s.contains('✔') && s.contains('✖'), "{s}");
         }
-        v.on_input(&Input::Down, &c);
+        // The cursor starts on the first waiting request, never on a section header.
         let s = draw(&mut v, &c, 160, 48);
         assert!(s.contains("https://moochy.dev/decide/pl_01J"), "the /decide link: {s}");
         let Outcome::Confirm { action, .. } = v.on_input(&Input::Char('a'), &c) else { panic!() };
         assert_eq!(action, Action::Accept { request_id: "pl_01J".into() });
         v.on_input(&Input::End, &c);
-        assert_eq!(v.on_input(&Input::Char('a'), &c), Outcome::Ignored, "history is read-only");
+        assert!(matches!(v.on_input(&Input::Char('a'), &c), Outcome::Toast(_)), "history is read-only");
         let s = draw(&mut v, &c, 160, 48);
         assert!(s.contains("Via        passkey"), "{s}");
     }

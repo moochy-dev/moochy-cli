@@ -35,32 +35,35 @@ fn cap_text(used: u64, cap: u64) -> String {
 fn rows(ctx: &Ctx) -> Vec<TreeRow<K>> {
     let (snap, t) = (ctx.snap, *ctx.theme);
     let mut out = Vec::new();
+    let name_w = snap.orgs.iter().flat_map(|o| std::iter::once(o.path.as_str()).chain(o.covered.iter().map(|c| c.slug.as_str()))).map(|s| clean(s).chars().count()).max().unwrap_or(0).clamp(12, 34);
     for (i, o) in snap.orgs.iter().enumerate() {
         let path = clean(&o.path);
         if !w::matches(ctx.filter, &[&path]) && !o.covered.iter().any(|c| w::matches(ctx.filter, &[&clean(&c.slug)])) {
             continue;
         }
-        let mut spans = if o.paused_since_ms > 0 {
-            vec![w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused"), Span::raw("  ")]
-        } else {
-            vec![Span::styled(format!("{} ", t.glyph(Glyph::Ok)), t.ok())]
-        };
-        spans.extend([w::bold(path), w::muted(t, format!("  {} donors  ", o.donors)), Span::styled(w::dollars(o.month_uusd), t.money())]);
-        out.push(TreeRow { depth: 0, line: Line::from(spans), key: K::Org(i) });
+        let status = if o.paused_since_ms > 0 { w::badge(t, Tone::Bad, t.glyph(Glyph::Paused), "paused") } else { w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "active") };
+        let spans = vec![
+            w::col(&status, pending::STATUS_W.saturating_add(2)),
+            w::col(&w::bold(path), name_w),
+            Span::styled(format!("{:>9}", w::dollars(o.month_uusd)), t.money()),
+            w::muted(t, format!("  {} donors", o.donors)),
+        ];
+        out.push(TreeRow { header: false, depth: 0, line: Line::from(spans), key: K::Org(i) });
         for (j, c) in o.covered.iter().enumerate() {
             let line = Line::from(vec![
-                w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "covered"),
-                Span::raw(format!("  {}  ", clean(&c.slug))),
-                w::muted(t, cap_text(c.used_uusd, c.share_cap_uusd)),
+                w::col(&w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "covered"), pending::STATUS_W),
+                w::col(&Span::raw(clean(&c.slug)), name_w),
+                Span::styled(format!("{:>9}", w::dollars(c.used_uusd)), t.money()),
+                w::muted(t, if c.share_cap_uusd == 0 { "  no cap".to_string() } else { format!(" of {} cap", w::dollars(c.share_cap_uusd)) }),
             ]);
-            out.push(TreeRow { depth: 1, line, key: K::Covered(i, j) });
+            out.push(TreeRow { header: false, depth: 1, line, key: K::Covered(i, j) });
         }
         for (j, p) in candidates(o, ctx) {
-            let line = Line::from(vec![w::badge(t, Tone::Info, "+", "not covered"), Span::raw(format!("  {}", clean(&p)))]);
-            out.push(TreeRow { depth: 1, line, key: K::Candidate(i, j) });
+            let line = Line::from(vec![w::col(&w::badge(t, Tone::Info, "+", "not covered"), pending::STATUS_W), Span::raw(clean(&p))]);
+            out.push(TreeRow { header: false, depth: 1, line, key: K::Candidate(i, j) });
         }
         for (k, p) in snap.pending.iter().enumerate().filter(|(_, p)| p.target == o.path || p.target == o.id) {
-            out.push(TreeRow { depth: 1, line: pending::line(t, p), key: K::Pending(k) });
+            out.push(TreeRow { header: false, depth: 1, line: pending::line(t, p, name_w), key: K::Pending(k) });
         }
     }
     out
@@ -192,7 +195,7 @@ impl View for OrgsView {
 
     fn on_input(&mut self, input: &Input, ctx: &Ctx) -> Outcome {
         let rows = rows(ctx);
-        if self.cur.input(input, rows.len()) {
+        if self.cur.input(input, &rows) {
             return Outcome::Redraw;
         }
         let Some(key) = self.cur.pick(&rows).map(|r| r.key) else { return Outcome::Ignored };
@@ -208,6 +211,9 @@ impl View for OrgsView {
             },
             (K::Pending(k), Input::Char('a')) => snap.pending.get(k).map_or(Outcome::Ignored, |p| pending::confirm_accept(*ctx.theme, p, &snap.me.web, ctx.now_ms)),
             (K::Pending(k), Input::Char('r')) => snap.pending.get(k).map_or(Outcome::Ignored, pending::refuse),
+            (_, Input::Char('a')) => Outcome::Toast("a adds a “not covered” repo or accepts a waiting request: select one first".into()),
+            (_, Input::Char('x')) => Outcome::Toast("x removes a covered repo: select one first".into()),
+            (_, Input::Char('r')) => Outcome::Toast("r refuses a waiting request: select one first".into()),
             _ => Outcome::Ignored,
         }
     }
@@ -228,8 +234,8 @@ mod tests {
         for (w, h) in [(80, 24), (160, 48)] {
             let s = draw(&mut v, &c, w, h);
             assert!(s.contains("github/acme") && s.contains("2 donors"), "{s}");
-            assert!(s.contains("covered  github/acme/widget  $3.00 of $10.00 cap"), "{s}");
-            assert!(s.contains("not covered  github/acme/gadget") && s.contains("carol"), "{s}");
+            assert!(s.contains("covered") && s.contains("github/acme/widget") && s.contains("$3.00 of $10.00 cap"), "{s}");
+            assert!(s.contains("not covered github/acme/gadget") && s.contains("carol"), "{s}");
             assert!(!s.contains('%'), "share caps are dollars, never a percent");
         }
         let s = draw(&mut v, &c, 160, 48);
@@ -243,12 +249,12 @@ mod tests {
         let c = ctx(&snap, &t, "");
         let mut v = OrgsView::default();
         draw(&mut v, &c, 80, 24);
-        assert_eq!(v.on_input(&Input::Char('x'), &c), Outcome::Ignored, "the org row");
+        assert!(matches!(v.on_input(&Input::Char('x'), &c), Outcome::Toast(_)), "the org row");
         v.on_input(&Input::Down, &c);
         let Outcome::Confirm { action, body, .. } = v.on_input(&Input::Char('x'), &c) else { panic!() };
         assert_eq!(action, Action::OrgRemove { org: "github/acme".into(), repo: "github/acme/widget".into() });
         assert!(body.contains("ORG_REPO_REMOVED") && body.contains("github/acme/widget"));
-        assert_eq!(v.on_input(&Input::Char('a'), &c), Outcome::Ignored, "a covered repo is not added twice");
+        assert!(matches!(v.on_input(&Input::Char('a'), &c), Outcome::Toast(_)), "a covered repo is not added twice");
         v.on_input(&Input::Down, &c);
         let Outcome::Confirm { action, .. } = v.on_input(&Input::Char('a'), &c) else { panic!() };
         assert_eq!(action, Action::OrgAdd { org: "github/acme".into(), repo: "github/acme/gadget".into() });
@@ -256,7 +262,7 @@ mod tests {
         // for the node to check with the server.
         v.on_input(&Input::Down, &c);
         let s = draw(&mut v, &c, 160, 48);
-        assert!(s.contains("evil") && !s.contains('\u{1b}'));
+        assert!(s.contains("acme/\u{FFFD}tool") && !s.contains("evil"), "{s}");
         v.on_input(&Input::Down, &c);
         assert!(matches!(v.on_input(&Input::Char('a'), &c), Outcome::Confirm { action: Action::Accept { .. }, .. }));
     }

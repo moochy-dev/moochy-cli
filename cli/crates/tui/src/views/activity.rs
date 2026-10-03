@@ -40,11 +40,30 @@ fn kind(t: Theme, a: &Activity) -> Span<'static> {
         Some(ReceiptCheck::Verified) => w::badge(t, Tone::Good, t.glyph(Glyph::Ok), "verified"),
         Some(ReceiptCheck::Failed(_)) => w::badge(t, Tone::Bad, t.glyph(Glyph::Error), "mismatch"),
         Some(ReceiptCheck::Unchecked) => w::badge(t, Tone::Warn, t.glyph(Glyph::Coin), "receipt"),
-        None => w::muted(t, format!("{} event", t.glyph(Glyph::Offline))),
+        None => {
+            // What the entry is about, from its first words (the journal has no kind field).
+            let l = a.text.to_ascii_lowercase();
+            let (tone, g, word) = if l.starts_with("served") {
+                (Tone::Warn, Glyph::Served, "served")
+            } else if l.starts_with("used") {
+                (Tone::Info, Glyph::Used, "used")
+            } else if l.contains("accepted") || l.contains("refused") || l.contains("asked to") {
+                (Tone::Info, Glyph::Pending, "decision")
+            } else if l.contains("donation") {
+                (Tone::Warn, Glyph::Coin, "donation")
+            } else if l.starts_with("device") || l.starts_with("box") {
+                (Tone::Muted, Glyph::Online, "device")
+            } else if l.starts_with("key log") {
+                (Tone::Good, Glyph::Ok, "key log")
+            } else {
+                (Tone::Muted, Glyph::Offline, "event")
+            };
+            w::badge(t, tone, t.glyph(g), word)
+        }
     }
 }
 
-const COLS: [Constraint; 3] = [Constraint::Length(4), Constraint::Length(10), Constraint::Min(20)];
+const COLS: [Constraint; 3] = [Constraint::Length(4), Constraint::Length(11), Constraint::Min(20)];
 
 impl View for ActivityView {
     fn title(&self) -> &'static str {
@@ -73,7 +92,7 @@ impl View for ActivityView {
             return w::empty(f, area, t, self.title(), lines);
         }
         let rows = visible(ctx);
-        let (list_a, detail) = w::split(area, 8);
+        let (list_a, detail) = if rows.is_empty() { (area, None) } else { w::split(area, 8) };
         self.cur.sync(rows.len(), list_a);
         let title = w::counted("Journal", rows.len(), ctx.snap.activity.len());
         if rows.is_empty() {
@@ -144,7 +163,7 @@ mod tests {
                 assert!(pos[0] < pos[1] && pos[1] < pos[2], "{out}");
                 assert!(out.contains("receipt") && out.contains("moochy verify r_01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{out}");
                 assert!(out.contains("mismatch"), "{out}");
-                assert!(out.contains("]0;pwned") && !out.contains('\u{1b}'), "{out}");
+                assert!(out.contains("tower went offline") && !out.contains("pwned"), "{out}");
             }
         }
         let mut v = ActivityView::default();

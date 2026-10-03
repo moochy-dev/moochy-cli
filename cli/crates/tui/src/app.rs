@@ -481,7 +481,9 @@ impl App {
             Outcome::Ignored => false,
             Outcome::Redraw => true,
             Outcome::Confirm { title, body, action } => {
-                self.mode = Mode::Confirm { title: clean(&title), body: clean(&body), action, yes: false };
+                // Sanitized line by line: the body's own line breaks stay line breaks.
+                let body = body.lines().map(clean).collect::<Vec<_>>().join("\n");
+                self.mode = Mode::Confirm { title: clean(&title), body, action, yes: false };
                 true
             }
             Outcome::Run(a) => {
@@ -489,6 +491,10 @@ impl App {
                 true
             }
             Outcome::Command(c) => self.exec(c),
+            Outcome::Toast(t) => {
+                self.toast(Glyph::Warn, &t);
+                true
+            }
             Outcome::Prompt(p) => {
                 let input: String = clean(&p.initial).chars().take(p.max_len).collect();
                 let prompt = Prompt { title: clean(&p.title), body: clean(&p.body), label: clean(&p.label), ..p };
@@ -526,6 +532,12 @@ impl App {
             }
             Command::Quit => self.quit = true,
             Command::Key(i) => return self.on_input(&i),
+            Command::TabKey(t, i) => {
+                if t < self.views.len() {
+                    self.active = t;
+                }
+                self.on_input(&i);
+            }
         }
         true
     }
@@ -537,10 +549,14 @@ impl App {
             .enumerate()
             .map(|(i, view)| Item { label: format!("Go to {}", view.title()), key: TAB_KEYS.get(i).copied().unwrap_or(""), cmd: Command::GoTo(i) })
             .collect();
-        if let Some(view) = self.views.get(self.active) {
+        // Every tab's keys, the focused tab's first: picking one opens that tab, then presses it.
+        let order = std::iter::once(self.active).chain((0..self.views.len()).filter(|&i| i != self.active));
+        for t in order {
+            let Some(view) = self.views.get(t) else { continue };
             for (key, what) in view.hints() {
                 if let Some(i) = hint_input(key) {
-                    v.push(Item { label: format!("{}: {what}", view.title()), key, cmd: Command::Key(i) });
+                    let cmd = if t == self.active { Command::Key(i) } else { Command::TabKey(t, i) };
+                    v.push(Item { label: format!("{}: {what}", view.title()), key, cmd });
                 }
             }
         }
@@ -723,12 +739,13 @@ impl App {
         // View keys first, then the globals; `? help` always stays (it lists the rest).
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         let mut used: usize = 1;
-        let help = Line::from(key_hint(th, "?", "help").to_vec()).width().saturating_add(2);
+        // `q quit` and `? help` always stay; the rest is dropped from the right when narrow.
+        let help = Line::from(key_hint(th, "?", "help").to_vec()).width().saturating_add(Line::from(key_hint(th, "q", "quit").to_vec()).width()).saturating_add(4);
         let budget = usize::from(area.width).saturating_sub(help);
         // A view hint for a key the shell owns (or one already listed) is not repeated.
         let shell = |k: &str| matches!(k, "/" | ":" | "?" | "q" | "j/k" | "↑↓" | "tab");
         let mut seen: Vec<&str> = Vec::new();
-        for (k, w) in view.iter().filter(|(k, _)| !shell(k)).chain(FOOTER_GLOBAL.iter().filter(|(k, _)| *k != "?")) {
+        for (k, w) in view.iter().filter(|(k, _)| !shell(k)).chain(FOOTER_GLOBAL.iter().filter(|(k, _)| *k != "?" && *k != "q")) {
             if seen.contains(k) {
                 continue;
             }
@@ -742,22 +759,26 @@ impl App {
             spans.extend(item);
             spans.push(Span::raw("  "));
         }
+        spans.extend(key_hint(th, "q", "quit"));
+        spans.push(Span::raw("  "));
         spans.extend(key_hint(th, "?", "help"));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_toasts(&self, f: &mut Frame, main: Rect) {
         let th = &self.theme;
+        // Inside the pane, one row above its bottom border and two columns in from its right one.
+        let main = main.inner(ratatui::layout::Margin::new(2, 1));
         let mut y = main.bottom();
         for t in self.toasts.iter().rev() {
             let text = format!("{} {}", th.glyph(t.glyph), t.text);
-            let w = (Line::raw(text.as_str()).width() as u16).saturating_add(4).min(main.width.saturating_sub(2)).min(60);
+            let w = (Line::raw(text.as_str()).width() as u16).saturating_add(4).min(main.width).min(60);
             let h = 3;
             if y < main.y.saturating_add(h) {
                 break;
             }
             y = y.saturating_sub(h);
-            let r = Rect { x: main.right().saturating_sub(w).saturating_sub(1), y, width: w, height: h };
+            let r = Rect { x: main.right().saturating_sub(w), y, width: w, height: h };
             f.render_widget(Clear, r);
             let block = Block::default().borders(Borders::ALL).border_set(th.border_set()).border_style(th.glyph_style(t.glyph));
             f.render_widget(Paragraph::new(Line::styled(text, th.glyph_style(t.glyph))).block(block), r);
@@ -767,30 +788,42 @@ impl App {
     fn render_help(&self, f: &mut Frame, main: Rect, scroll: u16) {
         let th = &self.theme;
         let view = self.views.get(self.active);
-        let title = view.map_or("", |v| v.title());
-        let mut lines: Vec<Line> = vec![Line::styled(title, th.accent())];
-        for (k, w) in view.map_or(&[][..], |v| v.hints()) {
-            lines.push(help_line(th, k, w));
+        let hints = view.map_or(&[][..], |v| v.hints());
+        let mut left: Vec<Line> = vec![Line::styled(view.map_or("", |v| v.title()), th.accent())];
+        for (k, w) in hints {
+            left.push(help_line(th, k, w));
         }
-        if lines.len() == 1 {
-            lines.push(Line::styled("  (no keys of its own: the global keys below work here)", th.muted()));
+        if hints.is_empty() {
+            left.push(Line::styled("  no keys of its own", th.muted()));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("Everywhere", th.accent()));
-        let own: Vec<&str> = view.map_or(&[][..], |v| v.hints()).iter().map(|(k, _)| *k).collect();
+        let own: Vec<&str> = hints.iter().map(|(k, _)| *k).collect();
+        let mut right: Vec<Line> = vec![Line::styled("Everywhere", th.accent())];
         for (k, w) in GLOBAL_KEYS.iter().filter(|(k, _)| !own.contains(k)) {
-            lines.push(help_line(th, k, w));
+            right.push(help_line(th, k, w));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("Mouse: click a tab, a row or a panel; the wheel scrolls.", th.muted()));
-        let r = centered(main, 64, (lines.len() as u16).saturating_add(2));
+        let mouse = Line::styled("Mouse: click a tab, a row or a panel; the wheel scrolls.", th.muted());
+        // Two columns when there is room (everything on one screen), else one scrolling column.
+        let two = main.width >= 76;
+        let body_h = if two { left.len().max(right.len()) } else { left.len().saturating_add(right.len()).saturating_add(1) };
+        let want = (body_h as u16).saturating_add(4);
+        let r = centered(main, if two { 76 } else { 64 }, want);
+        let more = want > r.height;
         f.render_widget(Clear, r);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_set(th.border_set())
-            .border_style(th.border_focus())
-            .title(Span::styled(" Help · esc closes ", th.accent()));
-        f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), r);
+        let title = if more { " Help · j/k scroll · esc closes " } else { " Help · esc closes " };
+        let block = crate::widgets::block_focus(*th, "").title(Span::styled(title, th.accent()));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let [body, _, foot] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+        if two {
+            let [a, b] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body);
+            f.render_widget(Paragraph::new(left), a);
+            f.render_widget(Paragraph::new(right), b);
+        } else {
+            left.push(Line::raw(""));
+            left.extend(right);
+            f.render_widget(Paragraph::new(left).scroll((scroll, 0)), body);
+        }
+        f.render_widget(Paragraph::new(mouse), foot);
     }
 
     fn render_palette(&self, f: &mut Frame, main: Rect, input: &str, sel: usize) {
@@ -810,7 +843,7 @@ impl App {
         let mut lines = vec![Line::from(vec![Span::styled(": ", th.key()), Span::raw(clean(input)), Span::styled("▏", th.accent())])];
         lines.push(Line::styled("─".repeat(usize::from(inner.width)).replace('─', if th.ascii { "-" } else { "─" }), th.border()));
         if items.is_empty() {
-            lines.push(Line::styled("No command matches.", th.muted()));
+            lines.push(Line::styled(format!("No command matches “{}”.", clean(input)), th.muted()));
         }
         let start = sel.saturating_sub(9);
         for (i, it) in items.iter().enumerate().skip(start).take(10) {
@@ -839,26 +872,28 @@ fn help_line<'a>(th: &Theme, k: &'a str, w: &'a str) -> Line<'a> {
 }
 
 fn render_confirm(th: &Theme, f: &mut Frame, main: Rect, title: &str, body: &str, yes: bool) {
-    let w = 56.min(main.width.saturating_sub(4));
-    let body_lines = (body.chars().count() as u16).checked_div(w.saturating_sub(4)).unwrap_or(0).saturating_add(1);
-    let r = centered(main, w, body_lines.saturating_add(5));
+    let w = 64.min(main.width.saturating_sub(4));
+    let tw = usize::from(w.saturating_sub(4).max(1));
+    // Each body line wraps on its own; `code` spans show as keys, without the backticks.
+    let rows: u16 = body.lines().map(|l| (l.chars().count().max(1).div_ceil(tw)) as u16).sum();
+    let r = centered(main, w, rows.saturating_add(4));
     f.render_widget(Clear, r);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(th.border_set())
         .border_style(th.warn())
+        .padding(ratatui::widgets::Padding::horizontal(1))
         .title(Span::styled(format!(" {} {title} ", th.glyph(Glyph::Warn)), th.warn().add_modifier(ratatui::style::Modifier::BOLD)));
     let inner = block.inner(r);
     f.render_widget(block, r);
     let [b, _, btn] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
-    f.render_widget(Paragraph::new(body.to_string()).wrap(Wrap { trim: true }), b);
+    let lines: Vec<Line> = body
+        .lines()
+        .map(|l| Line::from(l.split('`').enumerate().map(|(i, part)| if i % 2 == 1 { crate::widgets::key(part) } else { Span::raw(part.to_string()) }).collect::<Vec<_>>()))
+        .collect();
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), b);
     let (ys, ns) = if yes { (th.selected(), th.muted()) } else { (th.muted(), th.selected()) };
-    let buttons = Line::from(vec![
-        Span::styled(" y  Yes, do it ", ys),
-        Span::raw("   "),
-        Span::styled(" n  No, cancel ", ns),
-    ])
-    .centered();
+    let buttons = Line::from(vec![Span::styled(" y  Yes, do it ", ys), Span::raw("   "), Span::styled(" n  No, cancel ", ns)]).centered();
     f.render_widget(Paragraph::new(buttons), btn);
 }
 
@@ -867,7 +902,7 @@ fn render_prompt(th: Theme, f: &mut Frame, main: Rect, p: &Prompt, input: &str, 
     let w = 64.min(main.width.saturating_sub(4));
     let inner_w = w.saturating_sub(4).max(1);
     let body_rows = (p.body.chars().count() as u16).div_ceil(inner_w).max(1);
-    let r = centered(main, w, body_rows.saturating_add(8));
+    let r = centered(main, w, body_rows.saturating_add(7));
     f.render_widget(Clear, r);
     let block = crate::widgets::block_focus(th, p.title.as_str());
     let inner = block.inner(r).inner(ratatui::layout::Margin::new(1, 0));

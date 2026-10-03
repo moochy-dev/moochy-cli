@@ -133,6 +133,7 @@ impl View for DevicesView {
         let promise_rows = u16::try_from(KEYS_PROMISE.len()).unwrap_or(u16::MAX).div_ceil(list_a.width.max(1)).min(3);
         let [promise, list_a] = Layout::vertical([Constraint::Length(promise_rows), Constraint::Min(0)]).areas(list_a);
         f.render_widget(Paragraph::new(Span::styled(KEYS_PROMISE, w::tone(t, Tone::Good))).wrap(Wrap { trim: true }), promise);
+        self.cur.set_headers(items.iter().map(|i| matches!(i, Item::Head(..) | Item::Hint(_))).collect());
         self.cur.sync(items.len(), list_a);
         if items.is_empty() {
             w::empty(f, list_a, t, self.title(), w::no_match(t, ctx.filter));
@@ -196,10 +197,11 @@ impl View for DevicesView {
     }
 
     fn on_input(&mut self, input: &Input, ctx: &Ctx) -> Outcome {
+        let items = items(ctx);
+        self.cur.set_headers(items.iter().map(|i| matches!(i, Item::Head(..) | Item::Hint(_))).collect());
         if self.cur.on_input(input) {
             return Outcome::Redraw;
         }
-        let items = items(ctx);
         match (input, self.cur.selected().and_then(|i| items.get(i))) {
             (Input::Char('x'), Some(Item::Box(b))) if !b.id.is_empty() => {
                 let id = clean(&b.id);
@@ -224,6 +226,7 @@ impl View for DevicesView {
                     action: Action::RevokeBoxToken(b.id.clone()),
                 }
             }
+            (Input::Char('x'), _) => Outcome::Toast("x revokes a cloud box or a box token: select one first".into()),
             _ => Outcome::Ignored,
         }
     }
@@ -314,14 +317,11 @@ mod tests {
         let c = ctx(&s, &t, "");
         let mut v = DevicesView::default();
         draw(&mut v, &c, 160, 48);
-        assert_eq!(v.on_input(&Input::Char('x'), &c), Outcome::Ignored, "header row");
-        v.on_input(&Input::Down, &c);
-        assert_eq!(v.on_input(&Input::Char('x'), &c), Outcome::Ignored, "a device");
+        assert!(matches!(v.on_input(&Input::Char('x'), &c), Outcome::Toast(_)), "the cursor starts on a device, not the header");
         v.on_input(&Input::End, &c);
         let Outcome::Confirm { action, .. } = v.on_input(&Input::Char('x'), &c) else { panic!() };
         assert_eq!(action, Action::RevokeBoxToken("bt_1".into()));
-        v.on_input(&Input::Up, &c);
-        v.on_input(&Input::Up, &c);
+        v.on_input(&Input::Up, &c); // over the "Box tokens" header, onto the box
         let Outcome::Confirm { action, body, .. } = v.on_input(&Input::Char('x'), &c) else { panic!() };
         assert_eq!(action, Action::RevokeBox("d_box9".into()));
         assert!(body.contains("github/foo/bar"));
