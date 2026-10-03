@@ -116,9 +116,12 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             handle: String::new(),
             pseudonym: cfg.as_ref().and_then(|c| c.pseudonym.clone()).unwrap_or_default(),
             relay: st.relay.clone(),
+            // ponytail: the relay serves the web on its own origin (BaseURL); a separate web base when that changes.
+            web: st.relay.clone(),
             connected: st.link_state == "up",
             roles: st.roles.clone(),
-            lockdown: if st.locked { "locked".into() } else { "off".into() },
+            // ponytail: Status has only `locked`; mechanisms and failures once the node reports them.
+            lockdown: if st.locked { model::Lockdown::Enforced(String::new()) } else { model::Lockdown::Unknown },
         },
         ..Snapshot::default()
     };
@@ -137,6 +140,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             models: d.models.clone(),
             // ponytail: the link's Donation has no per-project split yet (integrator request).
             per_repo_uusd: d.per_repo.iter().map(|r| (r.repo_slug.clone(), uusd(r.spent_uusd))).collect(),
+            ..model::Donation::default()
         })
         .collect();
     // Decisions: the trail of every donation to my projects; projects: grouped from the same list.
@@ -187,6 +191,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
                 donors: u32::try_from(t.donors).unwrap_or(0),
                 month_uusd: uusd(t.month_uusd),
                 paused_since_ms: ms(t.paused_since_ms),
+                ..model::Org::default()
             })
             .collect();
     }
@@ -207,6 +212,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             subject: if q.subject_username.is_empty() { q.subject.clone() } else { q.subject_username.clone() },
             summary: q.kind.clone(),
             created_at_ms: ms(q.issued_at_ms),
+            ..model::Pending::default()
         })
         .chain(owned.iter().filter(|d| d.status == "pending").map(|d| model::Pending {
             request_id: d.pledge_id.clone(),
@@ -215,6 +221,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             subject: d.donor.clone(),
             summary: format!("{} µ$/month", d.budget_uusd),
             created_at_ms: ms(d.created_at_ms),
+            ..model::Pending::default()
         }))
         .collect();
     // Settings: what `moochy config show` prints (the config file holds no secret), plus the doors.
@@ -266,7 +273,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             outcome: e.status.clone(),
         })
         .collect();
-    s.activity = entries.iter().rev().take(MAX_SERVED).map(|e| model::Activity { at_ms: ms(e.t_ms), text: format!("{} {} {} {}", e.role, e.repo, e.model, e.status) }).collect();
+    s.activity = entries.iter().rev().take(MAX_SERVED).map(|e| model::Activity { at_ms: ms(e.t_ms), text: format!("{} {} {} {}", e.role, e.repo, e.model, e.status), ..model::Activity::default() }).collect();
     Ok(s)
 }
 
@@ -431,7 +438,7 @@ impl Source for NodeSource {
                 }
                 self.donation_action(&request_id, "refuse", 0, &reason)
             }
-            Action::RevokeBox(id) => {
+            Action::RevokeBox(id) | Action::RevokeBoxToken(id) => {
                 if !moochy_keylog::entry::is_id(&id, "d_") && !moochy_keylog::entry::is_id(&id, "bt_") {
                     return ActionResult::Refused("not a box or box token id".into());
                 }

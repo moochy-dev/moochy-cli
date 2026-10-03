@@ -189,7 +189,7 @@ impl View for DevicesView {
             }
             Some(Item::Token(b)) if !b.revoked => {
                 lines.push(Line::raw(""));
-                lines.push(Line::from(vec![w::key("x"), Span::raw(format!(" revoke token {} (enrolled boxes keep running until they expire)", clean(&b.id)))]));
+                lines.push(Line::from(vec![w::key("x"), Span::raw(format!(" revoke token {} and every box it enrolled", clean(&b.id)))]));
             }
             _ => {}
         }
@@ -219,7 +219,7 @@ impl View for DevicesView {
                 Outcome::Confirm {
                     title: "Revoke this box token".into(),
                     body: format!(
-                        "Revoke enrollment token {id} for {}? No new box can enroll with it; the {} box(es) already enrolled keep running until they expire. Same as `moochy box token revoke {id}`.",
+                        "Revoke enrollment token {id} for {}? No new box can enroll with it, and the {} box(es) it enrolled are revoked now. Same as `moochy box token revoke {id}`.",
                         clean(&b.project),
                         b.boxes_enrolled
                     ),

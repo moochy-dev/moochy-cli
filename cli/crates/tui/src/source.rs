@@ -18,7 +18,7 @@ pub enum Action {
     OrgAdd { org: String, repo: String },
     OrgRemove { org: String, repo: String },
     RevokeBox(String),
-    /// Revoke a box enrollment token (§17.1): boxes already enrolled keep running until expiry.
+    /// Revoke a box enrollment token (§17.1) and every box it enrolled (link RevokeBox with a `bt_` id).
     RevokeBoxToken(String),
     Refresh,
 }
