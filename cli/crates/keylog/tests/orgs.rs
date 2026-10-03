@@ -131,7 +131,7 @@ fn alerts(v: &Value, owner_keys: Vec<[u8; 32]>) -> Vec<String> {
 #[test]
 fn org_monitor_alerts() {
     let v = load();
-    // My owner key known: the takeovers of my repos r5, r7, r6 and my orgs o4, o6 by another account.
+    // My owner key known: the takeovers of my repos r5, r7, r6, r8 and my orgs o4, o6, o7 by another account.
     assert_eq!(
         alerts(&v, keys(&v, "known_owner_keys")),
         [
@@ -139,7 +139,9 @@ fn org_monitor_alerts() {
             "ClaimedByOther:39:o_",
             "ClaimedByOther:49:r_",
             "ClaimedByOther:50:o_",
-            "ClaimedByOther:51:r_"
+            "ClaimedByOther:51:r_",
+            "ClaimedByOther:63:r_",
+            "ClaimedByOther:64:o_"
         ]
     );
     // My owner key unknown (a rogue owner key on my account): every claim, org entry and

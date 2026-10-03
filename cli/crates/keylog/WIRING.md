@@ -414,6 +414,17 @@ id prefix tells the target. Existing logs and vectors verify unchanged. Vectors:
   the request's). Until then the existing `_ =>` arms refuse them (fail closed). Nodes submit
   org entries over the link like other owner-signed kinds; the relay answers `ungated` until its
   gate (11a) exists.
+- **A265: nothing signed before the current owner's claim.** Each repo and org remembers the
+  `issued_at` of the claim that set its current owner (a same-owner re-claim keeps it). Any
+  `DONOR_*`, `MEMBER_*` or `ORG_REPO_*` with `issued_at` at or before it is `replay`, and so is an
+  `ORG_REPO_ADDED` issued at or before the repo's own owner claim. A round trip A→E→A therefore
+  never revives a revoked approval or a removed repo, even if the relay replays A's old signatures.
+  **mo-relay:** after an owner change (a takeover, or the owner re-claiming after one), drop every
+  pending `ApprovalRequest` body built before it and push fresh ones; A must re-sign approvals and
+  "add all". Build every `body_to_sign` for `DONOR_*`/`MEMBER_*`/`ORG_REPO_*` with `IssuedAtMs =
+  max(now, issued_at of the current claim + 1)`: the claim's `issued_at` comes from the owner's
+  clock (up to `MaxSkew` ahead of the relay's), and a body built in the same millisecond is refused.
+  `klog.OwnerSinceMs(id)` returns that `issued_at`. Nodes need nothing: `State::apply` enforces it.
 - **`moochy owner status`: the orgs I own.** `view.state(|s| s.owned_orgs(&me))` →
   `Vec<(org_id, Vec<repo_id>)>`, sorted by id: each org this account owns and the repos it covers
   (active `ORG_REPO_ADDED`, repo claimed by the same owner: exactly the repos its donations serve).

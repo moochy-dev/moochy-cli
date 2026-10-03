@@ -143,6 +143,9 @@ struct Repo {
     provider_repo_id: String,
     owner: String,
     issued: u64,
+    /// `issued_at` of the claim that set `owner`: an older entry of this owner replayed
+    /// after a round trip (A→E→A, A265) is refused.
+    since: u64,
     /// subject pseudonym → DONOR_* grant (looked up by `&str`: no allocation per query).
     donors: HashMap<String, Grant>,
     /// subject pseudonym → MEMBER_* grant.
@@ -363,6 +366,7 @@ impl State {
                         provider_repo_id: provider_repo_id.to_owned(),
                         owner: owner.to_owned(),
                         issued: 0,
+                        since: issued_at_ms,
                         donors: HashMap::new(),
                         members: HashMap::new(),
                         covers: HashMap::new(),
@@ -373,6 +377,7 @@ impl State {
                     r.members.clear();
                     r.covers.clear();
                     owner.clone_into(&mut r.owner);
+                    r.since = issued_at_ms;
                 }
                 r.issued = issued_at_ms;
             }
@@ -392,9 +397,11 @@ impl State {
                 let member = matches!(e.kind, Kind::MemberAdded | Kind::MemberRemoved);
                 let r = self.repos.get(repo_id).ok_or(Code::Unclaimed)?;
                 let grants = if member { &r.members } else { &r.donors };
-                if grants
-                    .get(subject)
-                    .is_some_and(|g| issued_at_ms <= g.issued)
+                // A265: nothing signed before the current owner's claim.
+                if issued_at_ms <= r.since
+                    || grants
+                        .get(subject)
+                        .is_some_and(|g| issued_at_ms <= g.issued)
                 {
                     return Err(Code::Replay);
                 }
@@ -429,10 +436,15 @@ impl State {
                     if r.owner != o.owner {
                         return Err(Code::NotOwner);
                     }
+                    // Signed before the repo's current owner claimed it (A265).
+                    if issued_at_ms <= r.since {
+                        return Err(Code::Replay);
+                    }
                 }
-                if o.covers
-                    .get(repo_id)
-                    .is_some_and(|g| issued_at_ms <= g.issued)
+                if issued_at_ms <= o.since
+                    || o.covers
+                        .get(repo_id)
+                        .is_some_and(|g| issued_at_ms <= g.issued)
                 {
                     return Err(Code::Replay);
                 }
