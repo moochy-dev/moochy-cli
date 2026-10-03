@@ -116,8 +116,9 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
         .iter()
         .map(|d| model::Donation {
             id: d.pledge_id.clone(),
-            target: if d.org.is_empty() { d.repo_slug.clone() } else { d.org.clone() },
+            target: [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone(),
             org: !d.org.is_empty(),
+            person: d.person.clone(),
             status: d.status.clone(),
             budget_uusd: uusd(d.budget_uusd),
             per_task_cap_uusd: uusd(d.per_task_cap_uusd),
@@ -130,11 +131,11 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
         .collect();
     // Decisions: the trail of every donation to my projects; projects: grouped from the same list.
     for d in &owned {
-        let target = if d.org.is_empty() { d.repo_slug.clone() } else { d.org.clone() };
+        let target = [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone();
         for e in &d.events {
             s.decisions.push(model::Decision { at_ms: ms(e.at_ms), target: target.clone(), donor: d.donor.clone(), event: e.event.clone(), via: e.via.clone(), reason: e.reason.clone() });
         }
-        if d.org.is_empty() {
+        if d.org.is_empty() && d.person.is_empty() {
             if !s.projects.iter().any(|p| p.slug == d.repo_slug) {
                 s.projects.push(model::Project { slug: d.repo_slug.clone(), ..model::Project::default() });
             }
@@ -169,7 +170,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
         .chain(owned.iter().filter(|d| d.status == "pending").map(|d| model::Pending {
             request_id: d.pledge_id.clone(),
             kind: "DONATION_REQUEST".into(),
-            target: if d.org.is_empty() { d.repo_slug.clone() } else { d.org.clone() },
+            target: [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone(),
             subject: d.donor.clone(),
             summary: format!("{} µ$/month", d.budget_uusd),
             created_at_ms: ms(d.created_at_ms),
