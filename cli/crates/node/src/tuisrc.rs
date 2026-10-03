@@ -158,7 +158,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
     s.pending = pending
         .requests
         .iter()
-        .filter(|q| !["remove:", "member-device:", "revoke:", "org-repo-remove:"].iter().any(|p| q.request_id.starts_with(p)))
+        .filter(|q| !crate::cli::STANDING.iter().any(|p| q.request_id.starts_with(p)))
         .map(|q| model::Pending {
             request_id: q.request_id.clone(),
             kind: q.kind.clone(),
@@ -229,6 +229,11 @@ fn name_arg(s: &str) -> Option<String> {
     ok.then(|| s.to_owned())
 }
 
+/// A person profile (`github/LOGIN`, `gitlab/USERNAME`), canonical, or nothing.
+fn person_path(p: &str) -> Option<String> {
+    crate::config::canonical_org(p).filter(|c| c.matches('/').count() == 1)
+}
+
 fn org_args(org: &str, repo: &str, op: &str) -> Option<Vec<String>> {
     let org = crate::config::canonical_org(org)?;
     let repo = crate::config::canonical_slug(repo)?;
@@ -242,7 +247,16 @@ fn accept_args(id: &str, pending: &[crate::pb::local::SignResponse], owned: &[Do
     if let Some(q) = pending.iter().find(|q| q.request_id == id) {
         let who = if q.subject_username.is_empty() { &q.subject } else { &q.subject_username };
         let org = (!q.org_path.is_empty()).then(|| crate::config::canonical_org(&q.org_path)).flatten();
+        let person = (!q.person_path.is_empty()).then(|| person_path(&q.person_path)).flatten();
         let slug = crate::config::canonical_slug(&q.repo_slug);
+        if let Some(p) = person {
+            return match (q.kind.as_str(), slug) {
+                ("DONOR_APPROVED", _) => Some(v(&["accept", "--person", &p, "--", &name_arg(who)?])),
+                ("PERSON_CLAIMED", _) => Some(v(&["claim", "--person", &p])),
+                ("PERSON_REPO_ADDED", Some(r)) => Some(v(&["person", "add", "--person", &p, "--", &r])),
+                _ => None,
+            };
+        }
         return match (q.kind.as_str(), org, slug) {
             ("DONOR_APPROVED", Some(o), _) => Some(v(&["accept", "--org", &o, "--", &name_arg(who)?])),
             ("DONOR_APPROVED", None, Some(r)) => Some(v(&["accept", "--repo", &r, "--", &name_arg(who)?])),
@@ -256,6 +270,9 @@ fn accept_args(id: &str, pending: &[crate::pb::local::SignResponse], owned: &[Do
     // A donation request to my project: accept its donor, or (no public name) the passkey link.
     let d = owned.iter().find(|d| d.pledge_id == id && d.status == "pending")?;
     let pledge = name_arg(&d.pledge_id)?;
+    if let (Some(who), Some(p)) = (name_arg(&d.donor), person_path(&d.person)) {
+        return Some(v(&["accept", "--person", &p, "--", &who]));
+    }
     match (name_arg(&d.donor), crate::config::canonical_org(&d.org), crate::config::canonical_slug(&d.repo_slug)) {
         (Some(who), Some(o), _) => Some(v(&["accept", "--org", &o, "--", &who])),
         (Some(who), None, Some(r)) => Some(v(&["accept", "--repo", &r, "--", &who])),
@@ -418,6 +435,17 @@ mod tests {
         assert!(a(q("DONOR_APPROVED", "--yes", "", "ada")).is_none());
         assert!(a(q("KEY_REVOKED", "acme/api", "", "ada")).is_none());
         assert!(accept_args("other", &[q("DONOR_APPROVED", "acme/api", "", "ada")], &[]).is_none());
+        // §24 person entries.
+        let pq = |kind: &str, repo: &str, person: &str, who: &str| SignResponse { person_path: person.into(), ..q(kind, repo, "", who) };
+        assert_eq!(a(pq("DONOR_APPROVED", "", "github/alice", "ada")).unwrap(), ["accept", "--person", "github/alice", "--", "ada"]);
+        assert_eq!(a(pq("PERSON_CLAIMED", "", "github/alice", "")).unwrap(), ["claim", "--person", "github/alice"]);
+        assert_eq!(a(pq("PERSON_REPO_ADDED", "alice/tool", "github/alice", "")).unwrap(), ["person", "add", "--person", "github/alice", "--", "alice/tool"]);
+        assert!(a(pq("DONOR_APPROVED", "", "github/alice/x", "ada")).is_none(), "a person is one segment");
+        // The TUI hands over the raw stored slugs (mo-tui-maint): escapes and options are refused
+        // here, never cleaned into something else.
+        assert!(org_args("github/acme\u{1b}[2J", "acme/api", "add").is_none());
+        assert!(org_args("github/acme", "--yes", "add").is_none());
+        assert_eq!(org_args("github/acme", "github/acme/api", "remove").unwrap(), ["org", "remove", "--org", "github/acme", "--", "acme/api"]);
         let d = Donation { pledge_id: "p_01J".into(), status: "pending".into(), repo_slug: "acme/api".into(), ..Donation::default() };
         assert_eq!(accept_args("p_01J", &[], &[d]).unwrap(), ["decisions", "accept", "--", "p_01J"], "anonymous donor: the passkey link");
     }

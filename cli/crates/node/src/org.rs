@@ -6,6 +6,10 @@
 //! looked up as `org:<path>`, a namespace no project slug can reach), shows what it signs, and
 //! rebuilds the body with its own signer and time. `moochy org list` reads the owner's covered
 //! projects from the requests pushed over the link (else the public orgs API).
+//!
+//! A person profile (CONTRACT §24: `moochy claim --person`, `moochy person add|remove|list`,
+//! `moochy accept <donor> --person`) is the same machinery on an `m_` id: PERSON_CLAIMED,
+//! PERSON_REPO_ADDED/REMOVED and DONOR_* on the person, looked up as `person:<path>`.
 
 use crate::config::Home;
 use crate::owner::{check_own_key, key_path, load, register, rt, status, submit};
@@ -13,9 +17,36 @@ use crate::pb::link::{LookupRequest, LookupResponse};
 use crate::pb::local::{ApproveRequest, ClaimRequest, OrgRepoRequest, SignResponse, SubmitEntryRequest};
 use crate::util::{Result, auth, clean, internal, now_ms, usage};
 use moochy_keylog::Kind;
-use moochy_keylog::entry::{Body, grant_body, is_id, org_claim_body, org_repo_body, owner_key_id, parse_body, sig_message};
+use moochy_keylog::entry::{Body, grant_body, is_id, org_claim_body, org_repo_body, owner_key_id, parse_body, person_claim_body, person_repo_body, sig_message};
 use moochy_proto::crypto::SignKey;
 use serde_json::json;
+
+/// Whose entries: an organisation (§19) or a person profile (§24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Org,
+    Person,
+}
+
+impl Group {
+    /// Id prefix, Lookup namespace, and the word for people.
+    fn prefix(self) -> &'static str {
+        if self == Group::Org { "o_" } else { "m_" }
+    }
+
+    fn ns(self) -> &'static str {
+        if self == Group::Org { "org:" } else { "person:" }
+    }
+
+    fn noun(self) -> &'static str {
+        if self == Group::Org { "organisation" } else { "person" }
+    }
+
+    /// The preview's id and path labels for this group.
+    fn labels(self, p: &SignResponse) -> (&str, &str) {
+        if self == Group::Org { (&p.org_id, &p.org_path) } else { (&p.person_id, &p.person_path) }
+    }
+}
 
 /// What the command asked for.
 #[derive(Clone, Copy, Debug)]
@@ -28,13 +59,16 @@ pub enum Op<'a> {
 }
 
 impl Op<'_> {
-    fn kind(self) -> Kind {
-        match self {
-            Op::Claim => Kind::OrgClaimed,
-            Op::Repo { remove: false, .. } => Kind::OrgRepoAdded,
-            Op::Repo { remove: true, .. } => Kind::OrgRepoRemoved,
-            Op::Donor { revoke: false, .. } => Kind::DonorApproved,
-            Op::Donor { revoke: true, .. } => Kind::DonorRevoked,
+    fn kind(self, g: Group) -> Kind {
+        match (self, g) {
+            (Op::Claim, Group::Org) => Kind::OrgClaimed,
+            (Op::Claim, Group::Person) => Kind::PersonClaimed,
+            (Op::Repo { remove: false, .. }, Group::Org) => Kind::OrgRepoAdded,
+            (Op::Repo { remove: true, .. }, Group::Org) => Kind::OrgRepoRemoved,
+            (Op::Repo { remove: false, .. }, Group::Person) => Kind::PersonRepoAdded,
+            (Op::Repo { remove: true, .. }, Group::Person) => Kind::PersonRepoRemoved,
+            (Op::Donor { revoke: false, .. }, _) => Kind::DonorApproved,
+            (Op::Donor { revoke: true, .. }, _) => Kind::DonorRevoked,
         }
     }
 }
@@ -42,7 +76,9 @@ impl Op<'_> {
 /// The exact fields one signature covers, after binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Bound {
+    group: Group,
     kind: Kind,
+    /// The organisation's `o_` or the person's `m_` id.
     org_id: String,
     /// ORG_REPO_*: the project's `r_` id.
     repo_id: String,
@@ -52,42 +88,56 @@ struct Bound {
     claim: Option<(String, String)>,
     /// Approvals: the donor as the server confirmed it (empty until then: never signed).
     name: String,
-    /// The org and the project as typed, then as the server names them.
+    /// The org (or person) and the project as typed, then as the server names them.
     org: String,
     repo: String,
 }
 
 /// Check one previewed entry against the command and this account; `Err` = never sign it. Ids are
 /// checked by prefix here, from the body: a Lookup that lies cannot turn a project into an org.
-fn bind(op: Op<'_>, org: &str, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
+fn bind(g: Group, op: Op<'_>, org: &str, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
     let refuse = |what: &str| usage(format!("refusing to sign: the app proposed {what}, not what you asked for"));
     let kind = Kind::from_name(&p.kind).ok_or_else(|| refuse("an unknown entry kind"))?;
-    if kind != op.kind() {
-        return Err(refuse(&format!("{} instead of {}", kind.name(), op.kind().name())));
+    if kind != op.kind(g) {
+        return Err(refuse(&format!("{} instead of {}", kind.name(), op.kind(g).name())));
     }
-    if !p.org_path.eq_ignore_ascii_case(org) {
-        return Err(refuse(&format!("organisation {}", clean(&p.org_path))));
+    let (label_id, label_path) = g.labels(p);
+    if !label_path.eq_ignore_ascii_case(org) {
+        return Err(refuse(&format!("{} {}", g.noun(), clean(label_path))));
     }
     let provider = org.split('/').next().unwrap_or_default();
-    let b = Bound { kind, org_id: String::new(), repo_id: String::new(), subject: String::new(), claim: None, name: String::new(), org: org.into(), repo: String::new() };
-    match (parse_body(kind, &p.body_to_sign), op) {
-        (Ok(Body::OrgClaim { org_id, provider: pv, provider_org_id, owner, .. }), Op::Claim) => {
-            if !is_id(org_id, "o_") || org_id != p.org_id || me != Some(owner) || pv != provider || provider_org_id.is_empty() || !provider_org_id.bytes().all(|c| c.is_ascii_digit()) {
-                return Err(refuse("an organisation claim naming another account or organisation"));
+    let b = Bound { group: g, kind, org_id: String::new(), repo_id: String::new(), subject: String::new(), claim: None, name: String::new(), org: org.into(), repo: String::new() };
+    let body = parse_body(kind, &p.body_to_sign);
+    // Org and person entries have the same shape: (id, provider, provider's numeric id, owner) for
+    // a claim, (id, repo) for coverage.
+    let claim = match body {
+        Ok(Body::OrgClaim { org_id, provider, provider_org_id, owner, .. }) if g == Group::Org => Some((org_id, provider, provider_org_id, owner)),
+        Ok(Body::PersonClaim { person_id, provider, provider_user_id, owner, .. }) if g == Group::Person => Some((person_id, provider, provider_user_id, owner)),
+        _ => None,
+    };
+    let cover = match body {
+        Ok(Body::OrgRepo { org_id, repo_id, .. }) if g == Group::Org => Some((org_id, repo_id)),
+        Ok(Body::PersonRepo { person_id, repo_id, .. }) if g == Group::Person => Some((person_id, repo_id)),
+        _ => None,
+    };
+    match (claim, cover, body, op) {
+        (Some((id, pv, provider_id, owner)), _, _, Op::Claim) => {
+            if !is_id(id, g.prefix()) || id != label_id || me != Some(owner) || pv != provider || provider_id.is_empty() || !provider_id.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(refuse(&format!("{} claim naming another account or {}", if g == Group::Org { "an organisation" } else { "a person" }, g.noun())));
             }
-            Ok(Bound { org_id: org_id.into(), subject: owner.into(), claim: Some((pv.into(), provider_org_id.into())), name: owner.into(), ..b })
+            Ok(Bound { org_id: id.into(), subject: owner.into(), claim: Some((pv.into(), provider_id.into())), name: owner.into(), ..b })
         }
-        (Ok(Body::OrgRepo { org_id, repo_id, .. }), Op::Repo { repo, .. }) => {
+        (_, Some((id, repo_id)), _, Op::Repo { repo, .. }) => {
             let same_repo = crate::config::canonical_slug(&p.repo_slug).is_some_and(|s| s.eq_ignore_ascii_case(repo));
-            if !is_id(org_id, "o_") || !is_id(repo_id, "r_") || org_id != p.org_id || repo_id != p.repo_id || !same_repo {
-                return Err(refuse("an entry for another organisation or project"));
+            if !is_id(id, g.prefix()) || !is_id(repo_id, "r_") || id != label_id || repo_id != p.repo_id || !same_repo {
+                return Err(refuse(&format!("an entry for another {} or project", g.noun())));
             }
-            Ok(Bound { org_id: org_id.into(), repo_id: repo_id.into(), repo: repo.into(), ..b })
+            Ok(Bound { org_id: id.into(), repo_id: repo_id.into(), repo: repo.into(), ..b })
         }
-        (Ok(Body::Grant { repo_id: org_id, subject, .. }), Op::Donor { donor, .. }) => {
+        (_, _, Ok(Body::Grant { repo_id: org_id, subject, .. }), Op::Donor { donor, .. }) => {
             // A project id here would accept the donor for that project behind the org's label.
-            if !is_id(org_id, "o_") || org_id != p.org_id || org_id != p.repo_id || subject != p.subject || !subject.starts_with("ps_") {
-                return Err(refuse("an approval for another organisation or account"));
+            if !is_id(org_id, g.prefix()) || org_id != label_id || org_id != p.repo_id || subject != p.subject || !subject.starts_with("ps_") {
+                return Err(refuse(&format!("an approval for another {} or account", g.noun())));
             }
             // A pseudonym is matched exactly; a handle only by the server's Lookup.
             let name = if donor.starts_with("ps_") {
@@ -96,7 +146,7 @@ fn bind(op: Op<'_>, org: &str, me: Option<&str>, p: &SignResponse) -> Result<Bou
                 }
                 donor
             } else if donor.starts_with("d_") {
-                return Err(usage("an organisation accepts accounts (a handle or ps_…), not devices"));
+                return Err(usage(format!("{} accepts accounts (a handle or ps_…), not devices", if g == Group::Org { "an organisation" } else { "a person" })));
             } else {
                 ""
             };
@@ -138,9 +188,9 @@ fn lookup(cfg: &crate::config::Config, rt: &tokio::runtime::Runtime, slug: &str,
 /// server's names.
 fn check_org(b: &mut Bound, handle: Option<&str>, l: &LookupResponse) -> Result<()> {
     let refuse = |what: String| usage(format!("refusing to sign: the app and the server disagree on {what}"));
-    let path = l.repo_slug.strip_prefix("org:").unwrap_or_default();
+    let path = l.repo_slug.strip_prefix(b.group.ns()).unwrap_or_default();
     if l.repo_id != b.org_id || !path.eq_ignore_ascii_case(&b.org) {
-        return Err(refuse(format!("the organisation ({} vs {} {})", clean(&b.org_id), clean(&l.repo_slug), clean(&l.repo_id))));
+        return Err(refuse(format!("the {} ({} vs {} {})", b.group.noun(), clean(&b.org_id), clean(&l.repo_slug), clean(&l.repo_id))));
     }
     if let Some(h) = handle {
         if !l.handle.eq_ignore_ascii_case(h) || l.pseudonym != b.subject {
@@ -162,9 +212,14 @@ fn check_repo(b: &mut Bound, l: &LookupResponse) -> Result<()> {
 
 /// Every signed field, in words (A217); `--yes` skips only the question.
 fn confirm(b: &Bound, signer: &str, yes: bool) -> Result<()> {
-    let org = format!("the organisation {} ({})", clean(&b.org), clean(&b.org_id));
+    let org = format!("the {} {} ({})", b.group.noun(), clean(&b.org), clean(&b.org_id));
     let line = match b.kind {
         Kind::OrgClaimed => format!("your account ({}) is the owner of {org}", clean(&b.subject)),
+        Kind::PersonClaimed => format!("your account ({}) is {org}, for good (nobody else can ever claim it)", clean(&b.subject)),
+        Kind::PersonRepoAdded => format!("your sponsors' donations may pay for your own requests on {} ({})", clean(&b.repo), clean(&b.repo_id)),
+        Kind::PersonRepoRemoved => format!("your sponsors' donations no longer pay for your requests on {} ({})", clean(&b.repo), clean(&b.repo_id)),
+        Kind::DonorApproved if b.group == Group::Person && !b.name.is_empty() => format!("{} may sponsor your tokens ({org}): your own requests on the repos you cover", who(b)),
+        Kind::DonorRevoked if b.group == Group::Person && !b.name.is_empty() => format!("{} may no longer sponsor {org}", who(b)),
         Kind::OrgRepoAdded => format!("donations to {org} may fund your project {} ({})", clean(&b.repo), clean(&b.repo_id)),
         Kind::OrgRepoRemoved => format!("donations to {org} no longer fund your project {} ({})", clean(&b.repo), clean(&b.repo_id)),
         Kind::DonorApproved | Kind::DonorRevoked if b.name.is_empty() => return Err(usage("refusing to sign: the server did not confirm who this is")),
@@ -175,7 +230,7 @@ fn confirm(b: &Bound, signer: &str, yes: bool) -> Result<()> {
     eprintln!("Owner signature {}:", b.kind.name());
     eprintln!("  {line}");
     if let Some((prov, id)) = &b.claim {
-        eprintln!("  organisation at {} (id {})", clean(prov), clean(id));
+        eprintln!("  {} at {} (id {})", b.group.noun(), clean(prov), clean(id));
     }
     eprintln!("  signed by your owner key {signer}");
     if !yes && !matches!(crate::owner::ask("Type yes to sign: ", false)?.as_str(), "yes" | "y") {
@@ -191,28 +246,31 @@ fn who(b: &Bound) -> String {
 /// The body from the BOUND fields only, with this key and the current time (KEYLOG §5).
 fn body(b: &Bound, signer: &str, now: u64) -> Vec<u8> {
     match (&b.claim, b.kind) {
+        (Some((provider, provider_id)), Kind::PersonClaimed) => person_claim_body(&b.org_id, provider, provider_id, &b.subject, signer, now),
         (Some((provider, provider_org_id)), _) => org_claim_body(&b.org_id, provider, provider_org_id, &b.subject, signer, now),
         (None, Kind::OrgRepoAdded | Kind::OrgRepoRemoved) => org_repo_body(&b.org_id, &b.repo_id, signer, now),
+        (None, Kind::PersonRepoAdded | Kind::PersonRepoRemoved) => person_repo_body(&b.org_id, &b.repo_id, signer, now),
         (None, _) => grant_body(&b.org_id, &b.subject, signer, now),
     }
 }
 
-/// `moochy claim --org`, `moochy org add|remove`, `moochy accept|approve <donor> --org`.
-pub fn sign(home: &Home, org: &str, op: Op<'_>, yes: bool) -> Result<()> {
+/// `moochy claim --org|--person`, `moochy org|person add|remove`, `moochy accept|approve <donor>
+/// --org|--person`.
+pub fn sign(home: &Home, g: Group, org: &str, op: Op<'_>, yes: bool) -> Result<()> {
     let cfg = home.load()?;
     let rt = rt()?;
     let preview = rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        let org = org.to_owned();
+        let (org, person) = if g == Group::Org { (org.to_owned(), String::new()) } else { (String::new(), org.to_owned()) };
         let r = match op {
-            Op::Claim => c.claim(ClaimRequest { org, dry_run: true, ..ClaimRequest::default() }).await,
-            Op::Repo { repo, remove } => c.org_repo(OrgRepoRequest { org, repo: repo.into(), remove, dry_run: true, person: String::new() }).await,
-            Op::Donor { donor, revoke } => c.approve(ApproveRequest { org, donor: donor.into(), revoke, dry_run: true, ..ApproveRequest::default() }).await,
+            Op::Claim => c.claim(ClaimRequest { org, person, dry_run: true, ..ClaimRequest::default() }).await,
+            Op::Repo { repo, remove } => c.org_repo(OrgRepoRequest { org, repo: repo.into(), remove, dry_run: true, person }).await,
+            Op::Donor { donor, revoke } => c.approve(ApproveRequest { org, person, donor: donor.into(), revoke, dry_run: true, ..ApproveRequest::default() }).await,
         };
         r.map(tonic::Response::into_inner).map_err(|s| if s.code() == tonic::Code::Unimplemented { usage(clean(s.message()).into_owned()) } else { status(&s) })
     })?;
     let me = cfg.pseudonym.as_deref();
-    let mut b = bind(op, org, me, &preview)?;
+    let mut b = bind(g, op, org, me, &preview)?;
     let has_key = key_path(home, cfg.relay.as_deref()).exists();
     if !has_key {
         eprintln!("No owner key yet: one will be created (a separate key with its own passphrase) and registered in the public key log.");
@@ -222,13 +280,14 @@ pub fn sign(home: &Home, org: &str, op: Op<'_>, yes: bool) -> Result<()> {
     }
     let key = if has_key { load(home, cfg.relay.as_deref())? } else { register(home, &rt, None)? };
     check_own_key(home, &cfg, me, &key)?;
-    let org_slug = format!("org:{org}");
+    let org_slug = format!("{}{org}", g.ns());
     match op {
         // Like a project claim: the org is not claimed yet, the body names this account.
         Op::Claim => {}
         Op::Repo { repo, .. } => {
             check_org(&mut b, None, &lookup(&cfg, &rt, &org_slug, None)?)?;
-            check_repo(&mut b, &lookup(&cfg, &rt, repo, None)?)?;
+            // ponytail: an unclaimed repo a person covers (§24.3) has no Lookup answer yet: refused.
+            check_repo(&mut b, &lookup(&cfg, &rt, repo, None).map_err(|e| if g == Group::Person && e.exit == crate::util::Exit::Usage { usage(format!("refusing to sign: the Moochy server cannot confirm the id of {} yet (only claimed projects can be looked up)", clean(repo))) } else { e })?)?;
             eprintln!("Checked with the Moochy server (not through the app): {} is {}; {} is {}", clean(&b.org), clean(&b.org_id), clean(&b.repo), clean(&b.repo_id));
         }
         Op::Donor { donor, .. } => {
@@ -249,13 +308,16 @@ pub fn sign(home: &Home, org: &str, op: Op<'_>, yes: bool) -> Result<()> {
     let sig = key.sign(&sig_message(b.kind, &body));
     drop(key);
     let done = rt.block_on(submit(home, SubmitEntryRequest { request_id: preview.request_id.clone(), kind: b.kind.name().into(), body, sigs: vec![sig.to_vec()] }))?;
-    crate::util::emit(&json!({"request_id": done.request_id, "kind": b.kind.name(), "org": b.org, "org_id": b.org_id, "repo": b.repo, "repo_id": b.repo_id,
+    let (k_path, k_id) = if g == Group::Org { ("org", "org_id") } else { ("person", "person_id") };
+    crate::util::emit(&json!({"request_id": done.request_id, "kind": b.kind.name(), k_path: b.org, k_id: b.org_id, "repo": b.repo, "repo_id": b.repo_id,
         "subject": b.subject, "subject_username": b.name, "signer": done.signer, "issued_at_ms": done.issued_at_ms, "signed": done.signed, "log_index": done.log_index}));
     Ok(())
 }
 
 #[derive(serde::Deserialize)]
 struct OrgInfo {
+    /// The people API names it `person_id` (§24.6).
+    #[serde(alias = "person_id")]
     org_id: String,
     path: String,
     #[serde(default)]
@@ -272,23 +334,29 @@ struct Covered {
 /// the link (WIRING §4: the dedicated link port is gRPC only): exactly the ORG_REPO_REMOVED requests
 /// the relay pushes, each checked against the verified key log. Anyone else, or a node without a
 /// key log, reads the server's public orgs API (`GET /api/v1/orgs/{provider}/{path…}`, §19.6).
-pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
+/// `moochy person list` (§24.6): the same for the repos a person profile covers.
+pub fn list(home: &Home, g: Group, org: &str, json_out: bool) -> Result<()> {
     let cfg = home.load()?;
-    let mut info = match owned(home, &cfg, org) {
+    let mut info = match owned(home, &cfg, g, org) {
         Ok(Some(i)) => i,
         // The server does not know the org: the public API would not either.
         Err(e) if e.exit == crate::util::Exit::Usage => return Err(e),
-        _ => public(&cfg, org)?,
+        _ => public(&cfg, g, org)?,
     };
     for r in info.repos.iter_mut().filter(|r| !r.slug.is_empty()) {
         r.slug = qualified(&r.slug);
     }
-    if json_out {
+    if json_out && g == Group::Person {
+        crate::util::emit(&json!({"person": info.path, "person_id": info.org_id, "repos": info.repos}));
+    } else if json_out {
         crate::util::emit(&json!({"org": info.path, "org_id": info.org_id, "repos": info.repos}));
+    } else if info.repos.is_empty() && g == Group::Person {
+        println!("{} ({}) covers no repo yet: moochy person add <PROJECT>", clean(&info.path), clean(&info.org_id));
     } else if info.repos.is_empty() {
         println!("{} ({}) funds none of your projects yet: moochy org add <PROJECT> --org {}", clean(&info.path), clean(&info.org_id), clean(&info.path));
     } else {
-        println!("Donations to {} ({}) fund:", clean(&info.path), clean(&info.org_id));
+        let verb = if g == Group::Person { "Sponsorships of" } else { "Donations to" };
+        println!("{verb} {} ({}) fund:", clean(&info.path), clean(&info.org_id));
         for r in &info.repos {
             if r.slug.is_empty() {
                 println!("  {} (name not yet pushed by the server)", clean(&r.repo_id));
@@ -307,14 +375,14 @@ fn qualified(slug: &str) -> String {
 }
 
 /// The owner's view (WIRING §4). `Ok(None)`: not this account's org in the key log.
-fn owned(home: &Home, cfg: &crate::config::Config, org: &str) -> Result<Option<OrgInfo>> {
+fn owned(home: &Home, cfg: &crate::config::Config, g: Group, org: &str) -> Result<Option<OrgInfo>> {
     let Some(me) = cfg.pseudonym.as_deref() else { return Ok(None) };
     let rt = rt()?;
     // The org id from the server (dialed directly), never from the app's list.
-    let l = lookup(cfg, &rt, &format!("org:{org}"), None).map_err(|e| if e.exit == crate::util::Exit::Usage { usage(format!("the server knows no claimed organisation {}", clean(org))) } else { e })?;
-    let path = l.repo_slug.strip_prefix("org:").unwrap_or_default();
-    if !is_id(&l.repo_id, "o_") || !path.eq_ignore_ascii_case(org) {
-        return Err(internal("the server answered for another organisation"));
+    let l = lookup(cfg, &rt, &format!("{}{org}", g.ns()), None).map_err(|e| if e.exit == crate::util::Exit::Usage { usage(format!("the server knows no claimed {} {}", g.noun(), clean(org))) } else { e })?;
+    let path = l.repo_slug.strip_prefix(g.ns()).unwrap_or_default();
+    if !is_id(&l.repo_id, g.prefix()) || !path.eq_ignore_ascii_case(org) {
+        return Err(internal(format!("the server answered for another {}", g.noun())));
     }
     // A270: the verified key log decides what is listed (ORG_CLAIMED by this account, ORG_REPO_ADDED
     // active, the project claimed by this account too); the relay's push only names the rows.
@@ -331,8 +399,10 @@ fn owned(home: &Home, cfg: &crate::config::Config, org: &str) -> Result<Option<O
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
         })?;
-        rows = pushed.requests.into_iter().filter(|q| q.kind == Kind::OrgRepoRemoved.name() && q.org_id == l.repo_id).collect();
-        let Some(orgs) = crate::keylog::KeyLog::owned_orgs(home, cfg, me) else { return Ok(None) };
+        let remove = Op::Repo { repo: "", remove: true }.kind(g);
+        rows = pushed.requests.into_iter().filter(|q| q.kind == remove.name() && g.labels(q).0 == l.repo_id).collect();
+        let owned = if g == Group::Org { crate::keylog::KeyLog::owned_orgs(home, cfg, me) } else { crate::keylog::KeyLog::owned_people(home, cfg, me) };
+        let Some(orgs) = owned else { return Ok(None) };
         covered = orgs.into_iter().find(|(o, _)| *o == l.repo_id).map(|(_, r)| r);
         if covered.as_ref().is_some_and(|c| c.len() == rows.len() && rows.iter().all(|q| c.contains(&q.repo_id))) {
             break;
@@ -348,21 +418,22 @@ fn owned(home: &Home, cfg: &crate::config::Config, org: &str) -> Result<Option<O
 }
 
 /// Anyone's view: the server's public orgs API, on an origin that serves HTTP.
-fn public(cfg: &crate::config::Config, org: &str) -> Result<OrgInfo> {
+fn public(cfg: &crate::config::Config, g: Group, org: &str) -> Result<OrgInfo> {
     let relay = crate::tls::Origin::parse(cfg.relay.as_deref().unwrap_or(crate::config::DEFAULT_RELAY))?;
-    let f = moochy_keylog::fetch::Fetcher::with_roots(&format!("{}/api/v1/orgs/", relay.url()), std::time::Duration::from_secs(20), crate::tls::roots(cfg.ca_file.as_deref())?)
+    let api = if g == Group::Org { "orgs" } else { "people" };
+    let f = moochy_keylog::fetch::Fetcher::with_roots(&format!("{}/api/v1/{api}/", relay.url()), std::time::Duration::from_secs(20), crate::tls::roots(cfg.ca_file.as_deref())?)
         .map_err(|e| internal(format!("orgs API: {e}")))?;
     let raw = f.get(org, 256 * 1024).map_err(|e| {
         let e = e.to_string();
         if e.contains(" 404") {
-            usage(format!("the server knows no claimed organisation {} (or it does not support organisations yet)", clean(org)))
+            usage(format!("the server knows no claimed {} {} (or it does not support them yet)", g.noun(), clean(org)))
         } else {
-            crate::util::net(format!("could not read organisation {} from the server: {}", clean(org), clean(&e)))
+            crate::util::net(format!("could not read {} {} from the server: {}", g.noun(), clean(org), clean(&e)))
         }
     })?;
-    let info: OrgInfo = serde_json::from_slice(&raw).map_err(|_| internal("the server's organisation answer is not the expected JSON"))?;
-    if !is_id(&info.org_id, "o_") || !info.path.eq_ignore_ascii_case(org) || info.repos.iter().any(|r| !is_id(&r.repo_id, "r_")) {
-        return Err(internal("the server answered for another organisation"));
+    let info: OrgInfo = serde_json::from_slice(&raw).map_err(|_| internal(format!("the server's {} answer is not the expected JSON", g.noun())))?;
+    if !is_id(&info.org_id, g.prefix()) || !info.path.eq_ignore_ascii_case(org) || info.repos.iter().any(|r| !is_id(&r.repo_id, "r_")) {
+        return Err(internal(format!("the server answered for another {}", g.noun())));
     }
     Ok(info)
 }
@@ -385,18 +456,18 @@ mod tests {
     #[test]
     fn claim_names_this_account_and_the_typed_provider() {
         let ok = resp("ORG_CLAIMED", "", ME, org_claim_body(ORG, "github", "900", ME, OK, 1));
-        let b = bind(Op::Claim, "github/acme", Some(ME), &ok).unwrap();
+        let b = bind(Group::Org, Op::Claim, "github/acme", Some(ME), &ok).unwrap();
         assert_eq!(b.claim, Some(("github".into(), "900".into())));
         // Rebuilt with our signer and time, the body still says the same thing.
         assert!(matches!(parse_body(Kind::OrgClaimed, &body(&b, OK, 2)), Ok(Body::OrgClaim { org_id: ORG, owner: ME, provider_org_id: "900", .. })));
-        assert!(bind(Op::Claim, "github/acme", Some(ME), &resp("ORG_CLAIMED", "", ALICE, org_claim_body(ORG, "github", "900", ALICE, OK, 1))).is_err(), "another owner");
-        assert!(bind(Op::Claim, "github/acme", Some(ME), &resp("ORG_CLAIMED", "", ME, org_claim_body(ORG, "gitlab", "900", ME, OK, 1))).is_err(), "gitlab group behind github/");
-        assert!(bind(Op::Claim, "github/acme", Some(ME), &resp("ORG_CLAIMED", "", ME, org_claim_body(R, "github", "900", ME, OK, 1))).is_err(), "a project id");
-        assert!(bind(Op::Claim, "github/evil", Some(ME), &ok).is_err(), "label of another org");
-        assert!(bind(Op::Claim, "github/acme", None, &ok).is_err(), "unknown account");
+        assert!(bind(Group::Org, Op::Claim, "github/acme", Some(ME), &resp("ORG_CLAIMED", "", ALICE, org_claim_body(ORG, "github", "900", ALICE, OK, 1))).is_err(), "another owner");
+        assert!(bind(Group::Org, Op::Claim, "github/acme", Some(ME), &resp("ORG_CLAIMED", "", ME, org_claim_body(ORG, "gitlab", "900", ME, OK, 1))).is_err(), "gitlab group behind github/");
+        assert!(bind(Group::Org, Op::Claim, "github/acme", Some(ME), &resp("ORG_CLAIMED", "", ME, org_claim_body(R, "github", "900", ME, OK, 1))).is_err(), "a project id");
+        assert!(bind(Group::Org, Op::Claim, "github/evil", Some(ME), &ok).is_err(), "label of another org");
+        assert!(bind(Group::Org, Op::Claim, "github/acme", None, &ok).is_err(), "unknown account");
         let mut wrong = ok.clone();
         wrong.org_id = OTHER.into();
-        assert!(bind(Op::Claim, "github/acme", Some(ME), &wrong).is_err(), "label id differs from body");
+        assert!(bind(Group::Org, Op::Claim, "github/acme", Some(ME), &wrong).is_err(), "label id differs from body");
     }
 
     #[test]
@@ -404,11 +475,11 @@ mod tests {
         let mut p = resp("ORG_REPO_ADDED", R, "", org_repo_body(ORG, R, OK, 1));
         p.repo_slug = "acme/app1".into();
         let add = Op::Repo { repo: "acme/app1", remove: false };
-        let mut b = bind(add, "github/acme", Some(ME), &p).unwrap();
-        assert!(bind(Op::Repo { repo: "acme/app1", remove: true }, "github/acme", Some(ME), &p).is_err(), "kind");
-        assert!(bind(Op::Repo { repo: "acme/side", remove: false }, "github/acme", Some(ME), &p).is_err(), "another project");
+        let mut b = bind(Group::Org, add, "github/acme", Some(ME), &p).unwrap();
+        assert!(bind(Group::Org, Op::Repo { repo: "acme/app1", remove: true }, "github/acme", Some(ME), &p).is_err(), "kind");
+        assert!(bind(Group::Org, Op::Repo { repo: "acme/side", remove: false }, "github/acme", Some(ME), &p).is_err(), "another project");
         let swapped = resp("ORG_REPO_ADDED", R, "", org_repo_body(R, ORG, OK, 1));
-        assert!(bind(add, "github/acme", Some(ME), &swapped).is_err(), "ids swapped");
+        assert!(bind(Group::Org, add, "github/acme", Some(ME), &swapped).is_err(), "ids swapped");
         // The server must agree on both.
         let org = LookupResponse { repo_slug: "org:github/acme".into(), repo_id: ORG.into(), ..LookupResponse::default() };
         check_org(&mut b, None, &org).unwrap();
@@ -425,13 +496,13 @@ mod tests {
         // A project approval behind the org's label.
         let mut proj = resp("DONOR_APPROVED", R, ALICE, grant_body(R, ALICE, OK, 1));
         proj.org_id = R.into();
-        assert!(bind(approve("alice"), "github/acme", Some(ME), &proj).is_err());
-        assert!(bind(approve(ME), "github/acme", Some(ME), &p).is_err(), "pseudonym mismatch");
-        assert!(bind(approve("d_x"), "github/acme", Some(ME), &p).is_err(), "devices");
-        let b = bind(approve(ALICE), "github/acme", Some(ME), &p).unwrap();
+        assert!(bind(Group::Org, approve("alice"), "github/acme", Some(ME), &proj).is_err());
+        assert!(bind(Group::Org, approve(ME), "github/acme", Some(ME), &p).is_err(), "pseudonym mismatch");
+        assert!(bind(Group::Org, approve("d_x"), "github/acme", Some(ME), &p).is_err(), "devices");
+        let b = bind(Group::Org, approve(ALICE), "github/acme", Some(ME), &p).unwrap();
         assert_eq!(b.name, ALICE);
         // A handle: unconfirmed (never signed) until the server's Lookup says who it is.
-        let mut b = bind(approve("alice"), "github/acme", Some(ME), &p).unwrap();
+        let mut b = bind(Group::Org, approve("alice"), "github/acme", Some(ME), &p).unwrap();
         assert!(confirm(&b, OK, true).is_err());
         let l = LookupResponse { repo_slug: "org:github/acme".into(), repo_id: ORG.into(), handle: "alice".into(), pseudonym: ALICE.into() };
         assert!(check_org(&mut b.clone(), Some("alice"), &LookupResponse { pseudonym: ME.into(), ..l.clone() }).is_err(), "the server names another account");
@@ -445,5 +516,44 @@ mod tests {
         assert_eq!(qualified("acme/app1"), "github/acme/app1");
         assert_eq!(qualified("github/acme/app1"), "github/acme/app1");
         assert_eq!(qualified("gitlab/grp/sub/tool"), "gitlab/grp/sub/tool");
+    }
+
+    #[test]
+    fn person_entries_bind_an_m_id_never_an_org() {
+        const M: &str = "m_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let pr = |kind: &str, repo_id: &str, subject: &str, body: Vec<u8>| SignResponse {
+            kind: kind.into(),
+            repo_id: repo_id.into(),
+            subject: subject.into(),
+            body_to_sign: body,
+            person_id: M.into(),
+            person_path: "github/alice".into(),
+            ..SignResponse::default()
+        };
+        let p = Group::Person;
+        // Claim: this account, the typed provider, a numeric provider user id.
+        let ok = pr("PERSON_CLAIMED", "", ME, person_claim_body(M, "github", "4242", ME, OK, 1));
+        let b = bind(p, Op::Claim, "github/alice", Some(ME), &ok).unwrap();
+        assert!(matches!(parse_body(Kind::PersonClaimed, &body(&b, OK, 2)), Ok(Body::PersonClaim { person_id: M, owner: ME, provider_user_id: "4242", .. })));
+        assert!(bind(p, Op::Claim, "github/alice", Some(ME), &pr("PERSON_CLAIMED", "", ALICE, person_claim_body(M, "github", "4242", ALICE, OK, 1))).is_err(), "another account");
+        assert!(bind(p, Op::Claim, "github/bob", Some(ME), &ok).is_err(), "label of another person");
+        assert!(bind(p, Op::Claim, "github/alice", Some(ME), &pr("ORG_CLAIMED", "", ME, org_claim_body(ORG, "github", "4242", ME, OK, 1))).is_err(), "an org claim behind a person");
+        assert!(bind(Group::Org, Op::Claim, "github/alice", Some(ME), &ok).is_err(), "a person claim behind an org");
+        // Coverage: both ids, the typed repo, and the server must agree on the person (person: namespace).
+        let mut cov = pr("PERSON_REPO_ADDED", R, "", person_repo_body(M, R, OK, 1));
+        cov.repo_slug = "alice/tool".into();
+        let add = Op::Repo { repo: "alice/tool", remove: false };
+        let mut b = bind(p, add, "github/alice", Some(ME), &cov).unwrap();
+        assert!(bind(p, Op::Repo { repo: "alice/other", remove: false }, "github/alice", Some(ME), &cov).is_err());
+        assert!(bind(p, add, "github/alice", Some(ME), &pr("PERSON_REPO_ADDED", R, "", person_repo_body(ORG, R, OK, 1))).is_err(), "an org id");
+        let l = LookupResponse { repo_slug: "person:github/alice".into(), repo_id: M.into(), ..LookupResponse::default() };
+        assert!(check_org(&mut b.clone(), None, &LookupResponse { repo_slug: "org:github/alice".into(), ..l.clone() }).is_err(), "an org answer");
+        check_org(&mut b, None, &l).unwrap();
+        assert!(matches!(parse_body(Kind::PersonRepoAdded, &body(&b, OK, 2)), Ok(Body::PersonRepo { person_id: M, repo_id: R, .. })));
+        // Approval of a sponsor on the m_ id.
+        let g = pr("DONOR_APPROVED", M, ALICE, grant_body(M, ALICE, OK, 1));
+        let b = bind(p, Op::Donor { donor: ALICE, revoke: false }, "github/alice", Some(ME), &g).unwrap();
+        assert!(matches!(parse_body(Kind::DonorApproved, &body(&b, OK, 2)), Ok(Body::Grant { repo_id: M, subject: ALICE, .. })));
+        assert!(bind(p, Op::Donor { donor: ALICE, revoke: false }, "github/alice", Some(ME), &pr("DONOR_APPROVED", R, ALICE, grant_body(R, ALICE, OK, 1))).is_err(), "a project grant behind the person");
     }
 }

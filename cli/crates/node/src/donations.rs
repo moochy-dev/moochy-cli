@@ -59,13 +59,27 @@ pub(crate) fn call(home: &crate::config::Home, op: &str, request: Vec<u8>) -> Re
     })
 }
 
-/// What a donation funds, for people: the project, or `org github/acme` (CONTRACT §19).
+/// What a donation targets (CONTRACT §19, §24): exactly one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum To {
+    Repo,
+    Org,
+    Person,
+}
+
+/// What a donation funds, for people: the project, `org github/acme` or `person github/alice`.
 pub(crate) fn target(d: &Donation) -> String {
-    if d.org.is_empty() { clean(&d.repo_slug).into_owned() } else { format!("org {}", clean(&d.org)) }
+    if !d.person.is_empty() {
+        format!("person {}", clean(&d.person))
+    } else if d.org.is_empty() {
+        clean(&d.repo_slug).into_owned()
+    } else {
+        format!("org {}", clean(&d.org))
+    }
 }
 
 fn donation_json(d: &Donation) -> serde_json::Value {
-    json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
+    json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
         "per_request_limit_uusd": d.per_task_cap_uusd, "spent_uusd": d.spent_uusd, "reserved_uusd": d.reserved_uusd,
         "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule)})
 }
@@ -89,19 +103,24 @@ pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
         }
     }
     if r.donations.is_empty() && !json_out {
-        println!("No donations yet: `moochy donate --repo OWNER/NAME --cap $20` (or --org github/ORG)");
+        println!("No donations yet: `moochy donate --repo OWNER/NAME --cap $20` (or --org github/ORG, --person github/LOGIN)");
     }
     Ok(())
 }
 
-/// `moochy donate --repo OWNER/NAME | --org github/ORG --cap $N [--yes]`: start donating up to $N
-/// a month. The donation waits for the owner's approval (signed with their owner key). `org`:
-/// `slug` is an organisation (CONTRACT §19), funding the repos its owner covers.
-pub fn donate(home: &crate::config::Home, slug: &str, org: bool, monthly_uusd: i64, yes: bool) -> Result<()> {
+/// `moochy donate --repo OWNER/NAME | --org github/ORG | --person github/LOGIN --cap $N [--yes]`:
+/// start donating up to $N a month. The donation waits for the owner's approval (signed with their
+/// owner key). An organisation (CONTRACT §19) funds the repos its owner covers; a person (§24)
+/// only their own requests on the repos they cover.
+pub fn donate(home: &crate::config::Home, slug: &str, to: To, monthly_uusd: i64, yes: bool) -> Result<()> {
     if monthly_uusd <= 0 {
         return Err(usage("set a monthly limit: --cap $20 (or --budget-uusd N)"));
     }
-    let what = if org { format!("the organisation {}", clean(slug)) } else { clean(slug).into_owned() };
+    let what = match to {
+        To::Repo => clean(slug).into_owned(),
+        To::Org => format!("the organisation {}", clean(slug)),
+        To::Person => format!("{}'s own requests (sponsoring {})", clean(slug.rsplit('/').next().unwrap_or(slug)), clean(slug)),
+    };
     eprintln!("Donating tokens to {what} up to {} a month (at most {} per request).", dollars(monthly_uusd), dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)));
     if !yes {
         use std::io::IsTerminal as _;
@@ -117,10 +136,10 @@ pub fn donate(home: &crate::config::Home, slug: &str, org: bool, monthly_uusd: i
     }
     let q = DonateRequest {
         request_id: crate::util::ulid()?,
-        // §19: exactly one of repo_slug and org.
-        repo_slug: if org { String::new() } else { slug.into() },
-        org: if org { slug.into() } else { String::new() },
-        person: String::new(),
+        // §19, §24: exactly one of repo_slug, org and person.
+        repo_slug: if to == To::Repo { slug.into() } else { String::new() },
+        org: if to == To::Org { slug.into() } else { String::new() },
+        person: if to == To::Person { slug.into() } else { String::new() },
         budget_uusd: monthly_uusd,
         // D19: one request may use at most $5 by default (or the whole monthly limit when smaller).
         per_task_cap_uusd: monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD),

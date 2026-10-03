@@ -127,11 +127,25 @@ fn project_base(p: &Project) -> (String, &'static str) {
     }
 }
 
-/// An organisation's page and action separator (§19.6: no short form, `/-/` on GitLab).
-pub fn org_base(org: &str) -> Result<(String, &'static str)> {
-    let o = crate::config::canonical_org(org).ok_or_else(|| usage("--org is github/ORG or gitlab/GROUP[/SUBGROUP…]"))?;
-    let act = if o.starts_with("gitlab/") { "/-/" } else { "/" };
-    Ok((format!("{ORIGIN}/org/{o}"), act))
+/// The canonical page of a project, organisation or person, relative to the site (CONTRACT §9,
+/// §19.6, §22.1, §24.6): `p/github/OWNER/NAME`, `p/gitlab/…`, `org/PROVIDER/…`, `people/PROVIDER/LOGIN`.
+pub fn page(to: crate::donations::To, target: &str) -> Result<String> {
+    use crate::donations::To;
+    match to {
+        To::Repo => {
+            let c = crate::config::canonical_slug(target).ok_or_else(|| usage("not a project: owner/name, github/owner/name or gitlab/group[/subgroup]/name"))?;
+            Ok(if c.starts_with("gitlab/") { format!("p/{c}") } else { format!("p/github/{c}") })
+        }
+        To::Org => crate::config::canonical_org(target).map(|o| format!("org/{o}")).ok_or_else(|| usage("--org is github/ORG or gitlab/GROUP[/SUBGROUP…]")),
+        To::Person => crate::config::canonical_org(target).filter(|o| o.matches('/').count() == 1).map(|o| format!("people/{o}")).ok_or_else(|| usage("--person is github/LOGIN or gitlab/USERNAME")),
+    }
+}
+
+/// An organisation's or person's page and action separator (no short form, `/-/` on GitLab).
+pub fn group_base(to: crate::donations::To, path: &str) -> Result<(String, &'static str)> {
+    let page = page(to, path)?;
+    let act = if path.starts_with("gitlab/") { "/-/" } else { "/" };
+    Ok((format!("{ORIGIN}/{page}"), act))
 }
 
 const CHART_ALT: &str = "Tokens donated and used on Moochy";
@@ -360,15 +374,23 @@ mod tests {
         assert_eq!(project_chart(&gl, &Options { format: Some("html".into()), ..all }).unwrap(), format!("<a href=\"{page}\"><img alt=\"Our tokens &amp; use\" src=\"{page}/-/chart.svg{q}\"></a>"));
         assert_eq!(project_chart(&gl, &o("rst")).unwrap(), format!(".. image:: {page}/-/chart.svg\n   :target: {page}\n   :alt: Tokens donated and used on Moochy"));
         // Organisations: no short form; the card's pixel box (sparkline = a strip).
-        let (b, a) = org_base("gitlab/group/sub").unwrap();
+        let (b, a) = group_base(crate::donations::To::Org, "gitlab/group/sub").unwrap();
         let spark = Options { kind: Some("sparkline".into()), size: Some("s".into()), ..o("iframe") };
         assert_eq!(
             chart(&b, a, &spark).unwrap(),
             "<iframe src=\"https://moochy.dev/org/gitlab/group/sub/-/card?kind=sparkline&size=s\" title=\"Tokens donated and used on Moochy\" width=\"320\" height=\"40\" style=\"border:0\" loading=\"lazy\"></iframe>"
         );
-        let (b, a) = org_base("github/acme").unwrap();
+        let (b, a) = group_base(crate::donations::To::Org, "github/acme").unwrap();
         assert_eq!(chart(&b, a, &Options { period: Some("7d".into()), ..Options::default() }).unwrap(), "[![Tokens donated and used on Moochy](https://moochy.dev/org/github/acme/chart.svg?period=7d)](https://moochy.dev/org/github/acme)");
-        assert!(org_base("acme").is_err() && org_base("github/a/b").is_err());
+        assert!(group_base(crate::donations::To::Org, "acme").is_err());
+        // People (§24.6): `/people/…`, one segment, `/-/` on GitLab.
+        let (b, a) = group_base(crate::donations::To::Person, "gitlab/alice").unwrap();
+        assert_eq!(chart(&b, a, &Options::default()).unwrap(), "[![Tokens donated and used on Moochy](https://moochy.dev/people/gitlab/alice/-/chart.svg)](https://moochy.dev/people/gitlab/alice)");
+        assert!(group_base(crate::donations::To::Person, "github/a/b").is_err() && group_base(crate::donations::To::Person, "alice").is_err());
+        // §22.1 share pages.
+        assert_eq!(super::page(crate::donations::To::Repo, "acme/api").unwrap(), "p/github/acme/api");
+        assert_eq!(super::page(crate::donations::To::Repo, "gitlab/g/s/p").unwrap(), "p/gitlab/g/s/p");
+        assert_eq!(super::page(crate::donations::To::Org, "gitlab/g/s").unwrap(), "org/gitlab/g/s");
         // Refused: unknown values, a too long or hostile label, button-only and chart-only options.
         for bad in [
             Options { kind: Some("pie".into()), ..Options::default() },
