@@ -127,6 +127,7 @@ pub fn donate(home: &crate::config::Home, slug: &str, org: bool, monthly_uusd: i
         max_effort: String::new(),
         visibility: "pseudonymous".into(),
         schedule: "always".into(),
+        person: String::new(),
     };
     let b = call(home, "donate", q.encode_to_vec())?;
     let d = Donation::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;

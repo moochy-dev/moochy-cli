@@ -21,6 +21,8 @@ pub struct Snapshot {
     /// Per-day totals for the last 30 days (oldest first), for sparklines.
     pub donated_per_day_uusd: Vec<u64>,
     pub used_per_day_uusd: Vec<u64>,
+    /// The node's configuration as (key, value) for the Settings tab — never a secret value.
+    pub config: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39,6 +41,9 @@ pub struct Donation {
     /// `github/owner/name`, `gitlab/…`, or an org path when [`Donation::org`] is true.
     pub target: String,
     pub org: bool,
+    /// CONTRACT §24: the sponsored person (`github/{login}`, `gitlab/{username}`, link.proto
+    /// `Donation.person`); empty unless this is a person sponsorship.
+    pub person: String,
     pub status: String,
     pub budget_uusd: u64,
     pub per_task_cap_uusd: u64,
