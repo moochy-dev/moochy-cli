@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Custom cargo-dist publish job (dist-workspace.toml `publish-jobs`): every
-# release tag publishes the workspace crates to crates.io, in dependency order.
+# release tag publishes the workspace crates to crates.io.
 name: publish-crates
 on:
   workflow_call:
@@ -16,8 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
-      - name: cargo publish --workspace
+      # One crate at a time in dependency order, skipping versions already on
+      # crates.io, so a rerun (rate limit, network) finishes the release.
+      - name: cargo publish
         working-directory: cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --workspace --locked
+        run: |
+          for c in moochy-proto moochy-worker moochy-keylog moochy-sandbox moochy-tui moochy; do
+            if out=$(cargo publish --locked -p "$c" 2>&1); then echo "published $c"
+            elif grep -q 'already exists' <<<"$out"; then echo "$c: this version is already on crates.io"
+            else echo "$out"; exit 1; fi
+          done
