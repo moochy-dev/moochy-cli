@@ -146,3 +146,18 @@ fn a_paste_never_confirms_a_dialog() {
     keys(&mut app, "<enter>y");
     assert_eq!(app.take_actions(), vec![Action::LowerDonation { id: "don_7f3a".into(), budget_uusd: 30_000_000 }]);
 }
+
+#[test]
+fn keys_typed_before_the_first_snapshot_are_kept() {
+    use crate::app::{App, AppEvent};
+    use crate::source::SourceEvent;
+    use crate::theme::Theme;
+
+    let mut app = App::new(Theme::default(), fixtures::DEMO_NOW_MS);
+    for e in crate::snapshot::parse_keys("4").unwrap() {
+        app.on_event(AppEvent::Term(e));
+    }
+    assert_eq!(app.active(), 0, "held while connecting");
+    app.on_event(AppEvent::Source(SourceEvent::Snapshot(Box::new(fixtures::demo()))));
+    assert_eq!(app.active(), 3, "replayed once the data is there");
+}

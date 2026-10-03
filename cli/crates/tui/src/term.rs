@@ -60,13 +60,13 @@ pub fn run_views(source: Box<dyn Source>, events: Option<Receiver<SourceEvent>>,
             })
             .map_err(|e| e.to_string())?;
     }
+    install_panic_hook();
+    let mut guard = Guard::enter().map_err(|e| e.to_string())?;
+    // Read keys only once the terminal is raw: nothing typed at start-up is line-buffered or lost.
     let input = Input::spawn(tx.clone())?;
     #[cfg(unix)]
     signals(tx.clone())?;
     drop(tx);
-    install_panic_hook();
-
-    let mut guard = Guard::enter().map_err(|e| e.to_string())?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout())).map_err(|e| e.to_string())?;
     let mut app = App::with_views(views, theme, clock());
     term.draw(|f| app.render(f)).map_err(|e| e.to_string())?;
@@ -249,12 +249,35 @@ fn suspend_self() {
     }
 }
 
+/// The last `--home DIR` / `--home=DIR` of this process's arguments, if any.
+fn home_from_args(args: impl Iterator<Item = std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let mut home = None;
+    let mut args = args.peekable();
+    while let Some(a) = args.next() {
+        if a == "--home" {
+            home = args.next().map(std::path::PathBuf::from);
+        } else if let Some(v) = a.to_str().and_then(|s| s.strip_prefix("--home=")) {
+            home = Some(std::path::PathBuf::from(v));
+        }
+    }
+    home.filter(|h| !h.as_os_str().is_empty())
+}
+
 /// Runs `moochy <args>` on the restored terminal, then waits for Enter.
 fn run_external(args: &[String]) -> ActionResult {
     let shown = clean(&args.join(" "));
     let mut out = stdout();
     let _ = writeln!(out, "\n▶ moochy {shown}\n");
-    let status = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(args).status());
+    let status = std::env::current_exe().and_then(|exe| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args);
+        // The child talks to the same node as this dashboard (E119): `moochy --home X tui` hands
+        // X on as MOOCHY_HOME (the child has no --home of its own, so the env is what it uses).
+        if let Some(home) = home_from_args(std::env::args_os().skip(1)) {
+            cmd.env("MOOCHY_HOME", std::path::absolute(&home).unwrap_or(home));
+        }
+        cmd.status()
+    });
     // The toast names the command, not its arguments (they were on screen while it ran).
     let name = clean(args.first().map_or("", String::as_str));
     let r = match status {
@@ -319,4 +342,19 @@ fn install_panic_hook() {
             prev(info);
         }));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::home_from_args;
+
+    #[test]
+    fn the_child_gets_the_dashboards_home() {
+        let a = |v: &[&str]| home_from_args(v.iter().map(std::ffi::OsString::from));
+        assert_eq!(a(&["--home", "/h1", "tui"]).unwrap(), std::path::PathBuf::from("/h1"));
+        assert_eq!(a(&["tui", "--home=/h2"]).unwrap(), std::path::PathBuf::from("/h2"));
+        assert_eq!(a(&["--home", "/a", "tui", "--home", "/b"]).unwrap(), std::path::PathBuf::from("/b"));
+        assert!(a(&["tui", "--demo"]).is_none());
+        assert!(a(&["tui", "--home"]).is_none());
+    }
 }
