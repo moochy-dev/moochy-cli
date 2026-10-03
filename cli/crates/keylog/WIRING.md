@@ -466,6 +466,11 @@ logs and vectors verify unchanged. Vectors: `people.json`.
   worker's donor) with the **smallest** such approval index. Put it in `approval_log_index`.
   `klog.Owner(m_…)`, `OwnerSinceMs(m_…)`, `DonorApproved(m_…, ps)` answer for people;
   `klog.OwnedPeople(ps)` → person id → covered repo ids (sorted), for `moochy person list`.
+- **Submit.** `GatewayAllowed` is unchanged (a person never spends the repo's or its orgs'
+  donations through it). For a person donation, accept the requester with
+  `klog.PersonGatewayAllowed(gateway, repo)`: a logged, unrevoked, unexpired gateway device (scope
+  allowing the repo) of the owner of a person covering the repo (`not_member` otherwise), and route
+  it **only** to that person's donations.
 
 ### 12b. mo-donor: node gate and alerts
 
