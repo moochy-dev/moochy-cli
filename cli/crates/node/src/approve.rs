@@ -30,6 +30,9 @@ pub fn kind_num(kind: &str) -> Option<u32> {
         "ORG_CLAIMED" => 13,
         "ORG_REPO_ADDED" => 14,
         "ORG_REPO_REMOVED" => 15,
+        "PERSON_CLAIMED" => 16,
+        "PERSON_REPO_ADDED" => 17,
+        "PERSON_REPO_REMOVED" => 18,
         _ => return None,
     })
 }
@@ -57,21 +60,36 @@ pub fn on_ack(node: &Node, a: LogEntryAck) {
     }
 }
 
-/// `(repo_id, org_id, subject, signer, issued_at_ms)` of an owner-signed body, with the target
-/// prefixes checked (CONTRACT §19): a project is `r_…`, an organisation `o_…`, never one for the
-/// other. An org approval names the org as both (`DONOR_*` only: members belong to a project).
-fn targets<'a>(kind: Kind, body: &Body<'a>) -> Result<(&'a str, &'a str, &'a str, &'a str, u64), &'static str> {
+/// The ids an owner-signed body names: `repo` (`r_…`), `org` (`o_…`, CONTRACT §19), `person`
+/// (`m_…`, §24), never one for another. An org or person approval names its id as `repo` too
+/// (`DONOR_*` only: members belong to a project).
+struct Targets<'a> {
+    repo: &'a str,
+    org: &'a str,
+    person: &'a str,
+    subject: &'a str,
+    signer: &'a str,
+    ts: u64,
+}
+
+fn targets<'a>(kind: Kind, body: &Body<'a>) -> Result<Targets<'a>, &'static str> {
+    let t = |repo, org, person, subject, signer, ts| Targets { repo, org, person, subject, signer, ts };
+    let donor = matches!(kind, Kind::DonorApproved | Kind::DonorRevoked);
     let t = match *body {
-        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (repo_id, "", owner, signer, issued_at_ms),
-        Body::OrgClaim { org_id, owner, signer, issued_at_ms, .. } => ("", org_id, owner, signer, issued_at_ms),
-        Body::OrgRepo { org_id, repo_id, signer, issued_at_ms } => (repo_id, org_id, "", signer, issued_at_ms),
-        Body::Grant { repo_id, subject, signer, issued_at_ms } if repo_id.starts_with("o_") && matches!(kind, Kind::DonorApproved | Kind::DonorRevoked) => (repo_id, repo_id, subject, signer, issued_at_ms),
-        Body::Grant { repo_id, subject, signer, issued_at_ms } => (repo_id, "", subject, signer, issued_at_ms),
+        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => t(repo_id, "", "", owner, signer, issued_at_ms),
+        Body::OrgClaim { org_id, owner, signer, issued_at_ms, .. } => t("", org_id, "", owner, signer, issued_at_ms),
+        Body::OrgRepo { org_id, repo_id, signer, issued_at_ms } => t(repo_id, org_id, "", "", signer, issued_at_ms),
+        Body::PersonClaim { person_id, owner, signer, issued_at_ms, .. } => t("", "", person_id, owner, signer, issued_at_ms),
+        Body::PersonRepo { person_id, repo_id, signer, issued_at_ms } => t(repo_id, "", person_id, "", signer, issued_at_ms),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } if repo_id.starts_with("o_") && donor => t(repo_id, repo_id, "", subject, signer, issued_at_ms),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } if repo_id.starts_with("m_") && donor => t(repo_id, "", repo_id, subject, signer, issued_at_ms),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } => t(repo_id, "", "", subject, signer, issued_at_ms),
         _ => return Err("body does not match its kind"),
     };
-    let (repo_ok, org_ok) = (t.0.is_empty() || t.0.starts_with("r_") || t.0 == t.1, t.1.is_empty() || t.1.starts_with("o_"));
-    if !repo_ok || !org_ok || (t.0.is_empty() && t.1.is_empty()) {
-        return Err("body names neither a project nor an organisation");
+    let repo_ok = t.repo.is_empty() || t.repo.starts_with("r_") || t.repo == t.org || t.repo == t.person;
+    let (org_ok, person_ok) = (t.org.is_empty() || t.org.starts_with("o_"), t.person.is_empty() || t.person.starts_with("m_"));
+    if !repo_ok || !org_ok || !person_ok || [t.repo, t.org, t.person].iter().all(|s| s.is_empty()) {
+        return Err("body names neither a project, an organisation nor a person");
     }
     Ok(t)
 }
@@ -86,14 +104,17 @@ fn is_grant(kind: Kind) -> bool {
 fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String> {
     let kind = Kind::from_name(&q.kind).filter(|k| kind_num(k.name()).is_some()).ok_or("unknown entry kind")?;
     let body = parse_body(kind, &q.body_to_sign).map_err(|_| "body is not the expected key-log format")?;
-    let (repo_id, org_id, subject, signer, ts) = targets(kind, &body)?;
+    let Targets { repo: repo_id, org: org_id, person: person_id, subject, signer, ts } = targets(kind, &body)?;
     if repo_id != q.repo_id {
         return Err("body names another repository than the request".into());
     }
     if org_id != q.org_id {
         return Err("body names another organisation than the request".into());
     }
-    if matches!(kind, Kind::RepoClaimed | Kind::OrgClaimed) {
+    if person_id != q.person_id {
+        return Err("body names another person than the request".into());
+    }
+    if matches!(kind, Kind::RepoClaimed | Kind::OrgClaimed | Kind::PersonClaimed) {
         // A claim names its owner: it must be this user.
         if me.is_none_or(|m| m != subject) {
             return Err("claim names another owner than this account".into());
@@ -118,23 +139,25 @@ fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String>
         body_to_sign: q.body_to_sign.to_vec(),
         org_id: org_id.to_owned(),
         org_path: clean(&q.org_path).into_owned(),
-        ..SignResponse::default()
+        person_id: person_id.to_owned(),
+        person_path: clean(&q.person_path).into_owned(),
     })
 }
 
 /// Find the pending request and return its checked preview. Signing happens in the CLI. `org`
-/// empty = a project request (never an organisation's, CONTRACT §19.6); set = the organisation's
-/// (`repo` empty, except for ORG_REPO_*).
-pub fn preview(node: &Node, kind: &str, repo: &str, org: &str, subject: Option<&str>, dry_run: bool) -> Result<SignResponse, Status> {
+/// and `person` empty = a project request (never an organisation's or a person's, CONTRACT
+/// §19.6, §24.6); `org` set = the organisation's, `person` set = the person's (`repo` empty,
+/// except for ORG_REPO_* / PERSON_REPO_*).
+pub fn preview(node: &Node, kind: &str, repo: &str, org: &str, person: &str, subject: Option<&str>, dry_run: bool) -> Result<SignResponse, Status> {
     if !dry_run {
         return Err(Status::failed_precondition("approvals are signed with your owner key by `moochy approve|members|claim` in a terminal; this app never signs them"));
     }
     let q = lock(&node.approvals)
         .iter()
-        .find(|q| q.kind == kind && q.repo_slug.eq_ignore_ascii_case(repo) && q.org_path.eq_ignore_ascii_case(org) && subject.is_none_or(|s| q.subject_username.eq_ignore_ascii_case(s) || q.subject_pseudonym == s))
+        .find(|q| q.kind == kind && q.repo_slug.eq_ignore_ascii_case(repo) && q.org_path.eq_ignore_ascii_case(org) && q.person_path.eq_ignore_ascii_case(person) && subject.is_none_or(|s| q.subject_username.eq_ignore_ascii_case(s) || q.subject_pseudonym == s))
         .cloned()
         .ok_or_else(|| {
-            let target = if repo.is_empty() { org } else { repo };
+            let target = [repo, org, person].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
             Status::not_found(match (kind, subject) {
                 // The relay offers a revocation for each donor accepted in the key log.
                 ("DONOR_REVOKED", Some(s)) => format!("the server offers no revocation of {} for {}: they are not accepted there (see `moochy decisions`), or this server does not offer revocations yet (update the relay)", clean(s), clean(target)),
@@ -161,9 +184,10 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
     let body = parse_body(kind, &r.body).map_err(|_| Status::invalid_argument("body is not the expected key-log format"))?;
     let mut out = SignResponse { request_id: r.request_id.clone(), kind: r.kind.clone(), ..SignResponse::default() };
     match body {
-        Body::Claim { .. } | Body::Grant { .. } | Body::OrgClaim { .. } | Body::OrgRepo { .. } => {
-            let (repo_id, org_id, subject, signer, ts) = targets(kind, &body).map_err(Status::invalid_argument)?;
-            (out.repo_id, out.org_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), org_id.into(), subject.into(), signer.into(), i64::try_from(ts).unwrap_or(0));
+        Body::Claim { .. } | Body::Grant { .. } | Body::OrgClaim { .. } | Body::OrgRepo { .. } | Body::PersonClaim { .. } | Body::PersonRepo { .. } => {
+            let t = targets(kind, &body).map_err(Status::invalid_argument)?;
+            (out.repo_id, out.org_id, out.person_id, out.subject, out.signer) = (t.repo.into(), t.org.into(), t.person.into(), t.subject.into(), t.signer.into());
+            out.issued_at_ms = i64::try_from(t.ts).unwrap_or(0);
         }
         Body::OwnerKey { pseudonym, issued_at_ms, .. } => (out.subject, out.issued_at_ms) = (pseudonym.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
         // `moochy keys revoke <device>`: another device of this account (this one: `logout`).
@@ -175,11 +199,12 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
     }
     if !matches!(kind, Kind::OwnerKeyAdded | Kind::KeyAdded | Kind::KeyRevoked) {
         let q = lock(&node.approvals).iter().find(|q| q.request_id == r.request_id).cloned().ok_or_else(|| Status::not_found("no such pending request"))?;
-        if q.kind != r.kind || q.repo_id != out.repo_id || q.org_id != out.org_id || (is_grant(kind) && q.subject_pseudonym != out.subject) {
+        if q.kind != r.kind || q.repo_id != out.repo_id || q.org_id != out.org_id || q.person_id != out.person_id || (is_grant(kind) && q.subject_pseudonym != out.subject) {
             return Err(Status::failed_precondition("entry does not answer the pending request"));
         }
         out.repo_slug = clean(&q.repo_slug).into_owned();
         out.org_path = clean(&q.org_path).into_owned();
+        out.person_path = clean(&q.person_path).into_owned();
         out.subject_username = clean(&q.subject_username).into_owned();
     }
     // Our own new key: acknowledged before the relay logs it, so the monitor never flags it.
@@ -301,5 +326,38 @@ mod tests {
         assert!(decode(&q("DONOR_APPROVED", o, "", ps, grant_body(o, ps, ok, now)), Some(me)).is_err(), "an org approval labelled as a project's");
         assert!(decode(&q("DONOR_APPROVED", r, o, ps, grant_body(r, ps, ok, now)), Some(me)).is_err(), "a project approval labelled as an org's");
         assert!(decode(&q("REPO_CLAIMED", o, "", "", claim_body(o, "github", "42", me, ok, now)), Some(me)).is_err(), "an org id in a repo claim");
+    }
+
+    #[test]
+    fn decode_person_entries() {
+        use moochy_keylog::entry::{grant_body, person_claim_body, person_repo_body};
+        let now = now_ms();
+        let (m, o, r, ps, me, ok) = ("m_01ARZ3NDEKTSV4RRFFQ69G5FAV", "o_01ARZ3NDEKTSV4RRFFQ69G5FAV", "r_01ARZ3NDEKTSV4RRFFQ69G5FAV", "ps_aaaaaaaaaaaaaaaa", "ps_zzzzzzzzzzzzzzzz", "ok_00000000000000000000000000000000");
+        let q = |kind: &str, repo_id: &str, person_id: &str, subj: &str, body: Vec<u8>| ApprovalRequest {
+            request_id: "q1".into(),
+            kind: kind.into(),
+            repo_id: repo_id.into(),
+            person_id: person_id.into(),
+            person_path: "github/alice".into(),
+            subject_pseudonym: subj.into(),
+            body_to_sign: body.into(),
+            ..ApprovalRequest::default()
+        };
+        // PERSON_CLAIMED: only yourself.
+        let c = decode(&q("PERSON_CLAIMED", "", m, "", person_claim_body(m, "github", "42", me, ok, now)), Some(me)).unwrap();
+        assert_eq!((c.repo_id.as_str(), c.person_id.as_str(), c.subject.as_str(), c.person_path.as_str()), ("", m, me, "github/alice"));
+        assert!(decode(&q("PERSON_CLAIMED", "", m, "", person_claim_body(m, "github", "42", ps, ok, now)), Some(me)).is_err(), "someone else's profile");
+        assert!(decode(&q("PERSON_CLAIMED", "", o, "", person_claim_body(o, "github", "42", me, ok, now)), Some(me)).is_err(), "an org id as a person");
+        // PERSON_REPO_ADDED: the person and the project, as requested.
+        let a = decode(&q("PERSON_REPO_ADDED", r, m, "", person_repo_body(m, r, ok, now)), Some(me)).unwrap();
+        assert_eq!((a.repo_id.as_str(), a.person_id.as_str(), a.org_id.as_str()), (r, m, ""));
+        assert!(decode(&q("PERSON_REPO_ADDED", r, "m_01ARZ3NDEKTSV4RRFFQ69G5FAW", "", person_repo_body(m, r, ok, now)), Some(me)).is_err(), "another person");
+        assert!(decode(&q("PERSON_REPO_ADDED", m, m, "", person_repo_body(m, m, ok, now)), Some(me)).is_err(), "a person as a project");
+        // A sponsor approval: the m_ id is both targets; never a member, never an org's.
+        let g = decode(&q("DONOR_APPROVED", m, m, ps, grant_body(m, ps, ok, now)), Some(me)).unwrap();
+        assert_eq!((g.repo_id.as_str(), g.person_id.as_str(), g.subject.as_str()), (m, m, ps));
+        assert!(decode(&q("MEMBER_ADDED", m, m, ps, grant_body(m, ps, ok, now)), Some(me)).is_err());
+        assert!(decode(&q("DONOR_APPROVED", m, "", ps, grant_body(m, ps, ok, now)), Some(me)).is_err(), "a person approval labelled as a project's");
+        assert!(decode(&q("DONOR_APPROVED", r, m, ps, grant_body(r, ps, ok, now)), Some(me)).is_err(), "a project approval labelled as a person's");
     }
 }
