@@ -1,0 +1,98 @@
+//! Shell tests on ratatui's TestBackend through the snapshot mode (the same path E118 uses).
+
+use crate::{Options, demo_source, fixtures, snapshot};
+
+fn snap(size: (u16, u16), keys: &str, f: impl Fn(&mut Options)) -> String {
+    let mut o = Options { snapshot: Some(size), keys: keys.into(), demo: true, ..Options::default() };
+    f(&mut o);
+    snapshot(&mut demo_source(), &o).unwrap()
+}
+
+fn assert_shell(frame: &str, size: (u16, u16), what: &str) {
+    let lines: Vec<&str> = frame.lines().collect();
+    assert_eq!(lines.len(), usize::from(size.1), "{what}: row count\n{frame}");
+    for l in &lines {
+        assert!(crate::app::tests_width(l) <= usize::from(size.0), "{what}: line too wide: {l:?}");
+        assert!(!l.chars().any(char::is_control), "{what}: control char in {l:?}");
+    }
+    assert!(lines[0].contains("moochy"), "{what}: header\n{frame}");
+    assert!(lines[1].contains("1 "), "{what}: tab bar\n{frame}");
+    assert!(lines.last().unwrap().contains("help"), "{what}: footer\n{frame}");
+}
+
+#[test]
+fn every_tab_every_size_every_theme() {
+    for size in [(80, 24), (160, 48), (100, 30)] {
+        for tab in 1..=9 {
+            for (name, setup) in [
+                ("dark", (|_: &mut Options| {}) as fn(&mut Options)),
+                ("light", |o: &mut Options| o.theme = Some("light".into())),
+                ("ascii", |o: &mut Options| o.ascii = true),
+            ] {
+                let frame = snap(size, &tab.to_string(), setup);
+                assert_shell(&frame, size, &format!("tab {tab} {name} {size:?}"));
+                if name == "ascii" {
+                    assert!(frame.is_ascii() || !frame.contains('╭'), "ascii borders: {frame}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn overlays_render() {
+    let help = snap((80, 24), "?", |_| {});
+    assert!(help.contains("Help"), "{help}");
+    assert!(help.contains("command palette"), "{help}");
+    let pal = snap((80, 24), ":don", |_| {});
+    assert!(pal.contains("Go to Donations"), "{pal}");
+    let jumped = snap((80, 24), ":serv<enter>", |_| {});
+    assert!(jumped.lines().nth(1).unwrap().contains("Served"), "{jumped}");
+    let filt = snap((80, 24), "/axum", |_| {});
+    assert!(filt.lines().last().unwrap().contains("/axum"), "{filt}");
+}
+
+#[test]
+fn tabs_by_number_tab_key_and_mouse() {
+    let f = snap((160, 48), "<tab><tab>", |_| {});
+    assert!(f.lines().nth(1).unwrap().contains("3 Served"));
+    // Click the second tab label on row 1.
+    let f = snap((160, 48), "<click:14,1>", |_| {});
+    assert!(f.contains("Donations"), "{f}");
+}
+
+#[test]
+fn tiny_terminal_says_so() {
+    let f = snap((40, 10), "", |_| {});
+    assert!(f.contains("at least 60×15"), "{f}");
+}
+
+#[test]
+fn ansi_mode_has_colours_and_text_mode_none() {
+    let a = snap((80, 24), "", |o| o.ansi = true);
+    assert!(a.contains("\u{1b}[0;1;38;2;125;211;174m"), "mint bold expected");
+    let t = snap((80, 24), "", |_| {});
+    assert!(!t.contains('\u{1b}'));
+}
+
+#[test]
+fn hostile_strings_render_inert() {
+    for tab in 1..=9 {
+        let o = Options { snapshot: Some((160, 48)), keys: tab.to_string(), hostile: true, demo: true, ..Options::default() };
+        let f = snapshot(&mut fixtures::hostile(), &o).unwrap();
+        assert!(!f.chars().any(|c| c.is_control() && c != '\n'), "tab {tab}: {f:?}");
+        assert!(!f.contains('\u{202E}'));
+    }
+}
+
+#[test]
+fn options_fail_closed() {
+    let p = |a: &[&str]| Options::parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+    assert!(p(&["--demo", "--snapshot", "80x24", "--keys", "2j<enter>"]).is_ok());
+    assert!(p(&["--snapshot=160x48", "--theme=light", "--ascii", "--ansi"]).is_ok());
+    assert!(p(&["--bogus"]).is_err());
+    assert!(p(&["--theme", "pink"]).is_err());
+    assert!(p(&["--snapshot", "9999x1"]).is_err());
+    assert!(p(&["--keys", "<nope>", "--snapshot", "80x24"]).is_err());
+    assert!(p(&["--keys", "j"]).is_err());
+}

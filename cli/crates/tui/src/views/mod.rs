@@ -29,6 +29,29 @@ pub struct Ctx<'a> {
     pub now_ms: u64,
 }
 
+/// A shell command: what palette entries, the global keys and views (via [`Outcome::Command`])
+/// can ask the shell to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    GoTo(usize),
+    NextTab,
+    PrevTab,
+    Refresh,
+    Help,
+    Palette,
+    Filter,
+    /// Light ↔ dark.
+    ToggleDark,
+    /// Unicode ↔ ASCII glyphs and borders.
+    ToggleAscii,
+    /// truecolor → 256 → 16 → none → truecolor.
+    CycleDepth,
+    Suspend,
+    Quit,
+    /// Replay a key to the focused view (palette entries made from [`View::hints`]).
+    Key(Input),
+}
+
 /// A key or mouse input already decoded by the shell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -57,6 +80,8 @@ pub enum Outcome {
     Confirm { title: String, body: String, action: Action },
     /// Run now (read-only or already confirmed).
     Run(Action),
+    /// Ask the shell (switch tab, theme, help…).
+    Command(Command),
 }
 
 pub trait View {

@@ -11,4 +11,32 @@ publish = false
 # CONTRACT §20.4 / AGENTS.md: the only UI crates. ratatui 0.30 with its crossterm backend, no
 # default features (no termion/termwiz backends, no serde, no macros we do not use).
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.29", default-features = false, features = ["events"] }
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste"] }
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM/SIGHUP/SIGTSTP/SIGCONT → restore the terminal (CONTRACT §20.3). Already in the tree
+# through crossterm's SIGWINCH handling (signal-hook-mio), so no new code is compiled in.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+too_many_lines = "allow"
+# Theme is a 3-byte Copy struct that views receive as `&Theme` through Ctx; both are fine.
+trivially_copy_pass_by_ref = "allow"
+struct_excessive_bools = "allow"
+many_single_char_names = "allow"
