@@ -458,7 +458,9 @@ logs and vectors verify unchanged. Vectors: `people.json`.
   `PERSON_REPO_*` need the person's owner key (`not_owner`), the person claimed (`unclaimed`), and
   `issued_at` after the claim and after the previous entry for (person, repo) (`replay`). The repo
   need not be claimed. Build bodies with `IssuedAtMs = max(now, OwnerSinceMs(m_…)+1)`.
-- **Pool / `PoolSync`.** `dev, approvalIdx, err := klog.SealableFor(worker, repo, gateway)`: exactly
+- **Pool / `PoolSync`.** For a person donation's worker use `klog.PersonSealable(worker, repo,
+  gateway)` (the person rule alone, as the donor's Node checks it). `dev, approvalIdx, err :=
+  klog.SealableFor(worker, repo, gateway)`: exactly
   `Sealable(worker, repo)` when that allows; else the person path (gateway device = a logged,
   unrevoked, unexpired gateway of the pseudonym owning a person M that covers `repo` and approved the
   worker's donor) with the **smallest** such approval index. Put it in `approval_log_index`.
@@ -467,12 +469,16 @@ logs and vectors verify unchanged. Vectors: `people.json`.
 
 ### 12b. mo-donor: node gate and alerts
 
-- **Sealing gate.** For a request from local gateway device `X` (this Node's own device id), call
-  `View::seal_check_for(worker, repo, X, key_log_index, approval_log_index)` (same gate states and
-  `index_mismatch` as `seal_check`) or `State::sealable_for(_at)(worker, repo, X)`. It equals
-  `seal_check` whenever the repo/org rule allows, so it can replace it everywhere you know `X`.
-  Errors: `not_approved` (another member of the repo, a device of another account, an uncovered
-  repo, an unapproved sponsor), `unclaimed` (not an `r_` id), device codes for either device.
+- **Sealing gate.** `view.state(|s| s.person_sealable(worker, repo, gateway))` (and `_at(…, now_ms)`):
+  the person rule **alone** (a repo/org approval never satisfies it, and it never satisfies
+  `sealable`), `Sealable { enc_pub, key_idx, approval_idx }` with the smallest person approval index.
+  Gateway side: `gateway` = this Node's own device id; compare `key_idx` / `approval_idx` with
+  `PoolWorker` yourself and keep the `View::gate` check. Worker side, for a person pledge: `gateway` =
+  the task's gateway device, then verify the task signature with that device's `sign_pub`.
+  `s.sealable_for(worker, repo, gateway)` = `sealable` when it allows, else `person_sealable` (what
+  the relay's `SealableFor` answers). Errors: `not_approved` (another member of the repo, a device
+  of another account, an uncovered repo, an unapproved sponsor), `unclaimed` (not an `r_` id),
+  device codes for either device.
 - **Alerts: no new variant.** `Alert::NotSignedByMe { kind: PERSON_* | DONOR_*, repo_id: "m_…" }`
   for a person claim naming me, or an entry on my person, signed by an owner key I do not know;
   the message says "your person profile m_…". A takeover cannot happen (refused, `Rejected` alert).
