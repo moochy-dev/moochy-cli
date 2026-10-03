@@ -266,7 +266,10 @@ impl Guard {
         if !self.on {
             *self = Guard::enter().map_err(|e| e.to_string())?;
         }
-        term.clear().map_err(|e| e.to_string())
+        // A full repaint without `Terminal::clear` (it asks the terminal for the cursor position
+        // and waits up to 2 s for an answer some terminals never send).
+        let sz = term.size().map_err(|e| e.to_string())?;
+        term.resize(ratatui::layout::Rect::new(0, 0, sz.width, sz.height)).map_err(|e| e.to_string())
     }
 }
 
