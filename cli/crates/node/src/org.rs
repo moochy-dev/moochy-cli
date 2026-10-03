@@ -280,7 +280,7 @@ pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
         Err(e) if e.exit == crate::util::Exit::Usage => return Err(e),
         _ => public(&cfg, org)?,
     };
-    for r in &mut info.repos {
+    for r in info.repos.iter_mut().filter(|r| !r.slug.is_empty()) {
         r.slug = qualified(&r.slug);
     }
     if json_out {
@@ -290,7 +290,11 @@ pub fn list(home: &Home, org: &str, json_out: bool) -> Result<()> {
     } else {
         println!("Donations to {} ({}) fund:", clean(&info.path), clean(&info.org_id));
         for r in &info.repos {
-            println!("  {} ({})", clean(&r.slug), clean(&r.repo_id));
+            if r.slug.is_empty() {
+                println!("  {} (name not yet pushed by the server)", clean(&r.repo_id));
+            } else {
+                println!("  {} ({})", clean(&r.slug), clean(&r.repo_id));
+            }
         }
     }
     Ok(())
@@ -306,33 +310,40 @@ fn qualified(slug: &str) -> String {
 fn owned(home: &Home, cfg: &crate::config::Config, org: &str) -> Result<Option<OrgInfo>> {
     let Some(me) = cfg.pseudonym.as_deref() else { return Ok(None) };
     let rt = rt()?;
-    let pushed = rt.block_on(async {
-        let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
-    })?;
     // The org id from the server (dialed directly), never from the app's list.
     let l = lookup(cfg, &rt, &format!("org:{org}"), None).map_err(|e| if e.exit == crate::util::Exit::Usage { usage(format!("the server knows no claimed organisation {}", clean(org))) } else { e })?;
     let path = l.repo_slug.strip_prefix("org:").unwrap_or_default();
     if !is_id(&l.repo_id, "o_") || !path.eq_ignore_ascii_case(org) {
         return Err(internal("the server answered for another organisation"));
     }
-    let rows: Vec<&SignResponse> = pushed.requests.iter().filter(|q| q.kind == Kind::OrgRepoRemoved.name() && q.org_id == l.repo_id && is_id(&q.repo_id, "r_")).collect();
-    let ids: Vec<&str> = std::iter::once(l.repo_id.as_str()).chain(rows.iter().map(|q| q.repo_id.as_str())).collect();
-    let Some(owners) = crate::keylog::KeyLog::owners(home, cfg, &ids) else { return Ok(None) };
-    let mut owners = owners.into_iter();
-    if owners.next().flatten().as_deref() != Some(me) {
-        return Ok(None);
-    }
-    // ponytail: checks both claims name this account; that ORG_REPO_ADDED is still active needs a
-    // coverage query in moochy-keylog (requested), until then the relay's push is trusted for it.
-    let mut repos = Vec::new();
-    for (q, owner) in rows.into_iter().zip(owners) {
-        if owner.as_deref() == Some(me) {
-            repos.push(Covered { repo_id: q.repo_id.clone(), slug: q.repo_slug.clone() });
-        } else {
-            eprintln!("warning: the server lists {} ({}) as funded by {}, but your key log does not show it as your project: not listed", clean(&q.repo_slug), clean(&q.repo_id), clean(path));
+    // A270: the verified key log decides what is listed (ORG_CLAIMED by this account, ORG_REPO_ADDED
+    // active, the project claimed by this account too); the relay's push only names the rows.
+    // The node writes each pushed checkpoint to its copy within moments, and the relay re-pushes its
+    // offers after each entry: a fresh claim, cover or removal one side does not show yet gets a few
+    // seconds before the push and the log are called in disagreement. ponytail: a non-owner pays
+    // the 5 s before the public API; waiting on the mirror's size needs it on node.sock.
+    let (mut covered, mut rows) = (None, Vec::new());
+    for attempt in 0..=10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let pushed = rt.block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await?;
+            c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| status(&s))
+        })?;
+        rows = pushed.requests.into_iter().filter(|q| q.kind == Kind::OrgRepoRemoved.name() && q.org_id == l.repo_id).collect();
+        let Some(orgs) = crate::keylog::KeyLog::owned_orgs(home, cfg, me) else { return Ok(None) };
+        covered = orgs.into_iter().find(|(o, _)| *o == l.repo_id).map(|(_, r)| r);
+        if covered.as_ref().is_some_and(|c| c.len() == rows.len() && rows.iter().all(|q| c.contains(&q.repo_id))) {
+            break;
         }
     }
+    let Some(covered) = covered else { return Ok(None) };
+    let named = |id: &str| rows.iter().find(|q| q.repo_id == id).map(|q| q.repo_slug.clone());
+    for q in rows.iter().filter(|q| !covered.contains(&q.repo_id)) {
+        eprintln!("warning: the server lists {} ({}) as funded by {}, but your key log does not: not listed", clean(&q.repo_slug), clean(&q.repo_id), clean(path));
+    }
+    let repos = covered.into_iter().map(|repo_id| Covered { slug: named(&repo_id).unwrap_or_default(), repo_id }).collect();
     Ok(Some(OrgInfo { org_id: l.repo_id.clone(), path: path.to_owned(), repos }))
 }
 
