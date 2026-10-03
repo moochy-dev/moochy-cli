@@ -39,18 +39,18 @@ pub const ASCII_BARS: bar::Set = bar::Set {
 
 /// The glyph for the terminal: Unicode, or its ASCII fallback (`--ascii`).
 #[must_use]
-pub fn g(theme: &Theme, uni: &'static str, ascii: &'static str) -> &'static str {
+pub fn g(theme: Theme, uni: &'static str, ascii: &'static str) -> &'static str {
     if theme.ascii { ascii } else { uni }
 }
 
 /// The separator between items on one line.
 #[must_use]
-pub fn dot(theme: &Theme) -> &'static str {
+pub fn dot(theme: Theme) -> &'static str {
     g(theme, " · ", " - ")
 }
 
 #[must_use]
-pub fn block<'a>(theme: &Theme, title: impl Into<Line<'a>>) -> Block<'a> {
+pub fn block<'a>(theme: Theme, title: impl Into<Line<'a>>) -> Block<'a> {
     Block::bordered().border_set(if theme.ascii { ASCII_BORDER } else { border::ROUNDED }).title(title)
 }
 
@@ -65,7 +65,7 @@ pub enum Tone {
 }
 
 #[must_use]
-pub fn tone(theme: &Theme, t: Tone) -> Style {
+pub fn tone(theme: Theme, t: Tone) -> Style {
     let c = match t {
         Tone::Good => theme.mint(),
         Tone::Warn => theme.butter(),
@@ -79,7 +79,7 @@ pub fn tone(theme: &Theme, t: Tone) -> Style {
 
 /// `● active` style label: glyph + word, toned.
 #[must_use]
-pub fn badge(theme: &Theme, t: Tone, glyph: &str, label: &str) -> Span<'static> {
+pub fn badge(theme: Theme, t: Tone, glyph: &str, label: &str) -> Span<'static> {
     Span::styled(format!("{glyph} {label}"), tone(theme, t))
 }
 
@@ -95,12 +95,12 @@ pub fn key(k: &str) -> Span<'static> {
 
 /// The selected-row style: reversed (works without colour) with the selection arrow.
 #[must_use]
-pub fn selected(_theme: &Theme) -> Style {
+pub fn selected(_theme: Theme) -> Style {
     Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
 #[must_use]
-pub fn arrow(theme: &Theme) -> &'static str {
+pub fn arrow(theme: Theme) -> &'static str {
     g(theme, "▶ ", "> ")
 }
 
@@ -170,7 +170,7 @@ pub fn percent(part: u64, whole: u64) -> u64 {
 
 /// A text gauge `████░░░░ 42%` (`####---- 42%` in ASCII) toned by how full it is.
 #[must_use]
-pub fn gauge(theme: &Theme, part: u64, whole: u64, width: u16) -> Line<'static> {
+pub fn gauge(theme: Theme, part: u64, whole: u64, width: u16) -> Line<'static> {
     let pct = percent(part, whole);
     let w = u64::from(width);
     let filled = usize::try_from(w.saturating_mul(pct.min(100)) / 100).unwrap_or(0);
@@ -205,7 +205,7 @@ pub fn split(area: Rect, detail_rows: u16) -> (Rect, Option<Rect>) {
 }
 
 /// An empty state: what is missing, and what to do next.
-pub fn empty(f: &mut Frame, area: Rect, theme: &Theme, title: &str, lines: Vec<Line<'static>>) {
+pub fn empty(f: &mut Frame, area: Rect, theme: Theme, title: &str, lines: Vec<Line<'static>>) {
     let inner = block(theme, format!(" {title} "));
     let top = area.height.saturating_sub(2).saturating_sub(u16::try_from(lines.len()).unwrap_or(0)) / 2;
     let mut text = vec![Line::raw(""); usize::from(top)];
@@ -299,9 +299,9 @@ pub mod test_util {
     }
 
     /// Renders `view` at w×h and returns the screen as text lines; asserts no control bytes.
-    pub fn draw(view: &mut dyn View, snap: &Snapshot, theme: &Theme, filter: &str, w: u16, h: u16) -> String {
+    pub fn draw(view: &mut dyn View, snap: &Snapshot, theme: Theme, filter: &str, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let ctx = Ctx { snap, theme, filter, now_ms: NOW };
+        let ctx = Ctx { snap, theme: &theme, filter, now_ms: NOW };
         t.draw(|f| view.render(f, f.area(), &ctx)).unwrap();
         let buf = t.backend().buffer().clone();
         let mut out = String::new();

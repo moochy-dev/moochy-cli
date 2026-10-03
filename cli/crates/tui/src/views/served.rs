@@ -28,11 +28,11 @@ pub struct ServedView {
 fn visible<'a>(ctx: &Ctx<'a>) -> Vec<&'a Served> {
     let mut v: Vec<&Served> =
         ctx.snap.served.iter().filter(|s| k::matches(ctx.filter, &[&s.project, &s.model, &s.direction, &s.outcome])).collect();
-    v.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    v.sort_by_key(|s| std::cmp::Reverse(s.at_ms));
     v
 }
 
-fn direction(t: &Theme, s: &Served) -> Span<'static> {
+fn direction(t: Theme, s: &Served) -> Span<'static> {
     match s.direction.as_str() {
         "served" => k::badge(t, Tone::Warn, k::g(t, "↑", "^"), "served"),
         "used" => k::badge(t, Tone::Info, k::g(t, "↓", "v"), "used"),
@@ -40,7 +40,7 @@ fn direction(t: &Theme, s: &Served) -> Span<'static> {
     }
 }
 
-fn outcome(t: &Theme, s: &Served) -> Span<'static> {
+fn outcome(t: Theme, s: &Served) -> Span<'static> {
     match s.outcome.as_str() {
         "ok" | "done" | "served" => k::badge(t, Tone::Good, k::g(t, "✓", "+"), &s.outcome),
         "" => k::badge(t, Tone::Info, k::g(t, "…", "~"), "running"),
@@ -54,7 +54,7 @@ fn failed(o: &str) -> bool {
 }
 
 impl ServedView {
-    fn summary(t: &Theme, rows: &[&Served], now: u64, minutes: u16) -> (Line<'static>, Vec<u64>) {
+    fn summary(t: Theme, rows: &[&Served], now: u64, minutes: u16) -> (Line<'static>, Vec<u64>) {
         let mut buckets = vec![0u64; usize::from(minutes)];
         let (mut served, mut used, mut failures, mut uusd) = (0u64, 0u64, 0u64, 0u64);
         let mut lat = Vec::new();
@@ -98,7 +98,7 @@ impl ServedView {
         (line, buckets)
     }
 
-    fn detail(t: &Theme, s: &Served, now: u64) -> Vec<Line<'static>> {
+    fn detail(t: Theme, s: &Served, now: u64) -> Vec<Line<'static>> {
         let label = |x: &str| k::dim(format!("{x:<9}"));
         let why = match s.direction.as_str() {
             "served" => "  a device of yours answered it with your key",
@@ -128,7 +128,7 @@ impl View for ServedView {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let t = ctx.theme;
+        let t = *ctx.theme;
         if ctx.snap.served.is_empty() {
             let lines = vec![
                 Line::from(k::badge(t, Tone::Info, k::g(t, "◌", "o"), "Nothing served or used yet")),
@@ -164,12 +164,12 @@ impl View for ServedView {
 
         let (list, detail) = k::split(rest, 10);
         self.cur.sync(rows.len(), list);
-        let live = if self.anchor.is_none() {
+        let mode = if self.anchor.is_none() {
             k::badge(t, Tone::Good, k::g(t, "●", "*"), "live")
         } else {
             k::badge(t, Tone::Warn, k::g(t, "‖", "="), "held (g: newest)")
         };
-        let title = Line::from(vec![Span::raw(format!(" Requests ({}) ", rows.len())), live, Span::raw(" ")]);
+        let title = Line::from(vec![Span::raw(format!(" Requests ({}) ", rows.len())), mode, Span::raw(" ")]);
         if rows.is_empty() {
             let lines = vec![Line::raw(format!("No request matches /{}", clean(ctx.filter))), Line::from(k::dim("Esc clears the filter"))];
             return k::empty(f, list, t, &format!("Requests (0){}filtered", k::dot(t)), lines);
@@ -267,7 +267,7 @@ mod tests {
         for t in themes() {
             for (w, h) in [(80, 24), (160, 48)] {
                 let mut v = ServedView::default();
-                let out = draw(&mut v, &s, &t, "", w, h);
+                let out = draw(&mut v, &s, t, "", w, h);
                 let first = out.find("github/foo/bar").unwrap();
                 assert!(first < out.find("github/me/tool").unwrap() && out.find("github/me/tool").unwrap() < out.find("github/old/one").unwrap(), "{out}");
                 assert!(out.contains("2 served") && out.contains("1 used") && out.contains("1 failed"), "window excludes the 2h-old row:\n{out}");
@@ -279,7 +279,7 @@ mod tests {
             }
         }
         let mut v = ServedView::default();
-        let out = draw(&mut v, &Snapshot::default(), &themes()[0], "", 80, 24);
+        let out = draw(&mut v, &Snapshot::default(), themes()[0], "", 80, 24);
         assert!(out.contains("Nothing served or used yet") && out.contains("moochy up"), "{out}");
     }
 
@@ -287,9 +287,9 @@ mod tests {
     fn filter_applies_to_rows_and_summary() {
         let s = snap();
         let mut v = ServedView::default();
-        let out = draw(&mut v, &s, &themes()[0], "gpt", 160, 48);
+        let out = draw(&mut v, &s, themes()[0], "gpt", 160, 48);
         assert!(out.contains("github/me/tool") && !out.contains("github/foo/bar") && out.contains("0 served"), "{out}");
-        let out = draw(&mut v, &s, &themes()[0], "nope", 80, 24);
+        let out = draw(&mut v, &s, themes()[0], "nope", 80, 24);
         assert!(out.contains("No request matches /nope"), "{out}");
     }
 
@@ -298,11 +298,11 @@ mod tests {
         let mut s = snap();
         let t = themes()[0];
         let mut v = ServedView::default();
-        draw(&mut v, &s, &t, "", 160, 48);
+        draw(&mut v, &s, t, "", 160, 48);
         assert_eq!(v.on_input(&Input::Down, &ctx(&s, &t)), Outcome::Redraw);
         let held = v.anchor.unwrap();
         s.served.push(row(1, "used", "github/new/one", "gpt-5", ""));
-        let out = draw(&mut v, &s, &t, "", 160, 48);
+        let out = draw(&mut v, &s, t, "", 160, 48);
         assert!(out.contains("held") && out.contains("running"), "{out}");
         assert_eq!(visible(&ctx(&s, &t))[v.cur.selected().unwrap()].at_ms, held);
         v.on_input(&Input::Char('g'), &ctx(&s, &t));

@@ -46,7 +46,7 @@ struct Status {
     why: &'static str,
 }
 
-fn status(t: &Theme, d: &Donation) -> Status {
+fn status(t: Theme, d: &Donation) -> Status {
     let s = |tone, uni, ascii, label: &str, why| Status { tone, glyph: k::g(t, uni, ascii), label: label.to_owned(), why };
     match d.status.as_str() {
         "active" if d.budget_uusd > 0 && d.spent_uusd >= d.budget_uusd => {
@@ -70,7 +70,7 @@ fn visible<'a>(ctx: &Ctx<'a>) -> Vec<&'a Donation> {
 }
 
 impl DonationsView {
-    fn detail(&self, t: &Theme, d: &Donation) -> Vec<Line<'static>> {
+    fn detail(&self, t: Theme, d: &Donation) -> Vec<Line<'static>> {
         let st = status(t, d);
         let label = |s: &str| k::dim(format!("{s:<9}"));
         let mut v = vec![Line::from(vec![label("Status"), k::badge(t, st.tone, st.glyph, &st.label), k::dim(format!("  {}", st.why))])];
@@ -93,7 +93,7 @@ impl DonationsView {
                 v.push(Line::from(k::dim("  none yet: the organisation's projects have not used it")));
             }
             let mut repos: Vec<&(String, u64)> = d.per_repo_uusd.iter().collect();
-            repos.sort_by(|a, b| b.1.cmp(&a.1));
+            repos.sort_by_key(|r| std::cmp::Reverse(r.1));
             let top = repos.first().map_or(0, |r| r.1);
             for (name, used) in repos.iter().take(MAX_REPOS) {
                 let mut l = vec![Span::raw(format!("  {:<9}", dollars(*used)))];
@@ -183,7 +183,7 @@ impl View for DonationsView {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let t = ctx.theme;
+        let t = *ctx.theme;
         if ctx.snap.donations.is_empty() {
             let lines = vec![
                 Line::from(k::badge(t, Tone::Warn, k::g(t, "☀", "*"), "No donations yet")),
@@ -288,7 +288,6 @@ impl View for DonationsView {
                 body: format!("Stop donating to {target} for good? This cannot be undone: donate again to restart. Same as `moochy donations stop {id}`."),
                 action: Action::StopDonation(d.id.clone()),
             },
-            Input::Char('x') => refuse(self, "this donation is not running"),
             Input::Char('-') if live(d) => {
                 let floor = d.spent_uusd.div_ceil(CENT).max(1).saturating_mul(CENT);
                 let ceil = (d.budget_uusd.saturating_sub(1) / CENT).saturating_mul(CENT);
@@ -301,7 +300,7 @@ impl View for DonationsView {
                 self.note = None;
                 Outcome::Redraw
             }
-            Input::Char('-') => refuse(self, "this donation is not running"),
+            Input::Char('x' | '-') => refuse(self, "this donation is not running"),
             _ => Outcome::Ignored,
         }
     }
@@ -344,7 +343,7 @@ mod tests {
         for t in themes() {
             for (w, h) in [(80, 24), (160, 48)] {
                 let mut v = DonationsView::default();
-                let out = draw(&mut v, &s, &t, "", w, h);
+                let out = draw(&mut v, &s, t, "", w, h);
                 assert!(out.contains("github/foo/bar"), "{out}");
                 assert!(out.contains("active") && out.contains("paused") && out.contains("stopped"), "{out}");
                 assert!(out.contains("$3.10 / $20.00"), "{out}");
@@ -352,7 +351,7 @@ mod tests {
             }
         }
         let mut v = DonationsView::default();
-        let out = draw(&mut v, &Snapshot::default(), &themes()[0], "", 80, 24);
+        let out = draw(&mut v, &Snapshot::default(), themes()[0], "", 80, 24);
         assert!(out.contains("No donations yet") && out.contains("moochy donate"), "{out}");
     }
 
@@ -363,12 +362,12 @@ mod tests {
         let mut v = DonationsView::default();
         let c = ctx(&s, &t);
         assert_eq!(v.on_input(&Input::End, &c), Outcome::Ignored, "cursor not synced yet");
-        draw(&mut v, &s, &t, "", 160, 48);
+        draw(&mut v, &s, t, "", 160, 48);
         v.on_input(&Input::End, &c);
-        let out = draw(&mut v, &s, &t, "", 160, 48);
+        let out = draw(&mut v, &s, t, "", 160, 48);
         assert!(out.contains("Projects funded this month") && out.contains("github/acme/\u{FFFD}[31mb"), "{out}");
-        let b = out.find("[31mb").unwrap();
-        assert!(b < out.find("github/acme/a ").unwrap_or(usize::MAX), "biggest spender first");
+        let big = out.find("[31mb").unwrap();
+        assert!(big < out.find("github/acme/a ").unwrap_or(usize::MAX), "biggest spender first");
     }
 
     #[test]
@@ -377,7 +376,7 @@ mod tests {
         let t = themes()[0];
         let c = ctx(&s, &t);
         let mut v = DonationsView::default();
-        draw(&mut v, &s, &t, "", 80, 24);
+        draw(&mut v, &s, t, "", 80, 24);
         let Outcome::Confirm { action, .. } = v.on_input(&Input::Char('p'), &c) else { panic!() };
         assert_eq!(action, Action::PauseDonation("pl_1".into()));
         v.on_input(&Input::Down, &c);
@@ -385,7 +384,7 @@ mod tests {
         assert_eq!(action, Action::ResumeDonation("pl_2".into()));
         v.on_input(&Input::Down, &c);
         assert_eq!(v.on_input(&Input::Char('x'), &c), Outcome::Redraw); // stopped: refused with a note
-        assert!(draw(&mut v, &s, &t, "", 80, 24).contains("not running"));
+        assert!(draw(&mut v, &s, t, "", 80, 24).contains("not running"));
         v.on_input(&Input::Home, &c);
         let Outcome::Confirm { action, body, .. } = v.on_input(&Input::Char('x'), &c) else { panic!() };
         assert_eq!(action, Action::StopDonation("pl_1".into()));
@@ -398,9 +397,9 @@ mod tests {
         let t = themes()[0];
         let c = ctx(&s, &t);
         let mut v = DonationsView::default();
-        draw(&mut v, &s, &t, "", 80, 24);
+        draw(&mut v, &s, t, "", 80, 24);
         assert_eq!(v.on_input(&Input::Char('-'), &c), Outcome::Redraw);
-        assert!(draw(&mut v, &s, &t, "", 80, 24).contains("New limit"));
+        assert!(draw(&mut v, &s, t, "", 80, 24).contains("New limit"));
         assert_eq!(v.lower.as_ref().unwrap().value, 19 * DOLLAR);
         v.on_input(&Input::Up, &c);
         assert_eq!(v.lower.as_ref().unwrap().value, 19_990_000, "never above the current limit");
@@ -421,9 +420,9 @@ mod tests {
         let s = snap();
         let t = themes()[0];
         let mut v = DonationsView::default();
-        let out = draw(&mut v, &s, &t, "gitlab", 80, 24);
+        let out = draw(&mut v, &s, t, "gitlab", 80, 24);
         assert!(out.contains("gitlab/x/y") && !out.contains("github/foo/bar"), "{out}");
-        let out = draw(&mut v, &s, &t, "zzz", 80, 24);
+        let out = draw(&mut v, &s, t, "zzz", 80, 24);
         assert!(out.contains("No donation matches /zzz"), "{out}");
     }
 }

@@ -54,13 +54,13 @@ fn items<'a>(ctx: &Ctx<'a>) -> Vec<Item<'a>> {
     v
 }
 
-fn online(t: &Theme, on: bool) -> Span<'static> {
+fn online(t: Theme, on: bool) -> Span<'static> {
     if on { k::badge(t, Tone::Good, k::g(t, "●", "*"), "online") } else { k::badge(t, Tone::Muted, k::g(t, "○", "o"), "offline") }
 }
 
 /// The lockdown/sandbox status of the node (`Me.lockdown`), judged fail-closed: anything that
 /// says off/unsafe/not is bad, nothing at all is unknown.
-fn lockdown(t: &Theme, s: &str) -> (Tone, &'static str, String) {
+fn lockdown(t: Theme, s: &str) -> (Tone, &'static str, String) {
     let l = s.to_lowercase();
     if l.trim().is_empty() {
         (Tone::Warn, "!", "unknown: the app is not running here (`moochy up`)".into())
@@ -72,32 +72,32 @@ fn lockdown(t: &Theme, s: &str) -> (Tone, &'static str, String) {
 }
 
 /// The doctor summary from what the dashboard knows; `moochy doctor` does the full check.
-fn doctor(t: &Theme, s: &Snapshot, now: u64) -> Vec<(Tone, &'static str, String)> {
+fn doctor(t: Theme, snap: &Snapshot, now: u64) -> Vec<(Tone, &'static str, String)> {
     let (ok, warn, bad) = (k::g(t, "✓", "+"), "!", k::g(t, "✗", "x"));
-    let mut v = Vec::new();
-    if s.me.connected {
-        v.push((Tone::Good, ok, format!("connected to {}", clean(&s.me.relay))));
+    let mut out = Vec::new();
+    if snap.me.connected {
+        out.push((Tone::Good, ok, format!("connected to {}", clean(&snap.me.relay))));
     } else {
-        v.push((Tone::Bad, bad, "not connected: start the app with `moochy up`".into()));
+        out.push((Tone::Bad, bad, "not connected: start the app with `moochy up`".into()));
     }
-    let on = s.devices.iter().filter(|d| d.online).count();
-    let here = s.devices.iter().any(|d| d.this_device && d.online);
-    match (s.devices.len(), on) {
-        (0, _) => v.push((Tone::Bad, bad, "no device: `moochy login`".into())),
-        (n, 0) => v.push((Tone::Warn, warn, format!("0 of {n} devices online"))),
-        (n, o) => v.push((if here { Tone::Good } else { Tone::Warn }, if here { ok } else { warn }, format!("{o} of {n} devices online{}", if here { "" } else { ", not this one" }))),
+    let on = snap.devices.iter().filter(|d| d.online).count();
+    let here = snap.devices.iter().any(|d| d.this_device && d.online);
+    match (snap.devices.len(), on) {
+        (0, _) => out.push((Tone::Bad, bad, "no device: `moochy login`".into())),
+        (n, 0) => out.push((Tone::Warn, warn, format!("0 of {n} devices online"))),
+        (n, o) => out.push((if here { Tone::Good } else { Tone::Warn }, if here { ok } else { warn }, format!("{o} of {n} devices online{}", if here { "" } else { ", not this one" }))),
     }
-    let present: Vec<String> = s.keys.iter().filter(|x| x.present).map(|x| clean(&x.provider)).collect();
+    let present: Vec<String> = snap.keys.iter().filter(|x| x.present).map(|x| clean(&x.provider)).collect();
     if present.is_empty() {
-        v.push((Tone::Warn, warn, "no provider key: nothing to donate from here".into()));
+        out.push((Tone::Warn, warn, "no provider key: nothing to donate from here".into()));
     } else {
-        v.push((Tone::Good, ok, format!("{} provider key{} ({})", present.len(), if present.len() == 1 { "" } else { "s" }, present.join(", "))));
+        out.push((Tone::Good, ok, format!("{} provider key{} ({})", present.len(), if present.len() == 1 { "" } else { "s" }, present.join(", "))));
     }
-    let soon = s.boxes.iter().filter(|b| b.expires_at_ms > now && b.expires_at_ms <= now.saturating_add(DAY_MS)).count();
+    let soon = snap.boxes.iter().filter(|b| b.expires_at_ms > now && b.expires_at_ms <= now.saturating_add(DAY_MS)).count();
     if soon > 0 {
-        v.push((Tone::Warn, warn, format!("{soon} cloud box{} expire{} within 24 h", if soon == 1 { "" } else { "es" }, if soon == 1 { "s" } else { "" })));
+        out.push((Tone::Warn, warn, format!("{soon} cloud box{} expire{} within 24 h", if soon == 1 { "" } else { "es" }, if soon == 1 { "s" } else { "" })));
     }
-    v
+    out
 }
 
 impl View for DevicesView {
@@ -110,7 +110,7 @@ impl View for DevicesView {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let t = ctx.theme;
+        let t = *ctx.theme;
         let items = items(ctx);
         let (list, side) = k::split(area, 10);
         self.cur.sync(items.len(), list);
@@ -216,7 +216,7 @@ mod tests {
         for t in themes() {
             for (w, h) in [(80, 24), (160, 48)] {
                 let mut v = DevicesView::default();
-                let out = draw(&mut v, &s, &t, "", w, h);
+                let out = draw(&mut v, &s, t, "", w, h);
                 for want in ["Devices (2)", "laptop", "this device", "offline", "Provider keys (2)", "present", "absent", "box d_box9", "expires in 1h", "landlock+seccomp", "connected to relay.moochy.dev", "1 of 2 devices online", "1 cloud box expires within 24 h"] {
                     assert!(out.contains(want), "missing {want}:\n{out}");
                 }
@@ -229,14 +229,14 @@ mod tests {
     fn empty_and_unsafe_states_say_what_to_do() {
         let s = Snapshot::default();
         let mut v = DevicesView::default();
-        let out = draw(&mut v, &s, &themes()[0], "", 160, 48);
+        let out = draw(&mut v, &s, themes()[0], "", 160, 48);
         for want in ["moochy login", "moochy keys add", "moochy box token create", "not connected", "unknown", "no provider key"] {
             assert!(out.contains(want), "missing {want}:\n{out}");
         }
         let mut s = snap();
         s.me.lockdown = "UNSAFE: not locked down".into();
-        assert_eq!(lockdown(&themes()[0], &s.me.lockdown).0, Tone::Bad);
-        assert_eq!(lockdown(&themes()[0], "  ").0, Tone::Warn);
+        assert_eq!(lockdown(themes()[0], &s.me.lockdown).0, Tone::Bad);
+        assert_eq!(lockdown(themes()[0], "  ").0, Tone::Warn);
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
         let t = themes()[0];
         let c = ctx(&s, &t);
         let mut v = DevicesView::default();
-        draw(&mut v, &s, &t, "", 160, 48);
+        draw(&mut v, &s, t, "", 160, 48);
         assert_eq!(v.on_input(&Input::Char('x'), &c), Outcome::Ignored, "header row");
         v.on_input(&Input::Down, &c);
         assert_eq!(v.on_input(&Input::Char('x'), &c), Outcome::Ignored, "a device");
@@ -253,7 +253,7 @@ mod tests {
         let Outcome::Confirm { action, body, .. } = v.on_input(&Input::Char('x'), &c) else { panic!() };
         assert_eq!(action, Action::RevokeBox("d_box9".into()));
         assert!(body.contains("github/foo/bar"));
-        let out = draw(&mut v, &s, &t, "box", 160, 48);
+        let out = draw(&mut v, &s, t, "box", 160, 48);
         assert!(out.contains("Cloud boxes (1)") && !out.contains("laptop"), "{out}");
     }
 }
