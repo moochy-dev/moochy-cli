@@ -7,9 +7,13 @@ members = ["cargo:cli"]
 
 [dist]
 cargo-dist-version = "0.33.0"
+# Only the `moochy` package ships (its [package.metadata.dist] dist = true); the other
+# crates are libraries on crates.io, and moochy-sandbox's test helper never ships.
+dist = false
 ci = "github"
-# Only the `moochy` binary ships (cli/crates/node: [package.metadata.dist] dist = true).
-installers = ["shell", "powershell", "npm", "homebrew"]
+installers = ["shell", "npm", "homebrew"]
+# Windows (and the PowerShell installer) once the client builds there:
+# https://github.com/moochy-dev/moochy-cli/issues/7
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -17,8 +21,6 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
-    "aarch64-pc-windows-msvc",
-    "x86_64-pc-windows-msvc",
 ]
 # `npx -y moochy mcp` (plan 07 §5): unscoped package, fetches the signed binary.
 npm-package = "moochy"
@@ -50,4 +52,3 @@ aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
 x86_64-unknown-linux-gnu = "ubuntu-24.04"
 x86_64-unknown-linux-musl = "ubuntu-24.04"
-aarch64-pc-windows-msvc = "windows-11-arm"

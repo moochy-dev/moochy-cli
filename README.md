@@ -12,7 +12,7 @@ Open-source client (Apache-2.0) · 100% free. No fees, no commission, no paid ti
 cargo install moochy --locked        # from crates.io
 ```
 
-Each release also publishes signed archives for macOS, Linux and Windows (arm64 and x86_64), shell and PowerShell installers, a Homebrew formula and an npm package. To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
+Each release also publishes signed archives for macOS and Linux (arm64 and x86_64), a shell installer, a Homebrew formula and an npm package. Windows: [#7](https://github.com/moochy-dev/moochy-cli/issues/7). To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
 
 ## Build and test
 

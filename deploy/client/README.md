@@ -20,8 +20,8 @@ Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release
 
 `dist plan` produces, per release tag `vX.Y.Z`:
 
-- archives for macOS (arm64, x86_64), Linux (arm64, x86_64; glibc and musl), Windows (arm64, x86_64), each with a `.sha256`;
-- shell and PowerShell installers, a Homebrew formula (`moochy-dev/homebrew-tap`), and the npm package `moochy` (`npx -y moochy mcp`);
+- archives for macOS (arm64, x86_64) and Linux (arm64, x86_64; glibc and musl), each with a `.sha256` (Windows: [#7](https://github.com/moochy-dev/moochy-cli/issues/7));
+- a shell installer, a Homebrew formula (`moochy-dev/homebrew-tap`), and the npm package `moochy` (`npx -y moochy mcp`);
 - the crates on crates.io (`cargo install moochy --locked`), through the custom publish job `.github/workflows/publish-crates.yml`;
 - no auto-updater (`install-updater = false`): `moochy update` verifies signatures itself (06 §12).
 

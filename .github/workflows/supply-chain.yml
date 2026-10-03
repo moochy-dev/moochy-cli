@@ -40,6 +40,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
       - run: sudo apt-get install -y musl-tools
-      - run: rustup target add "${{ matrix.target }}"
+      - run: rustup target add "${{ matrix.target }}" # in cli/: the pinned toolchain
+        working-directory: cli
       - name: Two builds at different paths must be bit-identical
         run: deploy/client/scripts/repro-check.sh --target "${{ matrix.target }}"
