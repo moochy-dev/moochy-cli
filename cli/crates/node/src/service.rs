@@ -166,20 +166,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_units_match_deploy_client() {
-        // The crate embeds copies (crates.io packages only the crate directory);
-        // deploy/client/service/ stays the reviewed source.
-        let pairs = [
-            (USER_UNIT, include_str!("../../../../deploy/client/service/moochy.user.service")),
-            (SYSTEM_UNIT, include_str!("../../../../deploy/client/service/moochy.system.service")),
-            (AGENT_PLIST, include_str!("../../../../deploy/client/service/dev.moochy.agent.plist")),
-        ];
-        for (embedded, source) in pairs {
-            assert_eq!(embedded, source, "cp deploy/client/service/* cli/crates/node/assets/service/");
-        }
-    }
-
-    #[test]
     fn units_are_the_reviewed_files_with_substitutions() {
         let u = user_unit(Path::new("/usr/local/bin/moochy"), None).unwrap();
         assert!(u.contains("\nExecStart=/usr/local/bin/moochy up --foreground\n") && !u.contains("/bin/sh"), "{u}");

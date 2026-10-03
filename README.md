@@ -42,7 +42,7 @@ cargo clippy --all-targets -- -D warnings
 - `spec/proto/` and `spec/vectors/` are produced here (the vectors by `cargo run -p moochy-proto --example vecgen -- ../spec/vectors` from `cli/`). Copy them to moochy-docs after a change.
 - `docs/guides/integrations.md` and `docs/guides/donate-button.md` are written in moochy-docs. Copy them to `cli/crates/node/assets/` after a change.
 
-Relative links inside the two guide copies point to guides that live in moochy-docs. `cli/crates/node/assets/service/` copies `deploy/client/service/`; a test fails when they differ.
+Relative links inside the two guide copies point to guides that live in moochy-docs. `deploy/client/service/` links to the unit files in `cli/crates/node/assets/service/`.
 
 ## Release
 

@@ -15,8 +15,12 @@ defaults:
   run:
     working-directory: cli
 jobs:
-  linux:
-    runs-on: ubuntu-24.04
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,18 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: cli }
       # `moochy run` needs unprivileged user namespaces (Ubuntu 23.10+ restricts them).
-      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-
-  macos:
-    runs-on: macos-15
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: { persist-credentials: false }
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with: { workspaces: cli }
+      - if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
