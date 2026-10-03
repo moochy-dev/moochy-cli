@@ -2,3 +2,93 @@
 # cargo-vet audits file
 
 [audits]
+
+[[trusted.aead]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-05"
+end = "2027-10-03"
+
+[[trusted.chacha20]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-06-24"
+end = "2027-10-03"
+
+[[trusted.chacha20poly1305]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-30"
+end = "2027-10-03"
+
+[[trusted.curve25519-dalek]]
+criteria = "safe-to-deploy"
+user-id = 6979 # Michael Rosenberg (rozbb)
+start = "2022-12-13"
+end = "2027-10-03"
+
+[[trusted.ed25519-zebra]]
+criteria = "safe-to-deploy"
+user-id = 235397 # Marek (upbqdn)
+start = "2026-03-20"
+end = "2027-10-03"
+
+[[trusted.hkdf]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2021-12-07"
+end = "2027-10-03"
+
+[[trusted.hpke]]
+criteria = "safe-to-deploy"
+user-id = 6979 # Michael Rosenberg (rozbb)
+start = "2020-05-12"
+end = "2027-10-03"
+
+[[trusted.poly1305]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-15"
+end = "2027-10-03"
+
+[[trusted.ring]]
+criteria = "safe-to-deploy"
+user-id = 2342 # Brian Smith (briansmith)
+start = "2019-07-03"
+end = "2027-10-03"
+
+[[trusted.rustls]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-04-02"
+end = "2027-10-03"
+
+[[trusted.rustls-webpki]]
+criteria = "safe-to-deploy"
+user-id = 209038 # Daniel McCarney (cpu)
+start = "2023-07-04"
+end = "2027-10-03"
+
+[[trusted.scrypt]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-08-18"
+end = "2027-10-03"
+
+[[trusted.tokio-rustls]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2023-06-09"
+end = "2027-10-03"
+
+[[trusted.x25519-dalek]]
+criteria = "safe-to-deploy"
+user-id = 6979 # Michael Rosenberg (rozbb)
+start = "2023-03-31"
+end = "2027-10-03"
+
+[[trusted.zeroize]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-11-05"
+end = "2027-10-03"
