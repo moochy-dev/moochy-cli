@@ -217,6 +217,10 @@ fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
     }
 }
 
+/// What any owner key of the account can sign (KEYLOG §2, CONTRACT §19): `owner status` and
+/// `owner trust` say it, organisations included.
+const SIGNS: &str = "signs for your projects and your organisations: claims, the donors you accept, members, and which of your projects an organisation's donations fund";
+
 /// `moochy owner status` (KEYLOG §4c): this account's CLI owner key as the public key log shows it.
 pub fn show_status(home: &Home) -> Result<()> {
     let cfg = home.load()?;
@@ -235,6 +239,7 @@ pub fn show_status(home: &Home) -> Result<()> {
         Some(k) => eprintln!("Owner key {id} (log #{}): {}.{}", k.idx, proof_text(k.proof), if here { "" } else { " Its secret is not on this device." }),
         None => eprintln!("Owner key {id}."),
     }
+    eprintln!("It {SIGNS}.");
     crate::util::emit(&json!({"event": "owner_status", "owner_key": id, "log_index": row.map(|k| k.idx), "proof": row.map(|k| proof_name(k.proof)), "key_here": here}));
     Ok(())
 }
@@ -299,12 +304,12 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
     if !p.repo_slug.eq_ignore_ascii_case(ask.repo_slug) {
         return Err(refuse(&format!("project {}", clean(&p.repo_slug))));
     }
-    match (parse_body(kind, &p.body_to_sign), ask.subject) {
+    let b = match (parse_body(kind, &p.body_to_sign), ask.subject) {
         (Ok(Body::Claim { repo_id, provider, provider_repo_id, owner, .. }), None) => {
             if repo_id != p.repo_id || me != Some(owner) || p.subject != owner {
                 return Err(refuse("a claim naming another account or project"));
             }
-            Ok(Bound { kind, repo_id: repo_id.into(), subject: owner.into(), claim: Some((provider.into(), provider_repo_id.into())), name: owner.into(), slug: ask.repo_slug.into() })
+            Bound { kind, repo_id: repo_id.into(), subject: owner.into(), claim: Some((provider.into(), provider_repo_id.into())), name: owner.into(), slug: ask.repo_slug.into() }
         }
         (Ok(Body::Grant { repo_id, subject, .. }), Some(arg)) => {
             if repo_id != p.repo_id || subject != p.subject {
@@ -322,10 +327,16 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
             if !ok {
                 return Err(refuse(&format!("subject {}", clean(subject))));
             }
-            Ok(Bound { kind, repo_id: repo_id.into(), subject: subject.into(), claim: None, name: name.into(), slug: ask.repo_slug.into() })
+            Bound { kind, repo_id: repo_id.into(), subject: subject.into(), claim: None, name: name.into(), slug: ask.repo_slug.into() }
         }
-        _ => Err(refuse("a malformed entry")),
+        _ => return Err(refuse("a malformed entry")),
+    };
+    // §19: these commands name a project. The same body on an organisation id (`o_…`) would
+    // accept the donor for every project the organisation covers, behind a project's label.
+    if !b.repo_id.starts_with("r_") {
+        return Err(refuse(&format!("an entry for {}, not a project", clean(&b.repo_id))));
     }
+    Ok(b)
 }
 
 /// A218: what the server itself (dialed directly, not through `node.sock`) says the project and
@@ -617,7 +628,7 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
         None => "not checked: no public key log on this machine",
     };
     eprintln!("Owner key {id} of your account, registered in the public key log at #{}{}: {how}.", d.log_index, if d.revoked { " (since revoked)" } else { "" });
-    eprintln!("Trust it only if YOU registered it (e.g. a passkey you added on moochy.dev). If not, your account may be compromised.");
+    eprintln!("Trust it only if YOU registered it (e.g. a passkey you added on moochy.dev): it {SIGNS}. If not, your account may be compromised.");
     if !yes && !matches!(ask("Type yes to trust it: ", false)?.as_str(), "yes" | "y") {
         return Err(usage("not trusted"));
     }
@@ -692,6 +703,15 @@ mod tests {
         let mut p = grant("DONOR_APPROVED", ALICE, "alice", ALICE);
         p.repo_slug = "evil/repo".into();
         assert!(bind(&approve("alice"), Some(ME), &p).is_err());
+        // §19: an org approval (the donor for every covered project) behind the project's label,
+        // with a Lookup that agrees (a lying server).
+        let org = "o_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut p = grant("DONOR_APPROVED", ALICE, "alice", ALICE);
+        (p.repo_id, p.body_to_sign) = (org.into(), grant_body(org, ALICE, OK, 1));
+        let mut s = server("alice", ALICE);
+        s.repo_id = org.into();
+        assert!(bind(&approve("alice"), Some(ME), &p).is_err());
+        assert!(verified(&approve("alice"), &p, &s).is_err());
         // A pseudonym argument never matches a label.
         assert!(bind(&approve(MALLORY), Some(ME), &grant("DONOR_APPROVED", ALICE, MALLORY, ALICE)).is_err());
         // `members add d_… --device` (E32): the label is the device id, the body its owner's pseudonym.

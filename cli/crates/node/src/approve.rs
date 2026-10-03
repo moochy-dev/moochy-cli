@@ -27,6 +27,9 @@ pub fn kind_num(kind: &str) -> Option<u32> {
         "DONOR_REVOKED" => 5,
         "MEMBER_ADDED" => 6,
         "MEMBER_REMOVED" => 7,
+        "ORG_CLAIMED" => 13,
+        "ORG_REPO_ADDED" => 14,
+        "ORG_REPO_REMOVED" => 15,
         _ => return None,
     })
 }
@@ -51,25 +54,48 @@ pub fn on_ack(node: &Node, a: LogEntryAck) {
     }
 }
 
+/// `(repo_id, org_id, subject, signer, issued_at_ms)` of an owner-signed body, with the target
+/// prefixes checked (CONTRACT §19): a project is `r_…`, an organisation `o_…`, never one for the
+/// other. An org approval names the org as both (`DONOR_*` only: members belong to a project).
+fn targets<'a>(kind: Kind, body: &Body<'a>) -> Result<(&'a str, &'a str, &'a str, &'a str, u64), &'static str> {
+    let t = match *body {
+        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (repo_id, "", owner, signer, issued_at_ms),
+        Body::OrgClaim { org_id, owner, signer, issued_at_ms, .. } => ("", org_id, owner, signer, issued_at_ms),
+        Body::OrgRepo { org_id, repo_id, signer, issued_at_ms } => (repo_id, org_id, "", signer, issued_at_ms),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } if repo_id.starts_with("o_") && matches!(kind, Kind::DonorApproved | Kind::DonorRevoked) => (repo_id, repo_id, subject, signer, issued_at_ms),
+        Body::Grant { repo_id, subject, signer, issued_at_ms } => (repo_id, "", subject, signer, issued_at_ms),
+        _ => return Err("body does not match its kind"),
+    };
+    let (repo_ok, org_ok) = (t.0.is_empty() || t.0.starts_with("r_") || t.0 == t.1, t.1.is_empty() || t.1.starts_with("o_"));
+    if !repo_ok || !org_ok || (t.0.is_empty() && t.1.is_empty()) {
+        return Err("body names neither a project nor an organisation");
+    }
+    Ok(t)
+}
+
+fn is_grant(kind: Kind) -> bool {
+    matches!(kind, Kind::DonorApproved | Kind::DonorRevoked | Kind::MemberAdded | Kind::MemberRemoved)
+}
+
 /// Decode and check a relay-proposed body against the request. `Err` = never offer it. The signer
 /// and timestamp are rebuilt by the CLI with the owner key (KEYLOG §5), so only what the human
-/// approves is checked here: repository and subject, both mandatory (A183).
+/// approves is checked here: project, organisation and subject (A183).
 fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String> {
     let kind = Kind::from_name(&q.kind).filter(|k| kind_num(k.name()).is_some()).ok_or("unknown entry kind")?;
-    let (repo_id, subject, signer, ts) = match parse_body(kind, &q.body_to_sign).map_err(|_| "body is not the expected key-log format")? {
-        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (repo_id, owner, signer, issued_at_ms),
-        Body::Grant { repo_id, subject, signer, issued_at_ms } => (repo_id, subject, signer, issued_at_ms),
-        _ => return Err("body does not match its kind".into()),
-    };
+    let body = parse_body(kind, &q.body_to_sign).map_err(|_| "body is not the expected key-log format")?;
+    let (repo_id, org_id, subject, signer, ts) = targets(kind, &body)?;
     if repo_id != q.repo_id {
         return Err("body names another repository than the request".into());
     }
-    if kind == Kind::RepoClaimed {
+    if org_id != q.org_id {
+        return Err("body names another organisation than the request".into());
+    }
+    if matches!(kind, Kind::RepoClaimed | Kind::OrgClaimed) {
         // A claim names its owner: it must be this user.
         if me.is_none_or(|m| m != subject) {
             return Err("claim names another owner than this account".into());
         }
-    } else if q.subject_pseudonym.is_empty() || subject != q.subject_pseudonym {
+    } else if is_grant(kind) && (q.subject_pseudonym.is_empty() || subject != q.subject_pseudonym) {
         return Err("body names another subject than the request".into());
     }
     if ts.abs_diff(now_ms()) > MAX_SKEW_MS {
@@ -87,21 +113,23 @@ fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String>
         signed: false,
         log_index: 0,
         body_to_sign: q.body_to_sign.to_vec(),
-        org_id: clean(&q.org_id).into_owned(),
+        org_id: org_id.to_owned(),
         org_path: clean(&q.org_path).into_owned(),
     })
 }
 
-/// Find the pending request and return its checked preview. Signing happens in the CLI.
-pub fn preview(node: &Node, kind: &str, repo: &str, subject: Option<&str>, dry_run: bool) -> Result<SignResponse, Status> {
+/// Find the pending request and return its checked preview. Signing happens in the CLI. `org`
+/// empty = a project request (never an organisation's, CONTRACT §19.6); set = the organisation's
+/// (`repo` empty, except for ORG_REPO_*).
+pub fn preview(node: &Node, kind: &str, repo: &str, org: &str, subject: Option<&str>, dry_run: bool) -> Result<SignResponse, Status> {
     if !dry_run {
         return Err(Status::failed_precondition("approvals are signed with your owner key by `moochy approve|members|claim` in a terminal; this app never signs them"));
     }
     let q = lock(&node.approvals)
         .iter()
-        .find(|q| q.kind == kind && q.repo_slug.eq_ignore_ascii_case(repo) && subject.is_none_or(|s| q.subject_username.eq_ignore_ascii_case(s) || q.subject_pseudonym == s))
+        .find(|q| q.kind == kind && q.repo_slug.eq_ignore_ascii_case(repo) && q.org_path.eq_ignore_ascii_case(org) && subject.is_none_or(|s| q.subject_username.eq_ignore_ascii_case(s) || q.subject_pseudonym == s))
         .cloned()
-        .ok_or_else(|| Status::not_found(format!("no pending {kind} request for {repo} (requests appear here after the relay pushes them)")))?;
+        .ok_or_else(|| Status::not_found(format!("no pending {kind} request for {} (requests appear here after the relay pushes them)", if repo.is_empty() { org } else { repo })))?;
     decode(&q, node.cfg.pseudonym.as_deref()).map_err(|e| Status::failed_precondition(format!("refusing this request: {e}")))
 }
 
@@ -122,8 +150,10 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
     let body = parse_body(kind, &r.body).map_err(|_| Status::invalid_argument("body is not the expected key-log format"))?;
     let mut out = SignResponse { request_id: r.request_id.clone(), kind: r.kind.clone(), ..SignResponse::default() };
     match body {
-        Body::Claim { repo_id, owner, signer, issued_at_ms, .. } => (out.repo_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), owner.into(), signer.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
-        Body::Grant { repo_id, subject, signer, issued_at_ms } => (out.repo_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), subject.into(), signer.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
+        Body::Claim { .. } | Body::Grant { .. } | Body::OrgClaim { .. } | Body::OrgRepo { .. } => {
+            let (repo_id, org_id, subject, signer, ts) = targets(kind, &body).map_err(Status::invalid_argument)?;
+            (out.repo_id, out.org_id, out.subject, out.signer, out.issued_at_ms) = (repo_id.into(), org_id.into(), subject.into(), signer.into(), i64::try_from(ts).unwrap_or(0));
+        }
         Body::OwnerKey { pseudonym, issued_at_ms, .. } => (out.subject, out.issued_at_ms) = (pseudonym.into(), i64::try_from(issued_at_ms).unwrap_or(0)),
         // `moochy keys revoke <device>`: another device of this account (this one: `logout`).
         Body::Revoke { device_id, pseudonym, .. } if Some(pseudonym) == node.cfg.pseudonym.as_deref() && Some(device_id) != node.device_id() => {
@@ -134,10 +164,11 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
     }
     if !matches!(kind, Kind::OwnerKeyAdded | Kind::KeyAdded | Kind::KeyRevoked) {
         let q = lock(&node.approvals).iter().find(|q| q.request_id == r.request_id).cloned().ok_or_else(|| Status::not_found("no such pending request"))?;
-        if q.kind != r.kind || q.repo_id != out.repo_id || (kind != Kind::RepoClaimed && q.subject_pseudonym != out.subject) {
+        if q.kind != r.kind || q.repo_id != out.repo_id || q.org_id != out.org_id || (is_grant(kind) && q.subject_pseudonym != out.subject) {
             return Err(Status::failed_precondition("entry does not answer the pending request"));
         }
         out.repo_slug = clean(&q.repo_slug).into_owned();
+        out.org_path = clean(&q.org_path).into_owned();
         out.subject_username = clean(&q.subject_username).into_owned();
     }
     // Our own new key: acknowledged before the relay logs it, so the monitor never flags it.
@@ -224,5 +255,40 @@ mod tests {
         assert!(decode(&q(g(r, ps, now), ""), None).is_err(), "empty subject is never a wildcard (A183)");
         assert!(decode(&q(g(r, ps, now.saturating_sub(3 * MAX_SKEW_MS)), ps), None).is_err(), "stale");
         assert!(decode(&q(b"garbage".to_vec(), ps), None).is_err());
+    }
+
+    #[test]
+    fn decode_org_entries() {
+        use moochy_keylog::entry::{claim_body, grant_body, org_claim_body, org_repo_body};
+        let now = now_ms();
+        let (o, r, ps, me, ok) = ("o_01ARZ3NDEKTSV4RRFFQ69G5FAV", "r_01ARZ3NDEKTSV4RRFFQ69G5FAV", "ps_aaaaaaaaaaaaaaaa", "ps_zzzzzzzzzzzzzzzz", "ok_00000000000000000000000000000000");
+        let q = |kind: &str, repo_id: &str, org_id: &str, subj: &str, body: Vec<u8>| ApprovalRequest {
+            request_id: "q1".into(),
+            kind: kind.into(),
+            repo_id: repo_id.into(),
+            org_id: org_id.into(),
+            org_path: "github/acme".into(),
+            subject_pseudonym: subj.into(),
+            body_to_sign: body.into(),
+            ..ApprovalRequest::default()
+        };
+        // ORG_CLAIMED names this account; no repo.
+        let c = decode(&q("ORG_CLAIMED", "", o, "", org_claim_body(o, "github", "42", me, ok, now)), Some(me)).unwrap();
+        assert_eq!((c.repo_id.as_str(), c.org_id.as_str(), c.subject.as_str(), c.org_path.as_str()), ("", o, me, "github/acme"));
+        assert!(decode(&q("ORG_CLAIMED", "", o, "", org_claim_body(o, "github", "42", ps, ok, now)), Some(me)).is_err(), "another owner");
+        assert!(decode(&q("ORG_CLAIMED", "", "o_01ARZ3NDEKTSV4RRFFQ69G5FAW", "", org_claim_body(o, "github", "42", me, ok, now)), Some(me)).is_err(), "another org");
+        assert!(decode(&q("ORG_CLAIMED", "", r, "", org_claim_body(r, "github", "42", me, ok, now)), Some(me)).is_err(), "a repo id as an org");
+        // ORG_REPO_ADDED: the org and the project, both as requested.
+        let a = decode(&q("ORG_REPO_ADDED", r, o, "", org_repo_body(o, r, ok, now)), Some(me)).unwrap();
+        assert_eq!((a.repo_id.as_str(), a.org_id.as_str()), (r, o));
+        assert!(decode(&q("ORG_REPO_ADDED", "r_01ARZ3NDEKTSV4RRFFQ69G5FAW", o, "", org_repo_body(o, r, ok, now)), Some(me)).is_err(), "another project");
+        assert!(decode(&q("ORG_REPO_ADDED", o, o, "", org_repo_body(o, o, ok, now)), Some(me)).is_err(), "an org as a project");
+        // An org approval: the o_ id is both targets; members never belong to an org.
+        let g = decode(&q("DONOR_APPROVED", o, o, ps, grant_body(o, ps, ok, now)), Some(me)).unwrap();
+        assert_eq!((g.repo_id.as_str(), g.org_id.as_str(), g.subject.as_str()), (o, o, ps));
+        assert!(decode(&q("MEMBER_ADDED", o, o, ps, grant_body(o, ps, ok, now)), Some(me)).is_err());
+        assert!(decode(&q("DONOR_APPROVED", o, "", ps, grant_body(o, ps, ok, now)), Some(me)).is_err(), "an org approval labelled as a project's");
+        assert!(decode(&q("DONOR_APPROVED", r, o, ps, grant_body(r, ps, ok, now)), Some(me)).is_err(), "a project approval labelled as an org's");
+        assert!(decode(&q("REPO_CLAIMED", o, "", "", claim_body(o, "github", "42", me, ok, now)), Some(me)).is_err(), "an org id in a repo claim");
     }
 }
