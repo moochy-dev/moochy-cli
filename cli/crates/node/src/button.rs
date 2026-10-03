@@ -26,6 +26,13 @@ pub struct Options {
     pub theme: Option<String>,
     pub size: Option<String>,
     pub format: Option<String>,
+    /// `--chart` only (CONTRACT §21.2).
+    pub metric: Option<String>,
+    pub series: Option<String>,
+    pub kind: Option<String>,
+    pub period: Option<String>,
+    pub goal: bool,
+    pub total: bool,
 }
 
 fn valid_segment(s: &str) -> bool {
@@ -82,8 +89,8 @@ pub fn project(provider: &'static str, path: &str) -> Result<Project> {
     Ok(Project { provider, path: path.to_owned() })
 }
 
-fn valid_label(l: &str) -> bool {
-    (1..=32).contains(&l.chars().count()) && l.chars().all(|c| c.is_ascii_alphanumeric() || " .,:;!?'’&+-()/#@".contains(c))
+fn valid_label(l: &str, max: usize) -> bool {
+    (1..=max).contains(&l.chars().count()) && l.chars().all(|c| c.is_ascii_alphanumeric() || " .,:;!?'’&+-()/#@".contains(c))
 }
 
 /// Form-encoding of a label (`Fuel this project` → `Fuel+this+project`).
@@ -102,19 +109,113 @@ fn encode(s: &str) -> String {
     o
 }
 
+fn pick(v: Option<&str>, allowed: &[&str], name: &str) -> Result<Option<String>> {
+    match v {
+        None => Ok(None),
+        Some(x) if allowed.contains(&x) => Ok(Some(x.to_owned())),
+        Some(_) => Err(usage(format!("--{name} is one of: {}", allowed.join(", ")))),
+    }
+}
+
+/// `https://moochy.dev/p/…` (project page) and the separator before actions (`/` or `/-/`).
+fn project_base(p: &Project) -> (String, &'static str) {
+    // GitHub: the legacy short form (README buttons in the wild); GitLab: the canonical form, with
+    // actions after `/-/` so nested group paths stay unambiguous (A229).
+    match p.provider {
+        "github" => (format!("{ORIGIN}/p/{}", p.path), "/"),
+        _ => (format!("{ORIGIN}/p/{}/{}", p.provider, p.path), "/-/"),
+    }
+}
+
+/// An organisation's page and action separator (§19.6: no short form, `/-/` on GitLab).
+pub fn org_base(org: &str) -> Result<(String, &'static str)> {
+    let o = crate::config::canonical_org(org).ok_or_else(|| usage("--org is github/ORG or gitlab/GROUP[/SUBGROUP…]"))?;
+    let act = if o.starts_with("gitlab/") { "/-/" } else { "/" };
+    Ok((format!("{ORIGIN}/org/{o}"), act))
+}
+
+const CHART_ALT: &str = "Tokens donated and used on Moochy";
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// The showcase chart snippet (CONTRACT §21.3) for a project or organisation page `base` (its
+/// actions after `act`). Same format and URLs as the web studio: defaults left out, the rest in
+/// alphabetical order.
+pub fn chart(base: &str, act: &str, o: &Options) -> Result<String> {
+    let metric = pick(o.metric.as_deref(), &["tokens", "dollars"], "metric")?;
+    let series = pick(o.series.as_deref(), &["both", "donated", "used"], "series")?;
+    let kind = pick(o.kind.as_deref(), &["area", "bars", "line", "sparkline"], "kind")?;
+    let period = pick(o.period.as_deref(), &["7d", "30d", "90d", "12m"], "period")?;
+    let theme = pick(o.theme.as_deref(), &["light", "dark", "auto"], "theme")?;
+    let size = pick(o.size.as_deref(), &["s", "m", "l"], "size")?;
+    if o.label.as_deref().is_some_and(|l| !valid_label(l, 40)) {
+        return Err(usage("--label: 1 to 40 characters (letters, digits, spaces, . , : ; ! ? ' ’ & + - ( ) / # @)"));
+    }
+    if o.style.is_some() {
+        return Err(usage("--style is for the button, not --chart"));
+    }
+    let query = |theme_override: Option<&str>| -> String {
+        let mut q: Vec<String> = Vec::new();
+        let mut opt = |k: &str, v: Option<&str>, default: &str| {
+            if let Some(v) = v.filter(|v| *v != default) {
+                q.push(format!("{k}={v}"));
+            }
+        };
+        opt("goal", o.goal.then_some("1"), "");
+        opt("kind", kind.as_deref(), "area");
+        opt("label", o.label.as_deref().map(encode).as_deref(), "");
+        opt("metric", metric.as_deref(), "tokens");
+        opt("period", period.as_deref(), "30d");
+        opt("series", series.as_deref(), "both");
+        opt("size", size.as_deref(), "m");
+        opt("theme", theme_override.or(theme.as_deref()), "light");
+        opt("total", o.total.then_some("1"), "");
+        if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
+    };
+    let img = format!("{base}{act}chart.svg{}", query(None));
+    let alt = html_escape(o.label.as_deref().unwrap_or(CHART_ALT));
+    Ok(match o.format.as_deref().unwrap_or("markdown") {
+        // Markdown alt text: `[` and `]` are not in the label charset.
+        "markdown" => format!("[![{}]({img})]({base})", o.label.as_deref().unwrap_or(CHART_ALT)),
+        // No theme or `auto`: the studio's `<picture>` (light image, dark source).
+        "html" if theme.as_deref().is_none_or(|t| t == "auto") => format!(
+            "<a href=\"{base}\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"{base}{act}chart.svg{}\">\n    <img alt=\"{alt}\" src=\"{base}{act}chart.svg{}\">\n  </picture>\n</a>",
+            query(Some("dark")),
+            query(Some("light"))
+        ),
+        "html" => format!("<a href=\"{base}\"><img alt=\"{alt}\" src=\"{img}\"></a>"),
+        "rst" => format!(".. image:: {img}\n   :target: {base}\n   :alt: {}", o.label.as_deref().unwrap_or(CHART_ALT)),
+        "iframe" => {
+            // The studio's pixel boxes (sparklines are a strip).
+            let spark = kind.as_deref() == Some("sparkline");
+            let (w, h) = match size.as_deref() {
+                Some("s") => (320, if spark { 40 } else { 160 }),
+                Some("l") => (640, if spark { 80 } else { 320 }),
+                _ => (480, if spark { 60 } else { 240 }),
+            };
+            format!("<iframe src=\"{base}{act}card{}\" title=\"{alt}\" width=\"{w}\" height=\"{h}\" style=\"border:0\" loading=\"lazy\"></iframe>", query(None))
+        }
+        _ => return Err(usage("--format is one of: markdown, html, rst, iframe")),
+    })
+}
+
+/// A project's chart snippet: always the canonical `/p/PROVIDER/…` form (§9), as the studio.
+pub fn project_chart(p: &Project, o: &Options) -> Result<String> {
+    let act = if p.provider == "github" { "/" } else { "/-/" };
+    chart(&format!("{ORIGIN}/p/{}/{}", p.provider, p.path), act, o)
+}
+
 /// The snippet. `Options` values are checked against the guide's `button.svg` reference.
 pub fn snippet(p: &Project, o: &Options) -> Result<String> {
-    let pick = |v: &Option<String>, allowed: &[&str], name: &str| -> Result<Option<String>> {
-        match v.as_deref() {
-            None => Ok(None),
-            Some(x) if allowed.contains(&x) => Ok(Some(x.to_owned())),
-            Some(_) => Err(usage(format!("--{name} is one of: {}", allowed.join(", ")))),
-        }
-    };
-    let style = pick(&o.style, &["mascot", "text", "compact"], "style")?;
-    let theme = pick(&o.theme, &["light", "dark", "auto"], "theme")?;
-    let size = pick(&o.size, &["s", "m", "l"], "size")?;
-    if o.label.as_deref().is_some_and(|l| !valid_label(l)) {
+    if o.metric.is_some() || o.series.is_some() || o.kind.is_some() || o.period.is_some() || o.goal || o.total {
+        return Err(usage("--metric, --series, --kind, --period, --goal and --total go with --chart"));
+    }
+    let style = pick(o.style.as_deref(), &["mascot", "text", "compact"], "style")?;
+    let theme = pick(o.theme.as_deref(), &["light", "dark", "auto"], "theme")?;
+    let size = pick(o.size.as_deref(), &["s", "m", "l"], "size")?;
+    if o.label.as_deref().is_some_and(|l| !valid_label(l, 32)) {
         return Err(usage("--label: 1 to 32 characters (letters, digits, spaces, . , : ; ! ? ' ’ & + - ( ) / # @)"));
     }
     let label = o.label.clone().unwrap_or_else(|| DEFAULT_LABEL.to_owned());
@@ -135,12 +236,7 @@ pub fn snippet(p: &Project, o: &Options) -> Result<String> {
         }
         if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
     };
-    // GitHub: the legacy short form (README buttons in the wild); GitLab: the canonical form, with
-    // actions after `/-/` so nested group paths stay unambiguous (A229).
-    let (base, act) = match p.provider {
-        "github" => (format!("{ORIGIN}/p/{}", p.path), "/"),
-        _ => (format!("{ORIGIN}/p/{}/{}", p.provider, p.path), "/-/"),
-    };
+    let (base, act) = project_base(p);
     let (img, donate) = (format!("{base}{act}button.svg{}", query(None)), format!("{base}{act}donate"));
     let height = match size.as_deref() {
         Some("s") => 28,
@@ -227,5 +323,63 @@ mod tests {
         assert_eq!(from_slug("github/acme/widget").unwrap(), Project { provider: "github", path: "acme/widget".into() });
         assert_eq!(from_slug("github/docs").unwrap(), Project { provider: "github", path: "github/docs".into() });
         assert!(snippet(&p, &Options { label: Some("<script>".into()), ..Options::default() }).is_err());
+    }
+
+    #[test]
+    fn chart_snippets() {
+        let gh = Project { provider: "github", path: "tinyhttp/arrow".into() };
+        let o = |f: &str| Options { format: Some(f.into()), ..Options::default() };
+        // Canonical URLs (§9: `/p/github/…`), defaults left out.
+        assert_eq!(
+            project_chart(&gh, &Options::default()).unwrap(),
+            "[![Tokens donated and used on Moochy](https://moochy.dev/p/github/tinyhttp/arrow/chart.svg)](https://moochy.dev/p/github/tinyhttp/arrow)"
+        );
+        assert_eq!(
+            project_chart(&gh, &o("html")).unwrap(),
+            "<a href=\"https://moochy.dev/p/github/tinyhttp/arrow\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg?theme=dark\">\n    <img alt=\"Tokens donated and used on Moochy\" src=\"https://moochy.dev/p/github/tinyhttp/arrow/chart.svg\">\n  </picture>\n</a>"
+        );
+        let auto = Options { theme: Some("auto".into()), ..o("html") };
+        assert_eq!(project_chart(&gh, &auto).unwrap(), project_chart(&gh, &o("html")).unwrap(), "auto = the <picture> form");
+        // Every option, alphabetical; GitLab actions after `/-/`.
+        let gl = Project { provider: "gitlab", path: "group/sub/project".into() };
+        let all = Options {
+            label: Some("Our tokens & use".into()),
+            theme: Some("dark".into()),
+            size: Some("l".into()),
+            metric: Some("dollars".into()),
+            series: Some("used".into()),
+            kind: Some("bars".into()),
+            period: Some("12m".into()),
+            goal: true,
+            total: true,
+            ..Options::default()
+        };
+        let q = "?goal=1&kind=bars&label=Our+tokens+%26+use&metric=dollars&period=12m&series=used&size=l&theme=dark&total=1";
+        let page = "https://moochy.dev/p/gitlab/group/sub/project";
+        assert_eq!(project_chart(&gl, &all).unwrap(), format!("[![Our tokens & use]({page}/-/chart.svg{q})]({page})"));
+        assert_eq!(project_chart(&gl, &Options { format: Some("html".into()), ..all }).unwrap(), format!("<a href=\"{page}\"><img alt=\"Our tokens &amp; use\" src=\"{page}/-/chart.svg{q}\"></a>"));
+        assert_eq!(project_chart(&gl, &o("rst")).unwrap(), format!(".. image:: {page}/-/chart.svg\n   :target: {page}\n   :alt: Tokens donated and used on Moochy"));
+        // Organisations: no short form; the card's pixel box (sparkline = a strip).
+        let (b, a) = org_base("gitlab/group/sub").unwrap();
+        let spark = Options { kind: Some("sparkline".into()), size: Some("s".into()), ..o("iframe") };
+        assert_eq!(
+            chart(&b, a, &spark).unwrap(),
+            "<iframe src=\"https://moochy.dev/org/gitlab/group/sub/-/card?kind=sparkline&size=s\" title=\"Tokens donated and used on Moochy\" width=\"320\" height=\"40\" style=\"border:0\" loading=\"lazy\"></iframe>"
+        );
+        let (b, a) = org_base("github/acme").unwrap();
+        assert_eq!(chart(&b, a, &Options { period: Some("7d".into()), ..Options::default() }).unwrap(), "[![Tokens donated and used on Moochy](https://moochy.dev/org/github/acme/chart.svg?period=7d)](https://moochy.dev/org/github/acme)");
+        assert!(org_base("acme").is_err() && org_base("github/a/b").is_err());
+        // Refused: unknown values, a too long or hostile label, button-only and chart-only options.
+        for bad in [
+            Options { kind: Some("pie".into()), ..Options::default() },
+            Options { period: Some("1y".into()), ..Options::default() },
+            Options { label: Some("x".repeat(41)), ..Options::default() },
+            Options { label: Some("<img onerror=x>".into()), ..Options::default() },
+            Options { style: Some("text".into()), ..Options::default() },
+            o("svg"),
+        ] {
+            assert!(project_chart(&gh, &bad).is_err(), "{bad:?}");
+        }
+        assert!(snippet(&gh, &Options { total: true, ..Options::default() }).is_err());
     }
 }

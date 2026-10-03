@@ -68,6 +68,11 @@ COMMANDS:
   button [--repo P] [--provider github|gitlab] [--style mascot|text|compact] [--theme light|dark|auto]
          [--size s|m|l] [--label TEXT] [--format markdown|html|rst]
                                   The README Donate tokens button for this repository
+  button --chart [--repo P|--org ORG] [--metric tokens|dollars] [--series both|donated|used]
+         [--kind area|bars|line|sparkline] [--period 7d|30d|90d|12m] [--theme light|dark|auto]
+         [--size s|m|l] [--label TEXT] [--goal] [--total] [--format markdown|html|rst|iframe]
+                                  A live chart of the tokens donated to and used by the
+                                  project or organisation (README image or website card)
   audit --provider [--from-file usage.csv]
                                   What this device served (90 days), checked against the
                                   provider's usage export (date,model,cost_usd)
@@ -229,6 +234,12 @@ fn parse() -> Result<Opts> {
             Long("theme") => o.button.theme = Some(s(p.value().map_err(err)?)?),
             Long("size") => o.button.size = Some(s(p.value().map_err(err)?)?),
             Long("format") => o.button.format = Some(s(p.value().map_err(err)?)?),
+            Long("metric") => o.button.metric = Some(s(p.value().map_err(err)?)?),
+            Long("series") => o.button.series = Some(s(p.value().map_err(err)?)?),
+            Long("kind") => o.button.kind = Some(s(p.value().map_err(err)?)?),
+            Long("period") => o.button.period = Some(s(p.value().map_err(err)?)?),
+            Long("goal") => o.button.goal = true,
+            Long("total") => o.button.total = true,
             Long("from-file") => o.from_file = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
@@ -249,7 +260,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox"];
+                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -1000,11 +1011,20 @@ fn spend_limit_page(provider: &str) -> &'static str {
 /// `moochy button [--repo P] [--provider github|gitlab] [--style …] [--theme …] [--size …]
 /// [--label …] [--format markdown|html|rst]` (docs/guides/donate-button.md steps 1–3, offline).
 fn button(o: &Opts, rest: &[&str]) -> Result<()> {
+    // CONTRACT §21.3: an organisation's chart (no project to detect).
+    if let Some(org) = &o.org {
+        if !o.has("chart") || o.repo.is_some() || o.has("provider") || !rest.is_empty() {
+            return Err(usage("button --chart --org github/ORG|gitlab/GROUP[/SUB…] (not with --repo or --provider)"));
+        }
+        let (base, act) = crate::button::org_base(org)?;
+        println!("{}", crate::button::chart(&base, act, &o.button)?);
+        return Ok(());
+    }
     let provider = match (o.has("provider"), rest) {
         (true, ["github"]) => Some("github"),
         (true, ["gitlab"]) => Some("gitlab"),
         (false, []) => None,
-        _ => return Err(usage("button [--repo PROJECT] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst]")),
+        _ => return Err(usage("button [--chart] [--repo PROJECT|--org ORG] [--provider github|gitlab] [--style …] [--theme …] [--size …] [--label …] [--format markdown|html|rst|iframe]")),
     };
     let project = if let Some(r) = &o.repo {
         // `--provider gitlab --repo group/name`, or a provider-qualified `--repo`.
@@ -1031,7 +1051,8 @@ fn button(o: &Opts, rest: &[&str]) -> Result<()> {
             p
         }
     };
-    println!("{}", crate::button::snippet(&project, &o.button)?);
+    let out = if o.has("chart") { crate::button::project_chart(&project, &o.button)? } else { crate::button::snippet(&project, &o.button)? };
+    println!("{out}");
     Ok(())
 }
 
