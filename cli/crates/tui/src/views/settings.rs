@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use super::{Command, Ctx, Input, Outcome, View};
 use crate::app::GLOBAL_KEYS;
@@ -52,15 +52,13 @@ impl View for SettingsView {
             .iter()
             .enumerate()
             .map(|(i, (k, v, key))| {
-                let sel = i == self.sel;
-                let mark = if sel { th.glyph(Glyph::Selected) } else { " " };
-                let l = Line::from(vec![
-                    Span::raw(format!("{mark} ")),
-                    Span::styled(format!("{k:<10}"), if sel { th.bold() } else { th.muted() }),
-                    Span::styled(format!("{v:<14}"), th.accent()),
-                    Span::styled(format!("enter or {key}"), th.muted()),
-                ]);
-                if sel { l.style(th.selected()) } else { l }
+                // The selected row is one style end to end (Ink on Mint): no span keeps its own
+                // colour on the fill, so nothing on it ever drops below the contrast floor.
+                if i == self.sel {
+                    let text = format!("{} {k:<10}{v:<14}enter or {key} ", th.glyph(Glyph::Selected));
+                    return Line::styled(text, th.selected());
+                }
+                Line::from(vec![Span::raw("  "), Span::styled(format!("{k:<10}"), th.muted()), Span::styled(format!("{v:<14}"), th.accent()), Span::styled(format!("enter or {key}"), th.muted())])
             })
             .collect();
         lines.push(Line::styled("Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.", th.muted()));
@@ -74,13 +72,17 @@ impl View for SettingsView {
         let mut lines = Vec::new();
         let kv = |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:<16}"), th.muted()), Span::raw(v)]);
         if !me.handle.is_empty() {
-            lines.push(kv("account", format!("@{} ({})", clean(me.handle.trim_start_matches('@')), clean(&me.pseudonym))));
+            lines.push(kv("Account", format!("@{} ({})", clean(me.handle.trim_start_matches('@')), clean(&me.pseudonym))));
         }
-        if !me.lockdown.is_empty() {
-            lines.push(kv("lockdown", clean(&me.lockdown)));
+        if !me.web.is_empty() {
+            lines.push(kv("Web", crate::widgets::web_origin(&me.web)));
         }
+        // Config keys read as words (`serve_hours` → `Serve hours`); lockdown lives in Devices.
         for (k, v) in &ctx.snap.config {
-            lines.push(kv(&clean(k), clean(v)));
+            let k = clean(k).replace(['_', '.'], " ");
+            let mut c = k.chars();
+            let k: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+            lines.push(kv(&k, clean(v)));
         }
         if lines.is_empty() {
             lines.push(Line::styled("The node has not reported its configuration yet (`moochy status`).", th.muted()));
@@ -140,10 +142,6 @@ impl View for SettingsView {
     }
 }
 
-fn block<'a>(th: &Theme, title: &'a str, focus: bool) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_set(th.border_set())
-        .border_style(if focus { th.border_focus() } else { th.border() })
-        .title(Span::styled(format!(" {title} "), if focus { th.accent() } else { th.bold() }))
+fn block<'a>(th: &Theme, title: &str, focus: bool) -> Block<'a> {
+    if focus { crate::widgets::block_focus(*th, title) } else { crate::widgets::block(*th, title) }
 }

@@ -1,0 +1,98 @@
+# settings 160x48 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
+╭ Appearance ───────────────────────────────────────────────────────────────────────────────╮╭ Keybindings ────────────────────────────────────────────────────╮
+│ ▶ Theme     dark          enter or t                                                      ││ 1-9         go to tab                                           │
+│   Colours   truecolor     enter or c                                                      ││ tab/S-tab   next / previous tab (also ] and [)                  │
+│   Glyphs    Unicode       enter or a                                                      ││ j/k arrows  move                                                │
+│ Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.                            ││ g/G         first / last                                        │
+│                                                                                           ││ PgUp/PgDn   page                                                │
+╰───────────────────────────────────────────────────────────────────────────────────────────╯│ enter       open / act                                          │
+╭ Node ─────────────────────────────────────────────────────────────────────────────────────╮│ /           filter this list                                    │
+│ Account         @alice (brave-otter-42)                                                   ││ esc         clear filter / back                                 │
+│ Web             https://moochy.dev                                                        ││ : ctrl-k    command palette                                     │
+│ Relay           https://relay.moochy.dev                                                  ││ ctrl-r      refresh (r too, where the tab has no r)             │
+│ Node sock       ~/.local/state/moochy/node.sock                                           ││ ?           help                                                │
+│ Role            donor + maintainer                                                        ││ ctrl-z      suspend                                             │
+│ Sandbox         landlock + seccomp (enforced)                                             ││ q           quit                                                │
+│ Serve hours     always                                                                    ││                                                                 │
+│ Max concurrent  2                                                                         ││ Each tab adds its own keys in the footer and in ?.              │
+│ Notifications   email: weekly digest                                                      ││                                                                 │
+│ Keylog monitor  on (last check 6h ago)                                                    ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+╰───────────────────────────────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────╯
+ enter change  t light/dark  c colours  a ascii  / filter  : commands  q quit  ? help
+# settings 160x48 --ascii
+ (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
++ Appearance -------------------------------------------------------------------------------++ Keybindings ----------------------------------------------------+
+| > Theme     dark          enter or t                                                      || 1-9         go to tab                                           |
+|   Colours   truecolor     enter or c                                                      || tab/S-tab   next / previous tab (also ] and [)                  |
+|   Glyphs    ASCII         enter or a                                                      || j/k arrows  move                                                |
+| Start-up: --theme light|dark, --ascii, MOOCHY_THEME, NO_COLOR.                            || g/G         first / last                                        |
+|                                                                                           || PgUp/PgDn   page                                                |
++-------------------------------------------------------------------------------------------+| enter       open / act                                          |
++ Node -------------------------------------------------------------------------------------+| /           filter this list                                    |
+| Account         @alice (brave-otter-42)                                                   || esc         clear filter / back                                 |
+| Web             https://moochy.dev                                                        || : ctrl-k    command palette                                     |
+| Relay           https://relay.moochy.dev                                                  || ctrl-r      refresh (r too, where the tab has no r)             |
+| Node sock       ~/.local/state/moochy/node.sock                                           || ?           help                                                |
+| Role            donor + maintainer                                                        || ctrl-z      suspend                                             |
+| Sandbox         landlock + seccomp (enforced)                                             || q           quit                                                |
+| Serve hours     always                                                                    ||                                                                 |
+| Max concurrent  2                                                                         || Each tab adds its own keys in the footer and in ?.              |
+| Notifications   email: weekly digest                                                      ||                                                                 |
+| Keylog monitor  on (last check 6h ago)                                                    ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
++-------------------------------------------------------------------------------------------++-----------------------------------------------------------------+
+ enter change  t light/dark  c colours  a ascii  / filter  : commands  q quit  ? help

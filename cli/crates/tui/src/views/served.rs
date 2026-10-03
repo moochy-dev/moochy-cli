@@ -1,67 +1,102 @@
 //! The Served tab (CONTRACT §20.2): live requests my devices serve and the ones my projects use —
-//! model, project, tokens, cost, latency, outcome — newest first, filterable with `/`, under a
-//! per-minute sparkline. Owner: mo-tui-donor.
+//! model, project, tokens, cost, latency, outcome — newest first (or sorted with `s`), filterable
+//! with `/`, under a per-minute sparkline.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use super::donor_kit::{self as k, Cursor, Tone};
 use super::{Ctx, Input, Outcome, View};
 use crate::model::Served;
 use crate::sanitize::clean;
-use crate::theme::Theme;
+use crate::theme::{Glyph, Theme};
+use crate::widgets::{self as w, TableCursor, Tone, charts, list};
 
 const MINUTE_MS: u64 = 60_000;
-/// The sparkline covers at most this many minutes (one column each).
-const MAX_MINUTES: u16 = 60;
+/// The chart always covers the last hour, in 5-minute buckets spread over the width it gets.
+const MINUTES: u16 = 60;
+const BUCKET_MIN: u64 = 5;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Sort {
+    #[default]
+    Newest,
+    Cost,
+    Latency,
+    Tokens,
+}
+
+impl Sort {
+    fn next(self) -> Sort {
+        match self {
+            Sort::Newest => Sort::Cost,
+            Sort::Cost => Sort::Latency,
+            Sort::Latency => Sort::Tokens,
+            Sort::Tokens => Sort::Newest,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Sort::Newest => "newest",
+            Sort::Cost => "cost",
+            Sort::Latency => "latency",
+            Sort::Tokens => "tokens",
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct ServedView {
-    cur: Cursor,
+    cur: TableCursor,
     /// `at_ms` of the selected row once the user moved off the newest one: new rows then no longer
     /// move the selection. `None` follows the stream.
     anchor: Option<u64>,
+    sort: Sort,
 }
 
-fn visible<'a>(ctx: &Ctx<'a>) -> Vec<&'a Served> {
-    let mut v: Vec<&Served> =
-        ctx.snap.served.iter().filter(|s| k::matches(ctx.filter, &[&s.project, &s.model, &s.direction, &s.outcome])).collect();
-    v.sort_by_key(|s| std::cmp::Reverse(s.at_ms));
+fn visible<'a>(ctx: &Ctx<'a>, sort: Sort) -> Vec<&'a Served> {
+    let mut v: Vec<&Served> = ctx.snap.served.iter().filter(|s| w::matches(ctx.filter, &[&s.project, &s.model, &s.direction, &s.outcome])).collect();
+    match sort {
+        Sort::Newest => v.sort_by_key(|s| std::cmp::Reverse(s.at_ms)),
+        Sort::Cost => v.sort_by_key(|s| std::cmp::Reverse((s.cost_uusd, s.at_ms))),
+        Sort::Latency => v.sort_by_key(|s| std::cmp::Reverse((s.latency_ms, s.at_ms))),
+        Sort::Tokens => v.sort_by_key(|s| std::cmp::Reverse((s.tokens_in.saturating_add(s.tokens_out), s.at_ms))),
+    }
     v
 }
 
 fn direction(t: Theme, s: &Served) -> Span<'static> {
     match s.direction.as_str() {
-        "served" => k::badge(t, Tone::Warn, k::g(t, "↑", "^"), "served"),
-        "used" => k::badge(t, Tone::Info, k::g(t, "↓", "v"), "used"),
-        other => k::badge(t, Tone::Muted, "?", &clean(other)),
+        "served" => w::badge(t, Tone::Warn, t.glyph(Glyph::Served), "served"),
+        "used" => w::badge(t, Tone::Info, t.glyph(Glyph::Used), "used"),
+        other => w::badge(t, Tone::Muted, "?", &clean(other)),
     }
 }
 
 fn outcome(t: Theme, s: &Served) -> Span<'static> {
-    match s.outcome.as_str() {
-        "ok" | "done" | "served" => k::badge(t, Tone::Good, k::g(t, "✓", "+"), &s.outcome),
-        "" => k::badge(t, Tone::Info, k::g(t, "…", "~"), "running"),
-        o if failed(o) => k::badge(t, Tone::Bad, k::g(t, "✗", "x"), &clean(o)),
-        o => k::badge(t, Tone::Info, k::g(t, "·", "-"), &clean(o)),
-    }
+    if s.outcome.is_empty() { w::badge(t, Tone::Info, t.glyph(Glyph::Pending), "running") } else { w::status(t, &s.outcome) }
 }
 
 fn failed(o: &str) -> bool {
-    matches!(o, "refused" | "error" | "failed" | "timeout" | "cancelled" | "rejected" | "limit")
+    w::status_glyph(o) == Glyph::Error
 }
 
 impl ServedView {
-    fn summary(t: Theme, rows: &[&Served], now: u64, minutes: u16) -> (Line<'static>, Vec<u64>) {
-        let mut buckets = vec![0u64; usize::from(minutes)];
+    fn summary(t: Theme, rows: &[&Served], now: u64, minutes: u16) -> (Line<'static>, [Vec<u64>; 2]) {
+        let n = usize::try_from(u64::from(minutes) / BUCKET_MIN).unwrap_or(0);
+        let mut buckets = [vec![0u64; n], vec![0u64; n]];
         let (mut served, mut used, mut failures, mut uusd) = (0u64, 0u64, 0u64, 0u64);
         let mut lat = Vec::new();
         for s in rows {
             let age = now.saturating_sub(s.at_ms) / MINUTE_MS;
-            let Some(i) = usize::try_from(age).ok().and_then(|a| usize::from(minutes).checked_sub(a)?.checked_sub(1)) else { continue };
-            if let Some(b) = buckets.get_mut(i) {
+            if age >= u64::from(minutes) {
+                continue;
+            }
+            let i = n.saturating_sub(1).saturating_sub(usize::try_from(age / BUCKET_MIN).unwrap_or(0));
+            let kind = usize::from(s.direction == "used");
+            if let Some(b) = buckets.get_mut(kind).and_then(|k| k.get_mut(i)) {
                 *b = b.saturating_add(1);
             }
             match s.direction.as_str() {
@@ -75,23 +110,23 @@ impl ServedView {
             uusd = uusd.saturating_add(s.cost_uusd);
             lat.push(s.latency_ms);
         }
-        let dot = || k::dim(k::dot(t));
+        let dot = || w::muted(t, w::dot(t));
         let line = if lat.is_empty() {
-            Line::from(k::dim(format!("Quiet: nothing in the last {minutes} min")))
+            Line::from(w::muted(t, format!("Quiet: nothing in the last {minutes} min")))
         } else {
             lat.sort_unstable();
             let p50 = lat.get(lat.len() / 2).copied().unwrap_or(0);
             let mut l = vec![
-                k::badge(t, Tone::Warn, k::g(t, "↑", "^"), &format!("{served} served")),
+                w::badge(t, Tone::Warn, t.glyph(Glyph::Served), &format!("{served} served")),
                 dot(),
-                k::badge(t, Tone::Info, k::g(t, "↓", "v"), &format!("{used} used")),
+                w::badge(t, Tone::Info, t.glyph(Glyph::Used), &format!("{used} used")),
                 dot(),
-                Span::raw(k::cost(uusd)),
+                Span::styled(w::dollars(uusd), t.money()),
                 dot(),
-                Span::raw(format!("p50 {}", k::latency(p50))),
+                Span::raw(format!("p50 {}", w::latency(p50))),
             ];
             if failures > 0 {
-                l.extend([dot(), k::badge(t, Tone::Bad, k::g(t, "✗", "x"), &format!("{failures} failed"))]);
+                l.extend([dot(), w::badge(t, Tone::Bad, t.glyph(Glyph::Error), &format!("{failures} failed"))]);
             }
             Line::from(l)
         };
@@ -99,21 +134,20 @@ impl ServedView {
     }
 
     fn detail(t: Theme, s: &Served, now: u64) -> Vec<Line<'static>> {
-        let label = |x: &str| k::dim(format!("{x:<9}"));
         let why = match s.direction.as_str() {
             "served" => "  a device of yours answered it with your key",
             "used" => "  a project of yours used donated tokens",
             _ => "",
         };
         vec![
-            Line::from(vec![label("When"), Span::raw(format!("{} ago", k::ago(now, s.at_ms)))]),
-            Line::from(vec![label("Kind"), direction(t, s), k::dim(why)]),
-            Line::from(vec![label("Project"), Span::raw(clean(&s.project))]),
-            Line::from(vec![label("Model"), Span::raw(clean(&s.model))]),
-            Line::from(vec![label("Tokens"), Span::raw(format!("{} in{}{} out", k::count(s.tokens_in), k::dot(t), k::count(s.tokens_out)))]),
-            Line::from(vec![label("Cost"), Span::raw(k::cost(s.cost_uusd))]),
-            Line::from(vec![label("Latency"), Span::raw(k::latency(s.latency_ms))]),
-            Line::from(vec![label("Outcome"), outcome(t, s)]),
+            w::kv(t, "When", format!("{} ({} UTC)", w::ago_long(now, s.at_ms), w::datetime(s.at_ms))),
+            Line::from(vec![Span::styled(format!("{:<10} ", "Kind"), t.muted()), direction(t, s), w::muted(t, why)]),
+            w::kv(t, "Project", clean(&s.project)),
+            w::kv(t, "Model", clean(&s.model)),
+            w::kv(t, "Tokens", format!("{} in{}{} out", w::tokens(s.tokens_in), w::dot(t), w::tokens(s.tokens_out))),
+            w::kv_span(t, "Cost", Span::styled(w::cost(s.cost_uusd), t.money())),
+            w::kv(t, "Latency", w::latency(s.latency_ms)),
+            w::kv_span(t, "Outcome", outcome(t, s)),
         ]
     }
 }
@@ -124,64 +158,71 @@ impl View for ServedView {
     }
 
     fn hints(&self) -> &'static [(&'static str, &'static str)] {
-        &[("j/k", "move"), ("g", "newest (live)"), ("/", "filter")]
+        &[("g", "newest (live)"), ("s", "sort")]
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let t = *ctx.theme;
         if ctx.snap.served.is_empty() {
             let lines = vec![
-                Line::from(k::badge(t, Tone::Info, k::g(t, "◌", "o"), "Nothing served or used yet")),
+                Line::from(w::badge(t, Tone::Info, t.glyph(Glyph::Connecting), "Nothing served or used yet")),
                 Line::raw(""),
                 Line::raw("Your devices serve your donations while the app runs:"),
-                Line::from(k::key("moochy up")),
+                Line::from(w::key("moochy up")),
                 Line::raw("Your projects use donated tokens through your coding agent:"),
-                Line::from(k::key("moochy run -- <agent>")),
+                Line::from(w::key("moochy run -- <agent>")),
                 Line::raw(""),
-                Line::from(k::dim("Requests show up here live, newest first (never prompts or outputs).")),
+                Line::from(w::muted(t, "Requests show up here live, newest first (never prompts or outputs).")),
             ];
-            return k::empty(f, area, t, self.title(), lines);
+            return w::empty(f, area, t, self.title(), lines);
         }
-        let rows = visible(ctx);
+        let rows = visible(ctx, self.sort);
         if let Some(at) = self.anchor
             && let Some(i) = rows.iter().position(|s| s.at_ms == at)
         {
             self.cur.select(i);
         }
-        let [top, rest] = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
-        let minutes = top.width.saturating_sub(2).clamp(1, MAX_MINUTES);
-        let (line, buckets) = Self::summary(t, &rows, ctx.now_ms, minutes);
-        let spark_block = k::block(t, format!(" Last {minutes} min "));
+        let [top, rest] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        let (line, buckets) = Self::summary(t, &rows, ctx.now_ms, MINUTES);
+        let spark_block = w::block(t, "Last 60 min");
         let inner = spark_block.inner(top);
         f.render_widget(spark_block, top);
-        let [l1, l2] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-        f.render_widget(Paragraph::new(line), l1);
-        let bars = if t.ascii { k::ASCII_BARS } else { ratatui::symbols::bar::NINE_LEVELS };
-        let spark = Sparkline::default().data(&buckets).bar_set(bars).style(k::tone(t, Tone::Warn));
-        // Right-aligned: the last column is the current minute.
-        let w = minutes.min(l2.width);
-        f.render_widget(spark, Rect { x: l2.x.saturating_add(l2.width.saturating_sub(w)), width: w, ..l2 });
-
-        let (list, detail) = k::split(rest, 10);
-        self.cur.sync(rows.len(), list);
-        let mode = if self.anchor.is_none() {
-            k::badge(t, Tone::Good, k::g(t, "●", "*"), "live")
-        } else {
-            k::badge(t, Tone::Warn, k::g(t, "‖", "="), "held (g: newest)")
-        };
-        let title = Line::from(vec![Span::raw(format!(" Requests ({}) ", rows.len())), mode, Span::raw(" ")]);
-        if rows.is_empty() {
-            let lines = vec![Line::raw(format!("No request matches /{}", clean(ctx.filter))), Line::from(k::dim("Esc clears the filter"))];
-            return k::empty(f, list, t, &format!("Requests (0){}filtered", k::dot(t)), lines);
+        let [l1, l2, l3, l4] = Layout::vertical([Constraint::Length(1); 4]).areas(inner);
+        f.render_widget(Paragraph::new(list::fit(line, usize::from(l1.width))), l1);
+        // One row per kind, the whole hour across the whole width: left is 60 minutes ago, right is now.
+        let spark_w = usize::from(l2.width).saturating_sub(10);
+        let [sv, us] = &buckets;
+        let max = sv.iter().chain(us.iter()).copied().max().unwrap_or(0);
+        for (area, data, label, style) in [(l2, sv, format!("{} served ", t.glyph(Glyph::Served)), t.money()), (l3, us, format!("{} used   ", t.glyph(Glyph::Used)), t.info())] {
+            // Both rows on one scale, so their heights compare.
+            let mut scaled = charts::resample(data, spark_w);
+            scaled.push(max);
+            let mut spark = charts::spark_text(t, &scaled, spark_w.saturating_add(1), style);
+            spark.content = spark.content.chars().take(spark_w).collect::<String>().into();
+            f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{label:<10}"), style), spark])), area);
         }
-        let wide = list.width >= 100;
+        let gap = usize::from(l4.width).saturating_sub(20);
+        f.render_widget(Paragraph::new(Line::from(w::muted(t, format!("{:10}60m ago{:gap$}now", "", "")))), l4);
+
+        let (list_a, detail) = if rows.is_empty() { (rest, None) } else { w::split(rest, 10) };
+        self.cur.sync(rows.len(), list_a);
+        let mode = match (self.sort, self.anchor) {
+            (Sort::Newest, None) => "live".to_string(),
+            (Sort::Newest, Some(_)) => "held, g: newest".to_string(),
+            (s, _) => format!("by {}", s.label()),
+        };
+        let title = format!("{} · {mode}", w::counted("Requests", rows.len(), ctx.snap.served.len()));
+        if rows.is_empty() {
+            return w::empty(f, list_a, t, &title, w::no_match(t, ctx.filter));
+        }
+        let wide = list_a.width >= 100;
         let mut widths = vec![Constraint::Length(4), Constraint::Length(8), Constraint::Min(10), Constraint::Min(10)];
         let mut header = vec!["Age", "Kind", "Project", "Model"];
         if wide {
             widths.push(Constraint::Length(13));
             header.push("Tokens in/out");
         }
-        widths.push(Constraint::Length(8));
+        widths.push(Constraint::Length(9));
         header.push("Cost");
         if wide {
             widths.push(Constraint::Length(7));
@@ -189,41 +230,49 @@ impl View for ServedView {
         }
         widths.push(Constraint::Length(11));
         header.push("Outcome");
+        let cw = list::table_widths(list_a, &widths);
+        let cut = |s: String, i: usize| Cell::from(w::trunc(&s, cw.get(i).copied().unwrap_or(0)));
         let body = rows.iter().map(|s| {
             let mut cells = vec![
-                Cell::from(k::ago(ctx.now_ms, s.at_ms)),
+                Cell::from(w::muted(t, w::ago(ctx.now_ms, s.at_ms))),
                 Cell::from(direction(t, s)),
-                Cell::from(clean(&s.project)),
-                Cell::from(clean(&s.model)),
+                cut(w::short_slug(&clean(&s.project), cw.get(2).copied().unwrap_or(0)), 2),
+                cut(clean(&s.model), 3),
             ];
             if wide {
-                cells.push(Cell::from(format!("{} {} {}", k::count(s.tokens_in), k::g(t, "→", ">"), k::count(s.tokens_out))));
+                cells.push(Cell::from(format!("{} {} {}", w::tokens(s.tokens_in), if t.ascii { ">" } else { "→" }, w::tokens(s.tokens_out))));
             }
-            cells.push(Cell::from(k::cost(s.cost_uusd)));
+            cells.push(Cell::from(Span::styled(w::dollars(s.cost_uusd), t.money())));
             if wide {
-                cells.push(Cell::from(k::latency(s.latency_ms)));
+                cells.push(Cell::from(w::latency(s.latency_ms)));
             }
             cells.push(Cell::from(outcome(t, s)));
             Row::new(cells)
         });
         let table = Table::new(body, widths)
-            .header(Row::new(header).style(k::tone(t, Tone::Muted)))
-            .row_highlight_style(k::selected(t))
-            .highlight_symbol(k::arrow(t))
-            .block(k::block(t, title));
-        f.render_stateful_widget(table, list, &mut self.cur.state);
+            .header(Row::new(header).style(t.muted()))
+            .row_highlight_style(t.selected())
+            .highlight_symbol(list::marker(t))
+            .block(w::block_focus(t, title));
+        f.render_stateful_widget(table, list_a, &mut self.cur.state);
         if let (Some(area), Some(s)) = (detail, self.cur.selected().and_then(|i| rows.get(i))) {
-            f.render_widget(Paragraph::new(Self::detail(t, s, ctx.now_ms)).wrap(Wrap { trim: false }).block(k::block(t, " Request ")), area);
+            f.render_widget(Paragraph::new(Self::detail(t, s, ctx.now_ms)).wrap(Wrap { trim: false }).block(w::block(t, "Request")), area);
         }
     }
 
     fn on_input(&mut self, input: &Input, ctx: &Ctx) -> Outcome {
+        if *input == Input::Char('s') {
+            self.sort = self.sort.next();
+            self.anchor = None;
+            self.cur.select(0);
+            return Outcome::Redraw;
+        }
         if !self.cur.on_input(input) {
             return Outcome::Ignored;
         }
         self.anchor = match self.cur.selected() {
             Some(0) | None => None,
-            Some(i) => visible(ctx).get(i).map(|s| s.at_ms),
+            Some(i) => visible(ctx, self.sort).get(i).map(|s| s.at_ms),
         };
         Outcome::Redraw
     }
@@ -233,7 +282,7 @@ impl View for ServedView {
 mod tests {
     use super::*;
     use crate::model::Snapshot;
-    use crate::views::donor_kit::test_util::{NOW, ctx, draw, themes};
+    use crate::widgets::test_util::{NOW, ctx, draw, themes};
 
     fn row(ago_s: u64, dir: &str, project: &str, model: &str, outcome: &str) -> Served {
         Served {
@@ -267,46 +316,51 @@ mod tests {
         for t in themes() {
             for (w, h) in [(80, 24), (160, 48)] {
                 let mut v = ServedView::default();
-                let out = draw(&mut v, &s, t, "", w, h);
-                let first = out.find("github/foo/bar").unwrap();
-                assert!(first < out.find("github/me/tool").unwrap() && out.find("github/me/tool").unwrap() < out.find("github/old/one").unwrap(), "{out}");
+                let out = draw(&mut v, &ctx(&s, &t, ""), w, h);
+                let first = out.find("foo/bar").unwrap();
+                assert!(first < out.find("me/tool").unwrap() && out.find("me/tool").unwrap() < out.find("old/one").unwrap(), "{out}");
                 assert!(out.contains("2 served") && out.contains("1 used") && out.contains("1 failed"), "window excludes the 2h-old row:\n{out}");
                 assert!(out.contains("live") && out.contains("timeout"), "{out}");
-                assert!(!out.contains("]52;c;eA==\u{7}"), "{out}");
+                assert!(!out.contains('\u{1b}'), "{out}");
                 if w == 160 {
                     assert!(out.contains("12.3k") && out.contains("820ms"), "{out}");
                 }
             }
         }
         let mut v = ServedView::default();
-        let out = draw(&mut v, &Snapshot::default(), themes()[0], "", 80, 24);
+        let e = Snapshot::default();
+        let out = draw(&mut v, &ctx(&e, &themes()[0], ""), 80, 24);
         assert!(out.contains("Nothing served or used yet") && out.contains("moochy up"), "{out}");
     }
 
     #[test]
     fn filter_applies_to_rows_and_summary() {
         let s = snap();
+        let t = themes()[0];
         let mut v = ServedView::default();
-        let out = draw(&mut v, &s, themes()[0], "gpt", 160, 48);
+        let out = draw(&mut v, &ctx(&s, &t, "gpt"), 160, 48);
         assert!(out.contains("github/me/tool") && !out.contains("github/foo/bar") && out.contains("0 served"), "{out}");
-        let out = draw(&mut v, &s, themes()[0], "nope", 80, 24);
-        assert!(out.contains("No request matches /nope"), "{out}");
+        let out = draw(&mut v, &ctx(&s, &t, "nope"), 80, 24);
+        assert!(out.contains("Nothing matches") && out.contains("nope"), "{out}");
     }
 
     #[test]
-    fn selection_holds_while_new_rows_arrive() {
+    fn selection_holds_while_new_rows_arrive_and_sort_cycles() {
         let mut s = snap();
         let t = themes()[0];
         let mut v = ServedView::default();
-        draw(&mut v, &s, t, "", 160, 48);
-        assert_eq!(v.on_input(&Input::Down, &ctx(&s, &t)), Outcome::Redraw);
+        draw(&mut v, &ctx(&s, &t, ""), 160, 48);
+        assert_eq!(v.on_input(&Input::Down, &ctx(&s, &t, "")), Outcome::Redraw);
         let held = v.anchor.unwrap();
         s.served.push(row(1, "used", "github/new/one", "gpt-5", ""));
-        let out = draw(&mut v, &s, t, "", 160, 48);
+        let out = draw(&mut v, &ctx(&s, &t, ""), 160, 48);
         assert!(out.contains("held") && out.contains("running"), "{out}");
-        assert_eq!(visible(&ctx(&s, &t))[v.cur.selected().unwrap()].at_ms, held);
-        v.on_input(&Input::Char('g'), &ctx(&s, &t));
+        assert_eq!(visible(&ctx(&s, &t, ""), v.sort)[v.cur.selected().unwrap()].at_ms, held);
+        v.on_input(&Input::Home, &ctx(&s, &t, ""));
         assert!(v.anchor.is_none());
-        assert_eq!(v.on_input(&Input::Char('z'), &ctx(&s, &t)), Outcome::Ignored);
+        assert_eq!(v.on_input(&Input::Char('z'), &ctx(&s, &t, "")), Outcome::Ignored);
+        assert_eq!(v.on_input(&Input::Char('s'), &ctx(&s, &t, "")), Outcome::Redraw);
+        let out = draw(&mut v, &ctx(&s, &t, ""), 160, 48);
+        assert!(out.contains("by cost"), "{out}");
     }
 }

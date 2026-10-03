@@ -1,0 +1,98 @@
+# decisions 160x48 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                                                                                                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
+╭ Decisions · 11 ───────────────────────────────────────────────────────────────────────────╮╭ Request ────────────────────────────────────────────────────────╮
+│   Waiting for you · 3                                                                     ││ Request    req_51e0                                             │
+│ ▶   ◆ waiting     @grace            $25.00/month · claude-sonnet-5-5 · cap $0.50/task     ││ Kind       donor                                                │
+│     ◆ waiting     @heidi            $10.00 one-off · deepseek-v4                          ││ For        github/acme/widgets                                  │
+│     ◆ waiting     github/acme/gad…  add to the org's covered repos (share cap $5.00)      ││ From       @grace                                               │
+│   History · 6                                                                             ││ Terms      $25.00/month · claude-sonnet-5-5 · cap $0.50/task    │
+│     ✔ accepted    @dana              2h  github/acme/widgets                              ││ Received   42m ago                                              │
+│     ✖ refused     @mallory           5h  github/acme/widgets                              ││                                                                 │
+│     ✔ accepted    @frank             1d  github/acme/gadgets                              ││ a accept (owner key, checked with the server)   r refuse        │
+│     ✔ accepted    @eve               3d  github/acme                                      ││ Or with your passkey: https://moochy.dev/decide/req_51e0        │
+│     ✖ revoked     @trent             6d  github/acme/widgets                              ││                                                                 │
+│     ✔ accepted    @ivan             12d  gitlab/alice/notes                               ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+│                                                                                           ││                                                                 │
+╰───────────────────────────────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────╯
+ a accept  r refuse  / filter  : commands  q quit  ? help
+# decisions 160x48 --ascii
+ (o.o) moochy - @alice                                                                                                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
++ Decisions - 11 ---------------------------------------------------------------------------++ Request --------------------------------------------------------+
+|   Waiting for you - 3                                                                     || Request    req_51e0                                             |
+| >   ~ waiting     @grace            $25.00/month - claude-sonnet-5-5 - cap $0.50/task     || Kind       donor                                                |
+|     ~ waiting     @heidi            $10.00 one-off - deepseek-v4                          || For        github/acme/widgets                                  |
+|     ~ waiting     github/acme/gad~  add to the org's covered repos (share cap $5.00)      || From       @grace                                               |
+|   History - 6                                                                             || Terms      $25.00/month - claude-sonnet-5-5 - cap $0.50/task    |
+|     + accepted    @dana              2h  github/acme/widgets                              || Received   42m ago                                              |
+|     x refused     @mallory           5h  github/acme/widgets                              ||                                                                 |
+|     + accepted    @frank             1d  github/acme/gadgets                              || a accept (owner key, checked with the server)   r refuse        |
+|     + accepted    @eve               3d  github/acme                                      || Or with your passkey: https://moochy.dev/decide/req_51e0        |
+|     x revoked     @trent             6d  github/acme/widgets                              ||                                                                 |
+|     + accepted    @ivan             12d  gitlab/alice/notes                               ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
+|                                                                                           ||                                                                 |
++-------------------------------------------------------------------------------------------++-----------------------------------------------------------------+
+ a accept  r refuse  / filter  : commands  q quit  ? help

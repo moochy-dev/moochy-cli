@@ -1,0 +1,50 @@
+# served 80x24 dark (light: same text)
+ ◖•ᴗ•◗ moochy · @alice                ◆ 3 pending  ▲ 2 alerts  ● relay  ● node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
+╭ Last 60 min ─────────────────────────────────────────────────────────────────╮
+│ ↑ 19 served · ↓ 9 used · $4.31 · p50 2.4s · ✖ 5 failed                       │
+│ ↑ served                   ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅█████ │
+│ ↓ used                     ▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃ │
+│           60m ago                                                        now │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Requests · 28 · live ────────────────────────────────────────────────────────╮
+│   Age  Kind     Project             Model              Cost      Outcome     │
+│ ▶ now  ↑ served tokio-rs/axum       claude-sonnet-5-5  <$0.01    ✔ ok        │
+│   1m   ↑ served github/acme/widgets deepseek-v4        $0.08     ✔ ok        │
+│   3m   ↓ used   rust-lang/rustfmt   claude-opus-5-5    $0.16     ✔ ok        │
+│   4m   ↑ served github/acme/gadgets claude-haiku-4-5   $0.10     ✔ ok        │
+│   6m   ↑ served inkscape/inkscape   gpt-5.2-mini       $0.18     ✔ ok        │
+│   8m   ↓ used   tokio-rs/axum       claude-sonnet-5-5  $0.25     ✔ ok        │
+│   9m   ↑ served github/acme/widgets deepseek-v4        $0.20     ✖ refused   │
+│   11m  ↑ served rust-lang/rustfmt   claude-opus-5-5    $0.13     ✔ ok        │
+│   13m  ↓ used   github/acme/gadgets claude-haiku-4-5   $0.07     ✖ error     │
+│   14m  ↑ served inkscape/inkscape   gpt-5.2-mini       $0.15     ✔ ok        │
+│   16m  ↑ served tokio-rs/axum       claude-sonnet-5-5  $0.23     ✔ ok        │
+│   17m  ↓ used   github/acme/widgets deepseek-v4        $0.17     ✔ ok        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ g newest (live)  s sort  / filter  : commands  q quit  ? help
+# served 80x24 --ascii
+ (o.o) moochy - @alice                ~ 3 pending  ! 2 alerts  * relay  * node
+ 1 Home 2 Given 3 Served 4 Repos 5 Orgs 6 Decide 7 Keys 8 Log 9 Settings
++ Last 60 min -----------------------------------------------------------------+
+| ^ 19 served - v 9 used - $4.31 - p50 2.4s - x 5 failed                       |
+| ^ served                   --------------------------------------------##### |
+| v used                     _________________________________________________ |
+|           60m ago                                                        now |
++------------------------------------------------------------------------------+
++ Requests - 28 - live --------------------------------------------------------+
+|   Age  Kind     Project             Model              Cost      Outcome     |
+| > now  ^ served tokio-rs/axum       claude-sonnet-5-5  <$0.01    + ok        |
+|   1m   ^ served github/acme/widgets deepseek-v4        $0.08     + ok        |
+|   3m   v used   rust-lang/rustfmt   claude-opus-5-5    $0.16     + ok        |
+|   4m   ^ served github/acme/gadgets claude-haiku-4-5   $0.10     + ok        |
+|   6m   ^ served inkscape/inkscape   gpt-5.2-mini       $0.18     + ok        |
+|   8m   v used   tokio-rs/axum       claude-sonnet-5-5  $0.25     + ok        |
+|   9m   ^ served github/acme/widgets deepseek-v4        $0.20     x refused   |
+|   11m  ^ served rust-lang/rustfmt   claude-opus-5-5    $0.13     + ok        |
+|   13m  v used   github/acme/gadgets claude-haiku-4-5   $0.07     x error     |
+|   14m  ^ served inkscape/inkscape   gpt-5.2-mini       $0.15     + ok        |
+|   16m  ^ served tokio-rs/axum       claude-sonnet-5-5  $0.23     + ok        |
+|   17m  v used   github/acme/widgets deepseek-v4        $0.17     + ok        |
++------------------------------------------------------------------------------+
+ g newest (live)  s sort  / filter  : commands  q quit  ? help

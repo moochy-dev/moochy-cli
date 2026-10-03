@@ -3,7 +3,8 @@
 //! same world with escape sequences in every peer string (E121).
 
 use crate::model::{
-    Activity, Alert, BoxDevice, CoveredRepo, Decision, Device, Donation, Me, Org, Pending, Project, ProviderKey, Served, Snapshot,
+    Activity, Alert, BoxDevice, BoxToken, CoveredRepo, Decision, Device, Donation, Lockdown, Me, Org, Pending, Project, ProviderKey, Receipt, ReceiptCheck,
+    Served, Snapshot,
 };
 use crate::source::FakeSource;
 
@@ -22,10 +23,18 @@ fn ago(ms: u64) -> u64 {
     DEMO_NOW_MS.saturating_sub(ms)
 }
 
+/// 1 Nov 2026 00:00 UTC: when the monthly limits start again.
+const RENEWS: u64 = 1_793_491_200_000;
+
+/// A 30-day spend curve (µ$ per day, oldest first) that differs per `seed`.
+fn trend(seed: u64) -> Vec<u64> {
+    (0u64..30).map(|d| (d.wrapping_mul(seed).wrapping_add(seed) % 9).wrapping_mul(120_000).wrapping_add(d.wrapping_mul(9_000))).collect()
+}
+
 /// The demo source (`moochy tui --demo`).
 #[must_use]
 pub fn demo_source() -> FakeSource {
-    FakeSource { state: demo(), now_ms: DEMO_NOW_MS }
+    FakeSource::new(demo(), DEMO_NOW_MS)
 }
 
 #[must_use]
@@ -58,9 +67,10 @@ pub fn demo() -> Snapshot {
             handle: s("alice"),
             pseudonym: s("brave-otter-42"),
             relay: s("relay.moochy.dev"),
+            web: s("https://moochy.dev"),
             connected: true,
             roles: vec![s("donor"), s("maintainer")],
-            lockdown: s("sandboxed (landlock + seccomp)"),
+            lockdown: Lockdown::Enforced(s("landlock + seccomp")),
         },
         donations: vec![
             Donation {
@@ -75,6 +85,8 @@ pub fn demo() -> Snapshot {
                 schedule: s("monthly, renews 1 Nov"),
                 models: vec![s("claude-sonnet-5-5"), s("claude-haiku-4-5")],
                 per_repo_uusd: vec![],
+                per_day_uusd: trend(3),
+                renews_at_ms: RENEWS,
             },
             Donation {
                 id: s("don_19bc"),
@@ -88,6 +100,8 @@ pub fn demo() -> Snapshot {
                 schedule: s("monthly, renews 1 Nov"),
                 models: vec![s("deepseek-v4")],
                 per_repo_uusd: vec![],
+                per_day_uusd: trend(5),
+                renews_at_ms: RENEWS,
             },
             Donation {
                 id: s("don_a002"),
@@ -101,6 +115,8 @@ pub fn demo() -> Snapshot {
                 schedule: s("weekdays 09:00–18:00 UTC"),
                 models: vec![s("claude-opus-5-5"), s("claude-sonnet-5-5")],
                 per_repo_uusd: vec![(s("gitlab/inkscape/inkscape"), 12_300_000), (s("gitlab/inkscape/extensions"), 4_100_000), (s("gitlab/inkscape/website"), 2_250_000)],
+                per_day_uusd: trend(7),
+                renews_at_ms: RENEWS,
             },
             Donation {
                 id: s("don_0c11"),
@@ -114,6 +130,8 @@ pub fn demo() -> Snapshot {
                 schedule: s("one-off"),
                 models: vec![s("gpt-5.2-mini")],
                 per_repo_uusd: vec![],
+                per_day_uusd: trend(11),
+                renews_at_ms: RENEWS,
             },
         ],
         served,
@@ -163,6 +181,17 @@ pub fn demo() -> Snapshot {
             donors: 4,
             month_uusd: 28_300_000,
             paused_since_ms: 0,
+            per_day_uusd: trend(13),
+            person: false,
+        }, Org {
+            id: s("m_alice"),
+            path: s("github/alice"),
+            covered: vec![CoveredRepo { slug: s("gitlab/alice/notes"), used_uusd: 1_200_000, share_cap_uusd: 0 }],
+            donors: 2,
+            month_uusd: 1_200_000,
+            paused_since_ms: 0,
+            per_day_uusd: trend(17),
+            person: true,
         }],
         pending: vec![
             Pending {
@@ -171,6 +200,7 @@ pub fn demo() -> Snapshot {
                 target: s("github/acme/widgets"),
                 subject: s("@grace"),
                 summary: s("$25.00/month · claude-sonnet-5-5 · cap $0.50/task"),
+                decide_url: String::new(),
                 created_at_ms: ago(42 * MIN),
             },
             Pending {
@@ -179,6 +209,7 @@ pub fn demo() -> Snapshot {
                 target: s("github/acme/widgets"),
                 subject: s("@heidi"),
                 summary: s("$10.00 one-off · deepseek-v4"),
+                decide_url: String::new(),
                 created_at_ms: ago(3 * HOUR),
             },
             Pending {
@@ -187,6 +218,7 @@ pub fn demo() -> Snapshot {
                 target: s("github/acme"),
                 subject: s("github/acme/gadgets-pro"),
                 summary: s("add to the org's covered repos (share cap $5.00)"),
+                decide_url: String::new(),
                 created_at_ms: ago(DAY + 2 * HOUR),
             },
         ],
@@ -207,6 +239,10 @@ pub fn demo() -> Snapshot {
             BoxDevice { id: s("box_ci_01"), project: s("github/acme/widgets"), expires_at_ms: DEMO_NOW_MS.saturating_add(5 * HOUR), online: true },
             BoxDevice { id: s("box_ci_02"), project: s("github/acme/gadgets"), expires_at_ms: DEMO_NOW_MS.saturating_add(2 * DAY), online: false },
         ],
+        box_tokens: vec![
+            BoxToken { id: s("bt_7k2m"), project: s("github/acme/widgets"), created_at_ms: ago(DAY), expires_at_ms: DEMO_NOW_MS.saturating_add(6 * DAY), cap_uusd: 5_000_000, max_boxes: 4, boxes_enrolled: 1, revoked: false },
+            BoxToken { id: s("bt_19aa"), project: s("github/acme/gadgets"), created_at_ms: ago(9 * DAY), expires_at_ms: ago(2 * DAY), cap_uusd: 0, max_boxes: 1, boxes_enrolled: 1, revoked: false },
+        ],
         keys: vec![
             ProviderKey { provider: s("anthropic"), present: true, models: vec![s("claude-opus-5-5"), s("claude-sonnet-5-5"), s("claude-haiku-4-5")] },
             ProviderKey { provider: s("deepseek"), present: true, models: vec![s("deepseek-v4")] },
@@ -214,14 +250,14 @@ pub fn demo() -> Snapshot {
             ProviderKey { provider: s("ollama (local)"), present: true, models: vec![s("qwen3-coder:30b")] },
         ],
         activity: vec![
-            Activity { at_ms: ago(4 * MIN), text: s("Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2k tokens · $0.21") },
-            Activity { at_ms: ago(11 * MIN), text: s("Receipt rcpt_9a1f verified (relay signature ok, ledger match)") },
-            Activity { at_ms: ago(42 * MIN), text: s("@grace asked to donate to github/acme/widgets") },
-            Activity { at_ms: ago(2 * HOUR), text: s("Accepted @dana for github/acme/widgets (passkey)") },
-            Activity { at_ms: ago(3 * HOUR), text: s("Donation to github/rust-lang/rustfmt paused (94% of the limit)") },
-            Activity { at_ms: ago(6 * HOUR), text: s("Key log: checkpoint 18,442 consistent with the Git anchor") },
-            Activity { at_ms: ago(DAY), text: s("Device garage-tower (4090) came online") },
-            Activity { at_ms: ago(2 * DAY), text: s("Box box_ci_02 created for github/acme/gadgets (expires in 2 days)") },
+            Activity { at_ms: ago(4 * MIN), text: s("Served claude-sonnet-5-5 for github/tokio-rs/axum · 18.2k tokens · $0.21"), receipt: Some(Receipt { id: s("r_01JB2Y8V9Q3K7M4N5P6R8S0T1X"), check: ReceiptCheck::Unchecked }) },
+            Activity { at_ms: ago(11 * MIN), text: s("Receipt verified for github/tokio-rs/axum ($0.21)"), receipt: Some(Receipt { id: s("r_01JB2Y8V9Q3K7M4N5P6R8S0T1W"), check: ReceiptCheck::Verified }) },
+            Activity { at_ms: ago(42 * MIN), text: s("@grace asked to donate to github/acme/widgets"), receipt: None },
+            Activity { at_ms: ago(2 * HOUR), text: s("Accepted @dana for github/acme/widgets (passkey)"), receipt: None },
+            Activity { at_ms: ago(3 * HOUR), text: s("Donation to github/rust-lang/rustfmt paused (94% of the limit)"), receipt: None },
+            Activity { at_ms: ago(6 * HOUR), text: s("Key log: checkpoint 18,442 consistent with the Git anchor"), receipt: None },
+            Activity { at_ms: ago(DAY), text: s("Device garage-tower (4090) came online"), receipt: None },
+            Activity { at_ms: ago(2 * DAY), text: s("Box box_ci_02 created for github/acme/gadgets (expires in 2 days)"), receipt: None },
         ],
         alerts: vec![
             Alert { level: s("warn"), text: s("rustfmt donation is at 94% of its monthly limit") },
@@ -278,5 +314,5 @@ pub fn hostile() -> FakeSource {
     for (_, v) in &mut st.config {
         *v = evil(v);
     }
-    FakeSource { state: st, now_ms: DEMO_NOW_MS }
+    FakeSource::new(st, DEMO_NOW_MS)
 }
