@@ -776,6 +776,17 @@ impl State {
         self.repos.get(repo_id).map(|r| r.owner.as_str())
     }
 
+    /// Does the current owner of `target` (a repo `r_…` or an org `o_…`) hold an active
+    /// `DONOR_APPROVED` for `pseudonym`? An approval signed by a previous owner never counts
+    /// (dropped on the owner change, §19.2). For the node's org donation note (A269).
+    #[must_use]
+    pub fn donor_approved(&self, target: &str, pseudonym: &str) -> bool {
+        self.repos
+            .get(target)
+            .and_then(|r| r.donors.get(pseudonym))
+            .is_some_and(|g| g.active)
+    }
+
     /// The orgs `pseudonym` owns, each with the repos it covers (ORG_REPO_ADDED active and
     /// the repo claimed by the same owner: the repos its donations serve, §19.3), sorted by
     /// id. A takeover (§19.2) drops the org from the previous owner's list and starts the

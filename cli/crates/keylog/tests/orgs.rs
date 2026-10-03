@@ -92,6 +92,17 @@ fn org_state_and_sealable() {
         assert_eq!(Value::Object(got), *want, "owned_orgs({who})");
     }
     assert_eq!(v["owned_orgs"].as_object().unwrap().len(), 3);
+    for q in v["donor_approved"].as_array().unwrap() {
+        assert_eq!(
+            st.donor_approved(
+                q["target"].as_str().unwrap(),
+                q["pseudonym"].as_str().unwrap()
+            ),
+            q["want"].as_bool().unwrap(),
+            "donor_approved {q}"
+        );
+    }
+    assert_eq!(v["donor_approved"].as_array().unwrap().len(), 10);
     for (name, h) in v["invalid_records"].as_object().unwrap() {
         assert!(parse_record(&unhex(h.as_str().unwrap())).is_err(), "{name}");
     }
