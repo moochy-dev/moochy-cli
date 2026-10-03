@@ -1,20 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Client release tooling (open source, Apache-2.0)
 
-Release engineering for the open-source `moochy` client. Everything here is published with the client in the public `moochy-cli` repository (CONTRACT §0a). Contributions require a DCO sign-off (`git commit -s`).
+Release engineering for the open-source `moochy` client, in the public [`moochy-dev/moochy-cli`](https://github.com/moochy-dev/moochy-cli) repository. Contributions require a DCO sign-off (`git commit -s`).
 
 Open-source client (Apache-2.0) · 100% free.
 
-## Layout in the public repository
+## Layout
 
-The export copies these files into place; everything else stays where it is.
-
-| Here | Public repository |
+| Path | What |
 |---|---|
-| `dist-workspace.toml` | `/dist-workspace.toml` |
-| `github/build-setup.yml` | `/.github/build-setup.yml` |
-| `github/workflows/*.yml` | `/.github/workflows/` |
-| `deny.toml`, `supply-chain/`, `scripts/`, `container/`, `service/`, `apparmor/`, `boxes/`, `devcontainer/` | `/deploy/client/` (unchanged) |
+| `/dist-workspace.toml` | cargo-dist configuration |
+| `/.github/build-setup.yml` | reproducible-build flags for every dist build job |
+| `/.github/workflows/` | `release.yml` (generated), `attest-release.yml`, `supply-chain.yml` |
+| `/deploy/client/` | `deny.toml`, `supply-chain/`, `scripts/`, `container/`, `service/`, `apparmor/`, `boxes/`, `devcontainer/` |
 
 Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release"` in `cli/Cargo.toml`; `[package.metadata.dist] dist = true`, `repository`, `homepage` in `cli/crates/node/Cargo.toml`.
 
@@ -26,7 +24,7 @@ Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release
 - shell and PowerShell installers, a Homebrew formula (`moochy-dev/homebrew-tap`), and the npm package `moochy` (`npx -y moochy mcp`);
 - no auto-updater (`install-updater = false`): `moochy update` verifies signatures itself (06 §12).
 
-`github/workflows/release.yml` is **generated** by `dist generate` (cargo-dist 0.33.0); never edit it by hand.
+`.github/workflows/release.yml` is **generated** by `dist generate` (cargo-dist 0.33.0); never edit it by hand.
 
 ## Verify a release (users)
 

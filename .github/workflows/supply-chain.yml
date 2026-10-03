@@ -12,7 +12,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   dco:
-    if: github.event_name == 'pull_request'
+    # Dependabot cannot sign off; its PRs change only lockfiles and pins.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

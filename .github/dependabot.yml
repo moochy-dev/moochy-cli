@@ -1,0 +1,19 @@
+# Weekly, grouped. Every Cargo update still has to pass cargo deny + cargo vet
+# (supply-chain.yml): audit or exempt new versions in deploy/client/supply-chain.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /cli
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "deps" }
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: "ci" }
+    groups:
+      actions:
+        patterns: ["*"]

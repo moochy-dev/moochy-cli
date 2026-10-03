@@ -1,19 +1,20 @@
-# Rules for every agent working on Moochy
+# Rules for every agent working on the Moochy client
 
-Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vectors`, `docs/guides`) and a closed-source core (relay + web + e2e + internal docs)**, and is **100% free**. Respect the boundary in CONTRACT §0a: open code never depends on closed code; public wording is "Open-source client (Apache-2.0) · 100% free". Read `spec/CONTRACT.md` first (normative), then the plan docs it points to in `docs/plan/`.
+This repository is the open-source Moochy client (Apache-2.0): the `moochy` app in `cli/`, its release tooling in `deploy/client/`, and copies of the protocol files it builds and tests against (`spec/proto`, `spec/vectors`, two guides in `docs/guides/`). The design and the normative contract live in [moochy-docs](https://github.com/moochy-dev/moochy-docs): read [`spec/CONTRACT.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/CONTRACT.md) first, then the plan docs it points to. Open code never depends on closed code (CONTRACT §0a). Public wording: "Open-source client (Apache-2.0) · 100% free".
 
 ## 1. Scope and git discipline
 
-- Work **only** inside the paths your agent owns (CONTRACT §0). Need something elsewhere → list it under `## Requests to other owners` in your final report.
-- You are in your own git worktree on branch `agent/<your-name>`. Commit early and often with clear messages (`relay: scheduler actor with commit-before-assign`). Never touch `main`, never rebase, never force anything, never delete branches. There is no remote: do not push.
-- Never run `pkill -f`, `killall`, or kill processes you did not start (other agents share this machine). Kill only your own PIDs, or use `timeout`.
-- Wait in the **foreground** for builds and tests. Never end your turn on a background job: when your turn ends, you end.
-- Put scratch files under `/mnt/fast/tmp/<your-name>/`, never in the repo.
+- Commit early and often with clear messages (`worker: SSE parser handles split UTF-8`). Every commit carries a DCO sign-off (`git commit -s`); `deploy/client/scripts/dco-check.sh` enforces it in CI.
+- Never rewrite `main`, never force-push.
+- Never run `pkill -f` or `killall`; kill only processes you started, or use `timeout`.
+- Wait in the foreground for builds and tests.
+- Keep scratch files out of the repository.
 
-## 2. Testing: end-to-end first
+## 2. Testing
 
-- The definition of "working" is the E2E scenario table (CONTRACT §8). Unit tests only where a function is pure and tricky (crypto, frame codec, firewall tables, cost math). No mocks of our own components in E2E: real binaries, fake **providers** only.
-- Before you report done, run every E2E scenario your component participates in. A scenario you cannot run yet must `t.Skip("pending: <what>")` with the exact reason; never delete or weaken a scenario to make it pass.
+- Unit tests live next to the code (`cargo test --workspace` in `cli/`). Write them where a function is pure and tricky (crypto, frame codec, firewall tables, cost math).
+- The end-to-end scenarios (CONTRACT §8) run real binaries against fake providers in the private relay repository. A change to the wire format, the CLI surface or the vectors needs those scenarios rerun before release.
+- `spec/vectors` are generated here (`cargo run -p moochy-proto --example vecgen -- ../spec/vectors` from `cli/`). A protocol change is not done until the vectors are regenerated and copied to moochy-docs.
 
 ## 3. Rust (`cli/`): aggressive, lean, fast, safe
 
@@ -29,24 +30,9 @@ Moochy has an **open-source client (Apache-2.0: `cli/`, `spec/proto`, `spec/vect
 
 **Responsiveness is a hard requirement** (CONTRACT §13 budgets, measured by E22): flush every chunk immediately, `TCP_NODELAY`, warm connections, no avoidable allocation or lock per chunk, no fsync in the per-chunk path.
 
-## 4. Go (`relay/`, `e2e/`)
+## 4. Security is a feature, not a phase
 
-- Go 1.25, stdlib first. Allowed third-party: `google.golang.org/grpc` + `google.golang.org/protobuf` (the Node↔Relay link, CONTRACT §12), `golang.org/x/net` (only its HTTP/2 frame/header decoders, for the :443 link demux; already compiled in through grpc), `golang.org/x/image` (only in `relay/internal/web/og` to rasterise share cards, CONTRACT §22), `modernc.org/sqlite`, `golang.org/x/crypto` (HPKE not needed relay-side), `github.com/hdevalence/ed25519consensus`, `golang.org/x/mod/sumdb/tlog`+`note` (later), `golang.org/x/oauth2` (later), `github.com/yuin/goldmark` (+ its GFM table extension) only in `relay/internal/docsite` to render our own docs, raw HTML disabled.
-- `http.Server` with `ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`, `MaxHeaderBytes`; `http.MaxBytesReader` on every body; bounded queues; context deadlines everywhere. `go vet` and `-race` clean.
-- No content (prompts/outputs) ever written to the DB or logs. The Scheduler owns its state in one goroutine (docs/plan/04).
-
-## 5. Security is a feature, not a phase
-
-- Read `docs/plan/06-security-and-trust.md`. Every mitigation listed there for your component is in scope.
-- `docs/security/attack-catalog.md` (owned by `mo-sec`) is the running list of attacks with their counter-measure and the E2E scenario that proves it. When it exists, check your component against it.
+- Read [`docs/plan/06-security-and-trust.md`](https://github.com/moochy-dev/moochy-docs/blob/main/docs/plan/06-security-and-trust.md). Every mitigation listed there for the client is in scope.
+- [`docs/security/attack-catalog.md`](https://github.com/moochy-dev/moochy-docs/blob/main/docs/security/attack-catalog.md) lists the attacks with their counter-measure and the scenario that proves it. Check your change against it.
 - `security@moochy.dev` (in SECURITY.md) is confirmed by the product owner but NOT live yet: never send to it, test it, look it up, or configure anything for it; leave the text as it is.
 - Fail closed: on any doubt (bad signature, unknown field, oversize, wrong state) refuse with a specific code, never "best effort".
-
-## 6. Web palette (fixed)
-
-Playful, warm and alive (CONTRACT §9, product owner 2026-10-02, supersedes strict monochrome): Ink (navy)/Paper/Sky base with **Mint as the brand and call-to-action hue** (product owner 2026-10-03: mint is the default and only palette), Butter for donated tokens (suns/coins), Coral-soft for stop, as named tokens, NO orange/apricot/brown; the mascot is the mint hamster; color-blocked sections and illustrations welcome; a living mascot and a real motion system (scroll-driven reveals, View Transitions, live micro-interactions). Still banned: purple/blue neon gradients and glows, glassmorphism, particles, shimmer text, scroll-jacking. Always: WCAG AA, `prefers-reduced-motion`, no-JS works, transform/opacity only, §13 budgets.
-
-## 7. Final report (always, even when blocked)
-
-End your run with a short summary, then **one last line of JSON**:
-`{"agent":"<name>","branch":"agent/<name>","head":"<sha>","built":true|false,"e2e":{"pass":[...],"fail":[...],"skip":[...]},"done":[...],"todo":[...],"requests":[...]}`

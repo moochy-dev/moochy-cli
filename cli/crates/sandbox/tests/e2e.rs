@@ -313,10 +313,16 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     assert!(!o.stdout.contains("SUCCEEDED"), "{}", o.stdout);
     assert!(has(&o, "canary-read-fail"), "{}", o.stdout);
     assert!(has(&o, "state-write-ok"), "{}", o.stdout);
-    assert!(has(&o, "connect9-fail"), "{}", o.stdout);
     // The loopback gateway port may be bound; any other port may not.
     assert!(has(&o, "gw-bind-ok"), "{}", o.stdout);
-    assert!(has(&o, "bind-other-fail"), "{}", o.stdout);
+    // Port rules need the Landlock network ABI (>= 4, Linux 6.7): older kernels
+    // keep the filesystem cage and seccomp only (CONTRACT §15.2).
+    if has(&o, "net=Some(true)") {
+        assert!(has(&o, "connect9-fail"), "{}", o.stdout);
+        assert!(has(&o, "bind-other-fail"), "{}", o.stdout);
+    } else {
+        eprintln!("SKIP pending: no Landlock network ABI on this kernel; port rules not checked");
+    }
     // After lockdown the donor still resolves provider hosts and reaches :443.
     if ("api.anthropic.com", 443).to_socket_addrs().is_ok() {
         assert!(has(&o, "dns-ok https-connect-ok"), "{}", o.stdout);
@@ -380,7 +386,7 @@ fn e97_git_ignored_masked_and_git_exec_paths_read_only() {
     let f = Fixture::new("e97git");
     let wt = f.wt();
     let git = |args: &[&str]| Command::new("git").arg("-C").arg(&wt).args(args).output().map(|o| o.status.success());
-    if git(&["init", "-q"]).ok() != Some(true) {
+    if git(&["init", "-q", "--template="]).ok() != Some(true) {
         eprintln!("SKIP pending: git not available");
         return;
     }
@@ -415,7 +421,7 @@ fn e97_linked_worktree_read_only_and_isolated() {
         Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).output().is_ok_and(|o| o.status.success())
     };
     std::fs::create_dir_all(&main).unwrap();
-    if !git(&main, &["init", "-q"]) {
+    if !git(&main, &["init", "-q", "--template="]) {
         eprintln!("SKIP pending: git not available");
         return;
     }
@@ -470,7 +476,7 @@ fn e97_every_git_read_only_placeholder_and_change_notice() {
     // A nested repo (submodule / vendored): read-only too.
     let sub = f.wt().join("sub");
     std::fs::create_dir_all(&sub).unwrap();
-    if !Command::new("git").arg("-C").arg(&sub).args(["init", "-q"]).status().is_ok_and(|s| s.success()) {
+    if !Command::new("git").arg("-C").arg(&sub).args(["init", "-q", "--template="]).status().is_ok_and(|s| s.success()) {
         eprintln!("SKIP pending: git not available");
         return;
     }
@@ -574,6 +580,12 @@ fn e95_cgroup_limits_when_delegated() {
     };
     if !scope(&["true"]).is_ok_and(|o| o.status.success()) {
         eprintln!("SKIP pending: no systemd user manager (delegated cgroup) on this host");
+        return;
+    }
+    // cgroup v1 / hybrid hosts have no unified hierarchy to delegate: rlimits
+    // only, by design (CONTRACT §15.1, `moochy doctor` says so).
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        eprintln!("SKIP pending: no cgroup v2 unified hierarchy on this host");
         return;
     }
     let f = Fixture::new("e95cg");

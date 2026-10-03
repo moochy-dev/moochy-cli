@@ -71,7 +71,7 @@ The relay service and the moochy.dev website are not covered by this safe harbou
 
 ## How Moochy is built to resist attacks
 
-A public summary of the threats we design against, and where in the open client each defence lives: [`docs/guides/threat-model.md`](../docs/guides/threat-model.md). The protocol is specified in [`spec/protocol.md`](../spec/protocol.md) and [`spec/KEYLOG.md`](../spec/KEYLOG.md).
+A public summary of the threats we design against, and where in the open client each defence lives: [`docs/guides/threat-model.md`](https://github.com/moochy-dev/moochy-docs/blob/main/docs/guides/threat-model.md). The protocol is specified in [`spec/protocol.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/protocol.md) and [`spec/KEYLOG.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/KEYLOG.md).
 
 ## Supported versions
 

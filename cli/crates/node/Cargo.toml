@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+repository = "https://github.com/moochy-dev/moochy-cli"
+homepage = "https://moochy.dev"
+
+# cargo-dist ships this binary (dist-workspace.toml); archives carry the AppArmor
+# profile for `moochy run` on Ubuntu 23.10+ (deploy/client/README.md).
+[package.metadata.dist]
+dist = true
+include = ["../../../deploy/client/apparmor/"]
 
 [lib]
 name = "moochy_node"

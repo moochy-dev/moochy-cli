@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # cargo-dist configuration for the open-source `moochy` client (plan 07 §11).
-# Lives at the root of the public moochy-cli repository (the export copies
-# deploy/client/dist-workspace.toml there); the Cargo workspace is cli/.
+# Lives at the root of the moochy-cli repository; the Cargo workspace is cli/.
 # Regenerate .github/workflows/release.yml after any change: `dist generate`.
 [workspace]
 members = ["cargo:cli"]
@@ -38,6 +37,8 @@ pr-run-mode = "plan"
 # .github/workflows/ (file: .github/build-setup.yml, same flags as
 # deploy/client/scripts/repro-check.sh).
 github-build-setup = "../build-setup.yml"
+# Dependabot bumps the actions pinned in release.yml; `dist generate` re-pins them.
+allow-dirty = ["ci"]
 
 # Native runners for every Linux target (no cross toolchain in the musl
 # artifacts that the reproducibility check rebuilds).

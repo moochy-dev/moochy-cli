@@ -1,10 +1,3 @@
 /cli/target/
-/relay/bin/
-/e2e/.out/
-*.db
-*.db-wal
-*.db-shm
+/target/
 .DS_Store
-.worktrees/
-/.local-build/
-/.local-stack/
