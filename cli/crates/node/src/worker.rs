@@ -20,7 +20,7 @@ use moochy_worker::firewall::{self, MaxPrice, Policy, Route};
 use moochy_worker::validate::ValidateRequest;
 use moochy_worker::provider::Adapter;
 use moochy_worker::store::{Reservation, Store, StoreError};
-use moochy_worker::stream::StreamParser;
+use moochy_worker::stream::{Event, StreamParser};
 use prost::Message as _;
 use serde_json::json;
 use std::sync::atomic::Ordering;
@@ -718,7 +718,8 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
                 note_headroom(node, &a.route.model, rl);
             }
             let (code, retry) = f.nack();
-            let mut fl = Failure::new(code, retry, Some(String::from_utf8_lossy(&f.body).into_owned()));
+            // A291: the provider's error text (which may echo the key) stays here.
+            let mut fl = Failure::new(code, retry, Some(f.public_message()));
             fl.retry_after_ms = f.retry_after_ms;
             refuse.nack(Some(&a.ck), &fl).await;
             // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
@@ -745,6 +746,14 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     };
     let mut status = ReceiptStatus::Ok;
     let mut link_ok = true;
+    let red = a.adapter.redactor();
+    // CONTRACT §23, A291: only whole SSE events leave this machine and a provider error event
+    // never does (the stream is cut there; the Gateway reports it in our own words); a
+    // non-streamed body leaves once complete and known not to be an error. Everything that
+    // leaves is redacted of the key. `held`: received, not forwarded yet, starting at offset `fwd`.
+    let mut held = bytes::BytesMut::new();
+    let mut fwd: u64 = 0;
+    let len64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     loop {
         let next = tokio::select! {
             n = resp.next() => n,
@@ -752,18 +761,34 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
         };
         match next {
             Ok(Some(b)) => {
-                let tool_ends = parser.feed(&b, &mut |_, _| {}).map_or(0, |c| c.tool_ends);
-                if node.cfg.journal_full_text && seen.len() < MAX_JOURNAL_TEXT {
-                    seen.extend_from_slice(b.get(..b.len().min(MAX_JOURNAL_TEXT.saturating_sub(seen.len()))).unwrap_or_default());
-                }
-                // Seal and send at once (CONTRACT §13); the stream ends with an empty `last` chunk.
-                for part in b.chunks(crypto::MAX_CHUNK) {
-                    let Ok(c) = sealer.seal(part, false) else { break };
-                    if tx.send(up(serve_up::Msg::Chunk(c))).await.is_err() {
-                        link_ok = false;
+                let (mut cut, mut ready) = (None::<u64>, fwd);
+                let fed = parser.feed(&b, &mut |span, ev| {
+                    if cut.is_none() && matches!(ev, Event::Error) {
+                        cut = Some(span.start);
                     }
+                    ready = span.end;
+                });
+                let Ok(fed) = fed else {
+                    status = ReceiptStatus::ProviderError;
+                    break;
+                };
+                let end = fwd.saturating_add(len64(held.len())).saturating_add(len64(b.len()));
+                let upto = if a.route.stream { cut.unwrap_or(ready) } else { fwd };
+                // Fast path (one event or more per chunk, nothing held): the chunk as is.
+                let piece = if held.is_empty() && upto == end {
+                    b
+                } else {
+                    held.extend_from_slice(&b);
+                    let n = usize::try_from(upto.saturating_sub(fwd)).unwrap_or(usize::MAX).min(held.len());
+                    held.split_to(n).freeze()
+                };
+                fwd = upto;
+                let piece = redacted(red, piece);
+                if node.cfg.journal_full_text && seen.len() < MAX_JOURNAL_TEXT {
+                    seen.extend_from_slice(piece.get(..piece.len().min(MAX_JOURNAL_TEXT.saturating_sub(seen.len()))).unwrap_or_default());
                 }
-                if tool_ends > 0
+                link_ok = send_sealed(tx, &mut sealer, &piece).await;
+                if fed.tool_ends > 0
                     && let Some(c) = checkpoint(&sealer)
                 {
                     let _ = tx.send(up(serve_up::Msg::Checkpoint(c))).await;
@@ -772,8 +797,21 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
                     status = ReceiptStatus::Cancelled;
                     break;
                 }
+                if cut.is_some() {
+                    status = ReceiptStatus::ProviderError;
+                    break;
+                }
             }
-            Ok(None) => break,
+            Ok(None) => {
+                if !a.route.stream {
+                    let body = if parser.finish().provider_error { own_error_body(dialect.worker()) } else { redacted(red, held.split().freeze()) };
+                    if node.cfg.journal_full_text {
+                        seen.extend_from_slice(body.get(..body.len().min(MAX_JOURNAL_TEXT)).unwrap_or_default());
+                    }
+                    link_ok = send_sealed(tx, &mut sealer, &body).await;
+                }
+                break;
+            }
             Err(_) => {
                 status = ReceiptStatus::ProviderError;
                 break;
@@ -819,7 +857,7 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     // The donor's own cap settles at what xAI actually charged when that is above the receipt
     // (reasoning beyond the reservation).
     let local = if a.entry.provider == "xai" { out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok()).map_or(cost, |c| c.max(cost)) } else { cost };
-    let model = clean(out.model.as_deref().unwrap_or("")).into_owned();
+    let model = red.redact_str(&clean(out.model.as_deref().unwrap_or(""))).into_owned();
     let req_id = request_id.or(out.id).unwrap_or_default();
     let end = Ending { status, usage, cost, local, model: model.clone(), req_id, times: (t_start, t_started) };
     let st = match status {
@@ -833,6 +871,35 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let text = node.cfg.journal_full_text.then(|| (clip(&a.inner.body_b64.0), clip(&seen)));
     finish(node, keys, &a, attempt8, &sealer, end, down, refuse, (st, text.clone())).await;
     (st.into(), model, cost, text, true)
+}
+
+/// `b` with the adapter's key redacted (A291); the same buffer when clean.
+fn redacted(red: &moochy_worker::redact::Redactor, b: Bytes) -> Bytes {
+    let owned = match red.redact(&b) {
+        std::borrow::Cow::Owned(v) => Some(v),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    owned.map_or(b, Bytes::from)
+}
+
+/// A291: a non-streamed provider error body is replaced by ours (same shape, our words).
+fn own_error_body(d: moochy_worker::Dialect) -> Bytes {
+    Bytes::from_static(match d {
+        moochy_worker::Dialect::AnthropicMessages => br#"{"type":"error","error":{"type":"api_error","message":"the donor's provider reported an error"}}"#,
+        _ => br#"{"error":{"message":"the donor's provider reported an error","type":"server_error"}}"#,
+    })
+}
+
+/// Seal and send `piece` at once (CONTRACT §13), in frames of at most `MAX_CHUNK`. `false`:
+/// the link is gone.
+async fn send_sealed(tx: &mpsc::Sender<ServeUp>, sealer: &mut ResponseSealer, piece: &[u8]) -> bool {
+    for part in piece.chunks(crypto::MAX_CHUNK) {
+        let Ok(c) = sealer.seal(part, false) else { return true };
+        if tx.send(up(serve_up::Msg::Chunk(c))).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 struct Ending {
