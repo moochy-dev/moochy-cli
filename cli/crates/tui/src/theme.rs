@@ -59,7 +59,7 @@ impl Theme {
         Style::default().fg(self.mint()).add_modifier(Modifier::BOLD)
     }
 
-    fn pick(&self, rgb: (u8, u8, u8), idx256: u8, ansi16: Color) -> Color {
+    fn pick(self, rgb: (u8, u8, u8), idx256: u8, ansi16: Color) -> Color {
         match self.depth {
             Depth::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
             Depth::Ansi256 => Color::Indexed(idx256),
