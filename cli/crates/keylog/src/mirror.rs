@@ -43,14 +43,15 @@ pub enum Alert {
         device_id: String,
         pseudonym: String,
     },
-    /// A claim, approval or membership on my repo signed by a key I do not know.
+    /// A claim, approval or membership on my repo, or an org entry on my organisation
+    /// (§19: `repo_id` is then the `o_…` id), signed by a key I do not know.
     NotSignedByMe {
         idx: u64,
         kind: Kind,
         repo_id: String,
         signer: String,
     },
-    /// A repo I owned was claimed by another account.
+    /// A repo (or organisation, `o_…`) I owned was claimed by another account.
     RepoClaimedByOther {
         idx: u64,
         repo_id: String,
@@ -282,9 +283,14 @@ impl Mirror {
             return Ok(());
         };
         let owner_before = match e.body {
-            Body::Claim { repo_id, .. } | Body::Grant { repo_id, .. } => {
-                self.state.owner(repo_id).map(str::to_owned)
+            Body::Claim { repo_id, .. }
+            | Body::Grant { repo_id, .. }
+            | Body::OrgClaim {
+                org_id: repo_id, ..
             }
+            | Body::OrgRepo {
+                org_id: repo_id, ..
+            } => self.state.owner(repo_id).map(str::to_owned),
             _ => None,
         };
         if let Err(code) = self.state.apply(idx, &e, check_sigs) {
@@ -294,7 +300,10 @@ impl Mirror {
                 code,
             });
             let signer = match e.body {
-                Body::Claim { signer, .. } | Body::Grant { signer, .. } => Some(signer),
+                Body::Claim { signer, .. }
+                | Body::Grant { signer, .. }
+                | Body::OrgClaim { signer, .. }
+                | Body::OrgRepo { signer, .. } => Some(signer),
                 Body::OwnerPasskey { authorizer, .. } | Body::OwnerKey { authorizer, .. } => {
                     authorizer
                 }
@@ -444,6 +453,12 @@ impl Mirror {
                 owner,
                 signer,
                 ..
+            }
+            | Body::OrgClaim {
+                org_id: repo_id,
+                owner,
+                signer,
+                ..
             } => {
                 if owner == me.pseudonym && !signer_known(signer) {
                     alerts.push(Alert::NotSignedByMe {
@@ -463,6 +478,11 @@ impl Mirror {
             }
             Body::Grant {
                 repo_id, signer, ..
+            }
+            | Body::OrgRepo {
+                org_id: repo_id,
+                signer,
+                ..
             } if owner_before.as_deref() == Some(me.pseudonym.as_str())
                 && !signer_known(signer) =>
             {

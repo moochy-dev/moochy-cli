@@ -352,3 +352,66 @@ proof, then a dev log can set `Config.OwnerKeyProofFromMs = 1` so tests exercise
   `owner_key_proof`, `owner_key_exists` and `email_changed_recently` to plain sentences.
 - **Nothing else changes for verification.** The mirror applies the rule itself, with the
   compiled-in cutover. Legacy keys and their approvals stay valid.
+
+## 11. Organisations (CONTRACT §19, spec/KEYLOG.md §2c)
+
+New kinds: 13 `ORG_CLAIMED`, 14 `ORG_REPO_ADDED`, 15 `ORG_REPO_REMOVED`, all owner-signed (Ed25519
+or passkey, like kinds 3–7). `DONOR_APPROVED` / `DONOR_REVOKED` may target an org id (`o_…`); the
+id prefix tells the target. Existing logs and vectors verify unchanged. Vectors: `orgs.json`.
+
+### 11a. mo-relay: append path, gate, pool
+
+- **Bodies.** `tlog.OrgClaim{OrgID, Provider, ProviderOrgID /* numeric provider id */, Owner,
+  Signer, IssuedAtMs}.Body()`, `tlog.OrgRepo{OrgID, RepoID, Signer, IssuedAtMs}.Body()`, and
+  `tlog.Grant{RepoID: orgID, Subject: donor, …}` for an org approval. `Parse()` returns
+  `tlog.OrgClaim` / `tlog.OrgRepo` (new types: your `case tlog.Claim` / `tlog.Grant` arms do not
+  see org claims). `KindByName` knows the three names. `Kind.OwnerSigned()` is exported: use it
+  instead of `k >= RepoClaimed && k <= MemberRemoved` in `edge/keylog.go` (A180 gate) and
+  `edge/decide.go` (passkey kinds), once the gate below handles them.
+- **Fail closed today.** `AppendSigned` refuses kinds 13–15 with `ungated`, so nothing enters the
+  log through the link before your §19 gate exists. After your gate admits an entry, append it with
+  `klog.Append(ctx, k, body, sig)` (skew, signature, state rules run there as usual).
+- **Gate (`sched/keylog.go`, `logGate`), mirror of the repo rules:**
+  - `ORG_CLAIMED`: `Owner` is this user, and a fresh single-use provider check says they own the
+    org (GitHub membership `admin` with `read:org`, GitLab access level Owner), with `Provider` /
+    `ProviderOrgID` equal to the org row. Assign the `o_` id once per (provider, provider org id)
+    and never reuse it; a personal account is never an org.
+  - `ORG_REPO_ADDED`: the org's current owner is this user, the repo is claimed by this user too,
+    and the provider says the repo belongs to the org (repo owner id = org id; GitLab: the repo's
+    namespace is the group or a subgroup). The log enforces the same-owner rule itself
+    (`not_owner`); the provider check is yours. `ORG_REPO_REMOVED`: the org's owner only.
+  - `DONOR_*` on an `o_` id: the org's current owner. Today `s.repos[o_…]` is nil, so they are
+    refused with `not_owner` (fail closed) until you add the org lookup.
+  - Signer is one of `KeyLog.OwnerKeys(ps)`, as for repos.
+- **Codes:** `not_owner` (repo claimed by someone else, or not the org owner's key), `unclaimed`
+  (org or repo not claimed), `replay`, `repo_binding` (org re-claimed with another provider id),
+  `skew`, `bad_sig`, `ungated`.
+- **Pool / `PoolSync`.** `klog.Sealable(worker, repo)` already answers the org rule (repo approval,
+  else an org that covers the repo with both claims under the same owner). `approvalIdx` is the
+  repo's own approval when active, else the **smallest** index among covering orgs' approvals: put
+  exactly that in `approval_log_index` (the Gateway compares it), even when another org's donation
+  pays. `klog.Owner(o_…)` returns the org owner. `klog.Sealable(w, "o_…")` is `unclaimed`.
+- **Listings.** Activity/admin walkers: kinds 13–15 parse to the new types; show `ORG_*` with the
+  org slug from your DB (slugs never enter the log).
+
+### 11b. mo-donor: node gate and alerts
+
+- **Sealing gate: nothing to call.** `View::seal_check` / `State::sealable` apply the org rule and
+  return the same `approval_idx` as the relay's `Sealable`; `check_pool_worker` compares it
+  unchanged. Errors stay `not_approved` / `unclaimed`.
+- **Alerts: no new variant, no patch to `alert_fields`.** Org entries reuse
+  `Alert::NotSignedByMe { kind: ORG_CLAIMED | ORG_REPO_ADDED | ORG_REPO_REMOVED | DONOR_*, repo_id:
+  "o_…" }` (an org entry on my org, or an org claim naming me, signed by an owner key I do not
+  know) and `Alert::RepoClaimedByOther { repo_id: "o_…" }` (my org claimed by another account).
+  `repo_id` starting with `o_` means organisation; the monitor's message already says "your
+  organisation o_…". If the UI shows slugs, resolve `o_` ids like repo ids.
+- **Approvals on the CLI (`approve.rs`, `owner.rs`).** `parse_body` returns `Body::OrgClaim
+  { org_id, provider, provider_org_id, owner, signer, issued_at_ms }` and `Body::OrgRepo { org_id,
+  repo_id, signer, issued_at_ms }`; bodies to sign: `entry::org_claim_body`, `entry::org_repo_body`,
+  `entry::grant_body(org_id, donor, …)`. To offer them, add `ORG_CLAIMED` 13, `ORG_REPO_ADDED` 14,
+  `ORG_REPO_REMOVED` 15 to `kind_num`, and map the new bodies in `decode` / the sign handler (a
+  claim names this account as `owner`; `--org github/acme` resolves to the `o_` id and must equal
+  the request's). Until then the existing `_ =>` arms refuse them (fail closed). Nodes submit
+  org entries over the link like other owner-signed kinds; the relay answers `ungated` until its
+  gate (11a) exists.
+- **Mac.** `moochy-keylog` cannot be cross-checked here (ring); the integrator's Mac build covers it.
