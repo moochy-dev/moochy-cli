@@ -54,6 +54,7 @@ const FOOTER_GLOBAL: &[(&str, &str)] = &[("/", "filter"), (":", "commands"), ("?
 const TOAST_MS: u64 = 4_000;
 const MAX_TOASTS: usize = 3;
 const MAX_INPUT: usize = 64;
+const MAX_TOAST: usize = 240;
 const FLASH_MS: u64 = 1_000;
 const SMILE_MS: u64 = 1_500;
 const SMILE_EVERY_MS: u64 = 10_000;
@@ -209,7 +210,7 @@ impl App {
             self.toasts.remove(0);
         }
         let mut text = clean(text);
-        if let Some((i, _)) = text.char_indices().nth(120) {
+        if let Some((i, _)) = text.char_indices().nth(MAX_TOAST) {
             text.truncate(i);
         }
         self.toasts.push(Toast { text, glyph, until_ms: self.now_ms.saturating_add(TOAST_MS) });
@@ -820,7 +821,9 @@ impl App {
         let mut y = main.bottom();
         for t in self.toasts.iter().rev() {
             let text = format!("{} {}", th.glyph(t.glyph), t.text);
-            let w = (Line::raw(text.as_str()).width() as u16).saturating_add(4).min(main.width).min(60);
+            // As wide as the text needs, up to the pane (a hand-off command stays whole); beyond
+            // that it is cut with "…".
+            let w = (Line::raw(text.as_str()).width() as u16).saturating_add(4).min(main.width);
             let h = 3;
             if y < main.y.saturating_add(h) {
                 break;
@@ -829,7 +832,8 @@ impl App {
             let r = Rect { x: main.right().saturating_sub(w), y, width: w, height: h };
             f.render_widget(Clear, r);
             let block = Block::default().borders(Borders::ALL).border_set(th.border_set()).border_style(th.glyph_style(t.glyph));
-            f.render_widget(Paragraph::new(Line::styled(text, th.glyph_style(t.glyph))).block(block), r);
+            let line = crate::widgets::list::fit(Line::styled(text, th.glyph_style(t.glyph)), usize::from(w.saturating_sub(2)));
+            f.render_widget(Paragraph::new(line).block(block), r);
         }
     }
 
