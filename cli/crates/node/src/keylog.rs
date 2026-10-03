@@ -209,6 +209,12 @@ impl KeyLog {
         )
     }
 
+    /// A269: does each of `targets` (its current owner) accept `pseudonym` as a donor in the
+    /// mirror? `None`: no key log on this node.
+    pub fn accepts_donor(home: &Home, cfg: &Config, pseudonym: &str, targets: &[String]) -> Option<Vec<bool>> {
+        Self::mirror(home, cfg)?.state(|s| targets.iter().map(|t| s.donor_approved(t, pseudonym)).collect()).ok()
+    }
+
     /// `moochy owner status` (§19, keylog WIRING §11b): the orgs `pseudonym` owns in the mirror,
     /// each with the repos it covers, sorted. `None`: no key log on this node.
     pub fn owned_orgs(home: &Home, cfg: &Config, pseudonym: &str) -> Option<Vec<(String, Vec<String>)>> {

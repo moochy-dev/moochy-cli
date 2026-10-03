@@ -524,8 +524,9 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
 }
 
 /// A269 (§19.4): a project-level DONOR_REVOKED does not stop a donor approved through an
-/// organisation of yours that funds the project. Such organisations come from the verified key
-/// log; the org revoke is offered and needs its own yes (`--yes` only prints the command: it never
+/// organisation of yours that funds the project. Such organisations, and whether they accepted the
+/// donor, come from the verified key log (a handle's pseudonym from the relay's revoke offers;
+/// unknown: the note stays conditional); the org revoke is offered and needs its own yes (`--yes` only prints the command: it never
 /// signs more than was typed). Returns the organisations to revoke the donor for.
 fn covering_orgs(home: &Home, slug: &str, donor: &str, yes: bool) -> Result<Vec<String>> {
     let cfg = home.load()?;
@@ -548,18 +549,19 @@ fn covering_orgs(home: &Home, slug: &str, donor: &str, yes: bool) -> Result<Vec<
         })
         .map(|r| r.into_inner().requests)
         .unwrap_or_default();
+    let ps = if donor.starts_with("ps_") { Some(donor) } else { pushed.iter().find(|q| q.kind == "DONOR_REVOKED" && q.subject_username.eq_ignore_ascii_case(donor)).map(|q| q.subject.as_str()) };
+    let accepted = ps.and_then(|ps| crate::keylog::KeyLog::accepts_donor(home, &cfg, ps, &ids));
     let mut out = Vec::new();
-    for o in &ids {
+    for (i, o) in ids.iter().enumerate() {
+        let known = accepted.as_ref().and_then(|a| a.get(i).copied());
+        if known == Some(false) {
+            continue;
+        }
         let path = pushed.iter().find(|q| q.org_id == *o && q.repo_id == l.repo_id).and_then(|q| crate::config::canonical_org(&q.org_path));
         let target = path.as_deref().map_or_else(|| format!("<path of {}>", clean(o)), |p| clean(p).into_owned());
-        eprintln!(
-            "Note: your organisation {target} ({}) funds {}. If it accepted {}, they keep serving {} through it after this revoke; to stop them on every project of the organisation: moochy approve {} --revoke --org {target}",
-            clean(o),
-            clean(&l.repo_slug),
-            clean(donor),
-            clean(&l.repo_slug),
-            clean(donor)
-        );
+        let (who, project) = (clean(donor), clean(&l.repo_slug));
+        let fact = if known == Some(true) { format!("{who} is also accepted by your organisation {target} ({}), which funds {project}: they", clean(o)) } else { format!("your organisation {target} ({}) funds {project}. If it accepted {who}, they", clean(o)) };
+        eprintln!("Note: {fact} keep serving {project} through it after this revoke; to stop them on every project of the organisation: moochy approve {who} --revoke --org {target}");
         if let Some(p) = path
             && !yes
             && matches!(ask(&format!("Revoke {} for {} too? Type yes: ", clean(donor), clean(&p)), false)?.as_str(), "yes" | "y")
