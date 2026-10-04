@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # cargo-dist configuration for the open-source `moochy` client (plan 07 §11).
 # Lives at the root of the moochy-cli repository; the Cargo workspace is cli/.
-# Regenerate .github/workflows/release.yml after any change: `dist generate`.
+# Regenerate .github/workflows/release.yml after any change with `dist generate`,
+# then re-apply the hand hardening it drops (see `git diff`): actions pinned by
+# commit SHA, dist installed from a SHA-256-checked archive (no curl | sh), no
+# `secrets: inherit`, and the custom-attest-release job (attest-release.yml).
 [workspace]
 members = ["cargo:cli"]
 
@@ -25,7 +28,8 @@ targets = [
 npm-package = "moochy"
 tap = "moochy-dev/homebrew-tap"
 formula = "moochy"
-# crates.io on every tag (.github/workflows/publish-crates.yml, secret CARGO_REGISTRY_TOKEN).
+# crates.io on every tag (.github/workflows/publish-crates.yml): trusted publishing
+# over GitHub OIDC (crates.io trusts release.yml, environment crates-io); no stored token.
 # Add "homebrew" (secret HOMEBREW_TAP_TOKEN) and "npm" (secret NPM_TOKEN) once those
 # secrets exist, then run `dist generate`; until then their files ship on the release.
 publish-jobs = ["./publish-crates"]
@@ -41,14 +45,16 @@ pr-run-mode = "plan"
 # .github/workflows/ (file: .github/build-setup.yml, same flags as
 # deploy/client/scripts/repro-check.sh).
 github-build-setup = "../build-setup.yml"
-# Dependabot bumps the actions pinned in release.yml; `dist generate` re-pins them.
+# Dependabot bumps the actions pinned by SHA in release.yml; `dist generate` would
+# replace them with tags, so re-pin after regenerating.
 allow-dirty = ["ci"]
 
 # Native runners for every Linux target (no cross toolchain in the musl
 # artifacts that the reproducibility check rebuilds).
-# publish-crates.yml checks out the repository: it needs contents: read.
+# publish-crates.yml checks out the repository (contents: read) and asks
+# crates.io for a short-lived token (id-token: write).
 [dist.github-custom-job-permissions]
-"publish-crates" = { contents = "read" }
+"publish-crates" = { contents = "read", id-token = "write" }
 
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"

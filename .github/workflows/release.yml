@@ -56,17 +56,29 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # The pinned release archive, checked against SHA-256 values committed
+        # here (they match axodotdev/cargo-dist's GitHub build attestations for
+        # v0.33.0), instead of piping its installer script into sh.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-installer.sh | sh"
+        run: |
+          case "$(uname -sm)" in
+            "Linux x86_64") t=x86_64-unknown-linux-gnu sum=4b3f0a5f0ebbdb798f6db649d01b32ba1518376b6f7a0502b7d92b75cc2c8293 ;;
+            "Linux aarch64") t=aarch64-unknown-linux-gnu sum=9c554ab21a58ad46eb9b6710f89633ccb26bc2577cf4b0c2d18a5b826a31913e ;;
+            "Darwin arm64") t=aarch64-apple-darwin sum=7b3cbe25511de01d74c0f5fcb7909edabd379bea9cfa284d93af5a3cdfa3247c ;;
+            "Darwin x86_64") t=x86_64-apple-darwin sum=6a49bfb61bd86770d79c27f3d2b40c6b2e71cde940d3d31a6ccaaffc124d7a29 ;;
+            *) echo "no pinned dist archive for $(uname -sm)" >&2; exit 1 ;;
+          esac
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/dist.tar.xz" "https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-$t.tar.xz"
+          echo "$sum  $RUNNER_TEMP/dist.tar.xz" | shasum -a 256 -c -
+          tar -xJf "$RUNNER_TEMP/dist.tar.xz" -C "$RUNNER_TEMP"
+          mkdir -p ~/.cargo/bin && install -m 0755 "$RUNNER_TEMP/cargo-dist-$t/dist" ~/.cargo/bin/dist
       - name: Cache dist
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
@@ -82,7 +94,7 @@ jobs:
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -108,7 +120,6 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
@@ -120,17 +131,10 @@ jobs:
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
-        run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
       - name: "Reproducible build flags"
         run: |
           cargo_home=${CARGO_HOME:-$HOME/.cargo}
@@ -149,10 +153,25 @@ jobs:
         run: "rustup toolchain install \"$(sed -n 's/^channel *= *\"\\(.*\\)\"/\\1/p' cli/rust-toolchain.toml)\" --profile minimal --target \"$(uname -m)-unknown-linux-musl\""
         shell: "bash"
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        # The pinned release archive, checked against SHA-256 values committed
+        # here (they match axodotdev/cargo-dist's GitHub build attestations for
+        # v0.33.0), instead of piping its installer script into sh.
+        shell: bash
+        run: |
+          case "$(uname -sm)" in
+            "Linux x86_64") t=x86_64-unknown-linux-gnu sum=4b3f0a5f0ebbdb798f6db649d01b32ba1518376b6f7a0502b7d92b75cc2c8293 ;;
+            "Linux aarch64") t=aarch64-unknown-linux-gnu sum=9c554ab21a58ad46eb9b6710f89633ccb26bc2577cf4b0c2d18a5b826a31913e ;;
+            "Darwin arm64") t=aarch64-apple-darwin sum=7b3cbe25511de01d74c0f5fcb7909edabd379bea9cfa284d93af5a3cdfa3247c ;;
+            "Darwin x86_64") t=x86_64-apple-darwin sum=6a49bfb61bd86770d79c27f3d2b40c6b2e71cde940d3d31a6ccaaffc124d7a29 ;;
+            *) echo "no pinned dist archive for $(uname -sm)" >&2; exit 1 ;;
+          esac
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/dist.tar.xz" "https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-$t.tar.xz"
+          echo "$sum  $RUNNER_TEMP/dist.tar.xz" | shasum -a 256 -c -
+          tar -xJf "$RUNNER_TEMP/dist.tar.xz" -C "$RUNNER_TEMP"
+          mkdir -p ~/.cargo/bin && install -m 0755 "$RUNNER_TEMP/cargo-dist-$t/dist" ~/.cargo/bin/dist
       # Get the dist-manifest
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -166,7 +185,7 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - name: Attest
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
@@ -183,7 +202,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
@@ -200,19 +219,19 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -230,7 +249,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-global
           path: |
@@ -250,19 +269,19 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Fetch artifacts from scratch-storage
       - name: Fetch artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -275,14 +294,14 @@ jobs:
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: artifacts
@@ -311,10 +330,24 @@ jobs:
     uses: ./.github/workflows/publish-crates.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    # publish jobs get escalated permissions
+    # No secrets: crates.io trusted publishing (OIDC) gives the publish job a
+    # short-lived token (publish-crates.yml). Never `secrets: inherit`.
     permissions:
       "contents": "read"
+      "id-token": "write"
+
+  # Hand-added (not generated by dist): rebuild the Linux musl archives from
+  # this tag and sign only those, as attest-release.yml@refs/tags/<tag>.
+  custom-attest-release:
+    needs:
+      - plan
+      - host
+    uses: ./.github/workflows/attest-release.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    permissions:
+      "contents": "write"
+      "id-token": "write"
 
   announce:
     needs:
@@ -329,7 +362,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive

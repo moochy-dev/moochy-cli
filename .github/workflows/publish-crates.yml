@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Custom cargo-dist publish job (dist-workspace.toml `publish-jobs`): every
 # release tag publishes the workspace crates to crates.io.
+#
+# Dependency build scripts and proc-macros run only in `verify`, which holds no
+# credential. `publish` runs on a fresh runner, compiles nothing
+# (`--no-verify`), and gets a crates.io token that lives about 30 minutes
+# (trusted publishing over GitHub OIDC, revoked when the job ends). crates.io
+# trusts release.yml (the caller, whose name is in the OIDC workflow_ref) in
+# the environment `crates-io`; no long-lived token is stored in this repository.
 name: publish-crates
 on:
   workflow_call:
@@ -10,21 +17,42 @@ on:
         type: string
 permissions:
   contents: read
+env:
+  CRATES: moochy-proto moochy-worker moochy-keylog moochy-sandbox moochy-tui moochy # dependency order
 jobs:
-  crates-io:
+  verify:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
+      - name: Build every crate exactly as it will be published (no credentials here)
+        working-directory: cli
+        run: |
+          args=()
+          for c in $CRATES; do args+=(-p "$c"); done
+          cargo package --locked "${args[@]}"
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
       # One crate at a time in dependency order, skipping versions already on
       # crates.io, so a rerun (rate limit, network) finishes the release.
-      - name: cargo publish
+      - name: cargo publish (upload only, nothing is compiled)
         working-directory: cli
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          for c in moochy-proto moochy-worker moochy-keylog moochy-sandbox moochy-tui moochy; do
-            if out=$(cargo publish --locked -p "$c" 2>&1); then echo "published $c"
+          for c in $CRATES; do
+            if out=$(cargo publish --locked --no-verify -p "$c" 2>&1); then echo "published $c"
             elif grep -q 'already exists' <<<"$out"; then echo "$c: this version is already on crates.io"
             else echo "$out"; exit 1; fi
           done

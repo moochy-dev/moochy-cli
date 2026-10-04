@@ -21,12 +21,13 @@ Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release
 `dist plan` produces, per release tag `vX.Y.Z`:
 
 - archives for macOS (arm64, x86_64) and Linux (arm64, x86_64; glibc and musl), each with a `.sha256`;
-- the official one-line installer `curl -fsSL https://moochy.dev/install.sh | sh` (`install.sh` here; moochy.dev redirects to its raw copy on `main`): picks the static musl archive on Linux or the Darwin archive on macOS, verifies its `.sha256`, installs `moochy` to `~/.local/bin` (or `$MOOCHY_INSTALL_DIR`) without `sudo`; `MOOCHY_VERSION=vX.Y.Z` pins a release. Check with `shellcheck -s sh deploy/client/install.sh`;
+- the official one-line installer `curl -fsSL https://moochy.dev/install.sh | sh` (`install.sh` here; moochy.dev redirects to its raw copy on `main`): picks the static musl archive on Linux or the Darwin archive on macOS, verifies its `.sha256` and, when `gh` is signed in, its build attestation (`gh attestation verify`), installs `moochy` to `~/.local/bin` (or `$MOOCHY_INSTALL_DIR`) without `sudo`; `MOOCHY_VERSION=vX.Y.Z` pins a release. Check with `shellcheck -s sh deploy/client/install.sh`;
 - a shell installer, a Homebrew formula (`moochy-dev/homebrew-tap`), and the npm package `moochy` (`npx -y moochy mcp`);
-- the crates on crates.io (`cargo install moochy --locked`), through the custom publish job `.github/workflows/publish-crates.yml`;
+- the crates on crates.io (`cargo install moochy --locked`), through the custom publish job `.github/workflows/publish-crates.yml` (crates.io trusted publishing; dependency build scripts run only in a job without credentials);
+- cosign bundles (`.sigstore.json`) for the two Linux musl archives only, from `.github/workflows/attest-release.yml` after an independent rebuild matched them;
 - no auto-updater (`install-updater = false`): `moochy update` verifies signatures itself (06 §12).
 
-`.github/workflows/release.yml` is **generated** by `dist generate` (cargo-dist 0.33.0); never edit it by hand.
+`.github/workflows/release.yml` is **generated** by `dist generate` (cargo-dist 0.33.0), then hardened by hand: actions pinned by SHA, dist from a SHA-256-checked archive, no `secrets: inherit`, and the `custom-attest-release` job. After regenerating, re-apply these (see `dist-workspace.toml`).
 
 ## Verify a release (users)
 
@@ -34,12 +35,13 @@ Verification happens outside the binary; a binary checking itself would prove no
 
 ```sh
 # SLSA build provenance, Sigstore-signed by the release workflow
-gh attestation verify moochy-x86_64-unknown-linux-musl.tar.xz --repo moochy-dev/moochy-cli
+gh attestation verify moochy-x86_64-unknown-linux-musl.tar.xz --repo moochy-dev/moochy-cli \
+  --signer-workflow moochy-dev/moochy-cli/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
 
-# or cosign with the bundle attached to the release
+# Linux musl archives: the cosign bundle says an independent rebuild of tag vX.Y.Z matched it
 cosign verify-blob moochy-x86_64-unknown-linux-musl.tar.xz \
   --bundle moochy-x86_64-unknown-linux-musl.tar.xz.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/moochy-dev/moochy-cli/\.github/workflows/attest-release\.yml@refs/tags/v' \
+  --certificate-identity 'https://github.com/moochy-dev/moochy-cli/.github/workflows/attest-release.yml@refs/tags/vX.Y.Z' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # rebuild the Linux musl artifact yourself (Ubuntu 24.04, musl-tools, Rust as pinned)
