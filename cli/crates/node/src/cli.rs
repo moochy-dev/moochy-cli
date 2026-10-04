@@ -405,7 +405,17 @@ fn run() -> Result<()> {
         return Err(usage("missing command"));
     }
     let home = Home::resolve(o.home.clone())?;
-    let w: Vec<&str> = o.words.iter().map(String::as_str).collect();
+    let donor: String;
+    let mut w: Vec<&str> = o.words.iter().map(String::as_str).collect();
+    // M6: `accept p_…` names the donation request that `pending` and `decisions` print.
+    if let ["approve" | "accept", d] = w.as_slice()
+        && d.starts_with("p_")
+    {
+        donor = donor_of_request(&home, d)?;
+        if let Some(x) = w.get_mut(1) {
+            *x = donor.as_str();
+        }
+    }
     // A cloud box (§17.1) has no owner powers and no donor role.
     if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "org" | "person" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
         crate::boxes::refuse_on_box(&home.load()?, cmd)?;
@@ -562,6 +572,21 @@ fn restart_note(home: &Home, what: &str) {
     if running(home) {
         eprintln!("The app is running: restart it with `moochy down && moochy up` to use the new {what}.");
     }
+}
+
+/// M6: the donor a pending donation request (`p_…`) asks to accept: their handle (then checked with
+/// the server, A218), else their pseudonym.
+fn donor_of_request(home: &Home, id: &str) -> Result<String> {
+    let r = rt_small()?.block_on(async {
+        let mut c = crate::ctl::connect(&home.socket_path()).await?;
+        c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| internal(clean(s.message()).into_owned()))
+    })?;
+    let q = r
+        .requests
+        .iter()
+        .find(|q| q.request_id == id && q.kind == "DONOR_APPROVED")
+        .ok_or_else(|| usage(format!("no pending donation request {}: `moochy pending` lists them (or name the donor by handle or ps_ id)", clean(id))))?;
+    Ok(if q.subject_username.is_empty() { q.subject.clone() } else { q.subject_username.clone() })
 }
 
 /// Ask the running node to request `KEY_REVOKED` and stop, then wipe the device keys locally.
