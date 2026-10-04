@@ -155,7 +155,10 @@ fn verify_local(node: &Node, receipt_ref: &str) -> Result<Option<Value>, String>
             Some(_) => return Err("the donor key is not in the public key log".into()),
             None => "not checked (no key log pinned)",
         };
-        return Ok(Some(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": p.donor, "model": p.model,
+        // m13: a receipt names the donor only when they are shown publicly; the key log always
+        // knows the account of the device that signed it.
+        let donor = p.donor.clone().or_else(|| node.keylog.as_ref().and_then(|l| l.device_pseudonym(&e.worker_device)));
+        return Ok(Some(json!({"verified": true, "receipt_ref": receipt_ref, "repo_id": p.repo_id.text(), "donor": donor, "model": p.model,
             "cost_uusd": p.cost_uusd, "day": p.day, "worker_device": e.worker_device, "key_log": key_log, "source": "local"})));
     }
     Ok(None)

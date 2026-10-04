@@ -357,6 +357,11 @@ impl KeyLog {
     }
 
     /// The logged device whose signing key this is (`moochy verify`, mo-node).
+    /// m13: the account (`ps_…`) a logged device belongs to.
+    pub fn device_pseudonym(&self, device: &str) -> Option<String> {
+        self.view().state(|st| st.device(device).map(|d| d.pseudonym.clone())).ok().flatten()
+    }
+
     pub fn device_by_key(&self, sign_pub: &[u8; 32]) -> Option<String> {
         self.view().state(|st| st.device_by_key(sign_pub).map(str::to_owned)).ok().flatten()
     }
@@ -615,6 +620,8 @@ impl moochy_keylog::LogLink for Link {
 /// mirror, then that the projection names the requested reference. Without a key log, only in
 /// insecure dev mode, the relay-advertised pool key is used and the answer says so.
 pub async fn verify_ref(node: &Arc<Node>, receipt_ref: &str) -> Result<serde_json::Value, String> {
+    // m13: public pages show `r_` + the reference; the relay stores the bare one.
+    let receipt_ref = crate::util::bare_receipt_ref(receipt_ref);
     if !moochy_keylog::projection::valid_ref(receipt_ref) {
         return Err("not a receipt reference".into());
     }
@@ -622,7 +629,11 @@ pub async fn verify_ref(node: &Arc<Node>, receipt_ref: &str) -> Result<serde_jso
         return Err("not connected to the Moochy server".into());
     }
     let mut link = Link { node: node.clone(), notes: watch::channel(None).1, anchor_due: Instant::now() };
-    let reply = monitor::fetch_projection(&mut link, receipt_ref).await.map_err(|e| format!("no public receipt {receipt_ref}: {e}"))?;
+    let reply = monitor::fetch_projection(&mut link, receipt_ref).await.map_err(|e| match e {
+        moochy_keylog::Error::Io(m) if m.contains("no such projection") => format!("the server has no public receipt r_{receipt_ref} (check the reference; a receipt is public a few seconds after its request ends)"),
+        moochy_keylog::Error::Io(m) => format!("could not fetch the public receipt from the server ({m}); try again"),
+        e => format!("the server's answer for r_{receipt_ref} is not usable ({e})"),
+    })?;
     let v = crate::json::parse_object(&reply).map_err(|e| format!("malformed answer: {e}"))?;
     let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str).ok_or_else(|| format!("answer lacks {k}"));
     let projection = crate::util::b64d(field("projection_b64")?).ok_or("bad projection_b64")?;

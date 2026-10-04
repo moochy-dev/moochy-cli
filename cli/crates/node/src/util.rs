@@ -268,6 +268,12 @@ pub fn emit(v: &serde_json::Value) {
     let _ = out.flush();
 }
 
+/// A receipt reference as the relay stores it: public pages show `r_` + the 22-character base64url
+/// reference; both forms are accepted (a bare reference may itself start with `r_`).
+pub fn bare_receipt_ref(r: &str) -> &str {
+    r.strip_prefix("r_").filter(|b| b.len() == 22).unwrap_or(r)
+}
+
 /// Structured log line to stderr (never content: callers pass codes and ids only).
 pub fn log(level: &str, msg: &str, fields: &serde_json::Value) {
     let mut line = serde_json::json!({"level": level, "msg": msg, "t_ms": now_ms()});
@@ -282,6 +288,14 @@ pub fn log(level: &str, msg: &str, fields: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_refs_with_or_without_r() {
+        let bare = "8sP4lxQiSSCEisEFQAHpng";
+        assert_eq!(bare_receipt_ref(&format!("r_{bare}")), bare);
+        assert_eq!(bare_receipt_ref(bare), bare);
+        assert_eq!(bare_receipt_ref("r_8sP4lxQiSSCEisEFQAHp"), "r_8sP4lxQiSSCEisEFQAHp", "a bare ref that starts with r_");
+    }
 
     #[test]
     fn amounts_are_dollars() {

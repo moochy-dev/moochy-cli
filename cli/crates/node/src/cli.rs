@@ -496,7 +496,12 @@ fn run() -> Result<()> {
         ["verify", r] => rt_small()?.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await?;
             let v = c.verify(crate::pb::local::VerifyRequest { receipt_ref: (*r).into() }).await.map_err(|s| auth(format!("not verified: {}", clean(s.message()))))?;
-            println!("{}", v.into_inner().result_json);
+            let mut v = crate::json::parse(v.into_inner().result_json.as_bytes()).map_err(|_| internal("malformed answer from the app"))?;
+            // m13: the public page of the signed receipt (pages show `r_` + the reference).
+            if let Some(o) = v.as_object_mut() {
+                o.insert("receipt_url".into(), json!(format!("{}/r/r_{}", crate::decisions::web_origin(&home), crate::util::bare_receipt_ref(r))));
+            }
+            emit(&v);
             Ok(())
         }),
         ["donate"] => donate(&home, &o),
