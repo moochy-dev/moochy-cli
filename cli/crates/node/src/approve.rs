@@ -197,7 +197,10 @@ pub async fn submit(node: &Node, r: SubmitEntryRequest) -> Result<SignResponse, 
         Body::Key { device_id, pseudonym, .. } if Some(pseudonym) == node.cfg.pseudonym.as_deref() => (out.subject, out.signer) = (device_id.into(), node.device_id().unwrap_or_default().into()),
         _ => return Err(Status::invalid_argument("body does not match its kind")),
     }
-    if !matches!(kind, Kind::OwnerKeyAdded | Kind::KeyAdded | Kind::KeyRevoked) {
+    // §24.3: the relay offers no PERSON_REPO_ADDED (the owner picks the repos); the CLI builds it
+    // from the server's Lookups and sends it with no request id.
+    let unsolicited = kind == Kind::PersonRepoAdded && r.request_id.is_empty();
+    if !matches!(kind, Kind::OwnerKeyAdded | Kind::KeyAdded | Kind::KeyRevoked) && !unsolicited {
         let q = lock(&node.approvals).iter().find(|q| q.request_id == r.request_id).cloned().ok_or_else(|| Status::not_found("no such pending request"))?;
         if q.kind != r.kind || q.repo_id != out.repo_id || q.org_id != out.org_id || q.person_id != out.person_id || (is_grant(kind) && q.subject_pseudonym != out.subject) {
             return Err(Status::failed_precondition("entry does not answer the pending request"));

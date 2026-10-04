@@ -598,7 +598,7 @@ pub fn sign(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool, de
     let done = sign_entries(home, slug, words, yes, revoke, device, cap);
     // The org revokes the human asked for run even if the project's own entry failed.
     for org in &also {
-        crate::org::sign(home, crate::org::Group::Org, org, crate::org::Op::Donor { donor, revoke: true }, false)?;
+        crate::org::sign(home, crate::org::Group::Org, org, &[crate::org::Op::Donor { donor, revoke: true }], false)?;
     }
     done
 }

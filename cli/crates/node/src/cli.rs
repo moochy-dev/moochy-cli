@@ -136,13 +136,13 @@ COMMANDS:
                                   (also: claim --repo PROJECT)
   claim --org ORG [--yes]         Confirm you own an organisation (github/ORG: an admin;
                                   gitlab/GROUP[/SUB…]: an Owner)
-  org <add|remove> <PROJECT> --org ORG [--yes] | org list --org ORG [--json]
+  org <add|remove> <PROJECT>… --org ORG [--yes] | org list --org ORG [--json]
                                   Which of your projects your organisation's donations fund
   claim --person [PERSON] [--yes] Confirm your own GitHub/GitLab profile (after signing in on
                                   the web: Claim your profile), so people can sponsor you
-  person <add|remove> <PROJECT> [--person PERSON] [--yes] | person list [--person PERSON] [--json]
+  person <add|remove> <PROJECT>… [--person PERSON] [--yes] | person list [--person PERSON] [--json]
                                   Which public repos you maintain your sponsors' tokens serve
-                                  (your own requests only)
+                                  (your own requests only; several at once: one passphrase)
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_ENROLL (cloud box enrollment token),
      MOOCHY_INSECURE_DEV=1 (development only)
@@ -746,7 +746,8 @@ fn person_arg(o: &Opts) -> Result<Option<String>> {
 }
 
 /// Your own person profile: `--person` when given, else the one the app's pushed requests name
-/// (for `claim`: a waiting PERSON_CLAIMED, started on the web).
+/// (for `claim`: a waiting PERSON_CLAIMED, started on the web), else your code-host handle's
+/// profile when the key log says you claimed it.
 fn own_person(home: &Home, o: &Opts, claim: bool) -> Result<String> {
     if let Some(p) = person_arg(o)?.filter(|p| !p.is_empty()) {
         return Ok(p);
@@ -761,7 +762,7 @@ fn own_person(home: &Home, o: &Opts, claim: bool) -> Result<String> {
     match found.as_slice() {
         [one] => crate::config::canonical_org(one).filter(|c| c.matches('/').count() == 1).ok_or_else(|| internal("the app named a malformed person profile")),
         [] if claim => Err(usage("no profile claim is waiting: sign in on the web and choose Claim your profile, then run this again (or pass --person github/LOGIN)")),
-        [] => Err(usage(format!("no person profile of yours is known to the app: claim it first (moochy claim --person), or pass --person {PERSON_FORMS}"))),
+        [] => crate::org::own_profile(home).ok_or_else(|| usage(format!("no person profile of yours is known to the app: claim it first (moochy claim --person), or pass --person {PERSON_FORMS}"))),
         _ => Err(usage(format!("more than one profile: pass --person {PERSON_FORMS}"))),
     }
 }
@@ -778,35 +779,19 @@ fn person_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     let person = own_person(home, o, w == ["claim"])?;
     match w {
         ["claim"] => {
-            sign(home, Group::Person, &person, Op::Claim, yes)?;
+            sign(home, Group::Person, &person, &[Op::Claim], yes)?;
             share(home, &format!("people/{person}"));
-            offers(home, &person);
+            // §24.3: nothing is proposed for every repo you maintain; you pick them.
+            eprintln!("Choose the public repos your sponsors' tokens serve: moochy person add <PROJECT>… (one passphrase for all), or tick them in your profile settings: {}/people/{person}/settings", clean(&crate::decisions::web_origin(home)));
             Ok(())
         }
-        ["person", op @ ("add" | "remove"), repo] => sign(home, Group::Person, &person, Op::Repo { repo: &canonical_repo(repo)?.to_ascii_lowercase(), remove: *op == "remove" }, yes),
-        ["person", "list"] => list(home, Group::Person, &person, o.has("json")),
-        ["approve" | "accept", donor] if !donor.is_empty() => sign(home, Group::Person, &person, Op::Donor { donor, revoke: o.has("revoke") }, yes),
-        _ => Err(usage(format!("person <add|remove> <PROJECT> | person list | claim --person | accept <donor> --person [PERSON]: PERSON is {PERSON_FORMS}"))),
-    }
-}
-
-/// §24.3: after a person claim, the public repos you maintain that the server offers to cover.
-/// ponytail: one `person add` each (one passphrase each); a batch signature needs KEYLOG support.
-fn offers(home: &Home, person: &str) {
-    let Ok(Ok(r)) = rt_small().map(|rt| {
-        rt.block_on(async {
-            let mut c = crate::ctl::connect(&home.socket_path()).await?;
-            c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| internal(clean(s.message()).into_owned()))
-        })
-    }) else {
-        return;
-    };
-    let repos: Vec<String> = r.requests.iter().filter(|q| q.request_id.starts_with("person-repo:") && q.person_path.eq_ignore_ascii_case(person)).filter_map(|q| crate::config::canonical_slug(&q.repo_slug)).collect();
-    if !repos.is_empty() {
-        eprintln!("Public repos you maintain; your sponsors' tokens serve your own requests there once you add them:");
-        for r in repos {
-            eprintln!("  moochy person add {r}");
+        ["person", op @ ("add" | "remove"), repos @ ..] if !repos.is_empty() => {
+            let repos = canonical_repos(repos)?;
+            sign(home, Group::Person, &person, &repos.iter().map(|repo| Op::Repo { repo, remove: *op == "remove" }).collect::<Vec<_>>(), yes)
         }
+        ["person", "list"] => list(home, Group::Person, &person, o.has("json")),
+        ["approve" | "accept", donor] if !donor.is_empty() => sign(home, Group::Person, &person, &[Op::Donor { donor, revoke: o.has("revoke") }], yes),
+        _ => Err(usage(format!("person <add|remove> <PROJECT>… | person list | claim --person | accept <donor> --person [PERSON]: PERSON is {PERSON_FORMS}"))),
     }
 }
 
@@ -827,20 +812,35 @@ fn org_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
     let yes = o.has("yes");
     match w {
         ["claim"] => {
-            sign(home, Group::Org, &org, Op::Claim, yes)?;
+            sign(home, Group::Org, &org, &[Op::Claim], yes)?;
             share(home, &format!("org/{org}"));
             Ok(())
         }
-        ["org", op @ ("add" | "remove"), repo] => sign(home, Group::Org, &org, Op::Repo { repo: &canonical_repo(repo)?.to_ascii_lowercase(), remove: *op == "remove" }, yes),
+        ["org", op @ ("add" | "remove"), repos @ ..] if !repos.is_empty() => {
+            let repos = canonical_repos(repos)?;
+            sign(home, Group::Org, &org, &repos.iter().map(|repo| Op::Repo { repo, remove: *op == "remove" }).collect::<Vec<_>>(), yes)
+        }
         ["org", "list"] => crate::org::list(home, Group::Org, &org, o.has("json")),
-        ["approve" | "accept", donor] if !donor.is_empty() => sign(home, Group::Org, &org, Op::Donor { donor, revoke: o.has("revoke") }, yes),
-        _ => Err(usage(format!("org <add|remove> <PROJECT> --org ORG | org list --org ORG | claim --org ORG | accept <donor> --org ORG: ORG is {ORG_FORMS}"))),
+        ["approve" | "accept", donor] if !donor.is_empty() => sign(home, Group::Org, &org, &[Op::Donor { donor, revoke: o.has("revoke") }], yes),
+        _ => Err(usage(format!("org <add|remove> <PROJECT>… --org ORG | org list --org ORG | claim --org ORG | accept <donor> --org ORG: ORG is {ORG_FORMS}"))),
     }
 }
 
 /// A `--repo` value in the link's canonical form (`owner/name` = GitHub, `gitlab/…`).
 fn canonical_repo(r: &str) -> Result<String> {
     crate::config::canonical_slug(r).ok_or_else(|| usage(format!("--repo is {REPO_FORMS}")))
+}
+
+/// `org|person add|remove A B …`: each project in canonical lower case, once, in order.
+fn canonical_repos(rs: &[&str]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(rs.len());
+    for r in rs {
+        let c = canonical_repo(r)?.to_ascii_lowercase();
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    Ok(out)
 }
 
 /// `moochy up` on a cloud box (§17.1): enroll with `MOOCHY_ENROLL` when this machine has no device
