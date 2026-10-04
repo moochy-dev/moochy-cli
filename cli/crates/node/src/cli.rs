@@ -1399,7 +1399,9 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt as _;
     home.ensure()?;
-    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(home.state_dir().join("node.log")).ctx("open node.log")?;
+    let log_path = home.state_dir().join("node.log");
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ctx("open node.log")?;
+    let log_start = log_file.metadata().map_or(0, |m| m.len());
     let exe = std::env::current_exe().ctx("current exe")?;
     let mut cmd = std::process::Command::new(exe);
     // The background process never sees the owner passphrase (CONTRACT §15.4, A190).
@@ -1428,8 +1430,18 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
             4 => crate::util::Exit::Network,
             _ => crate::util::Exit::Internal,
         },
-        msg: format!("node failed to start (see {})", home.state_dir().join("node.log").display()),
+        msg: start_error(&log_path, log_start).unwrap_or_else(|| format!("node failed to start (see {})", log_path.display())),
     })
+}
+
+/// The reason a background start failed: the `message` of the last JSON error line the node
+/// wrote to `node.log` after `from` (e.g. "not logged in: run `moochy login` first"), with
+/// control characters removed so a log line cannot steer the terminal.
+fn start_error(log: &std::path::Path, from: u64) -> Option<String> {
+    let bytes = std::fs::read(log).ok()?;
+    let tail = String::from_utf8_lossy(bytes.get(usize::try_from(from).ok()?..)?).into_owned();
+    let msg = tail.lines().rev().find_map(|l| crate::json::parse_object(l.as_bytes()).ok()?.get("message")?.as_str().map(str::to_owned))?;
+    Some(msg.chars().filter(|c| !c.is_control()).collect())
 }
 
 fn up_foreground(home: Home, offline: bool, unsafe_no_lockdown: bool) -> Result<()> {
@@ -1650,3 +1662,24 @@ fn mcp(home: &Home, o: &Opts) -> Result<()> {
     })
 }
 
+
+#[cfg(test)]
+mod start_error_tests {
+    #[test]
+    fn start_error_reads_this_runs_message_only() {
+        let dir = std::env::temp_dir().join(format!("moochy-start-error-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("node.log");
+        let old = "{\"code\":\"network\",\"event\":\"error\",\"message\":\"an older run\"}\n";
+        std::fs::write(&log, old).unwrap();
+        let from = old.len() as u64;
+        // This run: a plain line, then the node's JSON error with a terminal escape in it.
+        let now = "starting\n{\"code\":\"auth\",\"event\":\"error\",\"message\":\"not logged in: run `moochy login` first\\u001b[2J\"}\n";
+        std::fs::write(&log, format!("{old}{now}")).unwrap();
+        assert_eq!(super::start_error(&log, from).as_deref(), Some("not logged in: run `moochy login` first[2J"));
+        // Nothing new after `from`: no message (the caller falls back to "see node.log").
+        std::fs::write(&log, old).unwrap();
+        assert_eq!(super::start_error(&log, from), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

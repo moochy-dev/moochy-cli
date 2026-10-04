@@ -80,7 +80,7 @@ pub async fn connect(sock: &Path) -> Result<LocalControlClient<Channel>> {
             async move { UnixStream::connect(p).await.map(TokioIo::new) }
         }))
         .await
-        .map_err(|_| net("moochy node is not running (start it with `moochy up`)"))?;
+        .map_err(|_| net("the Moochy app is not running: start it with `moochy up` (sign in first with `moochy login` if you have not)"))?;
     Ok(LocalControlClient::new(ch).max_decoding_message_size(MAX_MSG).max_encoding_message_size(MAX_MSG))
 }
 
