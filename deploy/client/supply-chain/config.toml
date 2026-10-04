@@ -20,7 +20,23 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
 
 [policy.moochy]
+audit-as-crates-io = false
 criteria = "safe-to-deploy"
+
+[policy.moochy-keylog]
+audit-as-crates-io = false
+
+[policy.moochy-proto]
+audit-as-crates-io = false
+
+[policy.moochy-sandbox]
+audit-as-crates-io = false
+
+[policy.moochy-tui]
+audit-as-crates-io = false
+
+[policy.moochy-worker]
+audit-as-crates-io = false
 
 [[exemptions.aes]]
 version = "0.7.5"

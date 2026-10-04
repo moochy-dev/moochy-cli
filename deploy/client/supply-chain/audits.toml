@@ -1,7 +1,17 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.signal-hook]]
+who = "sanix-darker <s4nixd@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.18 -> 0.4.4"
+notes = "Delta reviewed: build.rs only adds a non-Windows guard around the existing extract.c (feature extended-siginfo-raw); two unsafe lines in signal plumbing as before; no new I/O, process or network code. Published by the maintainer (vorner)."
+
+[[audits.zeroize]]
+who = "sanix-darker <s4nixd@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.8.2 -> 1.9.0"
+notes = "Delta reviewed: new unsafe blocks only wrap existing volatile writes/drop_in_place for edition-2024 unsafe_op_in_unsafe_fn, or are in tests; atomic fence replaced by optimization_barrier; no asm, I/O, process or new dependencies. Published by crates.io trusted publishing from RustCrypto/utils."
 
 [[trusted.aead]]
 criteria = "safe-to-deploy"
