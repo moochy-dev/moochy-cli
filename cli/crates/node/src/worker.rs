@@ -875,9 +875,8 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let fast = a.route.flags.iter().any(|f| f == "fast");
     // Fallback when a cost cannot be computed (e.g. OpenRouter without a reported cost): the reservation.
     let cost = money::cost_uusd(&a.entry, &usage, fast).unwrap_or(reserved);
-    // The donor's own cap settles at what xAI actually charged when that is above the receipt
-    // (reasoning beyond the reservation).
-    let local = if a.entry.provider == "xai" { out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok()).map_or(cost, |c| c.max(cost)) } else { cost };
+    let xai_charged = (a.entry.provider == "xai").then(|| out.usage.provider_cost_uusd.and_then(|c| i64::try_from(c).ok())).flatten();
+    let local = local_cost(cost, reserved, usage.estimated, xai_charged);
     let model = red.redact_str(&clean(out.model.as_deref().unwrap_or(""))).into_owned();
     let req_id = request_id.or(out.id).unwrap_or_default();
     let end = Ending { status, usage, cost, local, model: model.clone(), req_id, times: (t_start, t_started) };
@@ -892,6 +891,16 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
     let text = node.cfg.journal_full_text.then(|| (clip(&a.inner.body_b64.0), clip(&seen)));
     finish(node, keys, &a, attempt8, &sealer, end, down, refuse, (st, text.clone())).await;
     (st.into(), model, cost, text, true)
+}
+
+/// What the donor's own caps settle at: an upper bound of what the provider billed. The receipt
+/// cost; never less than the reservation when the usage is estimated (a cut or cancelled stream
+/// lost the final usage: the provider still billed the whole prompt; the relay settles these at
+/// the reservation too, 05 §5.2, F01); xAI: what it actually charged when that is above the
+/// receipt (reasoning beyond the reservation).
+fn local_cost(cost: i64, reserved: i64, estimated: bool, xai_charged: Option<i64>) -> i64 {
+    let c = xai_charged.map_or(cost, |x| x.max(cost));
+    if estimated { c.max(reserved) } else { c }
 }
 
 /// `b` with the adapter's key redacted (A291); the same buffer when clean.
@@ -1221,6 +1230,17 @@ pub fn utc_day(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_caps_settle_estimated_usage_at_the_reservation() {
+        use super::local_cost;
+        // F01: a stream cut before the final usage chunk prices ~0 input; the caps book the reservation.
+        assert_eq!(local_cost(12, 9_000, true, None), 9_000);
+        assert_eq!(local_cost(12, 9_000, true, Some(40)), 9_000, "xAI too");
+        assert_eq!(local_cost(12_000, 9_000, true, None), 12_000, "never below the receipt cost");
+        assert_eq!(local_cost(12, 9_000, false, None), 12, "final usage: the receipt cost");
+        assert_eq!(local_cost(12, 9_000, false, Some(15_000)), 15_000, "xAI's charge above the receipt");
+    }
+
     #[test]
     fn utc_days() {
         assert_eq!(super::utc_day(0), "1970-01-01");
