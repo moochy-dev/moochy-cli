@@ -73,7 +73,8 @@ impl View for OverviewView {
         let mut tr = tile_rects.iter().copied();
         if let Some(r) = tr.next() {
             let spent: u64 = s.donations.iter().map(|d| d.spent_uusd).sum();
-            let budget: u64 = s.donations.iter().filter(|d| d.status != "stopped").map(|d| d.budget_uusd).sum();
+            // m9: what can still be donated this month: the limits of active donations only.
+            let budget: u64 = s.donations.iter().filter(|d| d.status == "active").map(|d| d.budget_uusd).sum();
             tile_money(f, r, ctx, "Donated this month", &s.donated_per_day_uusd, spent, budget, ctx.theme.money());
             self.doors.push((r, TAB_DONATIONS));
         }
@@ -183,8 +184,10 @@ fn render_card(f: &mut Frame, area: Rect, ctx: &Ctx, fold: bool) {
     let [art, _, text] = Layout::horizontal([Constraint::Length(13), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(hamster(t, mood(ctx))), art);
     let tw = usize::from(text.width);
+    // m9: no handle known (signed in before 0.1.4): a plain greeting, never a bare "@".
     let handle = clean(s.me.handle.trim_start_matches('@'));
-    let mut lines = vec![Line::from(vec![Span::raw("Hi "), Span::styled(w::trunc(&format!("@{handle}"), tw.saturating_sub(3)), t.accent())])];
+    let hi = if handle.is_empty() { Line::from("Hi") } else { Line::from(vec![Span::raw("Hi "), Span::styled(w::trunc(&format!("@{handle}"), tw.saturating_sub(3)), t.accent())]) };
+    let mut lines = vec![hi];
     let p = s.pending.len();
     lines.push(if p > 0 {
         Line::from(vec![Span::styled(format!("{} ", t.glyph(Glyph::Pending)), t.warn()), Span::raw(format!("{p} to decide"))])

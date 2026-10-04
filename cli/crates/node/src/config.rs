@@ -26,6 +26,10 @@ pub struct Config {
     pub device_id: Option<String>,
     /// The user's public pseudonym (`ps_…`, from device approval): key-log entries name it.
     pub pseudonym: Option<String>,
+    /// The user's handle on the code host (`DevicePollResponse.username`, at login): shown, never
+    /// signed (A218 binds other people's handles with the server's Lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     pub device_monthly_cap_uusd: Option<u64>,
     pub slots_max: Option<u32>,
     pub gateway_addr: Option<String>,
@@ -177,6 +181,12 @@ pub fn device_limit(value: &str) -> Result<u64> {
         Ok(v) => Ok(v),
         Err(e) => Err(usage(format!("the monthly limit is a dollar amount, e.g. 25 or 12.50: {e}"))),
     }
+}
+
+/// A code-host handle safe to show and to pass as an argument: 1–64 of `[A-Za-z0-9._-]`, starting
+/// with a letter or a digit.
+pub fn plain_handle(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) && s.bytes().next().is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
 /// Atomic write with mode 0600 (tmp + fsync + rename).

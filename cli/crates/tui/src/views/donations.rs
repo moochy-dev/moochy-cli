@@ -81,7 +81,10 @@ fn kind(d: &Donation) -> &'static str {
 /// right shape (fail closed: never show a confusable link).
 fn share_url(web: &str, d: &Donation) -> Option<String> {
     let seg = |x: &str| !x.is_empty() && x != "." && x != ".." && x.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    let path = target(d);
+    // m9: the relay names a GitHub project `owner/name` (CONTRACT §9, legacy form).
+    let t = target(d);
+    let legacy = kind(d) == "project" && t.split('/').count() == 2 && !t.starts_with("github/") && !t.starts_with("gitlab/");
+    let path = if legacy { format!("github/{t}") } else { t.to_owned() };
     let parts: Vec<&str> = path.split('/').collect();
     let n = parts.len();
     let shape = match (parts.first().copied(), kind(d)) {
@@ -452,6 +455,7 @@ mod tests {
         let d = |target: &str, org: bool, person: &str| Donation { target: target.into(), org, person: person.into(), ..Donation::default() };
         let u = |web: &str, x: &Donation| share_url(web, x);
         assert_eq!(u("https://moochy.dev", &d("github/foo/bar", false, "")).as_deref(), Some("https://moochy.dev/p/github/foo/bar"));
+        assert_eq!(u("https://moochy.dev", &d("foo/bar", false, "")).as_deref(), Some("https://moochy.dev/p/github/foo/bar"), "the relay's owner/name form");
         assert_eq!(u("https://moochy.dev/", &d("gitlab/g/sub/repo", false, "")).as_deref(), Some("https://moochy.dev/p/gitlab/g/sub/repo"));
         assert_eq!(u("moochy.dev:443", &d("github/acme", true, "")).as_deref(), Some("https://moochy.dev/org/github/acme"));
         assert_eq!(u("https://web.test:8443", &d("gitlab/grp/sub", true, "")).as_deref(), Some("https://web.test:8443/org/gitlab/grp/sub"));

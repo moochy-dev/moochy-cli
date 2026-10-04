@@ -108,9 +108,9 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
         };
         match DeviceState::try_from(p.state) {
             Ok(DeviceState::Approved) => {
-                if moochy_keylog::entry::is_pseudonym(&p.user_pseudonym) {
-                    cfg.pseudonym = Some(p.user_pseudonym.clone());
-                }
+                // m9: the handle too (plain names only): shown by the dashboard and claims, never signed.
+                cfg.pseudonym = moochy_keylog::entry::is_pseudonym(&p.user_pseudonym).then(|| p.user_pseudonym.clone()).or(cfg.pseudonym.take());
+                cfg.handle = crate::config::plain_handle(&p.username).then(|| p.username.clone());
                 cfg.box_device = box_fp.map(|fp| crate::boxes::bind(&p, fp)).transpose()?;
                 break p.device_id;
             }

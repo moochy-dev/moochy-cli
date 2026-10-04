@@ -177,7 +177,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
     let web = crate::decisions::web_origin(home);
     let mut s = Snapshot {
         me: model::Me {
-            handle: String::new(),
+            // m9: the handle login stored (the server's word, not the app's).
+            handle: cfg.as_ref().and_then(|c| c.handle.clone()).unwrap_or_default(),
             pseudonym: cfg.as_ref().and_then(|c| c.pseudonym.clone()).unwrap_or_default(),
             relay: st.relay.clone(),
             // The public site, as `moochy decisions` and the share lines name it.

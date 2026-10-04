@@ -214,8 +214,8 @@ fn check_repo(b: &mut Bound, l: &LookupResponse) -> Result<()> {
 fn confirm(b: &Bound, signer: &str, yes: bool) -> Result<()> {
     let org = format!("the {} {} ({})", b.group.noun(), clean(&b.org), clean(&b.org_id));
     let line = match b.kind {
-        Kind::OrgClaimed => format!("your account ({}) is the owner of {org}", clean(&b.subject)),
-        Kind::PersonClaimed => format!("your account ({}) is {org}, for good (nobody else can ever claim it)", clean(&b.subject)),
+        Kind::OrgClaimed => format!("{} is the owner of {org}", crate::owner::your_account(&b.name, &b.subject)),
+        Kind::PersonClaimed => format!("{} is {org}, for good (nobody else can ever claim it)", crate::owner::your_account(&b.name, &b.subject)),
         Kind::PersonRepoAdded => format!("your sponsors' donations may pay for your own requests on {} ({})", clean(&b.repo), clean(&b.repo_id)),
         Kind::PersonRepoRemoved => format!("your sponsors' donations no longer pay for your requests on {} ({})", clean(&b.repo), clean(&b.repo_id)),
         Kind::DonorApproved if b.group == Group::Person && !b.name.is_empty() => format!("{} may sponsor your tokens ({org}): your own requests on the repos you cover", who(b)),
@@ -271,6 +271,11 @@ pub fn sign(home: &Home, g: Group, org: &str, op: Op<'_>, yes: bool) -> Result<(
     })?;
     let me = cfg.pseudonym.as_deref();
     let mut b = bind(g, op, org, me, &preview)?;
+    if matches!(op, Op::Claim)
+        && let Some(h) = crate::owner::own_handle(&cfg, &preview.subject_username)
+    {
+        b.name = h;
+    }
     let has_key = key_path(home, cfg.relay.as_deref()).exists();
     if !has_key {
         eprintln!("No owner key yet: one will be created (a separate key with its own passphrase) and registered in the public key log.");

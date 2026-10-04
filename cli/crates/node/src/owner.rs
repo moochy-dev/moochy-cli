@@ -470,7 +470,7 @@ fn confirm(b: &Bound, signer: &str, extra: &str, yes: bool) -> Result<()> {
     };
     eprintln!("Owner signature {}:", b.kind.name());
     let who = if b.claim.is_some() {
-        format!("your account ({})", clean(&b.subject))
+        your_account(&b.name, &b.subject)
     } else if b.name.starts_with("d_") {
         // A device as a member: the signature covers the device's whole account.
         format!("the account {} (all its devices, including {})", clean(&b.subject), clean(&b.name))
@@ -488,6 +488,17 @@ fn confirm(b: &Bound, signer: &str, extra: &str, yes: bool) -> Result<()> {
         return Err(usage("not signed"));
     }
     Ok(())
+}
+
+/// m15: "your account @handle (ps_…)" when the handle is known, else "your account (ps_…)".
+pub(crate) fn your_account(name: &str, subject: &str) -> String {
+    if name.is_empty() || name == subject { format!("your account ({})", clean(subject)) } else { format!("your account @{} ({})", clean(name), clean(subject)) }
+}
+
+/// Your own handle, for a claim's confirmation and output: the one login stored (the server's),
+/// else the app's label. Display only: the signed subject is checked to be this account.
+pub(crate) fn own_handle(cfg: &crate::config::Config, label: &str) -> Option<String> {
+    cfg.handle.clone().or_else(|| crate::config::plain_handle(label).then(|| label.to_owned()))
 }
 
 /// Build the owner-signed body from the BOUND fields only and hand it to the Node. `after`: the
@@ -631,6 +642,11 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
     };
     let me = cfg.pseudonym.as_deref();
     let mut main = bind(&want, me, &preview)?;
+    if main.claim.is_some()
+        && let Some(h) = own_handle(&cfg, &preview.subject_username)
+    {
+        main.name = h;
+    }
     // An approval needs an owner-signed claim of the same project naming this account
     // (KEYLOG §5): offered as its own entry, shown in full, confirmed on its own.
     let mut claim = (want.kind != Kind::RepoClaimed)
@@ -640,6 +656,11 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
         }))
         .flatten()
         .and_then(|p| bind(&Ask { kind: Kind::RepoClaimed, repo_slug: slug, subject: None, device: false, device_owner: None }, me, &p).ok().filter(|b| b.repo_id == main.repo_id).map(|b| (b, p)));
+    if let Some((b, p)) = claim.as_mut()
+        && let Some(h) = own_handle(&cfg, &p.subject_username)
+    {
+        b.name = h;
+    }
     let has_key = key_path(home, cfg.relay.as_deref()).exists();
     if !has_key {
         eprintln!("No owner key yet: one will be created (a separate key with its own passphrase) and registered in the public key log.");
@@ -775,6 +796,16 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_account_by_handle() {
+        assert_eq!(your_account("sanix-darker", "ps_x"), "your account @sanix-darker (ps_x)");
+        assert_eq!(your_account("ps_x", "ps_x"), "your account (ps_x)");
+        let cfg = crate::config::Config { handle: Some("alice".into()), ..Default::default() };
+        assert_eq!(own_handle(&cfg, "mallory").as_deref(), Some("alice"), "login's handle first");
+        assert_eq!(own_handle(&crate::config::Config::default(), "bob").as_deref(), Some("bob"));
+        assert_eq!(own_handle(&crate::config::Config::default(), "\u{1b}[2J"), None);
+    }
 
     #[test]
     fn paused_claims_say_how_to_resume_and_when_they_go() {
