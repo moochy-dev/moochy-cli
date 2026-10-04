@@ -850,7 +850,7 @@ impl Driver {
             if b.is_empty() {
                 continue;
             }
-            let s = emit(&self.tx, TaskEv::Bytes(b)).await;
+            let s = emit(&self.tx, TaskEv::Bytes(self.gate.end_turn(b))).await;
             if !matches!(s, Step::Continue) {
                 return s;
             }
@@ -858,7 +858,7 @@ impl Driver {
         if finale {
             match self.canon.finish() {
                 Ok(b) if b.is_empty() => {}
-                Ok(b) => return emit(&self.tx, TaskEv::Bytes(b)).await,
+                Ok(b) => return emit(&self.tx, TaskEv::Bytes(self.gate.end_turn(b))).await,
                 Err(why) => return retry_fail("provider_error", why),
             }
         }

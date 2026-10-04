@@ -66,6 +66,9 @@ pub struct Gate {
     max_index: Option<u32>,
     /// Reused parse tape for the per-event text scan (no per-chunk allocation).
     tape: Vec<moochy_worker::json::Node>,
+    /// m12: `Some(true)` = every tool call so far was replaced by a notice (the turn then ends),
+    /// `Some(false)` = one was released, `None` = none seen.
+    only_withheld: Option<bool>,
 }
 
 const MAX_TOOL_INPUT: usize = 4 << 20;
@@ -111,6 +114,7 @@ impl Gate {
             warning: None,
             max_index: None,
             tape: Vec::new(),
+            only_withheld: None,
         }
     }
 
@@ -380,6 +384,7 @@ impl Gate {
             Out::Bytes(b) => Some(b),
             Out::Tool { seq, bytes, calls, block } => {
                 let signed = verified.is_some_and(|v| v >= seq);
+                self.only_withheld = Some(!(block.is_none() && signed) && self.only_withheld != Some(false));
                 Some(match (block, signed) {
                     (None, true) => bytes,
                     (Some(r), _) => self.replacement(&calls, &r),
@@ -423,9 +428,28 @@ impl Gate {
             self.out.push_back(Out::Bytes(body));
             return Ok(());
         }
+        self.only_withheld = Some(blocked.iter().all(Option::is_some));
         let rewritten = rewrite_body(self.dialect, &body, &blocked).ok_or("malformed provider response")?;
         self.out.push_back(Out::Bytes(rewritten));
         Ok(())
+    }
+}
+
+impl Gate {
+    /// m12: every tool call of the response was withheld, so it ends as a text turn: on the
+    /// canonical bytes (`Canon` writes compact JSON, and inside a string the quotes are escaped,
+    /// so the pattern cannot hide there), Anthropic's `tool_use` stop becomes `end_turn` and
+    /// OpenAI's `tool_calls` finish becomes `stop`. An agent never waits for a call that is not there.
+    pub fn end_turn(&self, b: Bytes) -> Bytes {
+        const SWAP: [(&str, &str); 2] = [(r#""stop_reason":"tool_use""#, r#""stop_reason":"end_turn""#), (r#""finish_reason":"tool_calls""#, r#""finish_reason":"stop""#)];
+        if self.only_withheld != Some(true) {
+            return b;
+        }
+        let Ok(s) = std::str::from_utf8(&b) else { return b };
+        if !SWAP.iter().any(|(from, _)| s.contains(from)) {
+            return b;
+        }
+        Bytes::from(SWAP.iter().fold(s.to_owned(), |s, (from, to)| s.replace(from, to)))
     }
 }
 
@@ -660,6 +684,40 @@ mod tests {
             assert!(o.contains("[moochy]") && !o.contains(r#""type":"tool_use""#), "{o}");
             assert!(o.ends_with(&stream(t, i)[7..].concat()), "rest of the stream intact");
         }
+    }
+
+    /// m12: a withheld call ends the turn (`end_turn`), through canonical re-emission; a released
+    /// one keeps `tool_use`.
+    #[test]
+    fn withheld_calls_end_the_turn() {
+        let through = |release: bool| {
+            let (mut g, mut c, mut out) = (Gate::new(Dialect::Anthropic, true, REQ, release), Canon::new(Dialect::Anthropic, true), String::new());
+            for (i, ev) in stream("get_weather", r#"{"city":"Paris"}"#).iter().enumerate() {
+                g.push(u32::try_from(i).unwrap(), ev.as_bytes()).unwrap();
+                while let Some(b) = g.pop(Some(8), false) {
+                    out.push_str(std::str::from_utf8(&g.end_turn(c.push(&b).unwrap())).unwrap());
+                }
+            }
+            g.finish(true).unwrap();
+            while let Some(b) = g.pop(Some(8), true) {
+                out.push_str(std::str::from_utf8(&g.end_turn(c.push(&b).unwrap())).unwrap());
+            }
+            out
+        };
+        let withheld = through(false);
+        assert!(withheld.contains("[moochy] tool call") && withheld.contains(r#""stop_reason":"end_turn""#) && !withheld.contains("tool_use"), "{withheld}");
+        assert!(through(true).contains(r#""stop_reason":"tool_use""#));
+        // OpenAI: the finish reason of a body whose only call was withheld.
+        let req = br#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}"#;
+        let body = br#"{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let mut g = Gate::new(Dialect::OpenAi, false, req, false);
+        g.push(0, body).unwrap();
+        g.finish(true).unwrap();
+        let mut c = Canon::new(Dialect::OpenAi, false);
+        let mut out = c.push(&g.pop(Some(0), true).unwrap()).unwrap().to_vec();
+        out.extend_from_slice(&c.finish().unwrap());
+        let out = String::from_utf8(g.end_turn(Bytes::from(out)).to_vec()).unwrap();
+        assert!(out.contains(r#""finish_reason":"stop""#) && !out.contains(r#""finish_reason":"tool_calls""#), "{out}");
     }
 
     #[test]
