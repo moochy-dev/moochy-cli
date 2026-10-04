@@ -612,7 +612,12 @@ impl Driver {
                         })
                     });
                 let mut fl = Failure::new(&code, f.retryable, detail);
-                fl.retry_after_ms = (f.retry_after_ms > 0).then_some(u64::from(f.retry_after_ms));
+                fl.retry_after_ms = (f.retry_after_ms > 0).then_some(f.retry_after_ms);
+                // Protocol §15.3: a relay-side failure has nothing sealed; its detail is the relay's
+                // plain text (e.g. which limit refused, and when it starts again).
+                if f.attempt == 0 && f.worker_device.is_empty() {
+                    fl.relay = crate::native::relay_detail(&f.sealed_detail);
+                }
                 Step::Fail(fl)
             }
             _ => Step::Continue,

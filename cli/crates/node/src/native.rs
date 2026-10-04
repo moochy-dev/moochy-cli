@@ -34,9 +34,20 @@ fn message(f: &Failure) -> String {
         "route_mismatch" => "the route header does not match the request body",
         "rate_limited" => "the donor's provider is rate limited; retry later",
         "bad_envelope" => "the response failed authentication (possible tampering); retry",
-        code => return format!("moochy: {code}"),
+        code => return format!("moochy: {code}{}", f.relay.as_deref().map(|r| format!(": the server says: {r}")).unwrap_or_default()),
     };
-    format!("moochy: {text} ({})", f.code)
+    match f.relay.as_deref() {
+        Some(r) => format!("moochy: {text}; the server says: {r} ({})", f.code),
+        None => format!("moochy: {text} ({})", f.code),
+    }
+}
+
+/// The relay's own detail of a relay-side failure (protocol §15.3): UTF-8 text, at most about 300
+/// characters, without control or invisible characters. `None` when empty or not UTF-8.
+pub fn relay_detail(b: &[u8]) -> Option<Box<String>> {
+    let s: String = std::str::from_utf8(b).ok()?.chars().filter(|c| !c.is_control()).take(300).collect();
+    let s = crate::util::sanitize_text(s.trim()).into_owned();
+    (!s.is_empty()).then(|| Box::new(s))
 }
 
 /// Status + JSON body in the dialect's shape.
@@ -91,5 +102,13 @@ mod tests {
         assert!(b["error"]["message"].as_str().unwrap().contains("could cost more than what is left"), "{b}");
         let (_, b) = error_body(Dialect::Anthropic, &f("model_not_in_pool", false));
         assert!(b["error"]["message"].as_str().unwrap().contains("paused"), "{b}");
+        // Protocol §15.3: the relay's plain detail follows ours, cleaned and capped.
+        let relay = relay_detail(b"a donation's daily limit is used up;\x1b[2J it starts again at 2026-10-05 00:00 UTC\n");
+        assert_eq!(relay.as_deref().map(String::as_str), Some("a donation's daily limit is used up;[2J it starts again at 2026-10-05 00:00 UTC"));
+        let q = Failure { relay, ..f("quota_exceeded", false) };
+        let m = error_body(Dialect::Anthropic, &q).1["error"]["message"].as_str().unwrap().to_owned();
+        assert!(m.contains("could cost more than what is left") && m.ends_with("starts again at 2026-10-05 00:00 UTC (quota_exceeded)"), "{m}");
+        assert_eq!(relay_detail(&[b'x'; 2000]).map(|r| r.len()), Some(300));
+        assert_eq!((relay_detail(b""), relay_detail(b"\xff\xfe")), (None, None), "empty or not UTF-8: nothing");
     }
 }

@@ -59,18 +59,24 @@ impl Dialect {
 pub struct Failure {
     pub code: String,
     pub retryable: bool,
-    pub retry_after_ms: Option<u64>,
+    /// u32 as on the wire (`Failed.retry_after_ms`): keeps `Failure` small (clippy::result_large_err).
+    pub retry_after_ms: Option<u32>,
     /// Human detail (already unsealed). Never logged: it may name fields of the request.
     pub detail: Option<String>,
     /// The request field a firewall refusal names (OpenAI's `error.param`). Boxed: `Failure`
     /// travels in `Result::Err` on hot paths (clippy::result_large_err).
     #[allow(clippy::box_collection)]
     pub param: Option<Box<String>>,
+    /// A relay-side failure's own plain detail (protocol §15.3: attempt 0, no worker), cleaned
+    /// ([`crate::native::relay_detail`]): shown as text after ours, never interpreted. Boxed, as
+    /// `param`.
+    #[allow(clippy::box_collection)]
+    pub relay: Option<Box<String>>,
 }
 
 impl Failure {
     pub fn new(code: &str, retryable: bool, detail: impl Into<Option<String>>) -> Self {
-        Self { code: code.into(), retryable, retry_after_ms: None, detail: detail.into(), param: None }
+        Self { code: code.into(), retryable, retry_after_ms: None, detail: detail.into(), param: None, relay: None }
     }
 }
 

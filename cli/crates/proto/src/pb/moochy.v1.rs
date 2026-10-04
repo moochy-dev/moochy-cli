@@ -476,7 +476,7 @@ pub struct Failed {
     pub retryable: bool,
     #[prost(uint32, tag = "3")]
     pub retry_after_ms: u32,
-    /// detail sealed to the Gateway (Relay sees only `code`)
+    /// detail sealed to the Gateway (Relay sees only `code`); attempt = 0: the relay's own plain UTF-8 detail (protocol §15.3)
     #[prost(bytes = "bytes", tag = "4")]
     pub sealed_detail: ::prost::bytes::Bytes,
     /// attempt whose Worker produced sealed_detail (0 = relay-side failure)

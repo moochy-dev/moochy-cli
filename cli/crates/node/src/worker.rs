@@ -237,7 +237,7 @@ impl Refuse<'_> {
             }
             _ => Bytes::new(),
         };
-        let retry = f.retry_after_ms.map_or(0, |m| u32::try_from(m).unwrap_or(u32::MAX));
+        let retry = f.retry_after_ms.unwrap_or(0);
         let n = pb::Nack { r: Bytes::copy_from_slice(&self.r), code: f.code.clone(), retryable: f.retryable, retry_after_ms: retry, sealed_detail };
         let _ = self.tx.send(up(serve_up::Msg::Nack(n))).await;
     }
@@ -741,7 +741,7 @@ async fn run_provider(node: &Arc<Node>, keys: &Keys, a: Admitted, attempt: u32, 
             let (code, retry) = f.nack();
             // A291: the provider's error text (which may echo the key) stays here.
             let mut fl = Failure::new(code, retry, Some(f.public_message()));
-            fl.retry_after_ms = f.retry_after_ms;
+            fl.retry_after_ms = f.retry_after_ms.map(|m| u32::try_from(m).unwrap_or(u32::MAX));
             refuse.nack(Some(&a.ck), &fl).await;
             // After the Ack the relay awaits a receipt: zero usage, provably nothing generated.
             let end = Ending { status: ReceiptStatus::NotStarted, usage: Usage::default(), cost: 0, local: 0, model: String::new(), req_id: String::new(), times: (t_start, 0) };
