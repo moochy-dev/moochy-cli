@@ -750,6 +750,7 @@ fn person_arg(o: &Opts) -> Result<Option<String>> {
 /// profile when the key log says you claimed it.
 fn own_person(home: &Home, o: &Opts, claim: bool) -> Result<String> {
     if let Some(p) = person_arg(o)?.filter(|p| !p.is_empty()) {
+        remember_handle(home, &p);
         return Ok(p);
     }
     let r = rt_small()?.block_on(async {
@@ -762,8 +763,31 @@ fn own_person(home: &Home, o: &Opts, claim: bool) -> Result<String> {
     match found.as_slice() {
         [one] => crate::config::canonical_org(one).filter(|c| c.matches('/').count() == 1).ok_or_else(|| internal("the app named a malformed person profile")),
         [] if claim => Err(usage("no profile claim is waiting: sign in on the web and choose Claim your profile, then run this again (or pass --person github/LOGIN)")),
-        [] => crate::org::own_profile(home).ok_or_else(|| usage(format!("no person profile of yours is known to the app: claim it first (moochy claim --person), or pass --person {PERSON_FORMS}"))),
+        [] => crate::org::own_profile(home).ok_or_else(|| {
+            if home.load().is_ok_and(|c| c.handle.as_deref().is_none_or(str::is_empty)) {
+                // Signed in before 0.1.4: the handle was not stored then (m9).
+                usage(format!("this app does not know your handle yet (you signed in before moochy 0.1.4): pass --person {PERSON_FORMS} once and it is remembered"))
+            } else {
+                usage(format!("no person profile of yours is known to the app: claim it first (moochy claim --person), or pass --person {PERSON_FORMS}"))
+            }
+        }),
         _ => Err(usage(format!("more than one profile: pass --person {PERSON_FORMS}"))),
+    }
+}
+
+/// A login from before 0.1.4 stored no handle: when `--person` names a profile that the verified
+/// key log says this account owns, keep its login as the handle (display and inference only,
+/// never signed). Best effort: any failure leaves the config as it was.
+fn remember_handle(home: &Home, path: &str) {
+    let Ok(mut cfg) = home.load() else { return };
+    if cfg.handle.as_deref().is_some_and(|h| !h.is_empty()) {
+        return;
+    }
+    let Some(owned) = crate::org::owned_profile(home, &[path.to_owned()]) else { return };
+    let login = owned.split_once('/').map_or("", |(_, l)| l);
+    if crate::config::plain_handle(login) {
+        cfg.handle = Some(login.to_owned());
+        let _ = home.save(&cfg);
     }
 }
 

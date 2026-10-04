@@ -198,13 +198,20 @@ fn lookup(cfg: &crate::config::Config, rt: &tokio::runtime::Runtime, slug: &str,
 /// key log says this account claimed.
 pub(crate) fn own_profile(home: &Home) -> Option<String> {
     let cfg = home.load().ok()?;
-    let me = cfg.pseudonym.as_deref()?;
     let handle = cfg.handle.as_deref().filter(|h| !h.is_empty())?.to_ascii_lowercase();
+    owned_profile(home, &["github", "gitlab"].map(|p| format!("{p}/{handle}")))
+}
+
+/// The first of `paths` ("github/login") that the server names a claimed person profile AND the
+/// verified key log says this account owns (never the server's word alone).
+pub(crate) fn owned_profile(home: &Home, paths: &[String]) -> Option<String> {
+    let cfg = home.load().ok()?;
+    let me = cfg.pseudonym.as_deref()?;
     let rt = rt().ok()?;
-    let found: Vec<(String, String)> = ["github", "gitlab"]
-        .into_iter()
-        .filter_map(|p| {
-            let path = format!("{p}/{handle}");
+    let found: Vec<(String, String)> = paths
+        .iter()
+        .filter_map(|path| {
+            let path = path.to_ascii_lowercase();
             let l = lookup(&cfg, &rt, &format!("person:{path}"), None).ok()?;
             (is_id(&l.repo_id, "m_") && l.repo_slug.eq_ignore_ascii_case(&format!("person:{path}"))).then_some((path, l.repo_id))
         })
