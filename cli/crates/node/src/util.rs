@@ -209,10 +209,13 @@ pub fn ulid_from_bytes(b: &[u8; 16]) -> String {
 }
 
 /// C0, DEL, C1 (all `is_control`), zero-width and bidi marks/overrides/isolates, ALM, line and
-/// paragraph separators: everything that can hide text or drive a terminal (A46/A47).
+/// paragraph separators, and the other invisible format characters (soft hyphen, word joiner
+/// and invisible operators, Unicode tags, variation selectors, fillers: F18, "ASCII
+/// smuggling"): everything that can hide text or drive a terminal (A46/A47).
 fn bad_char(c: char) -> bool {
     c.is_control()
         || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{feff}')
+        || matches!(c, '\u{ad}' | '\u{34f}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{2060}'..='\u{2065}' | '\u{206a}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
 }
 
 /// Like [`clean`] but keeps `\n` and `\t`: for multi-line remote text handed to an agent or a
@@ -338,6 +341,14 @@ mod tests {
         }
         assert!(s.contains("\nB\tC"), "newline and tab kept");
         assert_eq!(sanitize_text("plain\ntext"), "plain\ntext");
+    }
+
+    #[test]
+    fn sanitize_shows_tag_smuggling() {
+        // F18: "LGTM" + Unicode tags spelling "Ign" (U+E0049 U+E0067 U+E006E), plus other invisibles.
+        let s = sanitize_text("LGTM\u{e0049}\u{e0067}\u{e006e}\u{2060}\u{ad}\u{fe0f}\u{e0101}");
+        assert_eq!(s, "LGTM\\u{e0049}\\u{e0067}\\u{e006e}\\u{2060}\\u{ad}\\u{fe0f}\\u{e0101}");
+        assert_eq!(sanitize_text("ünïcödé 日本 ok"), "ünïcödé 日本 ok", "visible text untouched");
     }
 
     #[test]
