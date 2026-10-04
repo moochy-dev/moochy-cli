@@ -60,6 +60,14 @@ impl Origin {
     pub fn url(&self) -> String {
         format!("https://{}", self.authority())
     }
+    /// For people: [`Self::url`] without the default `:443`. Never signed or dialed.
+    pub fn display(&self) -> String {
+        if self.port == 443 { format!("https://{}", self.host_part()) } else { self.url() }
+    }
+    /// The device approval page with the code filled in (the site redirects it to the web app).
+    pub fn device_url(&self, user_code: &str) -> String {
+        format!("{}/device?code={user_code}", self.display())
+    }
 }
 
 /// The relay's trust roots: `--ca-file` alone (development), else the web PKI.
@@ -123,5 +131,14 @@ mod tests {
         assert!(Origin::parse("https://x/path").is_err());
         assert!(Origin::parse("https://u@x").is_err());
         assert!(Origin::parse("https://x:0").is_err());
+        // Both spellings of the default relay are the same origin; people see it without :443.
+        for u in ["https://relay.moochy.dev", "https://relay.moochy.dev:443", "https://relay.moochy.dev:443/"] {
+            let o = Origin::parse(u).unwrap();
+            assert_eq!(o.url(), crate::config::DEFAULT_RELAY);
+            assert_eq!(o.display(), "https://relay.moochy.dev");
+            assert_eq!(o.device_url("CFGK-PMLS"), "https://relay.moochy.dev/device?code=CFGK-PMLS");
+        }
+        assert_eq!(Origin::parse("https://127.0.0.1:8443").unwrap().display(), "https://127.0.0.1:8443");
+        assert_eq!(Origin::parse("https://[::1]").unwrap().display(), "https://[::1]");
     }
 }

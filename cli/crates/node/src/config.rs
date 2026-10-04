@@ -82,6 +82,16 @@ pub const DEFAULT_RELAY: &str = "https://relay.moochy.dev:443";
 /// The earlier default (gRPC on 8443): a saved config naming it moves to `DEFAULT_RELAY`.
 const LEGACY_DEFAULT_RELAY: &str = "https://relay.moochy.dev:8443";
 
+/// A saved relay in its canonical origin form (`https://relay.moochy.dev` and `…:443` are one
+/// origin); the legacy default moves to [`DEFAULT_RELAY`]; an unparsable value is kept as is
+/// (dialing it reports the error).
+fn normalize_relay(r: &str) -> String {
+    if r == LEGACY_DEFAULT_RELAY {
+        return DEFAULT_RELAY.into();
+    }
+    crate::tls::Origin::parse(r).map_or_else(|_| r.to_owned(), |o| o.url())
+}
+
 /// Short stable tag of a relay origin (file names, keychain entries).
 pub fn origin_tag(origin: &str) -> String {
     use sha2::Digest as _;
@@ -143,9 +153,7 @@ impl Home {
         match fs::read(self.config_path()) {
             Ok(b) => {
                 let mut c: Config = serde_json::from_slice(&b).map_err(|e| usage(format!("bad config.json: {e}")))?;
-                if c.relay.as_deref() == Some(LEGACY_DEFAULT_RELAY) {
-                    c.relay = Some(DEFAULT_RELAY.into());
-                }
+                c.relay = c.relay.map(|r| normalize_relay(&r));
                 Ok(c)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -329,6 +337,15 @@ pub fn valid_slug(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_spellings() {
+        for r in ["https://relay.moochy.dev", "https://relay.moochy.dev:443", "https://Relay.moochy.dev/", "https://relay.moochy.dev:8443"] {
+            assert_eq!(super::normalize_relay(r), super::DEFAULT_RELAY, "{r}");
+        }
+        assert_eq!(super::normalize_relay("https://127.0.0.1:9443"), "https://127.0.0.1:9443");
+        assert_eq!(super::normalize_relay("nonsense"), "nonsense");
+    }
+
     #[test]
     fn slugs() {
         assert!(super::valid_slug("acme/widget.rs"));

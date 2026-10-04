@@ -1,6 +1,6 @@
 [package]
 name = "moochy"
-version = "0.1.1"
+version = "0.1.2"
 description = "Moochy node: gateway (API + MCP doors), worker, relay link"
 edition.workspace = true
 license.workspace = true
@@ -30,15 +30,15 @@ keychain = ["dep:keyring"]
 
 [dependencies]
 # Wire types, envelopes, signatures, money math, generated link.proto code (open, same workspace).
-moochy-proto = { path = "../proto", version = "0.1.1" }
+moochy-proto = { path = "../proto", version = "0.1.2" }
 # Firewall, provider adapters, stream parsers, tool-call inspection, outbox store.
-moochy-worker = { path = "../worker", version = "0.1.1" }
+moochy-worker = { path = "../worker", version = "0.1.2" }
 # Key-log verifier/mirror (spec/KEYLOG.md): KEY_ADDED proof of possession, sealable/gateway_allowed.
-moochy-keylog = { path = "../keylog", version = "0.1.1", features = ["http"] }
+moochy-keylog = { path = "../keylog", version = "0.1.2", features = ["http"] }
 # CONTRACT §15: `moochy run` jail (15.1), lockdown_self + validator jail of the background process (15.2).
-moochy-sandbox = { path = "../sandbox", version = "0.1.1" }
+moochy-sandbox = { path = "../sandbox", version = "0.1.2" }
 # CONTRACT §20: `moochy tui` (ratatui + crossterm, the only UI crates); NodeSource lives here.
-moochy-tui = { path = "../tui", version = "0.1.1" }
+moochy-tui = { path = "../tui", version = "0.1.2" }
 # K_det for sealed refusal details (CONTRACT §3); same version moochy-proto already links.
 hkdf = { version = "0.12", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal", "process", "fs"] }

@@ -39,6 +39,7 @@ pub mod run;
 pub mod pb;
 pub mod scrub;
 pub mod service;
+pub mod style;
 pub mod task;
 pub mod tls;
 pub mod tuisrc;

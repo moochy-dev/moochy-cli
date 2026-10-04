@@ -202,19 +202,22 @@ fn proof_name(p: OwnerKeyProof) -> &'static str {
 /// KEYLOG §4c/§10: the relay's refusals of an owner key, as plain sentences.
 fn proof_refusal(e: crate::util::Error) -> crate::util::Error {
     let say = |m: &str| usage(format!("{m}; nothing was registered"));
-    if e.msg.contains("owner_key_proof") {
-        say("the server refused an owner key without proof: this server does not offer the email confirmation yet (add a passkey on moochy.dev first, then run `moochy owner init` again so the passkey approves it)")
-    } else if e.msg.contains("email_changed_recently") {
-        say("your email address changed less than 72 hours ago: for your safety the server binds a first owner key by email only after that (or approve it with a passkey you already have)")
-    } else if e.msg.contains(": refused") {
-        say("you (or someone signed in to your account) refused this owner key on moochy.dev; if that was not you, secure your account")
-    } else if e.msg.contains("skew") {
-        say("the confirmation came too late (more than 10 minutes): run `moochy owner init` again and confirm the new email")
-    } else if e.msg.contains("did not acknowledge") {
-        say("nobody confirmed within 10 minutes")
-    } else {
-        e
+    if e.msg.contains("did not acknowledge") {
+        return say("nobody confirmed within 10 minutes");
     }
+    // The node reports a relay refusal as `relay refused the entry: <code>` (relay edge/firstkey.go, tlog codes).
+    let code = e.msg.rsplit_once("refused the entry: ").map(|(_, c)| c.trim());
+    say(match code {
+        Some("owner_key_proof") => "the server refused an owner key without proof: this server does not offer the email confirmation yet (add a passkey on moochy.dev first, then run `moochy owner init` again so the passkey approves it)",
+        Some("email_required") => "your account has no confirmed email address: add one and confirm it in your account settings on moochy.dev (https://moochy.dev/settings), then run `moochy owner init` again (or approve the key with a passkey you already have)",
+        Some("email_changed_recently") => "your email address changed less than 72 hours ago: for your safety the server binds a first owner key by email only after that (or approve it with a passkey you already have)",
+        Some("refused") => "you (or someone signed in to your account) refused this owner key on moochy.dev; if that was not you, secure your account",
+        Some("skew") => "the confirmation came too late (more than 10 minutes): run `moochy owner init` again and confirm the new email",
+        Some("unavailable" | "key_log_unavailable") => "the server cannot take an owner key right now (its email or public key log is unavailable): try again in a few minutes",
+        Some("unknown_owner_key") => "the server does not list the owner key this one replaces (`moochy owner status` shows the one this machine knows)",
+        Some("format" | "bad_signature" | "bad_sig") => "the server could not read the owner key this app sent: update moochy and run the command again",
+        _ => return e,
+    })
 }
 
 /// What any owner key of the account can sign (KEYLOG §2, CONTRACT §19): `owner status` and
@@ -899,7 +902,12 @@ mod tests {
         assert!(r("skew").contains("too late"));
         assert!(r("refused").contains("refused this owner key"));
         assert!(proof_refusal(crate::util::net("relay did not acknowledge the entry")).msg.contains("within 10 minutes"));
-        assert_eq!(r("bad_sig"), "relay refused the entry: bad_sig");
+        assert!(r("email_required").contains("confirm it in your account settings on moochy.dev"));
+        assert!(r("key_log_unavailable").contains("try again"));
+        assert!(r("bad_signature").contains("update moochy"));
+        // owner_key_exists goes to the passkey path unchanged; unknown codes stay as they are.
+        assert_eq!(r("owner_key_exists"), "relay refused the entry: owner_key_exists");
+        assert_eq!(r("dup_key"), "relay refused the entry: dup_key");
         assert_eq!(proof_name(OwnerKeyProof::Email), "email");
     }
 

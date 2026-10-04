@@ -26,8 +26,8 @@ PROJECT: owner/name or github/owner/name (GitHub), gitlab/group[/subgroup…]/na
 COMMANDS:
   tui [--demo] [--snapshot COLSxROWS [--keys K] [--ansi]] [--theme light|dark] [--ascii]
                                   The dashboard in your terminal (also: `moochy` alone)
-  login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless]
-                                  Add this device to your account. Roles: gateway uses donated
+  login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless] [--no-browser]
+                                  Add this device to your account (opens the approval page). Roles: gateway uses donated
                                   tokens, worker donates yours. Only the default server unless
                                   MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
   logout                          Remove this device: revoke its keys, then delete them here
@@ -165,7 +165,12 @@ fn emit_err(e: &Error) {
         crate::util::Exit::Network => "network",
         crate::util::Exit::Internal => "internal",
     };
-    eprintln!("{}", crate::util::clean_value(&json!({"event":"error","code":code,"message":e.msg})));
+    let p = crate::style::err();
+    if p.tty {
+        eprintln!("{}{} {}", p.mark(false), p.bad(&format!("{code} error:")), crate::util::clean(&e.msg));
+    } else {
+        eprintln!("{}", crate::util::clean_value(&json!({"event":"error","code":code,"message":e.msg})));
+    }
 }
 
 fn rt_small() -> Result<tokio::runtime::Runtime> {
@@ -290,7 +295,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart"];
+                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -548,7 +553,8 @@ fn donate(home: &Home, o: &Opts) -> Result<()> {
 
 /// CONTRACT §22.3: the canonical page to share, after a donation or a claim.
 fn share(home: &Home, page: &str) {
-    eprintln!("Share: {}/{page}", crate::decisions::web_origin(home));
+    let p = crate::style::err();
+    eprintln!("{} {}", p.bold("Share:"), p.link(&clean(&format!("{}/{page}", crate::decisions::web_origin(home)))));
 }
 
 /// `moochy decisions …` (CONTRACT §16.6).
@@ -582,6 +588,10 @@ fn down(home: &Home) -> Result<()> {
             }
         }
         emit(&json!({"event": "stopped"}));
+        let p = crate::style::err();
+        if p.tty {
+            eprintln!("{}{}", p.mark(true), p.ok("Moochy stopped."));
+        }
         Ok(())
     })
 }
@@ -737,7 +747,7 @@ fn box_enroll(home: &Home, o: &Opts) -> Result<()> {
     let Some(token) = token else { return Err(internal("enrollment without a token")) };
     let relay = checked_relay(o, cfg.relay.as_deref())?;
     let name = o.name.clone().unwrap_or_else(crate::login::default_name);
-    rt_small()?.block_on(crate::login::login(home, &relay, o.ca_file.clone(), vec!["gateway".into()], name, Some(token.as_str())))
+    rt_small()?.block_on(crate::login::login(home, &relay, o.ca_file.clone(), vec!["gateway".into()], name, Some(token.as_str()), false))
 }
 
 /// The relay for `login`/enrollment: the default one, others only in development (A135, A175).
@@ -750,7 +760,8 @@ fn checked_relay(o: &Opts, saved: Option<&str>) -> Result<String> {
         if !dev_mode() {
             return Err(usage("another server than the default needs MOOCHY_INSECURE_DEV=1 (development and tests only)"));
         }
-        eprintln!("Warning: signing in to a server that is not the default ({}). This device gets a separate keystore for it.", clean(relay));
+        let p = crate::style::err();
+        eprintln!("{} signing in to a server that is not the default ({}). This device gets a separate keystore for it.", p.hi("Warning:"), clean(&crate::tls::Origin::parse(relay)?.display()));
     }
     Ok(relay.to_owned())
 }
@@ -850,20 +861,30 @@ fn status(home: &Home, as_json: bool) -> Result<()> {
     if as_json {
         emit(&v);
     } else {
+        let p = crate::style::out();
+        let relay = crate::tls::Origin::parse(&r.relay).map_or_else(|_| clean(&r.relay).into_owned(), |o| o.display());
+        let link = clean(&r.link_state);
+        let link = if r.link_state == "up" { p.ok(&link) } else { p.hi(&link) };
+        let k = |s: &str| p.dim(&format!("{s:<11}"));
         println!(
-            "device      {}\nserver      {} ({})\nlocal API   {}\nMCP         {}\ndonating    {} of {} slots in use{}\nusing       {} requests in progress",
-            clean(&r.device_id),
-            clean(&r.relay),
-            clean(&r.link_state),
-            r.gateway_url,
-            r.mcp_url,
+            "{} {}\n{} {} ({link})\n{} {}\n{} {}\n{} {} of {} slots in use{}\n{} {} requests in progress",
+            k("device"),
+            p.bold(&clean(&r.device_id)),
+            k("server"),
+            clean(&relay),
+            k("local API"),
+            clean(&r.gateway_url),
+            k("MCP"),
+            clean(&r.mcp_url),
+            k("donating"),
             r.slots_busy,
             r.slots_max,
-            if r.paused { ", paused" } else { "" },
+            if r.paused { p.hi(", paused") } else { String::new() },
+            k("using"),
             r.gateway_tasks
         );
-        for p in &r.pools {
-            println!("project     {}: {} donor device(s), models {}", clean(&p.slug), p.workers, clean(&p.models.join(", ")));
+        for pool in &r.pools {
+            println!("{} {}: {} donor device(s), models {}", k("project"), p.bold(&clean(&pool.slug)), pool.workers, clean(&pool.models.join(", ")));
         }
     }
     Ok(())
@@ -936,20 +957,28 @@ fn doctor(home: &Home) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let cfg = home.load()?;
     let mut bad = 0u32;
+    let p = crate::style::out();
+    // `ok  ` / `note` / `FAIL`, plain off a terminal; with colour a mint ● / dim · / coral ×.
+    let tag = move |level: &str| match level {
+        "ok  " => format!("{}{}", p.mark(true), p.ok(level)),
+        "FAIL" => format!("{}{}", p.mark(false), p.bad(level)),
+        _ if p.color => p.dim(&format!("· {level}")),
+        _ => level.to_owned(),
+    };
     let mut line = |ok: bool, what: &str, detail: String| {
         if !ok {
             bad = bad.saturating_add(1);
         }
-        println!("{} {what:<9} {}", if ok { "ok  " } else { "FAIL" }, clean(&detail));
+        println!("{} {what:<9} {}", tag(if ok { "ok  " } else { "FAIL" }), clean(&detail));
     };
     match keystore::load(home, &cfg) {
         Ok(Some(s)) => {
             for p in s.providers.iter().filter(|p| p.remote_host.is_some()) {
-                println!("ok   local     remote, vetted {}, trust: {}", clean(p.remote_host.as_deref().unwrap_or("")), crate::keycheck::trust_name(p));
+                println!("{} local     remote, vetted {}, trust: {}", tag("ok  "), clean(p.remote_host.as_deref().unwrap_or("")), crate::keycheck::trust_name(p));
             }
             line(true, "keystore", format!("opens ({}), device keys {}", cfg.keystore.as_deref().unwrap_or("file"), if s.device.is_some() { "present" } else { "absent" }));
             for p in &s.providers {
-                println!("ok   key       {}: stored in {}, never sent to Moochy", clean(&p.provider), clean(&key_store_place(home, &cfg)));
+                println!("{} key       {}: stored in {}, never sent to Moochy", tag("ok  "), clean(&p.provider), clean(&key_store_place(home, &cfg)));
             }
         }
         Ok(None) => line(false, "keystore", "no keystore: run `moochy login`".into()),
@@ -960,7 +989,8 @@ fn doctor(home: &Home) -> Result<()> {
         c.status(StatusRequest {}).await.ok().map(tonic::Response::into_inner)
     });
     if let Some(s) = &st {
-        line(s.link_state == "up" || s.link_state == "offline", "relay", format!("{} ({})", s.relay, s.link_state));
+        let relay = crate::tls::Origin::parse(&s.relay).map_or_else(|_| s.relay.clone(), |o| o.display());
+        line(s.link_state == "up" || s.link_state == "offline", "relay", format!("{relay} ({})", s.link_state));
         let skew = s.clock_skew_ms.unsigned_abs();
         line(skew <= 300_000, "clock", format!("skew vs relay {} ms (limit ±5 min)", s.clock_skew_ms));
         line(true, "providers", format!("{} key(s), {} warm adapter(s), catalog v{}", s.provider_keys, s.warm_adapters, s.catalog_version));
@@ -977,7 +1007,7 @@ fn doctor(home: &Home) -> Result<()> {
     let root = std::env::current_dir().ok().and_then(|d| crate::files::git_root(&d));
     let sb = moochy_sandbox::doctor(root.as_deref());
     let sandbox_ok = !sb.iter().any(|l| l.level == moochy_sandbox::doctor::Level::Fail && matches!(l.topic, "sandbox" | "landlock"));
-    println!("     hidden    {}", moochy_sandbox::mask::SECRET_PATTERNS.join(" "));
+    println!("{}     hidden    {}", if p.color { "  " } else { "" }, moochy_sandbox::mask::SECRET_PATTERNS.join(" "));
     for l in &sb {
         let level = match l.level {
             moochy_sandbox::doctor::Level::Ok => "ok  ",
@@ -985,7 +1015,7 @@ fn doctor(home: &Home) -> Result<()> {
             moochy_sandbox::doctor::Level::Fail => "FAIL",
         };
         for (i, text) in l.text.lines().enumerate() {
-            if i == 0 { println!("{level} {:<9} {}", l.topic, clean(text)) } else { println!("               {}", clean(text)) }
+            if i == 0 { println!("{} {:<9} {}", tag(level), l.topic, clean(text)) } else { println!("{}               {}", if p.color { "  " } else { "" }, clean(text)) }
         }
     }
     // Cloud boxes (§17): the box binding, and what this runtime lacks.
@@ -993,7 +1023,7 @@ fn doctor(home: &Home) -> Result<()> {
         if level == "FAIL" {
             line(false, what, detail);
         } else {
-            println!("{level} {what:<9} {}", clean(&detail));
+            println!("{} {what:<9} {}", tag(level), clean(&detail));
         }
     }
     let me = std::fs::metadata(&home.dir).map(|m| m.uid()).ok();
@@ -1131,7 +1161,7 @@ fn login_cmd(home: &Home, o: &Opts) -> Result<()> {
     if let Some(k) = &o.log_key {
         moochy_keylog::NoteKey::parse(k).map_err(|e| usage(format!("--log-key: {e}")))?;
     }
-    rt_small()?.block_on(crate::login::login(home, relay, o.ca_file.clone(), roles, name, None))?;
+    rt_small()?.block_on(crate::login::login(home, relay, o.ca_file.clone(), roles, name, None, !o.has("no-browser") && !o.has("headless")))?;
     if let Some(k) = &o.log_key {
         let mut cfg = home.load()?;
         cfg.log_key = Some(k.clone());
@@ -1200,7 +1230,8 @@ fn key_store_place(home: &Home, cfg: &crate::config::Config) -> String {
 /// The §23.1 line after `keys add`, on stderr: stdout keeps only the JSON event.
 fn stored_where(home: &Home) -> Result<()> {
     let cfg = home.load()?;
-    eprintln!("Stored in {}. Never sent to Moochy.", clean(&key_store_place(home, &cfg)));
+    let p = crate::style::err();
+    eprintln!("{}Stored in {}. {}", p.mark(true), clean(&key_store_place(home, &cfg)), p.ok("Never sent to Moochy."));
     Ok(())
 }
 
@@ -1341,6 +1372,10 @@ fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<()> {
 fn up_background(home: &Home, o: &Opts) -> Result<()> {
     let line = start_node(home, o.has("offline"))?;
     print!("{line}");
+    let p = crate::style::err();
+    if p.tty {
+        eprintln!("{}{} {}", p.mark(true), p.ok("Moochy is running."), p.dim("`moochy status` shows it, `moochy down` stops it."));
+    }
     Ok(())
 }
 

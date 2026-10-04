@@ -128,7 +128,8 @@ pub fn donate(home: &crate::config::Home, slug: &str, to: To, monthly_uusd: i64,
         To::Org => format!("the organisation {}", clean(slug)),
         To::Person => format!("{}'s own requests (sponsoring {})", clean(slug.rsplit('/').next().unwrap_or(slug)), clean(slug)),
     };
-    eprintln!("Donating tokens to {what} up to {} a month (at most {} per request).", dollars(monthly_uusd), dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)));
+    let p = crate::style::err();
+    eprintln!("Donating tokens to {} up to {} a month {}.", p.bold(&what), p.hi(&dollars(monthly_uusd)), p.dim(&format!("(at most {} per request)", dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)))));
     if !yes {
         use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() {

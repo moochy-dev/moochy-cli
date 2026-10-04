@@ -33,7 +33,8 @@ pub fn default_name() -> String {
 
 /// `enroll`: a cloud-box enrollment token (CONTRACT §17.1, `MOOCHY_ENROLL`): the relay approves
 /// without a browser and the device is saved as a box bound to this machine.
-pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Vec<String>, name: String, enroll: Option<&str>) -> Result<()> {
+/// `browse`: try to open the approval page in a browser (`--no-browser` / `--headless` turn it off).
+pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Vec<String>, name: String, enroll: Option<&str>, browse: bool) -> Result<()> {
     let origin = Origin::parse(relay)?;
     // Box: gateway only; the machine-id hint is recorded with it.
     let box_fp = enroll.map(|_| crate::boxes::fingerprint());
@@ -77,8 +78,7 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
         return Err(net("relay sent a malformed device code"));
     }
     if enroll.is_none() {
-        emit(&json!({"event": "device_code", "user_code": r.user_code}));
-        eprintln!("To add this device, sign in to Moochy in your browser and enter the code {} ({}).", r.user_code, origin.url());
+        show_code(&origin, &r.user_code, browse);
     }
 
     let interval = Duration::from_millis(u64::from(r.poll_interval_ms).clamp(200, 5000));
@@ -134,5 +134,56 @@ pub async fn login(home: &Home, relay: &str, ca_file: Option<PathBuf>, roles: Ve
         Some(b) => emit(&json!({"event": "box_enrolled", "device_id": device_id, "repo": b.repo, "expires_at_ms": b.expires_at_ms, "monthly_limit": crate::util::fmt_dollars(u64::try_from(b.cap_uusd_month).unwrap_or(0))})),
         None => emit(&json!({"event": "logged_in", "device_id": device_id})),
     }
+    if enroll.is_none() {
+        let p = crate::style::err();
+        eprintln!("{}{} {}", p.mark(true), p.ok("This device is added:"), p.bold(&device_id));
+    }
     Ok(())
+}
+
+/// The `device_code` event (stdout) and, for people, the code and the approval link (stderr).
+fn show_code(origin: &Origin, user_code: &str, browse: bool) {
+    let url = origin.device_url(user_code);
+    emit(&json!({"event": "device_code", "user_code": user_code, "verification_url": url}));
+    let p = crate::style::err();
+    let url_shown = clean(&url);
+    eprintln!("\n{}\n\n  code  {}\n  link  {}\n", p.bold("Add this device to Moochy"), p.bold(&p.hi(user_code)), p.link(&url_shown));
+    let opened = browse && should_open(p.tty, |k| std::env::var_os(k).is_some_and(|v| !v.is_empty())) && open_browser(&url);
+    let how = if opened { "Your browser is open: sign in and confirm the code." } else { "Open the link, sign in to Moochy and confirm the code." };
+    eprintln!("{}\n{}", p.dim(how), p.dim("Waiting for approval (Ctrl-C to stop)…"));
+}
+
+/// Open a browser only where one can show up: a terminal, not over SSH, and on Linux a display.
+fn should_open(tty: bool, set: impl Fn(&str) -> bool) -> bool {
+    tty && !set("SSH_CONNECTION") && !set("SSH_TTY") && (cfg!(target_os = "macos") || set("DISPLAY") || set("WAYLAND_DISPLAY"))
+}
+
+/// Best effort: `open` (macOS) / `xdg-open`, detached, never an error. Runs in the `login`
+/// process, which is never locked down (only `up --foreground` applies the lockdown).
+fn open_browser(url: &str) -> bool {
+    let prog = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let child = crate::util::command(prog).arg(url).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+    match child {
+        Ok(mut c) => {
+            // Reap it without blocking the poll loop (xdg-open may wait for the browser).
+            std::thread::spawn(move || c.wait());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_open;
+
+    #[test]
+    fn browser_only_where_it_can_show() {
+        let env = |vars: &'static [&'static str]| move |k: &str| vars.contains(&k);
+        assert!(!should_open(false, env(&["DISPLAY"])), "not a terminal");
+        assert!(!should_open(true, env(&["DISPLAY", "SSH_CONNECTION"])), "over SSH");
+        assert!(should_open(true, env(&["DISPLAY"])));
+        assert!(should_open(true, env(&["WAYLAND_DISPLAY"])));
+        assert_eq!(should_open(true, env(&[])), cfg!(target_os = "macos"), "Linux without a display");
+    }
 }

@@ -21,6 +21,7 @@ Required in `cli/` (integrator / `mo-node`): `[profile.dist] inherits = "release
 `dist plan` produces, per release tag `vX.Y.Z`:
 
 - archives for macOS (arm64, x86_64) and Linux (arm64, x86_64; glibc and musl), each with a `.sha256`;
+- the official one-line installer `curl -fsSL https://moochy.dev/install.sh | sh` (`install.sh` here; moochy.dev redirects to its raw copy on `main`): picks the static musl archive on Linux or the Darwin archive on macOS, verifies its `.sha256`, installs `moochy` to `~/.local/bin` (or `$MOOCHY_INSTALL_DIR`) without `sudo`; `MOOCHY_VERSION=vX.Y.Z` pins a release. Check with `shellcheck -s sh deploy/client/install.sh`;
 - a shell installer, a Homebrew formula (`moochy-dev/homebrew-tap`), and the npm package `moochy` (`npx -y moochy mcp`);
 - the crates on crates.io (`cargo install moochy --locked`), through the custom publish job `.github/workflows/publish-crates.yml`;
 - no auto-updater (`install-updater = false`): `moochy update` verifies signatures itself (06 §12).

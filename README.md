@@ -9,8 +9,11 @@ Open-source client (Apache-2.0) · 100% free. No fees, no commission, no paid ti
 ## Install
 
 ```sh
-cargo install moochy --locked        # from crates.io
+curl -fsSL https://moochy.dev/install.sh | sh   # Linux and macOS: verified release binary into ~/.local/bin
+cargo install moochy --locked                   # from crates.io
 ```
+
+The installer ([`deploy/client/install.sh`](deploy/client/install.sh)) checks the SHA-256, never uses `sudo` and never edits your shell profile. `MOOCHY_VERSION=vX.Y.Z` pins a release; `MOOCHY_INSTALL_DIR` changes the target directory.
 
 Each release also publishes signed archives for macOS and Linux (arm64 and x86_64), a shell installer, a Homebrew formula and an npm package. To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
 
