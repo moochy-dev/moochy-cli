@@ -1168,6 +1168,10 @@ fn update(o: &Opts) -> Result<()> {
 }
 
 fn connect(home: &Home, o: &Opts, client: &str) -> Result<()> {
+    // m11: the tool first, before the project and the running app.
+    if !crate::connect::CLIENTS.contains(&client) {
+        return Err(usage(format!("unknown tool `{}`: `moochy connect list` shows the tools", clean(client))));
+    }
     let slug = slug_or_detect(o)?;
     let (url, models) = rt_small()?.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
