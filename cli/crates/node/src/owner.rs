@@ -241,25 +241,28 @@ pub fn show_status(home: &Home) -> Result<()> {
     let Some(active) = crate::keylog::KeyLog::active_owner_key(home, &cfg, &me) else {
         return Err(usage("no public key log on this machine (log_key): owner keys cannot be checked"));
     };
+    // §19.2a: as the relay last pushed them to the running app (none when it is not running); its
+    // requests also name the ids below (display only: the ids come from the verified key log).
+    let pending = rt()?
+        .block_on(async {
+            let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
+            c.pending(crate::pb::local::PendingRequest {}).await.ok()
+        })
+        .map(tonic::Response::into_inner)
+        .unwrap_or_default();
+    let names = id_names(&pending);
+    let claims = pending.claims;
     let orgs = crate::keylog::KeyLog::owned_orgs(home, &cfg, &me).unwrap_or_default();
-    for l in org_lines(&orgs) {
+    for l in org_lines(&orgs, &names) {
         eprintln!("{l}");
     }
     let orgs_json: Vec<_> = orgs.iter().map(|(o, r)| json!({"org_id": o, "repos": r})).collect();
     // §24.6: the person profiles this account claimed, and the repos each covers.
     let people = crate::keylog::KeyLog::owned_people(home, &cfg, &me).unwrap_or_default();
-    for l in person_lines(&people) {
+    for l in person_lines(&people, &names) {
         eprintln!("{l}");
     }
     let people_json: Vec<_> = people.iter().map(|(m, r)| json!({"person_id": m, "repos": r})).collect();
-    // §19.2a: as the relay last pushed them to the running app (none when it is not running).
-    let claims = rt()?
-        .block_on(async {
-            let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
-            c.pending(crate::pb::local::PendingRequest {}).await.ok()
-        })
-        .map(|r| r.into_inner().claims)
-        .unwrap_or_default();
     for l in claim_lines(&claims) {
         eprintln!("{l}");
     }
@@ -300,23 +303,49 @@ fn claim_lines(claims: &[crate::pb::local::ClaimState]) -> Vec<String> {
         .collect()
 }
 
+/// `owner status`: project, organisation and person names by id, as the relay last pushed them.
+fn id_names(p: &crate::pb::local::PendingResponse) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for q in &p.requests {
+        for (id, name) in [(&q.repo_id, &q.repo_slug), (&q.org_id, &q.org_path), (&q.person_id, &q.person_path)] {
+            if !id.is_empty() && !name.is_empty() {
+                m.insert(id.clone(), name.clone());
+            }
+        }
+    }
+    for c in &p.claims {
+        m.insert(c.target_id.clone(), c.path.clone());
+    }
+    m
+}
+
+/// A project by its slug when known, else its id; an organisation or person as `path (id)`.
+fn named(names: &std::collections::HashMap<String, String>, id: &str, with_id: bool) -> String {
+    match names.get(id) {
+        Some(n) if with_id => format!("{} ({})", clean(n), clean(id)),
+        Some(n) => clean(n).into_owned(),
+        None => clean(id).into_owned(),
+    }
+}
+
 /// `owner status` (§19): the organisations this account owns in the verified key log, each with
-/// the projects its donations fund. Ids are validated ASCII in the log; still printed `clean`.
-fn org_lines(orgs: &[(String, Vec<String>)]) -> Vec<String> {
+/// the projects its donations fund. Ids are validated ASCII in the log; names come from the relay's
+/// push: both printed `clean`.
+fn org_lines(orgs: &[(String, Vec<String>)], names: &std::collections::HashMap<String, String>) -> Vec<String> {
     orgs.iter()
         .map(|(o, r)| {
-            let covers = if r.is_empty() { "funds none of your projects yet (`moochy org add`)".to_owned() } else { format!("funds {}", r.iter().map(|x| clean(x)).collect::<Vec<_>>().join(", ")) };
-            format!("Organisation {}: {covers}.", clean(o))
+            let covers = if r.is_empty() { "funds none of your projects yet (`moochy org add`)".to_owned() } else { format!("funds {}", r.iter().map(|x| named(names, x, false)).collect::<Vec<_>>().join(", ")) };
+            format!("Organisation {}: {covers}.", named(names, o, true))
         })
         .collect()
 }
 
-fn person_lines(people: &[(String, Vec<String>)]) -> Vec<String> {
+fn person_lines(people: &[(String, Vec<String>)], names: &std::collections::HashMap<String, String>) -> Vec<String> {
     people
         .iter()
         .map(|(m, r)| {
-            let covers = if r.is_empty() { "covers no repo yet (`moochy person add`)".to_owned() } else { format!("covers {}", r.iter().map(|x| clean(x)).collect::<Vec<_>>().join(", ")) };
-            format!("Person profile {}: {covers}.", clean(m))
+            let covers = if r.is_empty() { "covers no repo yet (`moochy person add`)".to_owned() } else { format!("covers {}", r.iter().map(|x| named(names, x, false)).collect::<Vec<_>>().join(", ")) };
+            format!("Person profile {}: {covers}.", named(names, m, true))
         })
         .collect()
 }
@@ -852,9 +881,13 @@ mod tests {
     #[test]
     fn org_lines_name_orgs_and_their_projects() {
         let orgs = vec![("o_a".to_owned(), vec!["r_1".to_owned(), "r_2".to_owned()]), ("o_b\x1b[2J".to_owned(), vec![])];
-        let l = org_lines(&orgs);
+        let l = org_lines(&orgs, &std::collections::HashMap::new());
         assert_eq!(l[0], "Organisation o_a: funds r_1, r_2.");
         assert!(l[1].starts_with("Organisation o_b") && !l[1].contains('\x1b') && l[1].contains("funds none"), "{}", l[1]);
+        // Names the relay pushed replace the ids, when known.
+        let q = SignResponse { repo_id: "r_1".into(), repo_slug: "moochy-dev/moochy-cli".into(), org_id: "o_a".into(), org_path: "github/moochy-dev".into(), ..SignResponse::default() };
+        let names = id_names(&crate::pb::local::PendingResponse { requests: vec![q], claims: vec![] });
+        assert_eq!(org_lines(&orgs, &names)[0], "Organisation github/moochy-dev (o_a): funds moochy-dev/moochy-cli, r_2.");
     }
 
     fn grant(kind: &str, subject: &str, label: &str, body_subject: &str) -> SignResponse {
