@@ -6,7 +6,7 @@
 # (or $MOOCHY_INSTALL_DIR). Never uses sudo, never edits shell rc files.
 # Checks the archive's SHA-256 and, when the GitHub CLI is signed in, its build
 # attestation (gh attestation verify). To not trust moochy.dev for this script,
-# read it first: curl -fsSLo install.sh https://raw.githubusercontent.com/moochy-dev/moochy-cli/main/deploy/client/install.sh
+# read it first: curl -fsSLo install.sh https://raw.githubusercontent.com/moochy-dev/moochy-cli/v0.1.6/deploy/client/install.sh  (a release tag, never main)
 #
 #   MOOCHY_VERSION=vX.Y.Z   install that release instead of the latest
 #   MOOCHY_INSTALL_DIR=DIR  install into DIR instead of ~/.local/bin
