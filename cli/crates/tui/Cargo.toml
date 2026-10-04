@@ -17,7 +17,7 @@ crossterm = { version = "0.29", default-features = false, features = ["events", 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM/SIGHUP/SIGTSTP/SIGCONT → restore the terminal (CONTRACT §20.3). Already in the tree
 # through crossterm's SIGWINCH handling (signal-hook-mio), so no new code is compiled in.
-signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 
 [lints.rust]
 unsafe_code = "forbid"
