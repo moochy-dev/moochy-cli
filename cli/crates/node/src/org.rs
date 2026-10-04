@@ -219,8 +219,10 @@ pub(crate) fn owned_profile(home: &Home, paths: &[String]) -> Option<String> {
     if found.is_empty() {
         return None;
     }
-    // The app writes a PERSON_CLAIMED signed moments ago to its key-log copy within a few seconds.
-    for attempt in 0..10 {
+    // The server names a claimed profile; the app's key-log copy may lag it (a PERSON_CLAIMED
+    // signed moments ago, a busy relay): wait up to 30 s for the verified copy, never trust the
+    // server's word alone.
+    for attempt in 0..60 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
