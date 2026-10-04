@@ -4,6 +4,9 @@
 #
 # Installs the `moochy` binary from the GitHub release into ~/.local/bin
 # (or $MOOCHY_INSTALL_DIR). Never uses sudo, never edits shell rc files.
+# Checks the archive's SHA-256 and, when the GitHub CLI is signed in, its build
+# attestation (gh attestation verify). To not trust moochy.dev for this script,
+# read it first: curl -fsSLo install.sh https://raw.githubusercontent.com/moochy-dev/moochy-cli/main/deploy/client/install.sh
 #
 #   MOOCHY_VERSION=vX.Y.Z   install that release instead of the latest
 #   MOOCHY_INSTALL_DIR=DIR  install into DIR instead of ~/.local/bin
@@ -107,6 +110,20 @@ got=$(sha256 "$tmp/$file")
 [ -n "$want" ] && [ "$want" = "$got" ] ||
 	die "checksum mismatch for $file (expected ${want:-nothing}, got $got). Nothing was installed."
 detail "$got"
+
+# The .sha256 comes from the same release, so it only proves the download is
+# whole. The build attestation is signed by this repository's release workflow
+# and checked against github.com, not against moochy.dev or the release files.
+step "Verifying build provenance"
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+	gh attestation verify "$tmp/$file" --repo moochy-dev/moochy-cli \
+		--signer-workflow moochy-dev/moochy-cli/.github/workflows/release.yml >/dev/null 2>&1 ||
+		die "build provenance check failed for $file (gh attestation verify). Nothing was installed."
+	detail "built by github.com/moochy-dev/moochy-cli release.yml"
+else
+	detail "skipped: needs the GitHub CLI, signed in (gh auth login). Check it yourself:"
+	detail "gh attestation verify $file --repo moochy-dev/moochy-cli"
+fi
 
 step "Extracting"
 # Prefer xz | tar (any tar); macOS has no xz but its bsdtar reads .xz itself.
