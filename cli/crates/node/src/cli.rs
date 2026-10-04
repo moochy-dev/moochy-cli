@@ -387,7 +387,7 @@ fn run() -> Result<()> {
     if let Some((home, args)) = tui_argv() {
         return tui(home, &args);
     }
-    let o = parse()?;
+    let mut o = parse()?;
     if o.has("version") {
         println!("moochy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -406,6 +406,22 @@ fn run() -> Result<()> {
         return Err(usage("missing command"));
     }
     let home = Home::resolve(o.home.clone())?;
+    // Bare `moochy approve` / `accept` (what the web pages and emails suggest): the donors waiting
+    // for you. One: that donor, with its project, organisation or profile. Several: the commands.
+    if matches!(o.words.as_slice(), [c] if c == "approve" || c == "accept") {
+        let home = Home::resolve(o.home.clone())?;
+        match waiting_donor(&home)? {
+            Some((donor, flag, target)) => {
+                o.words.push(donor);
+                match flag {
+                    "--org" => o.org = Some(target),
+                    "--person" => o.person = Some(target),
+                    _ => o.repo = Some(target),
+                }
+            }
+            None => return Ok(()),
+        }
+    }
     let donor: String;
     let mut w: Vec<&str> = o.words.iter().map(String::as_str).collect();
     // M6: `accept p_…` names the donation request that `pending` and `decisions` print.
@@ -591,6 +607,50 @@ fn restart_note(home: &Home, what: &str) {
     if running(home) {
         eprintln!("The app is running: restart it with `moochy down && moochy up` to use the new {what}.");
     }
+}
+
+/// Bare `moochy approve`: the one donor waiting for your signature as (donor, flag, target), or
+/// `None` after printing that nobody waits or the command for each of several.
+fn waiting_donor(home: &Home) -> Result<Option<(String, &'static str, String)>> {
+    let r = rt_small()?.block_on(async {
+        let mut c = crate::ctl::connect(&home.socket_path()).await?;
+        c.pending(crate::pb::local::PendingRequest {}).await.map(tonic::Response::into_inner).map_err(|s| internal(clean(s.message()).into_owned()))
+    })?;
+    let waiting = waiting_of(&r.requests);
+    match waiting.as_slice() {
+        [] => {
+            eprintln!("No donor is waiting for your approval (`moochy pending` shows every request).");
+            Ok(None)
+        }
+        [one] => Ok(Some(one.clone())),
+        many => {
+            eprintln!("{} donors are waiting for your approval. Accept each one:", many.len());
+            for (d, flag, t) in many {
+                eprintln!("  moochy approve {} {flag} {}", clean(d), clean(t));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// The unsigned donor requests as (donor, flag, target): handle else pseudonym; `--org`,
+/// `--person` or `--repo` with the request's own target.
+fn waiting_of(reqs: &[crate::pb::local::SignResponse]) -> Vec<(String, &'static str, String)> {
+    reqs.iter()
+        .filter(|q| q.kind == "DONOR_APPROVED" && !q.signed)
+        .map(|q| {
+            let donor = if q.subject_username.is_empty() { q.subject.clone() } else { q.subject_username.clone() };
+            let (flag, target) = if !q.org_path.is_empty() {
+                ("--org", q.org_path.clone())
+            } else if !q.person_path.is_empty() {
+                ("--person", q.person_path.clone())
+            } else {
+                ("--repo", q.repo_slug.clone())
+            };
+            (donor, flag, target)
+        })
+        .filter(|(d, _, t)| !d.is_empty() && !t.is_empty())
+        .collect()
 }
 
 /// M6: the donor a pending donation request (`p_…`) asks to accept: their handle (then checked with
@@ -1827,5 +1887,39 @@ mod start_error_tests {
         std::fs::write(&log, old).unwrap();
         assert_eq!(super::start_error(&log, from), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use crate::pb::local::SignResponse;
+
+    #[test]
+    fn bare_approve_targets() {
+        let q = |kind: &str, signed: bool, user: &str, repo: &str, org: &str, person: &str| SignResponse {
+            kind: kind.into(),
+            signed,
+            subject: "ps_aaaaaaaaaaaaaaaa".into(),
+            subject_username: user.into(),
+            repo_slug: repo.into(),
+            org_path: org.into(),
+            person_path: person.into(),
+            ..Default::default()
+        };
+        let w = super::waiting_of(&[
+            q("DONOR_APPROVED", false, "alice", "acme/api", "", ""),
+            q("DONOR_APPROVED", false, "", "", "github/acme", ""),
+            q("DONOR_APPROVED", false, "bob", "", "", "github/carol"),
+            q("DONOR_APPROVED", true, "done", "acme/api", "", ""),
+            q("REPO_CLAIMED", false, "me", "acme/api", "", ""),
+        ]);
+        assert_eq!(
+            w,
+            vec![
+                ("alice".into(), "--repo", "acme/api".into()),
+                ("ps_aaaaaaaaaaaaaaaa".into(), "--org", "github/acme".into()),
+                ("bob".into(), "--person", "github/carol".into()),
+            ]
+        );
     }
 }
