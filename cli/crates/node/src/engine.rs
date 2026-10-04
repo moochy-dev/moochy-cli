@@ -84,12 +84,15 @@ impl Failure {
 
 pub const MAX_ENTRIES: usize = 10_000;
 
-/// The price catalog pushed by the relay (`CatalogUpdate`). ponytail: relay-asserted until the
-/// key log carries `CATALOG` entries (D14); then verify `sig` against the logged catalog key.
+/// The price catalog pushed by the relay (`CatalogUpdate`), signed with the key-log key. A
+/// Worker prices with it only when the verified key log carries its `CATALOG` entry
+/// ([`Catalog::logged`], F11).
 #[derive(Debug, Default)]
 pub struct Catalog {
     pub version: u64,
     pub entries: Vec<CatalogEntry>,
+    /// SHA-256 of the exact catalog JSON (what a `CATALOG` entry logs).
+    pub sha256: [u8; 32],
 }
 
 impl Catalog {
@@ -103,7 +106,15 @@ impl Catalog {
             return Err("catalog: too many entries".into());
         }
         let entries = es.into_iter().map(serde_json::from_value).collect::<Result<Vec<CatalogEntry>, _>>().map_err(|e| format!("catalog entry: {e}"))?;
-        Ok(Self { version, entries })
+        Ok(Self { version, entries, sha256: moochy_proto::crypto::sha256(b) })
+    }
+
+    /// F11: the key log's `CATALOG` hash for this version (`None`: not logged, or no verified
+    /// log) is this catalog's. The relay signs catalogs with its online key: only a logged one
+    /// is the catalog every node and public monitor sees, not one pushed to a single Worker.
+    #[must_use]
+    pub fn logged(&self, logged_sha256: Option<[u8; 32]>) -> bool {
+        logged_sha256.is_some_and(|h| crate::util::ct_eq(&h, &self.sha256))
     }
 
     /// Entry for a model as a client names it: public slug, provider model id, or alias.
@@ -138,7 +149,7 @@ impl Catalog {
             max_output: 64_000,
             source: "stub".into(),
         };
-        Arc::new(Self { version: 1, entries: vec![e] })
+        Arc::new(Self { version: 1, entries: vec![e], sha256: [0; 32] })
     }
 }
 
@@ -363,5 +374,10 @@ mod tests {
         assert_eq!(c.resolve("claude-sonnet-5-5").unwrap().model, "anthropic/claude-sonnet-5.5");
         assert!(Catalog::parse(br#"{"version":1,"version":2,"entries":[]}"#).is_err());
         assert!(Catalog::parse(br#"{"version":1,"entries":[{"model":"x","bogus":1}]}"#).is_err());
+        // F11: priced with only when the key log carries this exact JSON for the version.
+        let h = moochy_proto::crypto::sha256(raw);
+        assert!(c.logged(Some(h)));
+        assert!(!c.logged(None), "not logged (a catalog pushed to one Worker)");
+        assert!(!c.logged(Some([7; 32])), "logged with other prices");
     }
 }

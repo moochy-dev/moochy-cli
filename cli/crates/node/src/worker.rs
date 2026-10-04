@@ -546,6 +546,15 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     // 2. Adapter + catalog entry, pledge policy, route expectations for the validator.
     let dialect = Dialect::from_wire(route.dialect.as_str()).ok_or_else(|| with_ck("route_mismatch", false, None))?;
     let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
+    // F11: the donor's limits are counted with this price list: only the one the key log shows.
+    // D14: relay-asserted only without a verified key log and in insecure dev mode.
+    let ok = match node.keylog.as_ref().filter(|l| l.verified()) {
+        Some(l) => cat.logged(l.catalog_sha256(cat.version)),
+        None => node.insecure_dev,
+    };
+    if !ok {
+        return Err(with_ck("model_unavailable", true, Some("price list not in the key log".into())));
+    }
     let Some((adapter, entry)) = node.adapters.iter().find_map(|a| {
         let e = cat.entry(&route.model, a.provider().as_str())?;
         (a.provider().serves(dialect.worker()) && e.dialects.contains(&route.dialect)).then(|| (a.clone(), e.clone()))

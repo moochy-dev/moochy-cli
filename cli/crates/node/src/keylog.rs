@@ -397,6 +397,14 @@ impl KeyLog {
         Some((info.1, info.2))
     }
 
+    /// F11: the `CATALOG` hash logged for `version`, from a fresh verified log only.
+    pub fn catalog_sha256(&self, version: u64) -> Option<[u8; 32]> {
+        if !self.verified() {
+            return None;
+        }
+        self.view().state(|s| s.catalog_sha256(version).copied()).ok().flatten()
+    }
+
     /// Worker side (T-03-088): this donor device holds an owner-signed DONOR_APPROVED for
     /// `repo_id` in a fresh verified log.
     pub fn donor_approved(&self, device: &str, repo_id: &str) -> bool {
