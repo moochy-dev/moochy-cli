@@ -236,6 +236,8 @@ pub fn token_create(home: &Home, slug: &str, ttl: Option<&str>, cap: Option<i64>
     if !secret.starts_with(TOKEN_PREFIX) || !moochy_keylog::entry::is_id(&t.token_id, "bt_") {
         return Err(net("the server sent a malformed box token"));
     }
+    // F10: a box enrolled with this token is this user's, not a rogue key.
+    crate::keylog::add_box_token(&home.state_dir(), &t.token_id);
     let mut v = token_json(&t);
     if let Some(o) = v.as_object_mut() {
         o.insert("token".into(), json!(clean(&secret)));

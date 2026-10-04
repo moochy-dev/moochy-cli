@@ -93,6 +93,24 @@ fn read_keys(path: &std::path::Path) -> Vec<[u8; 32]> {
     v
 }
 
+/// Box tokens this user created on this machine (`<state>/box_tokens`, one `bt_…` id per line),
+/// so a box enrolled with one of them is news, not an alert (F10).
+pub fn own_box_tokens(state: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(state.join("box_tokens")).map(|s| s.lines().map(str::to_owned).take(4096).collect()).unwrap_or_default()
+}
+
+pub fn add_box_token(state: &std::path::Path, id: &str) {
+    let path = state.join("box_tokens");
+    let mut all = std::fs::read_to_string(&path).unwrap_or_default();
+    if all.lines().any(|l| l == id) {
+        return;
+    }
+    all.push_str(id);
+    all.push('\n');
+    let _ = std::fs::create_dir_all(state);
+    let _ = crate::config::write_private(&path, all.as_bytes());
+}
+
 fn add_key(path: &std::path::Path, k: &[u8; 32]) {
     if read_keys(path).contains(k) {
         return;
@@ -295,10 +313,11 @@ impl KeyLog {
     pub fn start(self: &Arc<Self>, node: &Arc<Node>) {
         let Some(mut m) = lock(&self.monitor).take() else { return };
         let mut link = Link { node: node.clone(), notes: self.notes.subscribe(), anchor_due: Instant::now() };
-        let alerts = self.alerts.clone();
+        let (alerts, state) = (self.alerts.clone(), self.state.clone());
         tokio::spawn(async move {
             m.run(&mut link, |e| {
-                let (level, msg, mut fields) = event_fields(e);
+                let own = if matches!(e, Event::Alert(Alert::BoxEnrolled { .. })) { own_box_tokens(&state) } else { Vec::new() };
+                let (level, msg, mut fields) = event_fields(e, &own);
                 if let Some(o) = fields.as_object_mut() {
                     o.insert("keylog".into(), json!(e.message()));
                 }
@@ -467,7 +486,8 @@ fn person_seal(st: &State, worker: &str, repo_id: &str, gateway: &str, key_idx: 
 /// `unknown_key`, `rogue`, `unsigned`, `fork`, `stale`, `rollback` that tooling greps).
 /// Messages: `key log` (routine), `key log alert` (monitor rules; `detail` names the rule and
 /// its ids, e.g. `UnknownKey { idx, device_id }`, all validated ASCII), `KEY LOG FORK: …`.
-fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
+/// `own_boxes`: the box tokens this user created here ([`own_box_tokens`]).
+fn event_fields(e: &Event, own_boxes: &[String]) -> (&'static str, String, serde_json::Value) {
     let routine = |v| ("info", "key log".to_owned(), v);
     match e {
         Event::Synced { size } => routine(json!({"event": "synced", "size": size})),
@@ -489,9 +509,23 @@ fn event_fields(e: &Event) -> (&'static str, String, serde_json::Value) {
                     );
                 }
             }
-            // §17.1: a box of this account is news, not a threat (BoxOutsideRepo is the threat).
-            if matches!(a, Alert::BoxEnrolled { .. }) {
-                return ("info", "key log: box enrolled".into(), f);
+            // §17.1: a box enrolled with a token this user created here is news. Any other box
+            // on this account may be the relay's own (box id, scope and expiry are its word):
+            // the A139 rogue-key alert, as for a plain KEY_ADDED (F10).
+            if let Alert::BoxEnrolled { box_id, device_id, .. } = a {
+                if own_boxes.iter().any(|b| b == box_id) {
+                    return ("info", "key log: box enrolled".into(), f);
+                }
+                if let Some(o) = f.as_object_mut() {
+                    o.insert(
+                        "warning".into(),
+                        json!(format!(
+                            "a box was enrolled on your account with box token {}, which was not created on this machine. If you created it on moochy.dev, this is expected; if not, the server may have added it: moochy box revoke {}",
+                            clean(box_id),
+                            clean(device_id)
+                        )),
+                    );
+                }
             }
             // A224: a first CLI owner key without proof is a reminder when it is this device's own.
             if matches!(a, Alert::UnprovenOwnerKey { known: true, .. }) {
@@ -713,6 +747,14 @@ pub fn check_receipt_ack(node: &Node, receipt: &[u8], ack: &crate::pb::link::Rec
 #[cfg(test)]
 mod tests {
     use moochy_keylog::{Code, State, entry::parse_record};
+
+    #[test]
+    fn a_box_this_user_did_not_create_is_an_alert() {
+        use moochy_keylog::{Alert, Event};
+        let e = Event::Alert(Alert::BoxEnrolled { idx: 3, device_id: "d_x".into(), repo_id: "r_1".into(), box_id: "bt_relay".into(), expires_at_ms: 1 });
+        assert_eq!(super::event_fields(&e, &["bt_mine".into()]).0, "error", "F10: like an unknown key");
+        assert_eq!(super::event_fields(&e, &["bt_relay".into()]).0, "info", "a token made here");
+    }
 
     /// spec/vectors/keylog/people.json (mo-keylog's Go generator) applied to a fresh state.
     fn people() -> (State, serde_json::Value) {
