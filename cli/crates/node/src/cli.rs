@@ -926,11 +926,18 @@ fn env(home: &Home, o: &Opts) -> Result<()> {
             home.save(&cfg)?;
         }
     }
-    let r = rt_small()?.block_on(async {
+    let (r, st) = rt_small()?.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        c.env(EnvRequest { repo: slug.clone(), rotate: o.has("rotate") }).await.map_err(|s| internal(s.message().to_owned()))
+        let r = c.env(EnvRequest { repo: slug.clone(), rotate: o.has("rotate") }).await.map_err(|s| internal(s.message().to_owned()))?;
+        Ok::<_, Error>((r.into_inner(), c.status(StatusRequest {}).await.ok().map(tonic::Response::into_inner)))
     })?;
-    let r = r.into_inner();
+    // m7: the token is local and works for any name; whether donations reach the project is the
+    // server's to say. The app knows the projects it was pushed while connected: warn otherwise.
+    if let Some(st) = st.filter(|st| st.link_state == "up")
+        && !st.pools.iter().any(|p| p.slug.eq_ignore_ascii_case(&slug))
+    {
+        eprintln!("Warning: no donations reach {} for this account yet (an unknown project, one you are not a member of, or one no donor serves): requests with this token are refused until one does. `moochy status` lists your projects.", clean(&slug));
+    }
     if o.has("json") {
         emit(&json!({"anthropic_base_url": r.anthropic_base_url, "openai_base_url": r.openai_base_url, "token": r.token}));
     } else {
