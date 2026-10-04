@@ -98,6 +98,14 @@ struct Ctl {
     node: Arc<Node>,
 }
 
+/// m14: after a self-revocation request, the relay link drops and the reconnect is refused (waits
+/// at most 5 s).
+async fn revoked_since(node: &Node) -> bool {
+    node.link_kick.notify_one();
+    let mut rx = node.link_state.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| matches!(s, LinkState::Refused(_)))).await.is_ok_and(|r| r.is_ok())
+}
+
 pub(crate) fn link_state(node: &Node) -> String {
     if node.offline {
         return "offline".into();
@@ -371,7 +379,13 @@ impl LocalControl for Ctl {
     async fn logout(&self, r: Request<LogoutRequest>) -> std::result::Result<Response<LogoutResponse>, Status> {
         let reason = r.into_inner().reason;
         let reason = if !reason.is_empty() && reason.len() <= 32 && reason.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(&c)) { reason } else { "logout".into() };
-        let res = crate::approve::revoke_self(&self.node, &reason).await;
+        let mut res = crate::approve::revoke_self(&self.node, &reason).await;
+        // m14: revoking this device closes its own session, often before the relay's ack is
+        // flushed. A revoked device is refused at once when it reconnects (its key no longer
+        // authenticates): that refusal confirms the revocation.
+        if res.is_err() && revoked_since(&self.node).await {
+            res = Ok(crate::pb::link::LogEntryAck::default());
+        }
         // Stop either way: the session closes, so the relay drops the device at once.
         let stop = self.node.shutdown.clone();
         tokio::spawn(async move {
@@ -379,7 +393,8 @@ impl LocalControl for Ctl {
             stop.send_replace(true);
         });
         Ok(Response::new(match res {
-            Ok(a) if a.error.is_empty() => LogoutResponse { revoked: true, detail: format!("KEY_REVOKED at log index {}", a.index) },
+            Ok(a) if a.error.is_empty() && a.index > 0 => LogoutResponse { revoked: true, detail: format!("KEY_REVOKED at log index {}", a.index) },
+            Ok(a) if a.error.is_empty() => LogoutResponse { revoked: true, detail: "the server closed this device's session and now refuses its key".into() },
             Ok(a) => LogoutResponse { revoked: false, detail: crate::util::clean(&a.error).into_owned() },
             Err(s) => LogoutResponse { revoked: false, detail: crate::util::clean(s.message()).into_owned() },
         }))
