@@ -774,6 +774,11 @@ impl<'a> Walk<'a> {
             }
             Hook::InferenceGeo => {
                 self.need(Flags::INFERENCE_GEO, "is not allowed: data residency is the donor's call")?;
+                // F20: a regional value is billed at a premium (US-only: 1.1x) that the catalog
+                // does not price; the receipt and every limit would under-count it.
+                if !v.is_str("global") {
+                    return self.fail("is not allowed: only `global` (regional inference costs a premium Moochy does not price)");
+                }
                 self.acc.flags = self.acc.flags.with(Flags::INFERENCE_GEO);
             }
             Hook::TurnEffort => {

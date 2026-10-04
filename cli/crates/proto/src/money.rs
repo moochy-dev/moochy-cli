@@ -135,9 +135,28 @@ pub fn reserve_uusd(c: &CatalogEntry, est_input: u64, max_tokens: u32, ttl: Cach
     ceil_div(n, PER_MILLION.checked_mul(u128::from(den)).ok_or(Error::Overflow)?)
 }
 
-/// Reservation for a route header against a catalog entry.
+/// xAI (worker API.md "xAI (Grok) adapter"): every price doubles once the prompt reaches 200k
+/// tokens, and a reasoning model bills reasoning tokens as output beyond `max_tokens`.
+/// ponytail: provider-wide constants, as in the relay's `ledger.Reserve`; catalog fields once
+/// the catalog schema has them.
+const XAI_LONG_CONTEXT: u64 = 200_000;
+const XAI_REASONING_ALLOWANCE: u32 = 32_000;
+
+/// Reservation for a route header against a catalog entry: the relay's `ledger.Reserve`, xAI's
+/// long-context price and reasoning allowance included (F20), so a local cap that settles at
+/// the reservation stays an upper bound.
 pub fn reserve_for_route(c: &CatalogEntry, r: &RouteHeader) -> Result<i64, Error> {
-    reserve_uusd(c, r.est_input_tokens, r.max_tokens, r.cache_ttl, r.flags.iter().any(|f| f == "fast"))
+    let fast = r.flags.iter().any(|f| f == "fast");
+    if c.provider != "xai" {
+        return reserve_uusd(c, r.est_input_tokens, r.max_tokens, r.cache_ttl, fast);
+    }
+    let mut x = c.clone();
+    if r.est_input_tokens >= XAI_LONG_CONTEXT {
+        x.input = c.input.checked_mul(2).ok_or(Error::Overflow)?;
+        x.out = c.out.checked_mul(2).ok_or(Error::Overflow)?;
+    }
+    let reasoning = if c.default_effort == "none" { 0 } else { XAI_REASONING_ALLOWANCE };
+    reserve_uusd(&x, r.est_input_tokens, r.max_tokens.checked_add(reasoning).ok_or(Error::Overflow)?, r.cache_ttl, fast)
 }
 
 /// Exact decimal USD (JSON number text, e.g. OpenRouter's `usage.cost`: `0.0001234`, `1.5e-05`)

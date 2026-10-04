@@ -491,6 +491,16 @@ fn money_math() {
     let huge = Usage { input: u64::MAX, output: u64::MAX, ..Usage::default() };
     assert_eq!(money::cost_uusd(&c, &huge, false), Err(Error::Overflow));
     assert_eq!(money::reserve_uusd(&c, u64::MAX, u32::MAX, CacheTtl::H1, true), Err(Error::Overflow));
+    // F20: xAI's long-context price and reasoning allowance, as the relay's ledger.Reserve.
+    let mut r = msg::RouteHeader::parse(&route_bytes()).unwrap();
+    assert_eq!(money::reserve_for_route(&c, &r).unwrap(), money::reserve_uusd(&c, 10, 1024, CacheTtl::None, false).unwrap());
+    let xai = CatalogEntry { provider: "xai".into(), ..c.clone() };
+    assert_eq!(money::reserve_for_route(&xai, &r).unwrap(), money::reserve_uusd(&c, 10, 1024 + 32_000, CacheTtl::None, false).unwrap());
+    r.est_input_tokens = 200_000;
+    let long = CatalogEntry { input: 2 * c.input, out: 2 * c.out, ..c.clone() };
+    assert_eq!(money::reserve_for_route(&xai, &r).unwrap(), money::reserve_uusd(&long, 200_000, 1024 + 32_000, CacheTtl::None, false).unwrap());
+    let plain = CatalogEntry { default_effort: "none".into(), ..xai.clone() };
+    assert_eq!(money::reserve_for_route(&plain, &r).unwrap(), money::reserve_uusd(&long, 200_000, 1024, CacheTtl::None, false).unwrap());
     // Provider cost only for OpenRouter, and required there.
     assert_eq!(money::cost_uusd(&c, &Usage { provider_cost_uusd: Some(1), ..Usage::default() }, false), Err(Error::Malformed));
     let or = CatalogEntry { provider: "openrouter".into(), ..c.clone() };
