@@ -425,7 +425,12 @@ fn run() -> Result<()> {
         }),
         ["journal"] => journal(&home, o.has("follow")),
         ["env"] => env(&home, &o),
-        ["safety"] => safety(&home, &o, None),
+        ["safety"] => {
+            if safety(&home, &o, None)? {
+                restart_note(&home, "settings");
+            }
+            Ok(())
+        }
         ["button", rest @ ..] => button(&o, rest),
         ["audit"] if o.has("provider") => audit(&home, &o),
         ["service", "install"] => crate::service::install(&home, o.has("system"), o.has("print")),
@@ -433,13 +438,23 @@ fn run() -> Result<()> {
         ["run", cmd @ ..] => run_cmd(&home, &o, cmd),
         ["box", rest @ ..] => box_cmd(&home, &o, rest),
         ["mcp"] => mcp(&home, &o),
-        ["keys", "add", provider] => keys_add(&home, provider, &o),
+        ["keys", "add", provider] => {
+            keys_add(&home, provider, &o)?;
+            restart_note(&home, "key");
+            Ok(())
+        }
+        ["keys", "remove", _] => {
+            keys_cmd(&home, &w)?;
+            restart_note(&home, "keys");
+            Ok(())
+        }
         ["keys", "list" | "remove", ..] => keys_cmd(&home, &w),
         ["config", "set", key, value] => {
             let mut cfg = home.load()?;
             cfg.set(key, value)?;
             home.save(&cfg)?;
             emit(&json!({"event": "config_set", "key": key}));
+            restart_note(&home, "settings");
             Ok(())
         }
         ["config", "show"] => {
@@ -522,6 +537,15 @@ fn keys_cmd(home: &Home, w: &[&str]) -> Result<()> {
 /// The app answers on its control socket.
 fn running(home: &Home) -> bool {
     rt_small().is_ok_and(|rt| rt.block_on(crate::ctl::connect(&home.socket_path())).is_ok())
+}
+
+/// M2: the running app read its keys and settings once, at start: the keychain is read by a child
+/// process before the lockdown, which forbids starting one afterwards, and the lockdown fixed the
+/// provider ports it may reach. A change applies at the next start: say so.
+fn restart_note(home: &Home, what: &str) {
+    if running(home) {
+        eprintln!("The app is running: restart it with `moochy down && moochy up` to use the new {what}.");
+    }
 }
 
 /// Ask the running node to request `KEY_REVOKED` and stop, then wipe the device keys locally.
@@ -1000,8 +1024,10 @@ fn doctor(home: &Home) -> Result<()> {
         }
         println!("{} {what:<9} {}", tag(if ok { "ok  " } else { "FAIL" }), clean(&detail));
     };
+    let mut stored = None;
     match keystore::load(home, &cfg) {
         Ok(Some(s)) => {
+            stored = Some(s.providers.len());
             for p in s.providers.iter().filter(|p| p.remote_host.is_some()) {
                 println!("{} local     remote, vetted {}, trust: {}", tag("ok  "), clean(p.remote_host.as_deref().unwrap_or("")), crate::keycheck::trust_name(p));
             }
@@ -1022,7 +1048,10 @@ fn doctor(home: &Home) -> Result<()> {
         line(s.link_state == "up" || s.link_state == "offline", "relay", format!("{relay} ({})", s.link_state));
         let skew = s.clock_skew_ms.unsigned_abs();
         line(skew <= 300_000, "clock", format!("skew vs relay {} ms (limit ±5 min)", s.clock_skew_ms));
-        line(true, "providers", format!("{} key(s), {} warm adapter(s), catalog v{}", s.provider_keys, s.warm_adapters, s.catalog_version));
+        // M2: the running app's own keys, read at its start; a key added since needs a restart.
+        let n = usize::try_from(s.provider_keys).unwrap_or(usize::MAX);
+        let restart = stored.filter(|m| *m != n).map(|m| format!("; {m} stored on this machine: restart it with `moochy down && moochy up` to use them")).unwrap_or_default();
+        line(restart.is_empty(), "providers", format!("the running app uses {n} key(s), {} warm adapter(s), catalog v{}{restart}", s.warm_adapters, s.catalog_version));
     } else {
         line(false, "relay", "the Moochy app is not running (start it with `moochy up`)".into());
         line(false, "clock", "unknown: measured when the app connects".into());
@@ -1244,7 +1273,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     keystore::save(home, &cfg, &sec)?;
     emit(&json!({"event": "key_added", "provider": provider}));
     stored_where(home)?;
-    safety(home, o, Some(provider))
+    safety(home, o, Some(provider)).map(drop)
 }
 
 /// Where the keystore keeps provider keys on this machine (CONTRACT §23), for humans: never a value.
@@ -1354,11 +1383,12 @@ fn audit(home: &Home, o: &Opts) -> Result<()> {
     Ok(())
 }
 
-fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<()> {
+/// `Ok(true)`: the limit and the acknowledgement were saved.
+fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<bool> {
     use std::io::{BufRead as _, Write as _};
     let mut cfg = home.load()?;
     if cfg.donor_safety_ack_ms.is_some() && cfg.device_monthly_cap_uusd.is_some() && o.monthly_limit.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let page = provider.map_or("your provider's console", spend_limit_page);
     eprintln!(
@@ -1389,13 +1419,13 @@ fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<()> {
     let Some(cap) = cap.filter(|_| accepted) else {
         eprintln!("Not donating yet. To finish: moochy safety --monthly-limit 25 --accept-safety");
         emit(&json!({"event": "safety_step_pending"}));
-        return Ok(());
+        return Ok(false);
     };
     cfg.device_monthly_cap_uusd = Some(cap);
     cfg.donor_safety_ack_ms = Some(crate::util::now_ms());
     home.save(&cfg)?;
     emit(&json!({"event": "safety_step_done", "monthly_limit": crate::util::fmt_dollars(cap)}));
-    Ok(())
+    Ok(true)
 }
 
 fn up_background(home: &Home, o: &Opts) -> Result<()> {
