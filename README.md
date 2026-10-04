@@ -10,10 +10,28 @@ Open-source client (Apache-2.0) · 100% free. No fees, no commission, no paid ti
 
 ```sh
 curl -fsSL https://moochy.dev/install.sh | sh   # Linux and macOS: verified release binary into ~/.local/bin
-cargo install moochy --locked                   # from crates.io
 ```
 
-The installer ([`deploy/client/install.sh`](deploy/client/install.sh)) checks the SHA-256, never uses `sudo` and never edits your shell profile. `MOOCHY_VERSION=vX.Y.Z` pins a release; `MOOCHY_INSTALL_DIR` changes the target directory.
+The installer ([`deploy/client/install.sh`](deploy/client/install.sh)) checks the SHA-256 (and the build attestation when `gh` is signed in), never uses `sudo` and never edits your shell profile. `MOOCHY_VERSION=vX.Y.Z` pins a release; `MOOCHY_INSTALL_DIR` changes the target directory.
+
+This one-line command runs a script that moochy.dev serves before you can read it. To check everything first, use one of these instead:
+
+- **From crates.io**, with Rust installed: `cargo install moochy --locked`.
+- **A release archive checked before you unpack it** (Linux x86_64 here; the others are `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`):
+
+  ```sh
+  f=moochy-x86_64-unknown-linux-musl
+  gh release download --repo moochy-dev/moochy-cli --pattern "$f.tar.xz"
+  gh attestation verify "$f.tar.xz" --repo moochy-dev/moochy-cli --signer-workflow moochy-dev/moochy-cli/.github/workflows/release.yml
+  tar -xJf "$f.tar.xz" && mkdir -p ~/.local/bin && install -m 0755 "$f/moochy" ~/.local/bin/moochy
+  ```
+
+- **The same install script, read first**, from GitHub instead of moochy.dev:
+
+  ```sh
+  curl -fsSLo install.sh https://raw.githubusercontent.com/moochy-dev/moochy-cli/main/deploy/client/install.sh
+  less install.sh && sh install.sh
+  ```
 
 Each release also publishes signed archives for macOS and Linux (arm64 and x86_64), a shell installer, a Homebrew formula and an npm package. To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
 

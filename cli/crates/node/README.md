@@ -4,10 +4,16 @@ The Moochy app: donate LLM tokens from your own provider API account to the open
 projects you use, and use tokens donated to your own projects. Linux and macOS.
 
 ```sh
-curl -fsSL https://moochy.dev/install.sh | sh      # or: cargo install moochy --locked
+cargo install moochy --locked                      # or the one-line installer below
 moochy login                                       # opens your browser; confirm the code
 moochy up                                          # start the app on this machine
 ```
+
+The one-line installer, `curl -fsSL https://moochy.dev/install.sh | sh`, runs a script that
+moochy.dev serves before you can read it. To check first, install from crates.io as above, or
+download a release archive and check it with
+`gh attestation verify <archive> --repo moochy-dev/moochy-cli` before you unpack it
+([details](https://github.com/moochy-dev/moochy-cli#install)).
 
 This crate is the `moochy` binary and its node library:
 
