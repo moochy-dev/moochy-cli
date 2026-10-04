@@ -36,7 +36,8 @@ fn valid_id(id: &str) -> bool {
 fn decision_json(d: &Donation, origin: &str) -> serde_json::Value {
     let money = |v: i64| fmt_dollars(u64::try_from(v).unwrap_or(0));
     let mut v = json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "donor": clean(&d.donor), "status": clean(&d.status),
-        "monthly_limit": money(d.budget_uusd), "per_request_limit": money(d.per_task_cap_uusd), "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(),
+        "monthly_limit": money(d.budget_uusd), "weekly_limit": (d.weekly_limit_uusd > 0).then(|| money(d.weekly_limit_uusd)),
+        "daily_limit": (d.daily_limit_uusd > 0).then(|| money(d.daily_limit_uusd)), "per_request_limit": money(d.per_task_cap_uusd), "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(),
         "created_at_ms": d.created_at_ms,
         "events": d.events.iter().map(|e| json!({"event": clean(&e.event), "via": clean(&e.via), "at_ms": e.at_ms, "reason": clean(&e.reason), "log_index": e.log_index})).collect::<Vec<_>>()});
     if d.status == "pending"
@@ -73,7 +74,8 @@ pub fn list(home: &Home, slug: Option<&str>, org: Option<&str>, json_out: bool) 
             continue;
         }
         let who = if d.donor.is_empty() { "a hidden donor".into() } else { clean(&d.donor) };
-        let line = format!("{:<28} {:<9} {who}, up to {} a month ({})", crate::donations::target(d), clean(&d.status), fmt_dollars(u64::try_from(d.budget_uusd).unwrap_or(0)), clean(&d.pledge_id));
+        let windows = crate::donations::Limits { monthly: d.budget_uusd, weekly: (d.weekly_limit_uusd > 0).then_some(d.weekly_limit_uusd), daily: (d.daily_limit_uusd > 0).then_some(d.daily_limit_uusd) };
+        let line = format!("{:<28} {:<9} {who}, up to {} a month{} ({})", crate::donations::target(d), clean(&d.status), fmt_dollars(u64::try_from(d.budget_uusd).unwrap_or(0)), windows.extra(), clean(&d.pledge_id));
         println!("{line}");
         if d.status == "pending" {
             println!("    accept with your passkey: {origin}/decide/{}   refuse: moochy decisions refuse {} [--reason TEXT]", clean(&d.pledge_id), clean(&d.pledge_id));
@@ -141,6 +143,9 @@ mod tests {
         let d = Donation { pledge_id: "pl_01J".into(), repo_slug: "acme/widget".into(), status: "pending".into(), donor: "\u{1b}[31malice".into(), budget_uusd: 20_000_000, ..Donation::default() };
         let v = decision_json(&d, "https://moochy.dev");
         assert_eq!(v["decide_url"], "https://moochy.dev/decide/pl_01J");
+        assert!(v["weekly_limit"].is_null());
+        let w = decision_json(&Donation { weekly_limit_uusd: 8_000_000, daily_limit_uusd: 2_000_000, ..d.clone() }, "https://moochy.dev");
+        assert_eq!((w["weekly_limit"].as_str(), w["daily_limit"].as_str()), (Some("$8.00"), Some("$2.00")));
         assert!(!v["donor"].as_str().unwrap().contains('\u{1b}'), "donor names are cleaned");
         let done = decision_json(&Donation { status: "active".into(), ..d }, "https://moochy.dev");
         assert!(done.get("decide_url").is_none());

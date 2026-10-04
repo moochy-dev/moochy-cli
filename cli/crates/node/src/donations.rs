@@ -49,8 +49,14 @@ pub async fn relay(node: &Node, r: DonationsRequest) -> std::result::Result<Dona
     Ok(DonationsResponse { response })
 }
 
-fn status(s: &Status) -> crate::util::Error {
+fn status(op: &str, s: &Status) -> crate::util::Error {
     let m = clean(s.message()).into_owned();
+    // m5: the code says which case it is (an older relay sends one message for both).
+    match (op, s.code()) {
+        ("donate", tonic::Code::AlreadyExists) => return usage("you already have a live donation to this target: `moochy donations` shows it and its id. To change its limits, use the Dashboard on moochy.dev; to replace it, stop it first (`moochy donations stop <id>`)"),
+        ("action", tonic::Code::FailedPrecondition) => return usage("this donation has already ended (stopped or refused), or this request was already decided: nothing is left to change. `moochy donations` lists the live ones"),
+        _ => {}
+    }
     match s.code() {
         tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => net(m),
         tonic::Code::InvalidArgument | tonic::Code::NotFound | tonic::Code::AlreadyExists | tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted => usage(m),
@@ -62,7 +68,7 @@ pub(crate) fn call(home: &crate::config::Home, op: &str, request: Vec<u8>) -> Re
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
-        c.donations(DonationsRequest { op: op.into(), request }).await.map(|r| r.into_inner().response).map_err(|e| status(&e))
+        c.donations(DonationsRequest { op: op.into(), request }).await.map(|r| r.into_inner().response).map_err(|e| status(op, &e))
     })
 }
 
@@ -142,8 +148,8 @@ impl Limits {
         Ok(())
     }
 
-    /// `" ($8.00 a week, $2.00 a day)"`, or nothing.
-    fn extra(self) -> String {
+    /// `", $8.00 a week, $2.00 a day"`, or nothing.
+    pub(crate) fn extra(self) -> String {
         let parts: Vec<String> = [(self.weekly, "week"), (self.daily, "day")].iter().filter_map(|(v, w)| v.map(|v| format!("{} a {w}", dollars(v)))).collect();
         if parts.is_empty() { String::new() } else { format!(", {}", parts.join(", ")) }
     }
@@ -224,6 +230,14 @@ pub fn action(home: &crate::config::Home, action: &str, pledge_id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::Limits;
+
+    #[test]
+    fn refusals_say_which_case() {
+        let s = |op: &str, code| super::status(op, &tonic::Status::new(code, "a live donation to this repo exists, or this one has ended")).msg;
+        assert!(s("donate", tonic::Code::AlreadyExists).starts_with("you already have a live donation"));
+        assert!(s("action", tonic::Code::FailedPrecondition).starts_with("this donation has already ended"));
+        assert!(s("donate", tonic::Code::FailedPrecondition).contains("live donation to this repo"), "other cases keep the server's words");
+    }
 
     #[test]
     fn limits_order_and_sign() {
