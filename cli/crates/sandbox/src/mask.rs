@@ -179,11 +179,15 @@ pub(crate) fn glob1(pat: &str, name: &str) -> bool {
 
 /// Git-ignored entries. Runs `git` in the parent (the sandbox does not exist
 /// yet) with every config knob that could make it execute something forced
-/// off: the repo's config may already be hostile (A191). No git or no repo:
-/// nothing to add. A git that fails on a worktree that has its own repo:
-/// refuse (fail closed).
+/// off: the repo's config may already be hostile (A191). No repo: nothing to
+/// add. A git that is missing or fails on a worktree that has its own repo:
+/// refuse (fail closed, F22).
 fn git_ignored(worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
-    let output = std::process::Command::new("git")
+    ls_ignored("git", worktree, out)
+}
+
+fn ls_ignored(git: &str, worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+    let output = std::process::Command::new(git)
         .arg("-C")
         .arg(worktree)
         .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false"])
@@ -194,17 +198,20 @@ fn git_ignored(worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output();
-    let Ok(output) = output else { return Ok(()) }; // no git binary
-    if !output.status.success() {
-        let dotgit = worktree.join(".git");
-        if !(dotgit.is_file() || dotgit.join("HEAD").exists()) {
-            return Ok(()); // not a repo (or an empty placeholder left by a killed run)
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        failed => {
+            let dotgit = worktree.join(".git");
+            if !(dotgit.is_file() || dotgit.join("HEAD").exists()) {
+                return Ok(()); // not a repo (or an empty placeholder left by a killed run)
+            }
+            let err = match failed {
+                Ok(o) => std::io::Error::other(format!("git exited with {}", o.status)),
+                Err(e) => e, // no git binary
+            };
+            return Err(Error::Setup { what: "git ls-files (git-ignored masks)", err });
         }
-        return Err(Error::Setup {
-            what: "git ls-files (git-ignored masks)",
-            err: std::io::Error::other(format!("git exited with {}", output.status)),
-        });
-    }
+    };
     for rel in output.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
         let (rel, is_dir) = match rel.strip_suffix(b"/") {
             Some(r) => (r, true),
@@ -239,5 +246,15 @@ mod tests {
         for miss in ["README.md", "id_generator.rs", "main.rs", "gcloud", "keys.rs", "pem"] {
             assert!(!matches_secret(r, &r.join(miss)), "{miss} masked");
         }
+    }
+    #[test]
+    fn missing_git_refuses_a_repo() {
+        let wt = std::env::temp_dir().join(format!("moochy-mask-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(wt.join(".git")).unwrap();
+        let no_git = "/nonexistent/moochy-test/git";
+        assert!(ls_ignored(no_git, &wt, &mut Vec::new()).is_ok(), "no repo: nothing to mask");
+        std::fs::write(wt.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(matches!(ls_ignored(no_git, &wt, &mut Vec::new()), Err(Error::Setup { .. })), "F22: a repo without git refuses the run");
+        std::fs::remove_dir_all(&wt).unwrap();
     }
 }
