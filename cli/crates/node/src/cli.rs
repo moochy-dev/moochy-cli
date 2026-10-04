@@ -92,7 +92,8 @@ COMMANDS:
                                   gateway_addr, journal_full_text, auto_cache,
                                   firewall_level (safety checks: strict or paranoid),
                                   allow_unsandboxed_tools (owner/name list: tool calls reach
-                                  agents outside `moochy run`; warned at every start)
+                                  agents outside `moochy run` when the project allows it
+                                  too; warned at every start)
   connect <client> [--repo PROJECT] [--write]
                                   Show the setup for a coding tool, or merge it into the
                                   tool's config with --write (`connect list` shows the tools)

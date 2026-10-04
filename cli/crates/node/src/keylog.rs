@@ -425,6 +425,11 @@ impl KeyLog {
         self.view().state(|s| s.catalog_sha256(version).copied()).ok().flatten()
     }
 
+    /// F06: `pseudonym` owns or is a member of `repo_id` in the verified log.
+    pub fn owner_or_member(&self, repo_id: &str, pseudonym: &str) -> bool {
+        self.verified() && self.view().state(|s| s.owner_or_member(repo_id, pseudonym)).unwrap_or(false)
+    }
+
     /// Worker side (T-03-088): this donor device holds an owner-signed DONOR_APPROVED for
     /// `repo_id` in a fresh verified log.
     pub fn donor_approved(&self, device: &str, repo_id: &str) -> bool {

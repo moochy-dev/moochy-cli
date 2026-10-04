@@ -74,7 +74,7 @@ pub struct Gate {
 const MAX_TOOL_INPUT: usize = 4 << 20;
 
 /// Why a valid tool call is withheld from a client outside `moochy run` (§15.4).
-pub const NOT_SANDBOXED: &str = "this session is not sandboxed; run your agent with `moochy run`, or allow it for the project with `moochy config set allow_unsandboxed_tools owner/name`";
+pub const NOT_SANDBOXED: &str = "this session is not sandboxed; run your agent with `moochy run`, or, when the project allows it, consent on this machine with `moochy config set allow_unsandboxed_tools owner/name`";
 /// … to a `moochy run --box-is-sandbox` session of a project that does not allow platform sandboxes (§17.2).
 pub const PLATFORM_NOT_ALLOWED: &str = "this project does not allow platform sandboxes (`moochy run --box-is-sandbox`); use `moochy run` where the box supports it, or ask the maintainer to allow platform sandboxes";
 

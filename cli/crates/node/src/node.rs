@@ -429,11 +429,15 @@ impl Node {
             p.auto_cache = v.auto_cache;
             p.excluded_providers = v.excluded_providers.iter().take(16).filter(|x| plain_id(x)).cloned().collect();
             p.pinned_donors = v.pinned_donors.iter().take(64).filter(|x| plain_id(x)).cloned().collect();
+            // F06: every setting that lets tool calls out of `moochy run` is said on stderr, like
+            // the local one at start (outside `moochy run` it also needs this machine's consent).
             if v.allow_unsandboxed_tools && !p.allow_unsandboxed_tools {
+                eprintln!("WARNING: project {} lets tool calls from donated tokens reach agents outside `moochy run` (released only where `allow_unsandboxed_tools` on this machine names it).", crate::util::clean(&slug));
                 crate::util::log("warn", "this project lets tool calls from donated tokens reach agents outside `moochy run`", &serde_json::json!({"repo_id": v.repo_id}));
             }
             p.allow_unsandboxed_tools = v.allow_unsandboxed_tools;
             if v.allow_platform_sandboxes && !p.allow_platform_sandboxes {
+                eprintln!("WARNING: project {} lets tool calls from donated tokens reach agents in a box platform's sandbox (`--box-is-sandbox`, not `moochy run`).", crate::util::clean(&slug));
                 crate::util::log("warn", "this project lets tool calls from donated tokens reach agents in a box platform's sandbox (not `moochy run`)", &serde_json::json!({"repo_id": v.repo_id}));
             }
             p.allow_platform_sandboxes = v.allow_platform_sandboxes;

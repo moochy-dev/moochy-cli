@@ -235,13 +235,19 @@ async fn handle(node: Arc<Node>, allowed: &[String; 3], req: Request<Incoming>, 
         return native_error(dialect, &Failure::new("unauthorized", false, "moochy: invalid local token (see `moochy env`)".to_owned()));
     };
     // Tool calls are released only to sandboxed sessions or projects that opted in (§15.4).
-    // The project's own setting (PoolSync), or the local override in development only.
-    // A platform-sandboxed run (§17.2, `--box-is-sandbox`) only if the project allows platform sandboxes.
-    let (repo_allows, platform_ok) = crate::node::lock(&node.pools)
+    // The project's settings come from the relay (PoolSync), so only the pools of a repo this
+    // account owns or is a member of in the verified key log count (F06), never one the relay
+    // merely names with the same slug. A platform-sandboxed run (§17.2, `--box-is-sandbox`)
+    // only if the project allows platform sandboxes.
+    let bound = |repo: &str| match node.keylog.as_ref().filter(|l| l.verified()) {
+        Some(l) => node.cfg.pseudonym.as_deref().is_some_and(|me| l.owner_or_member(repo, me)),
+        None => node.insecure_dev,
+    };
+    let settings = crate::node::lock(&node.pools)
         .values()
-        .filter(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&slug)))
+        .filter(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&slug)) && bound(&p.repo_id))
         .fold((false, false), |(a, b), p| (a || p.allow_unsandboxed_tools, b || p.allow_platform_sandboxes));
-    let release = (sandboxed && (!platform || platform_ok)) || repo_allows || (node.insecure_dev && node.cfg.unsandboxed_tools_allowed(&slug));
+    let release = release_tools((sandboxed, platform), settings, (node.cfg.unsandboxed_tools_allowed(&slug), node.insecure_dev));
     match (req.method(), path.as_str()) {
         (&Method::POST, "/moochy/run") if !sandboxed => {
             let key = req.headers().get(crate::run::RUN_KEY_HEADER).and_then(|v| v.to_str().ok());
@@ -507,6 +513,30 @@ async fn api(node: Arc<Node>, slug: String, dialect: Dialect, req: Request<Incom
         h.insert("x-moochy-note", v);
     }
     resp
+}
+
+/// Whether donor tool calls reach this session (§15.4, F06): the session (`moochy run`, platform
+/// sandbox), the project's settings, and this machine (`allow_unsandboxed_tools` names the
+/// project, insecure dev mode).
+/// Outside `moochy run`, the relay's word is never enough: local consent is required too
+/// (development alone may skip the project's setting).
+fn release_tools((sandboxed, platform): (bool, bool), (repo_allows, platform_ok): (bool, bool), (consent, insecure_dev): (bool, bool)) -> bool {
+    (sandboxed && (!platform || platform_ok)) || (consent && (repo_allows || insecure_dev))
+}
+
+#[cfg(test)]
+mod release_tests {
+    #[test]
+    fn the_relay_alone_never_releases_tool_calls_outside_moochy_run() {
+        use super::release_tools as r;
+        let off = (false, false);
+        assert!(!r(off, (true, true), off), "F06: a relay-set project flag without local consent");
+        assert!(r(off, (true, false), (true, false)), "project setting + local consent");
+        assert!(!r(off, off, (true, false)), "local consent alone (production)");
+        assert!(r((true, false), off, off), "moochy run");
+        assert!(!r((true, true), off, off), "platform sandbox the project does not allow");
+        assert!(r((true, true), (false, true), off));
+    }
 }
 
 #[cfg(test)]
