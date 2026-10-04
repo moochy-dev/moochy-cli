@@ -327,6 +327,13 @@ const PLATFORM_KEEP_ENV: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL",
 /// marked platform-sandboxed (tool calls only if the project allows platform sandboxes).
 /// Run tokens are honoured only on the gateway's Unix socket (A215), so this process bridges a
 /// loopback port to it for the agent.
+/// F08: the first variable (by name; its value is never read) that marks a box holding a
+/// credential a donor's tool call could take outside a kernel sandbox: a GitHub Codespace, or a
+/// GitHub token in the environment.
+fn credential_platform(set: impl Fn(&str) -> bool) -> Option<&'static str> {
+    ["CODESPACES", "GITHUB_TOKEN", "GH_TOKEN"].into_iter().find(|n| set(n))
+}
+
 pub fn run_platform(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::path::PathBuf>) -> Result<i32> {
     let (prog, args) = cmd.split_first().ok_or_else(|| usage("moochy run --box-is-sandbox -- <command> [args…]"))?;
     let port: u16 = gw.anthropic.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).ok_or_else(|| internal("gateway URL without a port"))?;
@@ -334,6 +341,11 @@ pub fn run_platform(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::path
     let cwd = std::env::current_dir().map_err(|e| internal(format!("cwd: {e}")))?;
     let worktree = worktree.or_else(|| crate::files::git_root(&cwd)).unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or(cwd.clone()));
     guard_worktree(&worktree, gw.state_dir.parent().unwrap_or(&gw.state_dir))?;
+    if let Some(name) = credential_platform(|n| std::env::var_os(n).is_some()) {
+        return Err(usage(format!(
+            "refusing --box-is-sandbox: {name} is set, so this box holds a credential (a codespace's GITHUB_TOKEN can push to the repository) that a donor's tool call could take. Use `moochy connect <agent>` or moochy_delegate (no donated tool calls), or a VM box where plain `moochy run` works"
+        )));
+    }
     let exposed = moochy_sandbox::mask::collect(&worktree).map_err(|e| usage(format!("cannot check the worktree for secrets: {e}")))?;
     if !exposed.is_empty() {
         let list: Vec<String> = exposed.iter().take(10).map(|p| crate::util::clean(&p.strip_prefix(&worktree).unwrap_or(p).to_string_lossy()).into_owned()).collect();
@@ -476,6 +488,15 @@ pub fn run_unsandboxed(env: &[(&'static str, String)], cmd: &[String]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn box_is_sandbox_refuses_credential_platforms() {
+        // F08: by name only; a codespace, or a GitHub token, refuses --box-is-sandbox.
+        assert_eq!(credential_platform(|n| n == "CODESPACES"), Some("CODESPACES"));
+        assert_eq!(credential_platform(|n| n == "GH_TOKEN"), Some("GH_TOKEN"));
+        assert_eq!(credential_platform(|n| n == "GITHUB_TOKEN"), Some("GITHUB_TOKEN"));
+        assert_eq!(credential_platform(|n| n == "MOOCHY_ENROLL"), None);
+    }
 
     #[test]
     fn worktree_guard() {

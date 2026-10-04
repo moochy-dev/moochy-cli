@@ -64,7 +64,7 @@ install_moochy() {
 		mkdir -p "$HOME/.local/bin"
 		install -m 0755 "$bin" "$HOME/.local/bin/moochy"
 		PATH="$HOME/.local/bin:$PATH"
-		say "installed in ~/.local/bin (no root): if \`moochy doctor\` reports no sandbox, use \`moochy run --box-is-sandbox\`"
+		say "installed in ~/.local/bin (no root): if \`moochy doctor\` reports no sandbox, see the line printed after start"
 	fi
 	rm -rf "$tmp"
 	trap - EXIT
@@ -105,4 +105,4 @@ if [ -z "${MOOCHY_ENROLL:-}" ] && moochy config show 2>/dev/null | grep -q '"dev
 fi
 moochy up --headless
 say "ready. Start your agent with: moochy run -- <agent>"
-say "if \`moochy doctor\` reports no user namespaces or Landlock here: moochy run --box-is-sandbox -- <agent>"
+say "if \`moochy doctor\` reports no user namespaces or Landlock here: use \`moochy connect <agent>\` or moochy_delegate (no donated tool calls), or a VM box. \`moochy run --box-is-sandbox\` only in a box with no other credential: never a codespace or devcontainer (its GITHUB_TOKEN)"

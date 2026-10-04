@@ -22,6 +22,7 @@ const TOKEN_PREFIXES: &[(&[u8], usize, &str)] = &[
     (b"AIza", 35, "google_key"),
     (b"AKIA", 16, "aws_key"),
     (b"ASIA", 16, "aws_key"),
+    (b"mbx_", 32, "moochy_box_token"),
 ];
 
 const ENV_WORDS: &[&[u8]] = &[b"SECRET", b"TOKEN", b"PASSWORD", b"PASSWD", b"API_KEY", b"APIKEY", b"PRIVATE_KEY", b"ACCESS_KEY", b"CREDENTIAL"];
@@ -133,13 +134,14 @@ fn plausible(b: &[u8], i: usize, c: u8) -> bool {
         b'g' => (n(1) == b'h' && n(3) == b'_') || (n(1) == b'l' && n(2) == b'p') || (n(1) == b'i' && n(6) == b'_'),
         b'x' => (n(1) == b'o' && n(2) == b'x') || (n(1) == b'a' && n(2) == b'p'),
         b'A' => matches!((n(1), n(2)), (b'K' | b'S', b'I') | (b'I', b'z')),
+        b'm' => n(1) == b'b' && n(2) == b'x' && n(3) == b'_',
         _ => false,
     }
 }
 
 /// Bytes that can start a match (table: ~2× faster than a compare chain on prose).
 static TRIGGER: std::sync::LazyLock<[bool; 256]> =
-    std::sync::LazyLock::new(|| std::array::from_fn(|i| u8::try_from(i).is_ok_and(|c| b"=-esgxA".contains(&c))));
+    std::sync::LazyLock::new(|| std::array::from_fn(|i| u8::try_from(i).is_ok_and(|c| b"=-esgxAm".contains(&c))));
 
 /// Word boundary before `i`; a JSON escape (`\n`, `\t`, `\r`) right before also counts.
 fn boundary(b: &[u8], i: usize) -> bool {
@@ -195,6 +197,7 @@ mod tests {
         assert_eq!(s("key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123 end"), "key [REDACTED:anthropic_key] end");
         assert_eq!(s("AKIAABCDEFGHIJKLMNOP"), "[REDACTED:aws_key]");
         assert_eq!(s("x ghp_0123456789abcdefghijklmnopqrstuvwxyz"), "x [REDACTED:github_token]");
+        assert_eq!(s("MOOCHY_ENROLL mbx_0123456789abcdefghijklmnopqrstuv end"), "MOOCHY_ENROLL [REDACTED:moochy_box_token] end", "F08");
         assert_eq!(s("DB_PASSWORD=hunter2hunter2\nOK=1"), "DB_PASSWORD=[REDACTED:env_secret]\nOK=1");
         assert_eq!(s("export API_KEY = 'abcdefgh123'"), "export API_KEY = '[REDACTED:env_secret]'");
         assert_eq!(s("PATH=/usr/bin:/bin"), "PATH=/usr/bin:/bin");
