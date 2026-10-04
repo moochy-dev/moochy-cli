@@ -14,7 +14,7 @@
 use moochy_keylog::{
     Error, Event, LogLink, Me, Monitor, NoteKey,
     cosig::CosignerKey,
-    monitor::Config,
+    monitor::{Config, Gate},
     state::Code,
     tiles::{TILE_WIDTH, tile_path},
 };
@@ -283,6 +283,13 @@ fn fork_vs_anchor_and_rollback() {
             served: 27
         }]
     );
+    // F24: the gate is stale until the relay serves what the anchor shows; replaying the
+    // same checkpoint does not reopen it.
+    assert!(matches!(m.view().gate(), Gate::Stale { .. }), "{:?}", m.view().gate());
+    block_on(m.on_checkpoint(&mut f.link, &f.n23));
+    assert!(matches!(m.view().gate(), Gate::Stale { .. }), "{:?}", m.view().gate());
+    block_on(m.on_checkpoint(&mut f.link, &f.n300));
+    assert!(matches!(m.view().gate(), Gate::Verified { size: 300 }), "{:?}", m.view().gate());
     // An anchor with another root at 23: fork.
     assert!(matches!(&m.on_anchor(&f.fork23)[..], [Event::Fork { .. }]));
     assert!(m.view().forked());

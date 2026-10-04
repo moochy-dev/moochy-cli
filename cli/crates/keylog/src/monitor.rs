@@ -440,6 +440,9 @@ pub struct Monitor {
     view: View,
     /// Largest checkpoint size the relay has served (for rollback vs the anchor).
     served: u64,
+    /// Largest tree size the public anchor has shown: until the mirror reaches it, the
+    /// gate stays stale (F24).
+    anchored: u64,
 }
 
 fn io_err(e: impl std::fmt::Display) -> Error {
@@ -479,6 +482,7 @@ impl Monitor {
                 stale: false,
             }))),
             served,
+            anchored: 0,
         })
     }
 
@@ -578,12 +582,14 @@ impl Monitor {
             );
         }
         let slices: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let anchored = self.anchored;
         let res = match self.view.0.write() {
             Ok(mut g) => {
                 let out = g.mirror.update(&cp, &slices);
                 if out.is_ok() {
                     g.confirmed_at = Some(Instant::now());
-                    g.stale = false;
+                    // F24: a relay that withholds what the anchor already shows stays stale.
+                    g.stale = g.mirror.size() < anchored;
                 }
                 out
             }
@@ -625,10 +631,18 @@ impl Monitor {
                 "public Git anchor differs from the relay's history",
                 note,
             )],
-            Ok((cp, AnchorStatus::Behind)) => vec![Event::Rollback {
-                anchored: cp.size,
-                served: self.served,
-            }],
+            // F24: the relay withholds (or froze, or shows a shorter branch of) what the
+            // anchor already has: no sealing or task acceptance until it serves that size.
+            Ok((cp, AnchorStatus::Behind)) => {
+                self.anchored = self.anchored.max(cp.size);
+                if let Ok(mut g) = self.view.0.write() {
+                    g.stale = true;
+                }
+                vec![Event::Rollback {
+                    anchored: cp.size,
+                    served: self.served,
+                }]
+            }
         }
     }
 
