@@ -80,8 +80,18 @@ pub async fn connect(sock: &Path) -> Result<LocalControlClient<Channel>> {
             async move { UnixStream::connect(p).await.map(TokioIo::new) }
         }))
         .await
-        .map_err(|_| net("the Moochy app is not running: start it with `moochy up` (sign in first with `moochy login` if you have not)"))?;
+        .map_err(|_| not_running(sock))?;
     Ok(LocalControlClient::new(ch).max_decoding_message_size(MAX_MSG).max_encoding_message_size(MAX_MSG))
+}
+
+/// m2: why nothing answers on `<home>/state/node.sock`: not signed in (the config names no device
+/// or server, which `Boot::load` refuses too), or the app is not started.
+fn not_running(sock: &Path) -> crate::util::Error {
+    let home = sock.parent().and_then(Path::parent).map(|d| crate::config::Home { dir: d.to_path_buf() });
+    match home.map(|h| h.load()) {
+        Some(Ok(c)) if c.device_id.is_none() || c.relay.is_none() => crate::util::auth("not logged in: run `moochy login` first"),
+        _ => net("the Moochy app is not running: start it with `moochy up`"),
+    }
 }
 
 struct Ctl {
@@ -389,5 +399,22 @@ impl LocalControl for Ctl {
     async fn shutdown(&self, _: Request<ShutdownRequest>) -> std::result::Result<Response<ShutdownResponse>, Status> {
         self.node.shutdown.send_replace(true);
         Ok(Response::new(ShutdownResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// m2: nothing on node.sock is "not logged in" (auth) until the config names a device and a
+    /// server, then "not running" (network).
+    #[test]
+    fn not_running_says_why() {
+        let dir = std::env::temp_dir().join(format!("moochy-ctl-{}", std::process::id()));
+        let home = crate::config::Home { dir: dir.clone() };
+        std::fs::create_dir_all(home.state_dir()).unwrap();
+        let exit = || super::not_running(&home.socket_path()).exit;
+        assert_eq!(exit(), crate::util::Exit::Auth);
+        home.save(&crate::config::Config { device_id: Some("d_x".into()), relay: Some("https://relay.example".into()), ..Default::default() }).unwrap();
+        assert_eq!(exit(), crate::util::Exit::Network);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
