@@ -319,6 +319,13 @@ fn mirror_monitor_and_fork() {
     // Restore from persisted records: same root, no signature checks needed.
     let r = Mirror::restore(origin, key.clone(), refs.iter().copied(), &cp).unwrap();
     assert_eq!(r.check(&cp), AnchorStatus::Consistent);
+    // F04: an entry the live sync rejected (here a KEY_ADDED with a bad proof of possession)
+    // gains no authority after a restore.
+    for (e, rec) in v["entries"].as_array().unwrap().iter().zip(&recs) {
+        if let Ok(entry::Entry { body: entry::Body::Key { sign_pub, .. }, .. }) = parse_record(rec) {
+            assert_eq!(r.state().device_by_key(sign_pub), m.state().device_by_key(sign_pub), "{}", e["note"]);
+        }
+    }
     assert!(Mirror::restore(origin, key, refs[..22].iter().copied(), &cp).is_err());
 }
 

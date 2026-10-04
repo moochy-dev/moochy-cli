@@ -145,8 +145,9 @@ impl Mirror {
         }
     }
 
-    /// Rebuilds a mirror from records it verified earlier (persisted by the caller)
-    /// without re-checking signatures; the hashes must reproduce `cp`.
+    /// Rebuilds a mirror from persisted records; the hashes must reproduce `cp`. Every
+    /// signature is checked again (F04): the records file also holds the entries the live
+    /// sync rejected, and those must stay without authority after a restart.
     pub fn restore<'a>(
         origin: &str,
         key: NoteKey,
@@ -156,7 +157,7 @@ impl Mirror {
         let mut m = Self::new(origin, key);
         for r in records {
             let idx = m.size();
-            m.push(r, false, &mut Vec::new())?;
+            m.push(r, true, &mut Vec::new())?;
             if idx >= cp.size {
                 return Err(Error::Format("restore: more records than checkpoint"));
             }

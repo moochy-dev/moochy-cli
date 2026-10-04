@@ -447,8 +447,8 @@ fn io_err(e: impl std::fmt::Display) -> Error {
 }
 
 impl Monitor {
-    /// Opens the monitor, restoring the persisted mirror (no network, no signature
-    /// re-checks; the hashes must reproduce the stored checkpoint) and any persisted
+    /// Opens the monitor, restoring the persisted mirror (no network; signatures are
+    /// checked again and the hashes must reproduce the stored checkpoint) and any persisted
     /// fork evidence.
     pub fn open(cfg: Config) -> Result<Self, Error> {
         let mut mirror = Mirror::new(&cfg.origin, cfg.key.clone());
