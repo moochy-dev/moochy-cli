@@ -60,6 +60,29 @@ fn server(reply: fn(&str) -> Vec<u8>, stall: bool) -> String {
                 }
                 let line = String::from_utf8_lossy(&req);
                 let path = line.split(' ').nth(1).unwrap_or("").to_owned();
+                // Redirects (M7): `moved` → `checkpoint` on the same host, `away` → another
+                // site, `loop` → itself.
+                let host = line
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Host: "))
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                let to = match path.rsplit('/').next() {
+                    Some("moved") => Some(format!("https://{host}/log/checkpoint")),
+                    Some("away") => Some("https://example.com/log/checkpoint".to_owned()),
+                    Some("loop") => Some(format!("https://{host}{path}")),
+                    _ => None,
+                };
+                if let Some(to) = to {
+                    let _ = write!(
+                        tls,
+                        "HTTP/1.0 308 Permanent Redirect\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                    return;
+                }
                 let body = reply(&path);
                 let _ = write!(
                     tls,
@@ -93,6 +116,13 @@ fn tls_pinned_ca_size_cap_and_timeout() {
         f.get("tile/0/000", 1024).unwrap(),
         b"you asked for /log/tile/0/000"
     );
+    // M7: a redirect on the same host is followed; another site and loops are refused.
+    assert_eq!(
+        f.get("moved", 1024).unwrap(),
+        b"you asked for /log/checkpoint"
+    );
+    assert!(matches!(f.get("away", 1024), Err(Error::Io(m)) if m.contains("another site")));
+    assert!(matches!(f.get("loop", 1024), Err(Error::Io(m)) if m.contains("too many redirects")));
     // Response larger than the caller's cap: refused before it is returned.
     assert_eq!(f.get("checkpoint", 8), Err(Error::TooLarge));
 

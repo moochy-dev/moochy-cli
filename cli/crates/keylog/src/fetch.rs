@@ -50,41 +50,12 @@ impl Fetcher {
         timeout: Duration,
         roots: rustls::RootCertStore,
     ) -> Result<Self, Error> {
-        let (tls, rest) = if let Some(r) = base.strip_prefix("https://") {
-            (true, r)
-        } else if let Some(r) = base.strip_prefix("http://") {
-            (false, r)
-        } else {
-            return Err(Error::Format("url scheme"));
-        };
-        let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-        if authority.is_empty()
-            || authority.contains(['@', '?', '#'])
-            || path.contains(['?', '#'])
-            || base.chars().any(char::is_control)
-        {
-            return Err(Error::Format("url"));
-        }
-        let host = match authority.strip_prefix('[') {
-            Some(v6) => v6
-                .split_once(']')
-                .map(|(h, _)| h)
-                .ok_or(Error::Format("url host"))?,
-            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
-        };
-        let has_port = authority.rsplit_once(':').is_some_and(|(h, p)| {
-            !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) && !h.ends_with(':')
-        });
-        let addr = if has_port {
-            authority.to_owned()
-        } else {
-            format!("{authority}:{}", if tls { 443 } else { 80 })
-        };
-        let mut prefix = format!("/{path}");
+        let u = Url::parse(base)?;
+        let mut prefix = u.path;
         if !prefix.ends_with('/') {
             prefix.push('/');
         }
-        let tls_config = if tls {
+        let tls_config = if u.tls {
             let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
@@ -97,20 +68,45 @@ impl Fetcher {
             None
         };
         Ok(Self {
-            host: host.to_owned(),
-            authority: authority.to_owned(),
-            addr,
+            host: u.host,
+            authority: u.authority,
+            addr: u.addr,
             prefix,
             timeout,
             tls_config,
         })
     }
 
-    /// GET `prefix + path`; 200 only; body ≤ `max` bytes.
+    /// GET `prefix + path`; 200 only; body ≤ `max` bytes. Up to [`MAX_REDIRECTS`] redirects are
+    /// followed, `https://` only and within the same site (see [`same_site`]: `relay.moochy.dev`
+    /// → `moochy.dev`), under the same deadline, roots and size limit.
     pub fn get(&self, path: &str, max: usize) -> Result<Vec<u8>, Error> {
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or(Error::Io("timeout".into()))?;
+        let mut at = Url {
+            tls: self.tls_config.is_some(),
+            host: self.host.clone(),
+            authority: self.authority.clone(),
+            addr: self.addr.clone(),
+            path: format!("{}{}", self.prefix, path),
+        };
+        for _ in 0..=MAX_REDIRECTS {
+            let raw = self.request(&at, max.saturating_add(MAX_HEADER_BYTES), deadline)?;
+            let Some(location) = redirect(&raw) else {
+                return parse_response(&raw, max);
+            };
+            let next = Url::parse(&location).map_err(|_| Error::Io("bad redirect".into()))?;
+            if !next.tls || self.tls_config.is_none() || !same_site(&self.host, &next.host) {
+                return Err(Error::Io("redirect to another site refused".into()));
+            }
+            at = next;
+        }
+        Err(Error::Io("too many redirects".into()))
+    }
+
+    /// One HTTP/1.0 exchange with `at` before `deadline`: the raw answer, at most `limit` bytes.
+    fn request(&self, at: &Url, limit: usize, deadline: Instant) -> Result<Vec<u8>, Error> {
         let left = || {
             deadline
                 .checked_duration_since(Instant::now())
@@ -119,7 +115,7 @@ impl Fetcher {
         };
         let mut last = Error::Io("no address".into());
         let mut sock = None;
-        for a in self.addr.to_socket_addrs().map_err(io)? {
+        for a in at.addr.to_socket_addrs().map_err(io)? {
             match TcpStream::connect_timeout(&a, left()?) {
                 Ok(s) => {
                     sock = Some(s);
@@ -131,14 +127,12 @@ impl Fetcher {
         let sock = sock.ok_or(last)?;
         sock.set_nodelay(true).map_err(io)?;
         let req = format!(
-            "GET {}{} HTTP/1.0\r\nHost: {}\r\nUser-Agent: moochy-keylog\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
-            self.prefix, path, self.authority
+            "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: moochy-keylog\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+            at.path, at.authority
         );
-        let limit = max.saturating_add(MAX_HEADER_BYTES);
-        let raw = match &self.tls_config {
+        match &self.tls_config {
             Some(cfg) => {
-                let name =
-                    rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(io)?;
+                let name = rustls::pki_types::ServerName::try_from(at.host.clone()).map_err(io)?;
                 let conn = rustls::ClientConnection::new(Arc::clone(cfg), name).map_err(io)?;
                 exchange(
                     rustls::StreamOwned::new(conn, sock.try_clone().map_err(io)?),
@@ -146,7 +140,7 @@ impl Fetcher {
                     req.as_bytes(),
                     limit,
                     left,
-                )?
+                )
             }
             None => exchange(
                 sock.try_clone().map_err(io)?,
@@ -154,9 +148,8 @@ impl Fetcher {
                 req.as_bytes(),
                 limit,
                 left,
-            )?,
-        };
-        parse_response(&raw, max)
+            ),
+        }
     }
 
     /// One sync round: fetch + verify the checkpoint, fetch the missing entry bundles,
@@ -196,6 +189,98 @@ pub struct Synced {
     /// The new records, in log order.
     pub records: Vec<Vec<u8>>,
     pub alerts: Vec<Alert>,
+}
+
+/// Redirects one `get` follows at most.
+pub const MAX_REDIRECTS: usize = 3;
+
+/// A URL split the way the fetcher uses it.
+struct Url {
+    tls: bool,
+    host: String,
+    authority: String,
+    /// `host:port` to connect to.
+    addr: String,
+    /// Absolute path (`/…`), no query or fragment.
+    path: String,
+}
+
+impl Url {
+    fn parse(url: &str) -> Result<Self, Error> {
+        let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+            (true, r)
+        } else if let Some(r) = url.strip_prefix("http://") {
+            (false, r)
+        } else {
+            return Err(Error::Format("url scheme"));
+        };
+        let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+        if authority.is_empty()
+            || authority.contains(['@', '?', '#'])
+            || path.contains(['?', '#'])
+            || url.chars().any(char::is_control)
+        {
+            return Err(Error::Format("url"));
+        }
+        let host = match authority.strip_prefix('[') {
+            Some(v6) => v6
+                .split_once(']')
+                .map(|(h, _)| h)
+                .ok_or(Error::Format("url host"))?,
+            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+        };
+        let has_port = authority.rsplit_once(':').is_some_and(|(h, p)| {
+            !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) && !h.ends_with(':')
+        });
+        let addr = if has_port {
+            authority.to_owned()
+        } else {
+            format!("{authority}:{}", if tls { 443 } else { 80 })
+        };
+        Ok(Self {
+            tls,
+            host: host.to_owned(),
+            authority: authority.to_owned(),
+            addr,
+            path: format!("/{path}"),
+        })
+    }
+}
+
+/// The `Location` of a redirect answer (301, 302, 303, 307, 308); `None` for anything else.
+fn redirect(raw: &[u8]) -> Option<String> {
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(raw.get(..end)?).ok()?;
+    let mut lines = head.split("\r\n");
+    let code = lines.next()?.split(' ').nth(1)?;
+    if !matches!(code, "301" | "302" | "303" | "307" | "308") {
+        return None;
+    }
+    lines.find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("location")
+            .then(|| v.trim().to_owned())
+    })
+}
+
+/// The same host, or one is a subdomain of the other (`relay.moochy.dev` and `moochy.dev`): the
+/// same registrable domain without a public-suffix list. ponytail: never a sibling
+/// (`a.x.dev` → `b.x.dev`) nor an IP address; a public-suffix list if a relay ever needs more.
+fn same_site(from: &str, to: &str) -> bool {
+    let (a, b) = (from.to_ascii_lowercase(), to.to_ascii_lowercase());
+    if a == b {
+        return true;
+    }
+    let (long, short) = if a.len() > b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    short.contains('.')
+        && short.parse::<std::net::IpAddr>().is_err()
+        && long.parse::<std::net::IpAddr>().is_err()
+        && long.ends_with(&format!(".{short}"))
 }
 
 fn exchange(
@@ -268,4 +353,34 @@ fn parse_response(raw: &[u8], max: usize) -> Result<Vec<u8>, Error> {
         return Err(Error::TooLarge);
     }
     Ok(body.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{redirect, same_site};
+
+    #[test]
+    fn redirects_stay_on_the_site() {
+        assert!(same_site("relay.moochy.dev", "moochy.dev"));
+        assert!(same_site("moochy.dev", "relay.moochy.dev"));
+        assert!(same_site("Relay.Moochy.dev", "relay.moochy.dev"));
+        assert!(!same_site("relay.moochy.dev", "evil.dev"));
+        assert!(
+            !same_site("relay.moochy.dev", "web.moochy.dev"),
+            "never a sibling"
+        );
+        assert!(!same_site("moochy.dev", "xmoochy.dev"));
+        assert!(!same_site("relay.moochy.dev", "dev"), "never a bare suffix");
+        assert!(!same_site("1.2.3.4", "2.3.4"));
+        let r = b"HTTP/1.0 308 Permanent Redirect\r\nContent-Type: text/html\r\nLocation: https://moochy.dev/api/v1/orgs/x\r\n\r\n<a>";
+        assert_eq!(
+            redirect(r).as_deref(),
+            Some("https://moochy.dev/api/v1/orgs/x")
+        );
+        assert_eq!(
+            redirect(b"HTTP/1.0 200 OK\r\nLocation: https://x.dev/\r\n\r\n"),
+            None
+        );
+        assert_eq!(redirect(b"HTTP/1.1 302 Found\r\n\r\n"), None);
+    }
 }
