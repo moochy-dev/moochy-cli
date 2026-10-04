@@ -169,6 +169,16 @@ impl Home {
     }
 }
 
+/// This machine's monthly donation limit in µ$ (donor.md §5). m6: never $0, which would accept the
+/// safety step and then never donate without a word: pausing is the explicit way.
+pub fn device_limit(value: &str) -> Result<u64> {
+    match crate::util::parse_amount(value) {
+        Ok(0) => Err(usage("the monthly limit for this machine is more than $0 (to stop donating from this machine: `moochy pause`, or `moochy keys remove <provider>`)")),
+        Ok(v) => Ok(v),
+        Err(e) => Err(usage(format!("the monthly limit is a dollar amount, e.g. 25 or 12.50: {e}"))),
+    }
+}
+
 /// Atomic write with mode 0600 (tmp + fsync + rename).
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
@@ -212,11 +222,12 @@ impl Config {
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "monthly_limit" => {
-                self.device_monthly_cap_uusd = Some(crate::util::parse_amount(value).map_err(|e| usage(format!("monthly_limit is a dollar amount, e.g. 20 or 12.50: {e}")))?);
+                self.device_monthly_cap_uusd = Some(device_limit(value)?);
             }
             // Machine form of `monthly_limit` (millionths of a dollar), kept for scripts.
             "device_monthly_cap_uusd" => {
-                self.device_monthly_cap_uusd = Some(value.parse().map_err(|_| usage("device_monthly_cap_uusd is a whole number; use `monthly_limit 20` for $20"))?);
+                let v: u64 = value.parse().map_err(|_| usage("device_monthly_cap_uusd is a whole number; use `monthly_limit 20` for $20"))?;
+                self.device_monthly_cap_uusd = Some(if v == 0 { device_limit("0")? } else { v });
             }
             "slots_max" => {
                 let n: u32 = value.parse().map_err(|_| usage("expected an integer"))?;
@@ -337,6 +348,15 @@ pub fn valid_slug(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_limit_is_never_zero() {
+        assert_eq!(super::device_limit("$25").ok(), Some(25_000_000));
+        assert!(super::device_limit("0").is_err() && super::device_limit("$0.00").is_err() && super::device_limit("x").is_err());
+        let mut c = super::Config::default();
+        assert!(c.set("monthly_limit", "0").is_err() && c.set("device_monthly_cap_uusd", "0").is_err());
+        assert!(c.set("monthly_limit", "20").is_ok() && c.device_monthly_cap_uusd == Some(20_000_000));
+    }
+
     #[test]
     fn relay_spellings() {
         for r in ["https://relay.moochy.dev", "https://relay.moochy.dev:443", "https://Relay.moochy.dev/", "https://relay.moochy.dev:8443"] {

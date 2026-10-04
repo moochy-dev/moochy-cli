@@ -311,7 +311,7 @@ fn parse() -> Result<Opts> {
             Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("monthly-limit") => {
-                o.monthly_limit = Some(crate::util::parse_amount(&s(p.value().map_err(err)?)?).map_err(|e| usage(format!("--monthly-limit (dollars, e.g. 25): {e}")))?);
+                o.monthly_limit = Some(crate::config::device_limit(&s(p.value().map_err(err)?)?)?);
             }
             Long("cap-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--cap-uusd is a whole number of millionths of a dollar"))?),
             Long("cap") => {
@@ -1426,7 +1426,7 @@ fn safety(home: &Home, o: &Opts, provider: Option<&str>) -> Result<bool> {
         let cap = match o.monthly_limit {
             Some(c) => Some(c),
             None => match ask("Monthly limit for this machine in dollars [25]: ") {
-                Some(a) => Some(crate::util::parse_amount(if a.is_empty() { "25" } else { &a }).map_err(|e| usage(format!("monthly limit: {e}")))?),
+                Some(a) => Some(crate::config::device_limit(if a.is_empty() { "25" } else { &a })?),
                 None => None,
             },
         };
