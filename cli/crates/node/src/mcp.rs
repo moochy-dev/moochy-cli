@@ -358,7 +358,7 @@ async fn receipt_cost(rx: &mut tokio::sync::mpsc::Receiver<TaskEv>) -> Option<u6
 /// Donor-controlled text made safe to show (A46/A182/A189): terminal sequences stripped
 /// (`clean_text`), remaining invisible/bidi characters escaped, and anything that could close or
 /// spoof our frame or trailers neutralized, case-insensitively.
-fn neutralize(s: &str) -> String {
+pub(crate) fn neutralize(s: &str) -> String {
     let s = crate::util::sanitize_text(&moochy_worker::clean_text(s)).into_owned();
     let mut s = replace_ci(&s, "<untrusted-content", "&lt;untrusted-content");
     s = replace_ci(&s, "</untrusted-content", "&lt;/untrusted-content");

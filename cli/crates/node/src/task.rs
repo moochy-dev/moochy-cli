@@ -611,7 +611,8 @@ impl Driver {
                             engine::open_detail(&c, &code, &f.sealed_detail)
                         })
                     });
-                let mut fl = Failure::new(&code, f.retryable, detail);
+                // F16: the code is relay-written text that reaches the agent: known codes only.
+                let mut fl = Failure::new(crate::native::relay_code(&code), f.retryable, detail);
                 fl.retry_after_ms = (f.retry_after_ms > 0).then_some(f.retry_after_ms);
                 // Protocol §15.3: a relay-side failure has nothing sealed; its detail is the relay's
                 // plain text (e.g. which limit refused, and when it starts again).
