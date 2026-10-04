@@ -336,16 +336,12 @@ pub fn save(home: &Home, cfg: &Config, s: &Secrets) -> Result<()> {
 }
 
 #[cfg(all(feature = "keychain", any(target_os = "linux", target_os = "macos")))]
-mod keychain {
+pub mod keychain {
     use super::{Config, Home, Result, Zeroizing, b64d, b64e};
     use crate::util::{auth, internal};
 
     fn entry(home: &Home, cfg: &Config) -> Result<keyring::Entry> {
-        let user = match cfg.relay.as_deref() {
-            Some(r) if r != crate::config::DEFAULT_RELAY => format!("{}#{}", home.dir.to_string_lossy(), crate::config::origin_tag(r)),
-            _ => home.dir.to_string_lossy().into_owned(),
-        };
-        keyring::Entry::new("moochy", &user).map_err(|e| internal(format!("keychain: {e}")))
+        keyring::Entry::new("moochy", &user(home, cfg)).map_err(|e| internal(format!("keychain: {e}")))
     }
     /// Keyring calls may block on D-Bus (Linux Secret Service): run them on their own short-lived
     /// OS thread, never on an async runtime's thread, whoever the caller is.
@@ -353,16 +349,67 @@ mod keychain {
         std::thread::scope(|s| s.spawn(f).join()).map_err(|_| internal("keychain thread failed"))
     }
 
+    /// The keychain entry's user name for this home and relay.
+    fn user(home: &Home, cfg: &Config) -> String {
+        match cfg.relay.as_deref() {
+            Some(r) if r != crate::config::DEFAULT_RELAY => format!("{}#{}", home.dir.to_string_lossy(), crate::config::origin_tag(r)),
+            _ => home.dir.to_string_lossy().into_owned(),
+        }
+    }
+
     pub fn get(home: &Home, cfg: &Config) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let e = entry(home, cfg)?;
+        let found = if cfg!(target_os = "linux") { get_in_child(&user(home, cfg))? } else { get_here(&user(home, cfg))? };
+        let Some(p) = found else { return Ok(None) };
+        b64d(&p).map(|v| Some(Zeroizing::new(v))).ok_or_else(|| auth("keychain entry is corrupt"))
+    }
+
+    fn get_here(user: &str) -> Result<Option<Zeroizing<String>>> {
+        let e = keyring::Entry::new("moochy", user).map_err(|e| internal(format!("keychain: {e}")))?;
         match off_runtime(move || e.get_password())? {
-            Ok(p) => {
-                let p = Zeroizing::new(p);
-                b64d(&p).map(|v| Some(Zeroizing::new(v))).ok_or_else(|| auth("keychain entry is corrupt"))
-            }
+            Ok(p) => Ok(Some(Zeroizing::new(p))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(auth(format!("keychain: {e}"))),
         }
+    }
+
+    /// Linux Secret Service (D-Bus) leaves runtime threads behind, and `moochy up` must still be
+    /// single-threaded when it locks itself down (Landlock ABI < 8 cages only the calling
+    /// thread). So the read runs in a short-lived child (`moochy` itself, see [`helper_entry`]):
+    /// its threads end with it, and the entry comes back over a pipe.
+    fn get_in_child(user: &str) -> Result<Option<Zeroizing<String>>> {
+        let exe = std::env::current_exe().map_err(|e| internal(format!("keychain helper: {e}")))?;
+        let out = std::process::Command::new(exe)
+            .env(HELPER_ENV, user)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| internal(format!("keychain helper: {e}")))?;
+        let stdout = Zeroizing::new(out.stdout);
+        match out.status.code() {
+            Some(0) => String::from_utf8(stdout.to_vec()).map(|s| Some(Zeroizing::new(s))).map_err(|_| auth("keychain entry is corrupt")),
+            Some(3) => Ok(None),
+            _ => Err(auth(format!("keychain: {}", crate::util::clean(String::from_utf8_lossy(&out.stderr).trim())))),
+        }
+    }
+
+    /// Set to the entry's user name: `moochy` only prints that keychain entry and exits.
+    pub const HELPER_ENV: &str = "MOOCHY_KEYCHAIN_GET";
+
+    /// The child side of [`get_in_child`]; called first thing in `main`. Exit 0 with the entry
+    /// on stdout, 3 when there is none, 1 with the reason on stderr.
+    pub fn helper_entry() -> Option<u8> {
+        use std::io::Write as _;
+        let user = std::env::var(HELPER_ENV).ok()?;
+        Some(match get_here(&user) {
+            Ok(Some(p)) => {
+                let mut o = std::io::stdout().lock();
+                u8::from(o.write_all(p.as_bytes()).and_then(|()| o.flush()).is_err())
+            }
+            Ok(None) => 3,
+            Err(e) => {
+                eprintln!("{}", e.msg);
+                1
+            }
+        })
     }
     pub fn set(home: &Home, cfg: &Config, plain: &[u8]) -> Result<()> {
         let s = Zeroizing::new(b64e(plain));
@@ -372,7 +419,7 @@ mod keychain {
 }
 
 #[cfg(not(all(feature = "keychain", any(target_os = "linux", target_os = "macos"))))]
-mod keychain {
+pub mod keychain {
     use super::{Config, Home, Result, Zeroizing};
     use crate::util::usage;
     pub fn get(_: &Home, _: &Config) -> Result<Option<Zeroizing<Vec<u8>>>> {
@@ -380,6 +427,9 @@ mod keychain {
     }
     pub fn set(_: &Home, _: &Config, _: &[u8]) -> Result<()> {
         Err(usage("this build has no keychain support (feature `keychain`)"))
+    }
+    pub fn helper_entry() -> Option<u8> {
+        None
     }
 }
 

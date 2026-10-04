@@ -152,6 +152,10 @@ pub fn main() -> ExitCode {
     if let Some(code) = crate::validator::zygote_entry() {
         return ExitCode::from(code);
     }
+    // The keychain read helper (keystore::keychain::get_in_child): print one entry and exit.
+    if let Some(code) = crate::keystore::keychain::helper_entry() {
+        return ExitCode::from(code);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
