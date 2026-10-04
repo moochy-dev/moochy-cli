@@ -156,6 +156,7 @@ pub fn main() -> ExitCode {
     if let Some(code) = crate::keystore::keychain::helper_entry() {
         return ExitCode::from(code);
     }
+    quiet_broken_pipe();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -163,6 +164,21 @@ pub fn main() -> ExitCode {
             ExitCode::from(e.exit as u8)
         }
     }
+}
+
+/// m3: `moochy donations | head -1`. Rust ignores SIGPIPE, so a closed stdout makes `println!`
+/// panic, and `panic = "abort"` dumps core. A reader that stopped reading is not an error: exit 0
+/// quietly. Installed after the validator zygote and the keychain helper (nothing may run before
+/// them), and no signal disposition changes: the node's sockets keep reporting EPIPE as errors.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.payload().downcast_ref::<String>().map_or("", String::as_str);
+        if msg.starts_with("failed printing to stdout") && msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
 }
 
 fn emit_err(e: &Error) {
