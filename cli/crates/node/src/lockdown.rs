@@ -45,8 +45,13 @@ impl Boot {
         if !offline && crate::keylog::effective_log_key(&cfg).is_none() && std::env::var("MOOCHY_INSECURE_DEV").as_deref() != Ok("1") {
             return Err(usage("no key-log key for this server: `moochy login --log-key <vkey>` or `moochy config set log_key <vkey>`"));
         }
+        // M4: a running app holds the control socket: say that, not "Address already in use".
+        let ctl = crate::ctl::bind(&home.socket_path())?;
         let addr = cfg.gateway_addr()?;
-        let listener = std::net::TcpListener::bind(addr).map_err(|e| usage(format!("bind {addr}: {e}")))?;
+        let listener = std::net::TcpListener::bind(addr).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => usage(format!("bind {addr}: another program uses this port (stop it, or choose another: `moochy config set gateway_addr 127.0.0.1:PORT`)")),
+            _ => usage(format!("bind {addr}: {e}")),
+        })?;
         listener.set_nonblocking(true).ctx("gateway listener")?;
         let port = listener.local_addr().ctx("local addr")?.port();
         if cfg.gateway_addr.is_none() {
@@ -61,7 +66,6 @@ impl Boot {
         } else {
             None
         };
-        let ctl = crate::ctl::bind(&home.socket_path())?;
         let gateway_unix = crate::gateway::bind_gateway_socket(&home.state_dir());
         Ok(Self { cfg, secrets, listener, ctl, gateway_unix, validator, locked: false })
     }

@@ -406,6 +406,11 @@ fn run() -> Result<()> {
             if o.has("offline") && !dev_mode() {
                 return Err(usage("--offline requires MOOCHY_INSECURE_DEV=1"));
             }
+            // M4: a second `up` is not an error: say so and show the running app.
+            if !o.has("foreground") && running(&home) {
+                eprintln!("Moochy is already running for this --home (`moochy down` stops it).");
+                return status(&home, o.has("json"));
+            }
             box_enroll(&home, &o)?;
             if o.has("foreground") { up_foreground(home, o.has("offline"), o.has("unsafe-no-lockdown")) } else { up_background(&home, &o) }
         }
@@ -512,6 +517,11 @@ fn keys_cmd(home: &Home, w: &[&str]) -> Result<()> {
         }
         _ => Err(usage("keys add|list|remove|rotate")),
     }
+}
+
+/// The app answers on its control socket.
+fn running(home: &Home) -> bool {
+    rt_small().is_ok_and(|rt| rt.block_on(crate::ctl::connect(&home.socket_path())).is_ok())
 }
 
 /// Ask the running node to request `KEY_REVOKED` and stop, then wipe the device keys locally.
@@ -1426,7 +1436,10 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
     if line.contains("\"ready\"") {
         return Ok(line);
     }
-    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(10);
+    let st = child.wait().ok();
+    let code = st.and_then(|s| s.code()).unwrap_or(10);
+    // M4: killed before it could write its JSON error line (a crash, a blocked system call).
+    let signal = st.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)).map(|n| format!("the app stopped on signal {n} while starting (see {})", log_path.display()));
     Err(Error {
         exit: match code {
             2 => crate::util::Exit::Usage,
@@ -1434,7 +1447,7 @@ fn start_node(home: &Home, offline: bool) -> Result<String> {
             4 => crate::util::Exit::Network,
             _ => crate::util::Exit::Internal,
         },
-        msg: start_error(&log_path, log_start).unwrap_or_else(|| format!("node failed to start (see {})", log_path.display())),
+        msg: start_error(&log_path, log_start).or(signal).unwrap_or_else(|| format!("the app did not start (see {})", log_path.display())),
     })
 }
 

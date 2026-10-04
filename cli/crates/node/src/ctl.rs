@@ -35,7 +35,7 @@ pub fn bind(path: &Path) -> Result<std::os::unix::net::UnixListener> {
         return Err(crate::util::usage(format!("socket path too long for a Unix socket: {}", path.display())));
     }
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
-        return Err(crate::util::usage("a moochy node is already running for this --home"));
+        return Err(crate::util::usage("Moochy is already running for this --home (`moochy status` shows it, `moochy down` stops it)"));
     }
     let _ = std::fs::remove_file(path);
     let l = std::os::unix::net::UnixListener::bind(path).map_err(|e| internal(format!("bind {}: {e}", path.display())))?;
