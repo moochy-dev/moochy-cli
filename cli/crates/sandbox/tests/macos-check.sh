@@ -4,7 +4,7 @@
 # Usage: tests/macos-check.sh [path/to/moochy-sandbox-test]   (cargo build -p moochy-sandbox --bin moochy-sandbox-test)
 set -u
 B=${1:-$(cd "$(dirname "$0")/../../.." && pwd)/target/debug/moochy-sandbox-test}; BD=$(dirname "$B"); J=$(mktemp -d); trap 'rm -rf "$J"' EXIT
-mkdir -p $J/wt $J/outside; (cd $J/wt && git init -q && echo hi > app.txt && echo "API_KEY=topsecret" > .env && echo "ignored.txt" > .gitignore && echo ign > ignored.txt && echo "-----BEGIN KEY-----" > id_ed25519 && git add app.txt .gitignore && git -c commit.gpgsign=false -c user.email=t@t -c user.name=t commit -qm init); echo outsidesecret > $J/outside/secret.txt
+mkdir -p $J/wt $J/outside; (cd $J/wt && git init -q && echo hi > app.txt && echo "API_KEY=topsecret" > .env && echo "ignored.txt" > .gitignore && echo ign > ignored.txt && echo "-----BEGIN KEY-----" > id_ed25519 && mkdir -p deploy && echo "DB_PASSWORD=nested" > deploy/.env && git add app.txt .gitignore && git -c commit.gpgsign=false -c user.email=t@t -c user.name=t commit -qm init); echo outsidesecret > $J/outside/secret.txt
 python3 -m http.server --bind 127.0.0.1 18787 >/dev/null 2>&1 & GW=$!
 python3 -c "import socket,os,time; p='$J/gw.sock'; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); time.sleep(600)" & GS=$!
 for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:18787/ && [ -S $J/gw.sock ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
@@ -23,6 +23,9 @@ R deny $B write /tmp/moochy-check-$$-w.txt
 R deny $B read $HOME/.zshrc
 R deny $B read $HOME/.ssh/known_hosts
 R deny $B hardlink $J/wt/.env $J/wt/link
+R deny $B read $J/wt/deploy/.env
+R deny /bin/sh -c "mv $J/wt/deploy $J/wt/d2"
+R deny /bin/sh -c "mv $J/wt/deploy $J/wt/d2; cat $J/wt/d2/.env"
 R deny $B symlink $J/outside/secret.txt $J/wt/sl
 R ok   $B connect 127.0.0.1:18787
 R deny $B connect 1.1.1.1:443

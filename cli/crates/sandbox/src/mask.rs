@@ -95,6 +95,13 @@ pub fn dotgits(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
     walk_tree(worktree, false).map(|s| s.dotgits)
 }
 
+/// The directories strictly between `worktree` and `mask`, deepest first. Renaming one of them
+/// moves the masked path; where a mask is a path rule (macOS Seatbelt), these must not be
+/// renamed (F03). Empty for a mask outside the worktree.
+pub fn ancestors_below<'a>(worktree: &'a Path, mask: &'a Path) -> impl Iterator<Item = &'a Path> {
+    mask.ancestors().skip(1).take_while(move |a| a.starts_with(worktree) && *a != worktree)
+}
+
 fn too_big(what: &'static str) -> Error {
     Error::Setup { what, err: std::io::Error::other("worktree too large to scan for secrets (fail closed)") }
 }
@@ -247,6 +254,15 @@ mod tests {
             assert!(!matches_secret(r, &r.join(miss)), "{miss} masked");
         }
     }
+    #[test]
+    fn ancestors_of_a_nested_mask() {
+        let wt = Path::new("/w");
+        let got: Vec<_> = ancestors_below(wt, Path::new("/w/apps/api/.env")).collect();
+        assert_eq!(got, [Path::new("/w/apps/api"), Path::new("/w/apps")], "F03: every dir a rename could move it with");
+        assert_eq!(ancestors_below(wt, Path::new("/w/.env")).count(), 0, "top level: only the worktree root, which stays");
+        assert_eq!(ancestors_below(wt, Path::new("/elsewhere/config")).count(), 0);
+    }
+
     #[test]
     fn missing_git_refuses_a_repo() {
         let wt = std::env::temp_dir().join(format!("moochy-mask-nogit-{}", std::process::id()));

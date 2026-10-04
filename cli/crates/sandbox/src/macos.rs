@@ -217,9 +217,16 @@ pub fn maintainer_profile(
         let _ = writeln!(p, "(allow network-outbound (remote unix-socket (path-literal {q})))");
         let _ = writeln!(p, "(allow file-read* file-write* (literal {q}))");
     }
-    // Mask secret-shaped / git-ignored files last: they beat every allow above.
+    // Mask secret-shaped / git-ignored files last: they beat every allow above. A deny is a
+    // path, fixed at start: renaming a directory above a mask would move the secret out from
+    // under it (F03), so no directory between the worktree and a mask may be renamed or removed.
+    let mut ancestors = std::collections::BTreeSet::new();
     for m in masks {
         let _ = writeln!(p, "(deny file-read* file-write* process-exec* (subpath {}))", sbpl_quote(&m.to_string_lossy()));
+        ancestors.extend(mask::ancestors_below(worktree, m));
+    }
+    for a in ancestors {
+        let _ = writeln!(p, "(deny file-write-unlink (literal {}))", sbpl_quote(&a.to_string_lossy()));
     }
     // Git metadata the host's git later trusts (A191): no write to any `.git`
     // at any depth — which also blocks creating one (`git init`, a nested repo).
