@@ -64,6 +64,9 @@ pub struct Donation {
     pub person: String,
     pub status: String,
     pub budget_uusd: u64,
+    /// Optional weekly (ISO week, Monday 00:00 UTC) and daily (UTC day) limits; 0 = none.
+    pub weekly_limit_uusd: u64,
+    pub daily_limit_uusd: u64,
     pub per_task_cap_uusd: u64,
     pub spent_uusd: u64,
     pub schedule: String,

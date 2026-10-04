@@ -14,9 +14,9 @@
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ project github/tokio-rs/axum ────────────────────────────────────────────────╮
 │ Status     ● active  your devices serve it, up to the limit                  │
-│ Limit      $40.00 a month · $0.50 per task                                   │
+│ Limit      $40.00 a month · $15.00 a week · $3.00 a day · $0.50 per task     │
 │ Spent      $27.42   ██████████░░░░░░  68%                                    │
-│ Left       $12.58                                                            │
+│ Left       $12.58 this month · $11.40 this week · $2.73 today                │
 │ Share      https://moochy.dev/p/github/tokio-rs/axum                         │
 │ 30 days    ▃▆▁▃▆▁▃▆▁▄▆▁▄▇▁▄▇▂▄▇▂▄▇▂▅▇▂▅█▂                                    │
 │ Schedule   monthly · renews 1 Nov (in 28d)                                   │
@@ -39,9 +39,9 @@
 +------------------------------------------------------------------------------+
 + project github/tokio-rs/axum ------------------------------------------------+
 | Status     * active  your devices serve it, up to the limit                  |
-| Limit      $40.00 a month - $0.50 per task                                   |
+| Limit      $40.00 a month - $15.00 a week - $3.00 a day - $0.50 per task     |
 | Spent      $27.42   ##########------  68%                                    |
-| Left       $12.58                                                            |
+| Left       $12.58 this month - $11.40 this week - $2.73 today                |
 | Share      https://moochy.dev/p/github/tokio-rs/axum                         |
 | 30 days    _=._=._=.-=.-#.-#.-#.-#.-#.-#.                                    |
 | Schedule   monthly - renews 1 Nov (in 28d)                                   |

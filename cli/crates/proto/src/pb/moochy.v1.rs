@@ -668,7 +668,7 @@ pub struct Assign {
     pub body_len: u64,
     #[prost(uint32, tag = "9")]
     pub body_chunks: u32,
-    /// exact pledge policy JSON (models, max_effort, dialects, flags, max_slots, schedule) for local enforcement
+    /// exact pledge policy JSON (models, max_effort, dialects, flags, daily_limit_uusd, weekly_limit_uusd) for local enforcement; a Worker refuses a key it does not know
     #[prost(bytes = "bytes", tag = "10")]
     pub pledge_policy: ::prost::bytes::Bytes,
     /// budget - spent - reserved at assignment (advisory; the Worker's local caps still rule)
@@ -800,6 +800,13 @@ pub struct DonateRequest {
     /// repo_slug, org and person is set.
     #[prost(string, tag = "10")]
     pub person: ::prost::alloc::string::String,
+    /// Optional stricter windows (0 = none), µ$, needs moochy >= 0.1.3 on the donor's devices:
+    /// daily = the UTC calendar day, weekly = the ISO week (Monday 00:00 UTC). When set,
+    /// 0 \< daily \<= weekly \<= budget_uusd (INVALID_ARGUMENT otherwise).
+    #[prost(int64, tag = "11")]
+    pub weekly_limit_uusd: i64,
+    #[prost(int64, tag = "12")]
+    pub daily_limit_uusd: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationActionRequest {
@@ -873,6 +880,12 @@ pub struct Donation {
     /// spend of this donation, last 30 UTC days, oldest first, zero-filled (§20 TUI)
     #[prost(int64, repeated, tag = "21")]
     pub per_day_uusd: ::prost::alloc::vec::Vec<i64>,
+    /// 0 = none (DonateRequest.weekly_limit_uusd)
+    #[prost(int64, tag = "22")]
+    pub weekly_limit_uusd: i64,
+    /// 0 = none
+    #[prost(int64, tag = "23")]
+    pub daily_limit_uusd: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RepoSpend {

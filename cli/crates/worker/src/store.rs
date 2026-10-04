@@ -2,7 +2,8 @@
 //! - **outbox**: signed receipts, kept until acked + 7 days (for `receipt.replay_since`);
 //! - **served-task set**: `(gateway_device, task_id)` within the ±10 min window (03 §7.2);
 //! - **local reservation counters**: device monthly cap and per-pledge budgets, counting
-//!   every open attempt (layer 2 of 05 §6).
+//!   every open attempt (layer 2 of 05 §6), plus each pledge's optional daily (UTC day) and
+//!   weekly (ISO week, Monday 00:00 UTC) limits (protocol §9.1), attributed to the attempt's start.
 //!
 //! Durability (CONTRACT §13: no fsync before the ack or in the per-chunk path):
 //! reservations, served entries, acks and releases are decided in memory and *written*
@@ -71,6 +72,9 @@ pub struct Reservation<'a> {
     /// The pledge's current period id (periods are anchored per pledge, 05 §9).
     pub pledge_period: u64,
     pub pledge_budget_uusd: u64,
+    /// The pledge's daily and weekly limits (`u64::MAX` = none), see [`day_of`] / [`week_of`].
+    pub pledge_daily_uusd: u64,
+    pub pledge_weekly_uusd: u64,
     pub per_task_cap_uusd: u64,
     pub amount_uusd: u64,
     pub device_cap_uusd: u64,
@@ -113,6 +117,20 @@ const RESERVE: u8 = 4;
 const SETTLE: u8 = 5;
 const SPENT_DEVICE: u8 = 6;
 const SPENT_PLEDGE: u8 = 7;
+
+/// Pledge-counter keys of the daily and weekly windows: a tag above any month (`YYYYMM`) the
+/// caller passes as its period, so the three windows share the `pledge_spent` map and its log
+/// records (no format change).
+const DAY_TAG: u64 = 1 << 40;
+const WEEK_TAG: u64 = 2 << 40;
+
+fn day_key(ms: u64) -> u64 {
+    DAY_TAG | day_of(ms)
+}
+
+fn week_key(ms: u64) -> u64 {
+    WEEK_TAG | week_of(ms)
+}
 
 impl Store {
     /// Open (creating if needed), replay, truncate a torn tail, compact.
@@ -179,9 +197,14 @@ impl Store {
         if dev_used.checked_add(r.amount_uusd).is_none_or(|t| t > r.device_cap_uusd) {
             return Err(StoreError::Cap("device monthly cap"));
         }
-        let pl_used = self.pledge_used(r.pledge_id, r.pledge_period);
-        if pl_used.checked_add(r.amount_uusd).is_none_or(|t| t > r.pledge_budget_uusd) {
-            return Err(StoreError::Cap("pledge budget"));
+        for (period, limit, what) in [
+            (r.pledge_period, r.pledge_budget_uusd, "pledge budget"),
+            (week_key(r.now_ms), r.pledge_weekly_uusd, "weekly limit"),
+            (day_key(r.now_ms), r.pledge_daily_uusd, "daily limit"),
+        ] {
+            if self.pledge_used(r.pledge_id, period).checked_add(r.amount_uusd).is_none_or(|t| t > limit) {
+                return Err(StoreError::Cap(what));
+            }
         }
         let rec = frame(RESERVE, |w| {
             w.bytes(r.key);
@@ -281,9 +304,16 @@ impl Store {
         self.st.receipts.retain(|_, r| r.acked_ms.is_none_or(|a| now_ms.saturating_sub(a) <= RECEIPT_RETENTION_MS));
         prune_served(&mut self.st, now_ms);
         let cur = month_of(now_ms);
-        // Keep this and last month for the device; pledge periods are opaque, kept as is
-        // (ponytail: one small record per pledge period, prune when it ever matters).
+        // Keep this and last month for the device, this and the last day / week for the pledge
+        // windows; pledge periods are opaque, kept as is (ponytail: one small record per pledge
+        // period, prune when it ever matters).
         self.st.device_spent.retain(|m, _| *m >= prev_month(cur));
+        let (day, week) = (day_key(now_ms).saturating_sub(1), week_key(now_ms).saturating_sub(1));
+        self.st.pledge_spent.retain(|(_, per), _| match per & (DAY_TAG | WEEK_TAG) {
+            DAY_TAG => *per >= day,
+            WEEK_TAG => *per >= week,
+            _ => true,
+        });
 
         let mut out = Vec::new();
         for (m, v) in &self.st.device_spent {
@@ -359,8 +389,10 @@ fn apply_settle(st: &mut State, key: &[u8], cost: u64) {
     if let Some(o) = st.open.remove(key) {
         let d = st.device_spent.entry(o.month).or_insert(0);
         *d = d.saturating_add(cost);
-        let p = st.pledge_spent.entry((o.pledge, o.period)).or_insert(0);
-        *p = p.saturating_add(cost);
+        for per in [o.period, day_key(o.ts_ms), week_key(o.ts_ms)] {
+            let p = st.pledge_spent.entry((o.pledge.clone(), per)).or_insert(0);
+            *p = p.saturating_add(cost);
+        }
     }
 }
 
@@ -468,6 +500,17 @@ pub fn month_of(ms: u64) -> u32 {
     (y * 100 + m) as u32
 }
 
+/// UTC calendar day of a Unix time in ms: days since 1970-01-01 (the daily limit's window).
+pub fn day_of(ms: u64) -> u64 {
+    ms / 86_400_000
+}
+
+/// ISO week of a Unix time in ms: weeks since Monday 1969-12-29 00:00 UTC, so a week runs Monday
+/// 00:00 UTC to the next Monday (1970-01-01 was a Thursday). The weekly limit's window.
+pub fn week_of(ms: u64) -> u64 {
+    day_of(ms).saturating_add(3) / 7
+}
+
 fn prev_month(m: u32) -> u32 {
     if m % 100 == 1 { m.saturating_sub(89) } else { m.saturating_sub(1) }
 }
@@ -486,5 +529,29 @@ mod tests {
         assert_eq!(month_of(951_782_400_000), 200_002); // 2000-02-29
         assert_eq!(prev_month(202_601), 202_512);
         assert_eq!(prev_month(202_610), 202_609);
+    }
+
+    const DAY: u64 = 86_400_000;
+    const OCT1: u64 = 1_790_812_800_000; // Thursday 2026-10-01T00:00Z
+
+    #[test]
+    fn windows_utc_day_and_iso_week() {
+        // Day boundary: 23:59:59.999 and midnight UTC.
+        assert_eq!(day_of(OCT1 - 1) + 1, day_of(OCT1));
+        assert_eq!(day_of(OCT1), day_of(OCT1 + DAY - 1));
+        // 1970-01-01 (Thursday) is in the week that starts on Monday 1969-12-29.
+        assert_eq!(week_of(0), 0);
+        assert_eq!(week_of(4 * DAY - 1), 0, "Sunday 1970-01-04 23:59");
+        assert_eq!(week_of(4 * DAY), 1, "Monday 1970-01-05 00:00");
+        // The week across a month boundary: Monday 2026-09-28 .. Sunday 2026-10-04 is one week,
+        // while the month changes on Thursday 2026-10-01.
+        let mon = OCT1 - 3 * DAY;
+        assert_eq!(week_of(mon - 1) + 1, week_of(mon), "Sunday 2026-09-27 23:59 → new week");
+        assert_eq!(week_of(mon), week_of(OCT1));
+        assert_eq!(week_of(OCT1), week_of(mon + 7 * DAY - 1), "Sunday 2026-10-04 23:59");
+        assert_eq!(week_of(mon + 7 * DAY), week_of(mon) + 1, "Monday 2026-10-05 00:00");
+        assert_ne!(month_of(mon), month_of(OCT1));
+        // Tags keep the windows apart from months and from each other.
+        assert!(day_key(OCT1) > u64::from(u32::MAX) && week_key(OCT1) > day_key(OCT1));
     }
 }

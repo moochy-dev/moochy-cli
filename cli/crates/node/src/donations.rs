@@ -87,7 +87,7 @@ pub(crate) fn target(d: &Donation) -> String {
 
 fn donation_json(d: &Donation) -> serde_json::Value {
     json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
-        "per_request_limit_uusd": d.per_task_cap_uusd, "spent_uusd": d.spent_uusd, "reserved_uusd": d.reserved_uusd,
+        "weekly_limit_uusd": d.weekly_limit_uusd, "daily_limit_uusd": d.daily_limit_uusd, "per_request_limit_uusd": d.per_task_cap_uusd, "spent_uusd": d.spent_uusd, "reserved_uusd": d.reserved_uusd,
         "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule)})
 }
 
@@ -106,7 +106,8 @@ pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
         if json_out {
             emit(&donation_json(d));
         } else {
-            println!("{:<28} {:<9} {} of {} this month  ({})", target(d), clean(&d.status), dollars(d.spent_uusd), dollars(d.budget_uusd), clean(&d.pledge_id));
+            let windows = Limits { monthly: d.budget_uusd, weekly: (d.weekly_limit_uusd > 0).then_some(d.weekly_limit_uusd), daily: (d.daily_limit_uusd > 0).then_some(d.daily_limit_uusd) };
+            println!("{:<28} {:<9} {} of {} this month{}  ({})", target(d), clean(&d.status), dollars(d.spent_uusd), dollars(d.budget_uusd), windows.extra(), clean(&d.pledge_id));
         }
     }
     if r.donations.is_empty() && !json_out {
@@ -115,27 +116,65 @@ pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
     Ok(())
 }
 
+/// A new donation's limits in µ$ (CONTRACT D19a): monthly required, weekly and daily optional.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Limits {
+    pub monthly: i64,
+    pub weekly: Option<i64>,
+    pub daily: Option<i64>,
+}
+
+impl Limits {
+    /// Positive amounts, daily ≤ weekly ≤ monthly (the relay checks the same).
+    fn check(self) -> Result<()> {
+        if self.monthly <= 0 {
+            return Err(usage("set a monthly limit: --cap $20 (or --budget-uusd N)"));
+        }
+        if self.weekly.is_some_and(|w| w <= 0) || self.daily.is_some_and(|d| d <= 0) {
+            return Err(usage("a weekly or daily limit is more than $0 (leave it out for none)"));
+        }
+        if self.weekly.is_some_and(|w| w > self.monthly) {
+            return Err(usage("the weekly limit cannot be higher than the monthly limit"));
+        }
+        if self.daily.is_some_and(|d| d > self.weekly.unwrap_or(self.monthly)) {
+            return Err(usage(format!("the daily limit cannot be higher than the {} limit", if self.weekly.is_some() { "weekly" } else { "monthly" })));
+        }
+        Ok(())
+    }
+
+    /// `" ($8.00 a week, $2.00 a day)"`, or nothing.
+    fn extra(self) -> String {
+        let parts: Vec<String> = [(self.weekly, "week"), (self.daily, "day")].iter().filter_map(|(v, w)| v.map(|v| format!("{} a {w}", dollars(v)))).collect();
+        if parts.is_empty() { String::new() } else { format!(", {}", parts.join(", ")) }
+    }
+}
+
 /// `moochy donate --repo OWNER/NAME | --org github/ORG | --person github/LOGIN --cap $N [--yes]`:
 /// start donating up to $N a month. The donation waits for the owner's approval (signed with their
 /// owner key). An organisation (CONTRACT §19) funds the repos its owner covers; a person (§24)
 /// only their own requests on the repos they cover.
-pub fn donate(home: &crate::config::Home, slug: &str, to: To, monthly_uusd: i64, yes: bool) -> Result<()> {
-    if monthly_uusd <= 0 {
-        return Err(usage("set a monthly limit: --cap $20 (or --budget-uusd N)"));
-    }
+pub fn donate(home: &crate::config::Home, slug: &str, to: To, limits: Limits, yes: bool) -> Result<()> {
+    limits.check()?;
+    let monthly_uusd = limits.monthly;
     let what = match to {
         To::Repo => clean(slug).into_owned(),
         To::Org => format!("the organisation {}", clean(slug)),
         To::Person => format!("{}'s own requests (sponsoring {})", clean(slug.rsplit('/').next().unwrap_or(slug)), clean(slug)),
     };
     let p = crate::style::err();
-    eprintln!("Donating tokens to {} up to {} a month {}.", p.bold(&what), p.hi(&dollars(monthly_uusd)), p.dim(&format!("(at most {} per request)", dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD)))));
+    eprintln!(
+        "Donating tokens to {} up to {} a month{} {}.",
+        p.bold(&what),
+        p.hi(&dollars(monthly_uusd)),
+        limits.extra(),
+        p.dim(&format!("(at most {} per request)", dollars(monthly_uusd.min(DEFAULT_PER_REQUEST_UUSD))))
+    );
     if !yes {
         use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() {
             return Err(usage("pass --yes to donate non-interactively"));
         }
-        eprint!("Donate tokens to {what} up to {} a month? [y/N] ", dollars(monthly_uusd));
+        eprint!("Donate tokens to {what} up to {} a month{}? [y/N] ", dollars(monthly_uusd), limits.extra());
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
         if !matches!(line.trim(), "y" | "Y" | "yes") {
@@ -155,6 +194,8 @@ pub fn donate(home: &crate::config::Home, slug: &str, to: To, monthly_uusd: i64,
         max_effort: String::new(),
         visibility: "pseudonymous".into(),
         schedule: "always".into(),
+        weekly_limit_uusd: limits.weekly.unwrap_or(0),
+        daily_limit_uusd: limits.daily.unwrap_or(0),
     };
     let b = call(home, "donate", q.encode_to_vec())?;
     let d = Donation::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
@@ -178,4 +219,22 @@ pub fn action(home: &crate::config::Home, action: &str, pledge_id: &str) -> Resu
     let d = Donation::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
     emit(&donation_json(&d));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Limits;
+
+    #[test]
+    fn limits_order_and_sign() {
+        let l = |m, w, d| Limits { monthly: m, weekly: w, daily: d }.check().is_ok();
+        assert!(l(20, None, None));
+        assert!(l(20, Some(8), Some(2)));
+        assert!(l(20, Some(20), Some(20)), "equal is fine");
+        assert!(l(20, None, Some(20)) && !l(20, None, Some(21)), "daily vs monthly without weekly");
+        assert!(!l(0, None, None), "monthly is required");
+        assert!(!l(20, Some(21), None), "weekly > monthly");
+        assert!(!l(20, Some(8), Some(9)), "daily > weekly");
+        assert!(!l(20, Some(0), None) && !l(20, None, Some(-1)), "positive amounts");
+    }
 }

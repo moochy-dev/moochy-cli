@@ -3,16 +3,16 @@
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 ╭ Donations · 4 · $70.17 spent this month ──────────────────────────────────────────────────╮╭ project github/tokio-rs/axum ───────────────────────────────────╮
 │   Status          Donating to                           Spent / limit     Used            ││ Status     ● active  your devices serve it, up to the limit     │
-│ ▶ ● active        github/tokio-rs/axum                  $27.42 / $40.00   ██████░░░  68%  ││ Limit      $40.00 a month · $0.50 per task                      │
-│   ‖ paused        github/rust-lang/rustfmt              $14.10 / $15.00   ████████░  94%  ││ Spent      $27.42   ██████████░░░░░░  68%                       │
-│   ● active        org gitlab/inkscape                   $18.65 / $60.00   ██░░░░░░░  31%  ││ Left       $12.58                                               │
-│   ■ stopped       github/sharkdp/bat                    $10.00 / $10.00   █████████ 100%  ││ Share      https://moochy.dev/p/github/tokio-rs/axum            │
+│ ▶ ● active        github/tokio-rs/axum                  $27.42 / $40.00   ██████░░░  68%  ││ Limit      $40.00 a month · $15.00 a week · $3.00 a day · $0.50 │
+│   ‖ paused        github/rust-lang/rustfmt              $14.10 / $15.00   ████████░  94%  ││ per task                                                        │
+│   ● active        org gitlab/inkscape                   $18.65 / $60.00   ██░░░░░░░  31%  ││ Spent      $27.42   ██████████░░░░░░  68%                       │
+│   ■ stopped       github/sharkdp/bat                    $10.00 / $10.00   █████████ 100%  ││ Left       $12.58 this month · $11.40 this week · $2.73 today   │
+│                                                                                           ││ Share      https://moochy.dev/p/github/tokio-rs/axum            │
 │                                                                                           ││ 30 days    ▃▆▁▃▆▁▃▆▁▄▆▁▄▇▁▄▇▂▄▇▂▄▇▂▅▇▂▅█▂                       │
 │                                                                                           ││ Schedule   monthly · renews 1 Nov (in 28d)                      │
 │                                                                                           ││ Models     claude-sonnet-5-5, claude-haiku-4-5                  │
 │                                                                                           ││                                                                 │
 │                                                                                           ││ p pause  - lower the limit  x stop                              │
-│                                                                                           ││                                                                 │
 │                                                                                           ││                                                                 │
 │                                                                                           ││                                                                 │
 │                                                                                           ││                                                                 │
@@ -52,16 +52,16 @@
  1 Overview 2 Donations 3 Served 4 Projects 5 Organisations 6 Decisions 7 Devices & keys 8 Activity 9 Settings
 + Donations - 4 - $70.17 spent this month --------------------------------------------------++ project github/tokio-rs/axum -----------------------------------+
 |   Status          Donating to                           Spent / limit     Used            || Status     * active  your devices serve it, up to the limit     |
-| > * active        github/tokio-rs/axum                  $27.42 / $40.00   ######---  68%  || Limit      $40.00 a month - $0.50 per task                      |
-|   = paused        github/rust-lang/rustfmt              $14.10 / $15.00   ########-  94%  || Spent      $27.42   ##########------  68%                       |
-|   * active        org gitlab/inkscape                   $18.65 / $60.00   ##-------  31%  || Left       $12.58                                               |
-|   # stopped       github/sharkdp/bat                    $10.00 / $10.00   ######### 100%  || Share      https://moochy.dev/p/github/tokio-rs/axum            |
+| > * active        github/tokio-rs/axum                  $27.42 / $40.00   ######---  68%  || Limit      $40.00 a month - $15.00 a week - $3.00 a day - $0.50 |
+|   = paused        github/rust-lang/rustfmt              $14.10 / $15.00   ########-  94%  || per task                                                        |
+|   * active        org gitlab/inkscape                   $18.65 / $60.00   ##-------  31%  || Spent      $27.42   ##########------  68%                       |
+|   # stopped       github/sharkdp/bat                    $10.00 / $10.00   ######### 100%  || Left       $12.58 this month - $11.40 this week - $2.73 today   |
+|                                                                                           || Share      https://moochy.dev/p/github/tokio-rs/axum            |
 |                                                                                           || 30 days    _=._=._=.-=.-#.-#.-#.-#.-#.-#.                       |
 |                                                                                           || Schedule   monthly - renews 1 Nov (in 28d)                      |
 |                                                                                           || Models     claude-sonnet-5-5, claude-haiku-4-5                  |
 |                                                                                           ||                                                                 |
 |                                                                                           || p pause  - lower the limit  x stop                              |
-|                                                                                           ||                                                                 |
 |                                                                                           ||                                                                 |
 |                                                                                           ||                                                                 |
 |                                                                                           ||                                                                 |

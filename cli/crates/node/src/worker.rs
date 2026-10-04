@@ -444,13 +444,32 @@ async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'stati
 
 /// The pledge policy carried in `Assign` (models, dialects, max_effort, flags), enforced locally
 /// whatever the relay decided; the firewall level is the donor's own setting (06 §7.3).
-fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<Policy, String> {
+/// The keys of `Assign.pledge_policy` this client knows (protocol §9.1). Any other key is refused:
+/// a new limit must never be served as if it were absent.
+const POLICY_KEYS: [&str; 6] = ["models", "max_effort", "dialects", "flags", "daily_limit_uusd", "weekly_limit_uusd"];
+
+/// A donation's `(daily, weekly)` limits in µ$, `u64::MAX` = none.
+type Windows = (u64, u64);
+
+fn policy_windows(v: &serde_json::Map<String, serde_json::Value>) -> Result<Windows, String> {
+    if let Some(k) = v.keys().find(|k| !POLICY_KEYS.contains(&k.as_str())) {
+        return Err(format!("this donation has a setting this version of Moochy does not know (`{}`): update moochy", clean(k)));
+    }
+    let limit = |k: &str| match v.get(k) {
+        None | Some(serde_json::Value::Null) => Ok(u64::MAX),
+        Some(x) => x.as_u64().map(|n| if n == 0 { u64::MAX } else { n }).ok_or_else(|| format!("donation settings: `{k}` is not a whole number of µ$")),
+    };
+    Ok((limit("daily_limit_uusd")?, limit("weekly_limit_uusd")?))
+}
+
+fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<(Policy, Windows), String> {
     let level = if node.cfg.firewall_level.as_deref() == Some("paranoid") { firewall::Level::Paranoid } else { firewall::Level::Strict };
     if raw.is_empty() {
         // Older relay without the field: no opt-in flags, effort unbounded by the pledge.
-        return Ok(Policy { level, flags: moochy_worker::Flags::NONE, max_effort: Effort::Max });
+        return Ok((Policy { level, flags: moochy_worker::Flags::NONE, max_effort: Effort::Max }, (u64::MAX, u64::MAX)));
     }
     let v = crate::json::parse_object(raw).map_err(|e| format!("donation settings: {e}"))?;
+    let windows = policy_windows(&v)?;
     let strs = |k: &str| -> Vec<&str> { v.get(k).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).collect() };
     let models = strs("models");
     let model_ok = models.is_empty() || models.iter().any(|m| *m == route.model || m.strip_suffix('*').is_some_and(|p| route.model.starts_with(p)));
@@ -466,7 +485,7 @@ fn pledge_policy(node: &Node, raw: &[u8], route: &RouteHeader) -> Result<Policy,
         None => Effort::Max,
     };
     let flags = moochy_worker::Flags::parse(strs("flags")).map_err(|e| format!("donation settings: {e}"))?;
-    Ok(Policy { level, flags, max_effort })
+    Ok((Policy { level, flags, max_effort }, windows))
 }
 
 /// `H(repo_id ‖ gateway_device)`: pseudonymous end-user attribution for the provider (06 §7.1).
@@ -534,7 +553,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
         return Err(with_ck("model_unavailable", true, None));
     };
     let fwc = engine::fw_catalog(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
-    let policy = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
+    let (policy, (daily, weekly)) = pledge_policy(node, &assign.pledge_policy, &route).map_err(|d| with_ck("firewall", false, Some(d)))?;
     let pmid = node.provider_model_id(&entry).ok_or_else(|| with_ck("model_unavailable", true, None))?;
     let mut aliases: Vec<&str> = vec![entry.model.as_str(), pmid.as_str()];
     aliases.extend(entry.aliases.iter().map(String::as_str));
@@ -617,7 +636,7 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let positive = |v: i64| u64::try_from(v).ok().filter(|v| *v > 0);
     let task_cap = positive(assign.per_task_cap_uusd).unwrap_or(u64::MAX);
     if positive(assign.pledge_headroom_uusd).is_some_and(|h| amount > h) && assign.pledge_headroom_uusd != 0 {
-        return Err(with_ck("local_cap", true, Some("this donation's monthly limit is reached".into())));
+        return Err(with_ck("local_cap", true, Some("this donation's limit is reached".into())));
     }
     let key = attempt_key(&task.text(), u32::from(attempt));
     let (k2, p2, cap) = (key.clone(), pledge.text(), device_cap(node).unwrap_or(0));
@@ -627,6 +646,8 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
             pledge_id: &p2,
             pledge_period: u64::from(moochy_worker::store::month_of(now)),
             pledge_budget_uusd: u64::MAX,
+            pledge_daily_uusd: daily,
+            pledge_weekly_uusd: weekly,
             per_task_cap_uusd: task_cap,
             amount_uusd: amount,
             device_cap_uusd: cap,
@@ -1199,5 +1220,17 @@ mod tests {
         assert_eq!(super::utc_day(0), "1970-01-01");
         assert_eq!(super::utc_day(951_782_400_000), "2000-02-29");
         assert_eq!(super::utc_day(1_790_812_800_000), "2026-10-01");
+    }
+
+    #[test]
+    fn policy_windows_known_keys_and_unknown_refused() {
+        let w = |s: &str| super::policy_windows(&crate::json::parse_object(s.as_bytes()).unwrap_or_default());
+        assert_eq!(w(r#"{"models":[],"max_effort":"","dialects":[],"flags":[]}"#), Ok((u64::MAX, u64::MAX)), "the 0.1.2 relay's policy");
+        assert_eq!(w(r#"{"models":[],"daily_limit_uusd":2000000,"weekly_limit_uusd":8000000}"#), Ok((2_000_000, 8_000_000)));
+        assert_eq!(w(r#"{"daily_limit_uusd":0,"weekly_limit_uusd":null}"#), Ok((u64::MAX, u64::MAX)), "0 / null = none");
+        assert!(w(r#"{"daily_limit_uusd":-1}"#).is_err());
+        assert!(w(r#"{"weekly_limit_uusd":"8"}"#).is_err());
+        // A limit this client does not know: refuse the donation, never serve it without the limit.
+        assert!(w(r#"{"models":[],"hourly_limit_uusd":100}"#).is_err_and(|e| e.contains("hourly_limit_uusd")));
     }
 }

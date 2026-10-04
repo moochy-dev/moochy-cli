@@ -101,9 +101,12 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
-  donate --repo PROJECT | --org ORG | --person PERSON --cap $N [--yes]
+  donate --repo PROJECT | --org ORG | --person PERSON --cap $N [--weekly-limit $N]
+         [--daily-limit $N] [--yes]
                                   Donate tokens to a project, up to $N a month (it starts once
-                                  the project owner accepts you); --org donates to an organisation
+                                  the project owner accepts you); optional weekly (Monday 00:00
+                                  UTC) and daily (00:00 UTC) limits, no higher than the monthly
+                                  one; --org donates to an organisation
                                   (github/ORG or gitlab/GROUP[/SUB…]), shared by the projects its
                                   owner covers; --person sponsors a maintainer (github/LOGIN or
                                   gitlab/USERNAME): their own requests on the repos they cover
@@ -204,6 +207,9 @@ struct Opts {
     person: Option<String>,
     base_url: Option<String>,
     cap: Option<i64>,
+    /// `moochy donate`: optional weekly and daily limits (D19a), µ$.
+    weekly_limit: Option<i64>,
+    daily_limit: Option<i64>,
     out: Option<PathBuf>,
     reason: Option<String>,
     from_file: Option<PathBuf>,
@@ -292,6 +298,8 @@ fn parse() -> Result<Opts> {
                 let v = crate::util::parse_amount(&s(p.value().map_err(err)?)?).map_err(|e| usage(format!("--cap (a monthly amount in dollars): {e}")))?;
                 o.cap = Some(i64::try_from(v).map_err(|_| usage("--cap is too large"))?);
             }
+            Long("weekly-limit") => o.weekly_limit = Some(window_amount(&s(p.value().map_err(err)?)?, "weekly")?),
+            Long("daily-limit") => o.daily_limit = Some(window_amount(&s(p.value().map_err(err)?)?, "daily")?),
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
@@ -537,6 +545,12 @@ fn logout(home: &Home, o: &Opts) -> Result<()> {
 /// devices without a cap, accepted donors, covered projects and repos): actions, not things waiting.
 pub(crate) const STANDING: [&str; 5] = ["remove:", "member-device:", "revoke:", "org-repo-remove:", "person-repo-remove:"];
 
+/// `--weekly-limit` / `--daily-limit` (dollars) in µ$.
+fn window_amount(v: &str, which: &str) -> Result<i64> {
+    let v = crate::util::parse_amount(v).map_err(|e| usage(format!("--{which}-limit (dollars, e.g. 5): {e}")))?;
+    i64::try_from(v).map_err(|_| usage(format!("--{which}-limit is too large")))
+}
+
 /// `moochy donate --repo PROJECT | --org ORG | --person PERSON --cap $N` (CONTRACT §19.6, §24.6).
 fn donate(home: &Home, o: &Opts) -> Result<()> {
     use crate::donations::To;
@@ -546,7 +560,8 @@ fn donate(home: &Home, o: &Opts) -> Result<()> {
         (Some(org), None) => (org, To::Org),
         (None, None) => (slug_or_detect(o)?, To::Repo),
     };
-    crate::donations::donate(home, &target, to, o.cap.unwrap_or(0), o.has("yes"))?;
+    let limits = crate::donations::Limits { monthly: o.cap.unwrap_or(0), weekly: o.weekly_limit, daily: o.daily_limit };
+    crate::donations::donate(home, &target, to, limits, o.has("yes"))?;
     share(home, &crate::button::page(to, &target)?);
     Ok(())
 }

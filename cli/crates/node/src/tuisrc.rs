@@ -205,6 +205,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             person: d.person.clone(),
             status: d.status.clone(),
             budget_uusd: uusd(d.budget_uusd),
+            weekly_limit_uusd: uusd(d.weekly_limit_uusd),
+            daily_limit_uusd: uusd(d.daily_limit_uusd),
             per_task_cap_uusd: uusd(d.per_task_cap_uusd),
             spent_uusd: uusd(d.spent_uusd),
             schedule: d.schedule.clone(),

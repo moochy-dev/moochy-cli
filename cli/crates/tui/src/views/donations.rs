@@ -102,11 +102,25 @@ fn share_url(web: &str, d: &Donation) -> Option<String> {
     Some(format!("{}/{prefix}/{path}", w::web_origin(web)))
 }
 
+/// `(today, this ISO week)` spend from a per-day series that ends today (UTC days, oldest first);
+/// the week starts on Monday 00:00 UTC (1970-01-01 was a Thursday).
+fn window_spent(per_day: &[u64], now_ms: u64) -> (u64, u64) {
+    let since_monday = usize::try_from((now_ms / 86_400_000).saturating_add(3) % 7).unwrap_or(0);
+    let today = per_day.last().copied().unwrap_or(0);
+    let week = per_day.iter().rev().take(since_monday.saturating_add(1)).fold(0u64, |a, x| a.saturating_add(*x));
+    (today, week)
+}
+
 impl DonationsView {
     fn detail(&self, t: Theme, d: &Donation, web: &str, now: u64, width: u16) -> Vec<Line<'static>> {
         let st = status(d);
         let mut v = vec![Line::from(vec![Span::styled(format!("{:<10} ", "Status"), t.muted()), badge(t, d), w::muted(t, format!("  {}", st.why))])];
         let mut limit = vec![Span::styled(format!("{:<10} ", "Limit"), t.muted()), Span::raw(format!("{} a month", w::dollars(d.budget_uusd)))];
+        for (lim, per) in [(d.weekly_limit_uusd, "week"), (d.daily_limit_uusd, "day")] {
+            if lim > 0 {
+                limit.push(Span::raw(format!("{}{} a {per}", w::dot(t), w::dollars(lim))));
+            }
+        }
         if d.per_task_cap_uusd > 0 {
             limit.push(w::muted(t, format!("{}{} per task", w::dot(t), w::dollars(d.per_task_cap_uusd))));
         }
@@ -114,7 +128,18 @@ impl DonationsView {
         let mut spent = vec![Span::styled(format!("{:<10} ", "Spent"), t.muted()), Span::styled(format!("{:<9}", w::dollars(d.spent_uusd)), t.money())];
         spent.extend(charts::meter(t, d.spent_uusd, d.budget_uusd, 16).spans);
         v.push(Line::from(spent));
-        v.push(w::kv(t, "Left", w::dollars(d.budget_uusd.saturating_sub(d.spent_uusd))));
+        let mut left = w::dollars(d.budget_uusd.saturating_sub(d.spent_uusd));
+        if d.weekly_limit_uusd > 0 || d.daily_limit_uusd > 0 {
+            use std::fmt::Write as _;
+            let (today, week) = window_spent(&d.per_day_uusd, now);
+            left.push_str(" this month");
+            for (lim, used, per) in [(d.weekly_limit_uusd, week, "this week"), (d.daily_limit_uusd, today, "today")] {
+                if lim > 0 {
+                    let _ = write!(left, "{}{} {per}", w::dot(t), w::dollars(lim.saturating_sub(used)));
+                }
+            }
+        }
+        v.push(w::kv(t, "Left", left));
         // The share link (§22.3) high up, so it is on screen at 80×24.
         if let Some(url) = share_url(web, d) {
             v.push(w::kv_span(t, "Share", Span::styled(url, t.info())));
@@ -382,6 +407,29 @@ mod tests {
         let e = Snapshot::default();
         let out = draw(&mut DonationsView::default(), &ctx(&e, &t, ""), 80, 24);
         assert!(out.contains("No donations yet") && out.contains("moochy donate"), "{out}");
+    }
+
+    #[test]
+    fn window_spent_today_and_iso_week() {
+        const DAY: u64 = 86_400_000;
+        let days = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let thu = 1_790_812_800_000; // Thursday 2026-10-01: the week began Monday 2026-09-28
+        assert_eq!(window_spent(&days, thu), (10, 8 + 9 + 10 + 7));
+        assert_eq!(window_spent(&days, thu + 4 * DAY), (10, 10), "Monday: a new week");
+        assert_eq!(window_spent(&days, thu + 3 * DAY + DAY - 1), (10, 7 + 8 + 9 + 10 + 6 + 5 + 4), "Sunday 23:59: the whole week");
+        assert_eq!(window_spent(&[], thu), (0, 0));
+    }
+
+    #[test]
+    fn detail_shows_what_is_left_per_window() {
+        let mut s = snap();
+        s.donations[0].weekly_limit_uusd = DOLLAR;
+        s.donations[0].daily_limit_uusd = DOLLAR / 2;
+        let t = themes()[0];
+        let out = draw(&mut DonationsView::default(), &ctx(&s, &t, ""), 160, 48);
+        // NOW is a Monday: the week so far is today ($0.20).
+        assert!(out.contains("$1.00 a week") && out.contains("$0.50 a day"), "{out}");
+        assert!(out.contains("$16.90 this month") && out.contains("$0.80 this week") && out.contains("$0.30 today"), "{out}");
     }
 
     #[test]

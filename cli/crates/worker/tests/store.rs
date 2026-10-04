@@ -22,6 +22,8 @@ fn res<'a>(key: &'a [u8], pledge: &'a str, amount: u64, now: u64) -> Reservation
         pledge_id: pledge,
         pledge_period: 1,
         pledge_budget_uusd: 1_000,
+        pledge_daily_uusd: u64::MAX,
+        pledge_weekly_uusd: u64::MAX,
         per_task_cap_uusd: 500,
         amount_uusd: amount,
         device_cap_uusd: 1_500,
@@ -162,4 +164,33 @@ fn crash_mid_write_every_offset() {
     std::fs::write(&crash, &bad).unwrap();
     let s = Store::open(&crash, T0).unwrap();
     assert_eq!(s.pledge_left("p", 1, 1_000), 900);
+}
+
+#[test]
+fn daily_and_weekly_limits_refuse_and_reset() {
+    const DAY: u64 = 86_400_000;
+    let d = dir("windows");
+    let path = d.join("outbox.log");
+    let mut s = Store::open(&path, T0).unwrap();
+    // T0 is Thursday 2026-10-01: its ISO week runs Monday 2026-09-28 .. Sunday 2026-10-04.
+    let lim = |key: &'static [u8], amount: u64, now: u64| Reservation { pledge_daily_uusd: 300, pledge_weekly_uusd: 600, ..res(key, "p1", amount, now) };
+    // Spent in the previous month (Monday 2026-09-28) counts in this week, not in today.
+    s.reserve(&lim(b"mon", 200, T0 - 3 * DAY)).unwrap();
+    s.put_receipt(b"mon", b"r", 200, T0 - 3 * DAY).unwrap();
+    s.reserve(&lim(b"a", 250, T0)).unwrap();
+    // Daily: 250 open + 100 > 300.
+    assert!(matches!(s.reserve(&lim(b"b", 100, T0)), Err(StoreError::Cap("daily limit"))));
+    s.put_receipt(b"a", b"r", 250, T0).unwrap();
+    // Next day: daily resets, weekly (200 + 250 + 200 > 600) refuses.
+    assert!(matches!(s.reserve(&lim(b"b", 200, T0 + DAY)), Err(StoreError::Cap("weekly limit"))));
+    s.reserve(&lim(b"b", 50, T0 + DAY)).unwrap();
+    s.release(b"b").unwrap();
+    // Survives a reopen (compaction keeps the current windows).
+    drop(s);
+    let mut s = Store::open(&path, T0 + DAY).unwrap();
+    assert!(matches!(s.reserve(&lim(b"c", 200, T0 + DAY)), Err(StoreError::Cap("weekly limit"))));
+    // Monday 2026-10-05: a new week.
+    s.reserve(&lim(b"c", 300, T0 + 4 * DAY)).unwrap();
+    // No windows set: only the budget and the caps apply.
+    s.reserve(&res(b"d", "p2", 400, T0 + 4 * DAY)).unwrap();
 }
