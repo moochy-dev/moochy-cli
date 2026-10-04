@@ -29,7 +29,7 @@ fn fingerprint(n: &Node) -> (u64, u64, bool) {
     for c in lock(&n.claims).iter() {
         (&c.target_id, c.paused_since_ms, c.releases_at_ms).hash(&mut p);
     }
-    let mut d: Vec<(String, (String, bool))> = lock(&n.own_pledges).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut d: Vec<(String, (String, bool, String))> = lock(&n.own_pledges).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     d.sort_unstable();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     d.hash(&mut h);

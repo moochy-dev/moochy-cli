@@ -998,7 +998,8 @@ fn journal(home: &Home, follow: bool) -> Result<()> {
         // A broken stream is an error, never an empty journal.
         loop {
             match st.message().await {
-                Ok(Some(e)) => emit(&json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms})),
+                Ok(Some(e)) => emit(&json!({"t_ms": e.t_ms, "role": e.role, "task": e.task, "repo": e.repo, "model": e.model, "status": e.status, "cost_uusd": e.cost_uusd, "ms": e.ms,
+                    "tokens_in": e.tokens_in, "tokens_out": e.tokens_out})),
                 Ok(None) => return Ok(()),
                 Err(s) => return Err(internal(format!("journal unreadable: {:?}: {}", s.code(), clean(s.message())))),
             }

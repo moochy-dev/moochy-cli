@@ -116,10 +116,10 @@ pub struct Node {
     pub catalogs: Mutex<VecDeque<Arc<Catalog>>>,
     /// Worker: one warm adapter per provider key.
     pub adapters: Vec<Arc<Adapter>>,
-    /// Worker: this donor's own donations (pledge id → (status, targets a person §24)), from
-    /// `ListDonations` on our own session, and when they were fetched (ms). The relay's pledge
-    /// assignment is never trusted alone (T-03-088).
-    pub own_pledges: Mutex<HashMap<String, (String, bool)>>,
+    /// Worker: this donor's own donations (pledge id → (status, targets a person §24, what it funds
+    /// as `donations::target` names it)), from `ListDonations` on our own session, and when they
+    /// were fetched (ms). The relay's pledge assignment is never trusted alone (T-03-088).
+    pub own_pledges: Mutex<HashMap<String, (String, bool, String)>>,
     /// Worker: the sponsored profile (`m_…`, `Donation.person_id`) of each own person pledge whose
     /// listing names it (CONTRACT §24.4), refreshed with `own_pledges`.
     pub own_people: Mutex<HashMap<String, String>>,

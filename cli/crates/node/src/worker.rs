@@ -379,7 +379,7 @@ const OWN_PLEDGES_REFRESH_MS: u64 = 250;
 /// (CONTRACT §24.4, [`requester_key`]). Returns the sponsored profile when the pledge targets a
 /// person (`Some("")` when the relay did not name its `m_` id).
 async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<Option<String>, &'static str> {
-    let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|(s, person)| (s == "active", *person));
+    let known = |n: &Node| lock(&n.own_pledges).get(pledge).map(|(s, person, _)| (s == "active", *person));
     if known(node).is_none_or(|k| !k.0) {
         refresh_own_pledges(node, pledge).await?;
     }
@@ -406,7 +406,7 @@ async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<O
 /// "relay-asserted, dev": a relay without the donation RPCs under `MOOCHY_INSECURE_DEV` (the
 /// caller then accepts).
 async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'static str> {
-    let active = |n: &Node| !want.is_empty() && lock(&n.own_pledges).get(want).is_some_and(|(s, _)| s == "active");
+    let active = |n: &Node| !want.is_empty() && lock(&n.own_pledges).get(want).is_some_and(|(s, ..)| s == "active");
     let mut last = node.pledge_refresh.lock().await;
     if active(node) {
         return Ok(());
@@ -432,10 +432,10 @@ async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'stati
             *last = now_ms();
             let ds = r.into_inner().donations;
             *lock(&node.own_people) = ds.iter().take(10_000).filter(|d| !d.person.is_empty() && !d.person_id.is_empty()).map(|d| (d.pledge_id.clone(), d.person_id.clone())).collect();
-            *lock(&node.own_pledges) = ds.into_iter().take(10_000).map(|d| (d.pledge_id, (d.status, !d.person.is_empty()))).collect();
+            *lock(&node.own_pledges) = ds.into_iter().take(10_000).map(|d| (d.pledge_id.clone(), (d.status.clone(), !d.person.is_empty(), crate::donations::target(&d)))).collect();
         }
         Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => {
-            lock(&node.own_pledges).insert(want.to_owned(), ("active".into(), false));
+            lock(&node.own_pledges).insert(want.to_owned(), ("active".into(), false, String::new()));
         }
         _ => *last = 0, // failed: retry at the next task
     }
@@ -969,10 +969,16 @@ async fn finish(
     }
     let (t0, now) = (e.times.0, now_ms());
     let (request, response) = journal.1.unwrap_or_default();
+    // m8: the project as this donor's donation names it (an org or person donation: the org or
+    // person; `Assign` carries only the served repo's id), and the donation.
+    let pledge = a.pledge.text();
+    let repo = lock(&node.own_pledges).get(&pledge).map(|(.., t)| t.clone()).unwrap_or_default();
     node.journal(JournalEntry {
         t_ms: i64::try_from(t0).unwrap_or(0),
         role: "worker".into(),
         task: refuse.task.to_owned(),
+        repo,
+        pledge_id: pledge,
         status: journal.0.to_owned(),
         model: e.model.clone(),
         cost_uusd: e.cost,
