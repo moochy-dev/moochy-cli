@@ -26,7 +26,10 @@ fn message(f: &Failure) -> String {
     // Plain words first (docs/brand/VOICE.md), then the machine code for agents and scripts.
     let text = match f.code.as_str() {
         "over_task_cap" => "this request could cost more than the donors' limit per request; lower max_tokens",
-        "quota_exceeded" => "your monthly limit for this project, or its donations' monthly, weekly or daily limits, are used up",
+        // M5: also refused before anything is spent: the request reserves what max_tokens could
+        // cost, which can be more than a limit has left (the relay names no limit, 03 §10.3).
+        "quota_exceeded" => "this request could cost more than what is left of a monthly, weekly or daily limit (yours for this project, or a donation's): lower max_tokens, or wait for the limit to start again",
+        "model_not_in_pool" => "no donor serves this model to this project right now (its donations may be paused, waiting for approval, or at their limit); `moochy status` lists the models",
         "firewall" => "request refused by the safety checks",
         "route_mismatch" => "the route header does not match the request body",
         "rate_limited" => "the donor's provider is rate limited; retry later",
@@ -84,5 +87,9 @@ mod tests {
         assert_eq!(b["error"]["type"], "invalid_request_error");
         assert!(b["error"]["message"].as_str().unwrap().contains("limit per request"));
         assert!(sse_error(Dialect::Anthropic, &f("overloaded", true)).starts_with(b"event: error\n"));
+        let (_, b) = error_body(Dialect::OpenAi, &f("quota_exceeded", false));
+        assert!(b["error"]["message"].as_str().unwrap().contains("could cost more than what is left"), "{b}");
+        let (_, b) = error_body(Dialect::Anthropic, &f("model_not_in_pool", false));
+        assert!(b["error"]["message"].as_str().unwrap().contains("paused"), "{b}");
     }
 }
