@@ -5,6 +5,7 @@
 //! Fails closed: a worktree too large to scan completely, or with more secrets
 //! than the mask budget, refuses the run instead of leaving the rest readable.
 
+use std::collections::HashSet;
 use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -86,7 +87,32 @@ pub fn collect(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
 
 /// [`collect`] plus every `.git` in the tree.
 pub fn scan(worktree: &Path) -> Result<Scan, Error> {
-    let mut s = walk_tree(worktree, true)?;
+    scan_with(worktree, &HashSet::new())
+}
+
+/// [`scan`], plus every entry whose inode an earlier run masked, from `record` (F09): masks
+/// computed again each run follow the agent-writable `.gitignore`, and a rename moves a file
+/// to a path nothing matches; the inode stays. Then `record` holds this run's masked inodes.
+/// A record that cannot be written refuses the run (fail closed).
+pub fn scan_kept(worktree: &Path, record: Option<&Path>) -> Result<Scan, Error> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(record) = record else { return scan(worktree) };
+    let kept: HashSet<u64> = std::fs::read_to_string(record).unwrap_or_default().lines().filter_map(|l| l.parse().ok()).collect();
+    let s = scan_with(worktree, &kept)?;
+    let text: Vec<String> = s.masks.iter().filter_map(|m| std::fs::symlink_metadata(m).ok()).map(|m| m.ino().to_string()).collect();
+    let text = text.join("\n");
+    let tmp = record.with_extension("tmp");
+    record
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&tmp, text))
+        .and_then(|()| std::fs::rename(&tmp, record))
+        .map_err(|err| Error::Setup { what: "write the mask record", err })?;
+    Ok(s)
+}
+
+fn scan_with(worktree: &Path, kept: &HashSet<u64>) -> Result<Scan, Error> {
+    let mut s = walk_tree(worktree, true, kept)?;
     git_ignored(worktree, &mut s.masks)?;
     // F21: a git config holding a credential (token in a remote URL, CI extraheader) is masked
     // like any secret file; also one too large to check.
@@ -104,7 +130,7 @@ pub fn scan(worktree: &Path) -> Result<Scan, Error> {
 
 /// Only the `.git` entries (no masks, no `git`): for the post-run check.
 pub fn dotgits(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
-    walk_tree(worktree, false).map(|s| s.dotgits)
+    walk_tree(worktree, false, &HashSet::new()).map(|s| s.dotgits)
 }
 
 /// The directories strictly between `worktree` and `mask`, deepest first. Renaming one of them
@@ -118,7 +144,8 @@ fn too_big(what: &'static str) -> Error {
     Error::Setup { what, err: std::io::Error::other("worktree too large to scan for secrets (fail closed)") }
 }
 
-fn walk_tree(root: &Path, masks: bool) -> Result<Scan, Error> {
+fn walk_tree(root: &Path, masks: bool, kept: &HashSet<u64>) -> Result<Scan, Error> {
+    use std::os::unix::fs::DirEntryExt as _;
     let mut s = Scan::default();
     let mut seen = 0usize;
     let mut stack = vec![root.to_path_buf()];
@@ -135,7 +162,7 @@ fn walk_tree(root: &Path, masks: bool) -> Result<Scan, Error> {
                 s.dotgits.push(path);
                 continue; // its contents are handled by git::view
             }
-            if masks && matches_secret(root, &path) {
+            if masks && (kept.contains(&entry.ino()) || matches_secret(root, &path)) {
                 if s.masks.len() >= MASK_LIMIT {
                     return Err(too_big("mask limit"));
                 }
@@ -291,6 +318,29 @@ mod tests {
         std::fs::write(&cfg, text).unwrap();
         assert!(scan(&wt).unwrap().masks.contains(&cfg), "F21: a config holding a CI token is masked");
         std::fs::remove_dir_all(&wt).unwrap();
+    }
+
+    #[test]
+    fn a_masked_file_stays_masked_after_gitignore_edits_and_renames() {
+        let root = std::env::temp_dir().join(format!("moochy-mask-kept-{}", std::process::id()));
+        let (wt, record) = (root.join("wt"), root.join("state/masks/wt"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(wt.join("config")).unwrap();
+        if !std::process::Command::new("git").arg("-C").arg(&wt).args(["init", "-q"]).status().is_ok_and(|s| s.success()) {
+            return; // no git here: nothing to check
+        }
+        std::fs::write(wt.join(".gitignore"), "config/local_settings.py\n").unwrap();
+        std::fs::write(wt.join("config/local_settings.py"), "SECRET = 1\n").unwrap();
+        std::fs::write(wt.join("config/settings.py"), "DEBUG = 0\n").unwrap();
+        let first = scan_kept(&wt, Some(&record)).unwrap();
+        assert!(first.masks.contains(&wt.join("config/local_settings.py")));
+        // Run 1's agent: ignore rule gone, directory renamed.
+        std::fs::write(wt.join(".gitignore"), "").unwrap();
+        std::fs::rename(wt.join("config"), wt.join("conf2")).unwrap();
+        assert!(scan(&wt).unwrap().masks.is_empty(), "without a record the file is visible");
+        let masks = scan_kept(&wt, Some(&record)).unwrap().masks;
+        assert!(masks.contains(&wt.join("conf2/local_settings.py")), "F09: {masks:?}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

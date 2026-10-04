@@ -225,6 +225,9 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
         spec.run_token = Some(token);
         spec.allow_hosts.clone_from(&gw.allow_hosts);
         spec.git_writable = gw.git_writable;
+        // F09: masks kept per worktree, in the state dir the agent never sees (A197).
+        let id = crate::util::b64e(&moochy_proto::crypto::sha256(worktree.as_os_str().as_encoded_bytes()));
+        spec.mask_record = Some(gw.state_dir.join("masks").join(id));
         // A197, second layer: nothing visible may contain the Moochy home (keys, run key, state).
         spec.protected.push(gw.state_dir.parent().unwrap_or(&gw.state_dir).to_path_buf());
         spec.protected.push(gw.state_dir.clone());

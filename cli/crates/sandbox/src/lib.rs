@@ -106,6 +106,10 @@ pub struct Spec {
     /// the host's git to agent-written config (DESIGN.md). Default `false`:
     /// `.git` is read-only inside. Linked worktrees are always read-only.
     pub git_writable: bool,
+    /// File keeping this worktree's masked inodes from one run to the next (F09): a file
+    /// masked once stays masked after an agent edits a `.gitignore` or renames its directory.
+    /// Must be out of the agent's reach. `None` = masks come from this run's tree only.
+    pub mask_record: Option<PathBuf>,
     /// Escape hatch for debugging only. When true, [`run`](Spec::run) executes
     /// the command with NO sandbox after printing a loud warning to stderr.
     pub unsafe_no_sandbox: bool,
@@ -197,6 +201,7 @@ impl Spec {
             cwd: None,
             run_token: None,
             git_writable: false,
+            mask_record: None,
             allow_hosts: Vec::new(),
             protected: default_protected(),
             limits: Limits::default(),

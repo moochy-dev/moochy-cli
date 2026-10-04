@@ -41,7 +41,7 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         .worktree
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
-    let scan = mask::scan(&worktree)?;
+    let scan = mask::scan_kept(&worktree, spec.mask_record.as_deref())?;
     let git_before = crate::git::snapshot(&scan.dotgits);
     // A private scratch dir per run: the shared /tmp and the per-user
     // /var/folders stay out of reach (other apps' files live there).

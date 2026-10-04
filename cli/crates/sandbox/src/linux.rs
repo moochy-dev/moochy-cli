@@ -52,7 +52,7 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .worktree
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
-    let scan = mask::scan(&worktree)?;
+    let scan = mask::scan_kept(&worktree, spec.mask_record.as_deref())?;
     let git = crate::git::view(&worktree, spec.git_writable, &scan.dotgits)?;
     let _placeholder = git.placeholder.clone().map(RmdirOnDrop);
     let git_before = crate::git::snapshot(&scan.dotgits.iter().chain(&git.placeholder).cloned().collect::<Vec<_>>());
