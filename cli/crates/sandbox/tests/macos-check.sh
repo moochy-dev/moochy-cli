@@ -22,6 +22,8 @@ R deny $B read $SHARED
 R deny $B write /tmp/moochy-check-$$-w.txt
 R deny $B read $HOME/.zshrc
 R deny $B read $HOME/.ssh/known_hosts
+# Package managers' data and config (F23); vacuous without Homebrew/MacPorts.
+R deny /bin/sh -c "ls /opt/homebrew/var/ || ls /usr/local/var/ || ls /opt/local/var/"
 R deny $B hardlink $J/wt/.env $J/wt/link
 R deny $B read $J/wt/deploy/.env
 R deny /bin/sh -c "mv $J/wt/deploy $J/wt/d2"

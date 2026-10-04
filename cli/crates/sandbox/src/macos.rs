@@ -192,6 +192,9 @@ pub fn maintainer_profile(
     p.push_str("(allow file-read-metadata)\n");
     // System paths (and dyld): read + exec.
     p.push_str("(allow process-exec* file-read* (regex #\"^/(usr|bin|sbin|opt|System|Library|Applications)/\"))\n");
+    // F23: not the package managers' own data and config (Homebrew, MacPorts): user-owned
+    // local databases and service configs live there. Their CA bundles stay readable.
+    p.push_str(HOMEBREW_DATA_DENY);
     p.push_str("(allow file-read* (regex #\"^/(private/etc|private/var/db|etc)/\") (literal \"/\") (literal \"/private\"))\n");
     // Basic devices and the terminal (interactive agents).
     p.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\") (literal \"/dev/dtracehelper\"))\n");
@@ -244,6 +247,9 @@ pub fn maintainer_profile(
     }
     Ok(p)
 }
+
+const HOMEBREW_DATA_DENY: &str = "(deny file-read* file-write* process-exec* (regex #\"^/(opt/homebrew|opt/local|usr/local)/(var|etc)(/|$)\"))\n\
+    (allow file-read* (regex #\"^/(opt/homebrew|opt/local|usr/local)/etc/(openssl[^/]*|ca-certificates)/\"))\n";
 
 /// A path as a literal inside an SBPL `#"…"` regex; `None` for characters we
 /// can't express safely there (quote, backslash, control).
@@ -384,4 +390,16 @@ fn sbpl_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    #[test]
+    fn package_manager_data_is_not_a_system_path() {
+        let wt = std::env::temp_dir();
+        let p = super::maintainer_profile(&crate::Spec::new(wt.clone()), &wt, &[], &wt, None).unwrap();
+        let (sys, deny) = (p.find("(usr|bin|sbin|opt|").unwrap(), p.find(super::HOMEBREW_DATA_DENY).unwrap());
+        assert!(deny > sys, "F23: the deny follows (beats) the system-path allow");
+    }
 }
