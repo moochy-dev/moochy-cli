@@ -1065,6 +1065,7 @@ fn doctor(home: &Home) -> Result<()> {
     let root = std::env::current_dir().ok().and_then(|d| crate::files::git_root(&d));
     let sb = moochy_sandbox::doctor(root.as_deref());
     let sandbox_ok = !sb.iter().any(|l| l.level == moochy_sandbox::doctor::Level::Fail && matches!(l.topic, "sandbox" | "landlock"));
+    let sandbox_failed = sb.iter().filter(|l| l.level == moochy_sandbox::doctor::Level::Fail).count();
     println!("{}     hidden    {}", if p.color { "  " } else { "" }, moochy_sandbox::mask::SECRET_PATTERNS.join(" "));
     for l in &sb {
         let level = match l.level {
@@ -1089,7 +1090,9 @@ fn doctor(home: &Home) -> Result<()> {
         Ok(m) => line(Some(m.uid()) == me && m.mode() & 0o777 == 0o600, "socket", format!("node.sock uid {} mode {:o}", m.uid(), m.mode() & 0o777)),
         Err(_) => line(st.is_none(), "socket", "no node.sock".into()),
     }
-    if bad > 0 && st.is_some() {
+    // m1: any FAIL line is a failed check, whether the app runs or not (exit 10, CONTRACT §6).
+    let bad = usize::try_from(bad).unwrap_or(usize::MAX).saturating_add(sandbox_failed);
+    if bad > 0 {
         return Err(Error { exit: crate::util::Exit::Internal, msg: format!("{bad} check(s) failed") });
     }
     Ok(())
