@@ -1208,6 +1208,16 @@ fn doctor(home: &Home) -> Result<()> {
         line(false, "relay", "the Moochy app is not running (start it with `moochy up`)".into());
         line(false, "clock", "unknown: measured when the app connects".into());
     }
+    // F05: split-view protection (A204): a public anchor, and whether the last check read it.
+    match crate::keylog::effective_anchor(&cfg) {
+        None if crate::keylog::effective_log_key(&cfg).is_none() => {}
+        None if dev_mode() => println!("{} anchor    no public key-log anchor: split-view protection is off (MOOCHY_INSECURE_DEV)", tag("note")),
+        None => line(false, "anchor", "no public key-log anchor and no witnesses: split-view protection is off (`moochy config set log_anchor_url https://…`)".into()),
+        Some(u) if st.as_ref().is_some_and(|s| s.alerts.iter().any(|a| a.contains("anchor_unreadable"))) => {
+            println!("{} anchor    {} could not be read at the last check: split-view protection is off until it can", tag("note"), clean(&u));
+        }
+        Some(u) => line(true, "anchor", format!("key log checked hourly against {u}")),
+    }
     line(true, "safety", format!("checks level {}, tables of moochy-worker {}", cfg.firewall_level.as_deref().unwrap_or("strict"), env!("CARGO_PKG_VERSION")));
     for (ok, what, detail) in crate::lockdown::doctor(home, st.is_some()) {
         line(ok, what, detail);
@@ -1747,6 +1757,11 @@ async fn up(home: Home, offline: bool, boot: crate::lockdown::Boot) -> Result<()
     tokio::spawn(crate::ctl::serve(node.clone(), sock, sock_path.clone()));
     if !node.adapters.is_empty() {
         tokio::spawn(crate::worker::warm_loop(node.clone()));
+    }
+    // F05: no anchor (and no witnesses): a relay could show this machine a key log nobody
+    // else sees. Said at every start, not only in the log.
+    if node.keylog.is_some() && crate::keylog::effective_anchor(&node.cfg).is_none() {
+        eprintln!("WARNING: split-view protection is off: no public key-log anchor (`moochy config set log_anchor_url https://…`) and no witnesses, so the server could show this machine a key log nobody else sees (A204).");
     }
     match &node.keylog {
         Some(l) => l.start(&node),

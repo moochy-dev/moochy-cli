@@ -54,9 +54,34 @@ pub fn effective_log_key(cfg: &Config) -> Option<String> {
     })
 }
 
-/// The default relay's public Git anchor of the key log (raw-file base URL), compiled into
-/// release builds (`MOOCHY_DEFAULT_LOG_ANCHOR`, T-C06-015).
-pub const DEFAULT_LOG_ANCHOR: Option<&str> = option_env!("MOOCHY_DEFAULT_LOG_ANCHOR");
+/// The default relay's public Git anchor of the key log, compiled into every build
+/// (`MOOCHY_DEFAULT_LOG_ANCHOR` at build time overrides it, T-C06-015, F05). A GitHub
+/// repository is read as raw files of its default branch ([`anchor_base`]). Until it can be
+/// read, every hourly check raises an alert instead of stopping the node (fail-safe).
+pub const DEFAULT_LOG_ANCHOR: Option<&str> = Some(match option_env!("MOOCHY_DEFAULT_LOG_ANCHOR") {
+    Some(u) => u,
+    None => "https://github.com/moochy-dev/moochy-keylog-anchor",
+});
+
+/// Where an anchor's `checkpoint` file is read: `https://github.com/<owner>/<repo>` becomes the
+/// raw-file base of its default branch (`https://raw.githubusercontent.com/<owner>/<repo>/HEAD/`);
+/// any other URL is the base itself.
+pub fn anchor_base(url: &str) -> String {
+    match url.strip_prefix("https://github.com/").map(|r| r.trim_end_matches('/').trim_end_matches(".git")) {
+        Some(r) if r.split('/').count() == 2 && r.split('/').all(|p| !p.is_empty()) => format!("https://raw.githubusercontent.com/{r}/HEAD/"),
+        _ => url.to_owned(),
+    }
+}
+
+/// Adds an error-level line to `Status.alerts` (the last [`MAX_ALERTS`]).
+fn raise(alerts: &watch::Sender<Vec<String>>, msg: &str, fields: &serde_json::Value) {
+    alerts.send_modify(|v| {
+        if v.len() >= MAX_ALERTS {
+            v.remove(0);
+        }
+        v.push(json!({"message": msg, "fields": fields}).to_string());
+    });
+}
 
 fn default_relay(cfg: &Config) -> bool {
     cfg.relay.as_deref().is_none_or(|r| crate::tls::Origin::parse(r).is_ok_and(|o| o.url() == crate::config::DEFAULT_RELAY))
@@ -322,12 +347,7 @@ impl KeyLog {
                     o.insert("keylog".into(), json!(e.message()));
                 }
                 if level == "error" {
-                    alerts.send_modify(|v| {
-                        if v.len() >= MAX_ALERTS {
-                            v.remove(0);
-                        }
-                        v.push(json!({"message": &msg, "fields": &fields}).to_string());
-                    });
+                    raise(&alerts, &msg, &fields);
                 }
                 log(level, &msg, &fields);
             })
@@ -554,7 +574,8 @@ fn event_fields(e: &Event, own_boxes: &[String]) -> (&'static str, String, serde
         Event::Stale { served, mirrored } => ("error", "key log alert".into(), json!({"event": "stale", "served": served, "mirrored": mirrored})),
         Event::Rollback { anchored, served } => ("error", "KEY LOG FORK: rollback vs the public anchor".into(), json!({"event": "rollback", "anchored": anchored, "served": served})),
         Event::Unwitnessed { size, cosignatures } => ("error", "key log alert".into(), json!({"event": "unwitnessed", "size": size, "cosignatures": cosignatures})),
-        Event::FailOpen => ("warn", e.message(), json!({"event": "fail_open"})),
+        // F05: shown, not only logged (Status.alerts, the dashboard).
+        Event::FailOpen => ("error", e.message(), json!({"event": "fail_open"})),
     }
 }
 
@@ -648,11 +669,18 @@ impl moochy_keylog::LogLink for Link {
             return None;
         }
         self.anchor_due = Instant::now().checked_add(ANCHOR_EVERY)?;
-        let got = tokio::task::spawn_blocking(move || moochy_keylog::fetch::Fetcher::new(&url, TILE_TIMEOUT).and_then(|f| f.get("checkpoint", moochy_keylog::note::MAX_NOTE))).await;
+        let base = anchor_base(&url);
+        let got = tokio::task::spawn_blocking(move || moochy_keylog::fetch::Fetcher::new(&base, TILE_TIMEOUT).and_then(|f| f.get("checkpoint", moochy_keylog::note::MAX_NOTE))).await;
         if let Ok(Ok(note)) = got {
             return Some(note);
         }
-        log("warn", "key-log anchor fetch failed", &json!({}));
+        // F05: loud, not fatal: an unreadable anchor (not created yet, offline) leaves split-view
+        // protection off until the next hourly check reads it.
+        let (msg, fields) = ("key log: the public anchor could not be read: split-view protection is off until it can (A204)", json!({"event": "anchor_unreadable", "anchor": clean(&url)}));
+        log("error", msg, &fields);
+        if let Some(k) = &self.node.keylog {
+            raise(&k.alerts, msg, &fields);
+        }
         None
     }
 }
@@ -755,6 +783,18 @@ pub fn check_receipt_ack(node: &Node, receipt: &[u8], ack: &crate::pb::link::Rec
 #[cfg(test)]
 mod tests {
     use moochy_keylog::{Code, State, entry::parse_record};
+
+    #[test]
+    fn anchor_urls() {
+        // F05: the compiled-in default is a GitHub repository, read as raw files.
+        assert_eq!(super::anchor_base("https://github.com/moochy-dev/moochy-keylog-anchor"), "https://raw.githubusercontent.com/moochy-dev/moochy-keylog-anchor/HEAD/");
+        assert_eq!(super::anchor_base("https://github.com/o/r.git/"), "https://raw.githubusercontent.com/o/r/HEAD/");
+        assert_eq!(super::anchor_base("https://anchor.example/keylog/"), "https://anchor.example/keylog/");
+        assert_eq!(super::anchor_base("https://github.com/o/r/tree/main"), "https://github.com/o/r/tree/main");
+        let cfg = crate::config::Config::default();
+        assert_eq!(super::effective_anchor(&cfg).as_deref(), super::DEFAULT_LOG_ANCHOR, "the default relay has an anchor");
+        assert_eq!(super::event_fields(&moochy_keylog::Event::FailOpen, &[]).0, "error", "fail-open reaches Status.alerts");
+    }
 
     #[test]
     fn a_box_this_user_did_not_create_is_an_alert() {
