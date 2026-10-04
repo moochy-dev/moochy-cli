@@ -856,46 +856,102 @@ impl<'a> Walk<'a> {
 }
 
 /// Pages of a PDF, deterministically (the Gateway and the Worker must agree):
-/// `max(number of "/Type /Page" objects, largest "/Count")`. `None` when the bytes are not a
-/// PDF or no page object is visible (page tree only inside compressed object streams): such
-/// documents are refused rather than under-estimated. Over-counting only raises the
-/// reservation.
-pub fn pdf_pages(b: &[u8]) -> Option<u64> {
+/// `max(number of "/Type /Page" objects, largest "/Count", references in "/Kids" arrays)`,
+/// read after decoding `#xx` name escapes, with comments as whitespace between a key and its
+/// value. `None` (refused rather than under-counted, F02) when the bytes are not a PDF, use
+/// object streams (page objects may hide inside them), give `/Count` or `/Kids` as an indirect
+/// reference, or show no page at all. Over-counting only raises the reservation.
+pub fn pdf_pages(raw: &[u8]) -> Option<u64> {
     const DELIM: &[u8] = b" \t\r\n\x0c\x00()<>[]{}/%";
-    let head = b.get(..b.len().min(1024))?;
+    let head = raw.get(..raw.len().min(1024))?;
     head.windows(5).position(|w| w == b"%PDF-")?;
-    let ws = |c: u8| b" \t\r\n\x0c\x00".contains(&c);
+    let b = unescape_names(raw);
+    let b = b.as_slice();
+    let name_at = |at: usize, name: &[u8]| b.get(at..at.saturating_add(name.len())) == Some(name) && b.get(at.saturating_add(name.len())).is_none_or(|c| DELIM.contains(c));
+    if b.windows(7).enumerate().any(|(at, w)| w == b"/ObjStm" && name_at(at, b"/ObjStm")) {
+        return None;
+    }
     let skip_ws = |mut i: usize| {
-        while b.get(i).is_some_and(|c| ws(*c)) {
-            i = i.saturating_add(1);
+        loop {
+            match b.get(i) {
+                Some(b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00') => i = i.saturating_add(1),
+                Some(b'%') => {
+                    while b.get(i).is_some_and(|c| !matches!(c, b'\r' | b'\n')) {
+                        i = i.saturating_add(1);
+                    }
+                }
+                _ => return i,
+            }
         }
-        i
     };
-    let (mut objects, mut count) = (0u64, 0u64);
+    // An unsigned integer at `i`: (value, end).
+    let int = |mut j: usize| {
+        let (start, mut n) = (j, 0u64);
+        while let Some(d) = b.get(j).filter(|c| c.is_ascii_digit()) {
+            n = n.saturating_mul(10).saturating_add(u64::from(d.wrapping_sub(b'0')));
+            j = j.saturating_add(1);
+        }
+        (j > start).then_some((n, j))
+    };
+    // `N G R` at `i`: the end of the reference.
+    let reference = |i: usize| {
+        let (_, j) = int(i)?;
+        let (_, j) = int(skip_ws(j))?;
+        let j = skip_ws(j);
+        (b.get(j) == Some(&b'R') && b.get(j.saturating_add(1)).is_none_or(|c| DELIM.contains(c))).then(|| j.saturating_add(1))
+    };
+    let (mut objects, mut count, mut kids) = (0u64, 0u64, 0u64);
     let mut i = 0usize;
-    while let Some(off) = b.get(i..).and_then(|r| r.windows(5).position(|w| w == b"/Type" || w == b"/Coun")) {
+    while let Some(off) = b.get(i..).and_then(|r| r.windows(5).position(|w| w == b"/Type" || w == b"/Coun" || w == b"/Kids")) {
         let at = i.saturating_add(off);
         i = at.saturating_add(5);
-        if b.get(at..at.saturating_add(5)) == Some(b"/Type") {
-            let j = skip_ws(i);
-            if b.get(j..j.saturating_add(5)) == Some(b"/Page") && b.get(j.saturating_add(5)).is_none_or(|c| DELIM.contains(c)) {
+        if name_at(at, b"/Type") {
+            if name_at(skip_ws(i), b"/Page") {
                 objects = objects.saturating_add(1);
             }
-        } else if b.get(at..at.saturating_add(6)) == Some(b"/Count") {
-            let mut j = skip_ws(at.saturating_add(6));
-            let mut n = 0u64;
-            let start = j;
-            while let Some(d) = b.get(j).filter(|c| c.is_ascii_digit()) {
-                n = n.saturating_mul(10).saturating_add(u64::from(d.wrapping_sub(b'0')));
-                j = j.saturating_add(1);
+        } else if name_at(at, b"/Count") {
+            let j = skip_ws(at.saturating_add(6));
+            if reference(j).is_some() {
+                return None;
             }
-            if j > start {
+            if let Some((n, _)) = int(j) {
                 count = count.max(n);
             }
+        } else if name_at(at, b"/Kids") {
+            let mut j = skip_ws(i);
+            if b.get(j) != Some(&b'[') {
+                return None;
+            }
+            j = skip_ws(j.saturating_add(1));
+            while b.get(j) != Some(&b']') {
+                j = skip_ws(reference(j)?);
+                kids = kids.saturating_add(1);
+            }
+            i = j;
         }
     }
-    let pages = objects.max(count);
+    let pages = objects.max(count).max(kids);
     (pages > 0).then_some(pages)
+}
+
+/// `b` with every `#xx` hex escape decoded (PDF names: `/P#61ge` is `/Page`). Decoding outside
+/// names too can only add matches, never hide a plainly written one.
+fn unescape_names(b: &[u8]) -> Vec<u8> {
+    let hex = |c: Option<&u8>| c.and_then(|c| char::from(*c).to_digit(16));
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while let Some(&c) = b.get(i) {
+        if c == b'#'
+            && let (Some(h), Some(l)) = (hex(b.get(i.saturating_add(1))), hex(b.get(i.saturating_add(2))))
+        {
+            out.push(u8::try_from(h.saturating_mul(16).saturating_add(l)).unwrap_or(0));
+            i = i.saturating_add(3);
+        } else {
+            out.push(c);
+            i = i.saturating_add(1);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -913,6 +969,22 @@ mod tests {
         assert_eq!(pdf_pages(b"not a pdf /Type /Page"), None);
         assert_eq!(pdf_pages(b"%PDF-1.4 /Type /Pages"), None, "/Pages is not a page");
         assert_eq!(pdf_pages(b"%PDF-1.4 /Count 99999999999999999999999 /Type /Page"), Some(u64::MAX));
+    }
+
+    #[test]
+    fn pdf_page_count_is_not_fooled() {
+        // F02: name escapes, a comment between key and value, and a decoy in a comment.
+        let escaped = b"%PDF-1.4\n%/Type /Page\n2 0 obj << /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /C#6funt %x\n 150 >> endobj\n3 0 obj << /Type /P#61ge >> endobj";
+        assert_eq!(pdf_pages(escaped), Some(150));
+        assert_eq!(pdf_pages(b"%PDF-1.4\n<< /Type %c\n/Page >> << /Type /Page >>"), Some(2));
+        // Pages without /Type still sit in a /Kids array.
+        assert_eq!(pdf_pages(b"%PDF-1.4\n<< /Type /Pages /Count 1 /Kids [3 0 R %c ]\n 4 0 R 5 0 R] >>"), Some(3));
+        // Object streams (even next to a decoy page), an indirect /Count or /Kids: refused.
+        assert_eq!(pdf_pages(b"%PDF-1.7\n%/Type /Page\n<< /Type /Obj#53tm /N 40 >> stream x endstream"), None);
+        assert_eq!(pdf_pages(b"%PDF-1.7\n<< /Type /Pages /Count 9 0 R >> << /Type /Page >>"), None);
+        assert_eq!(pdf_pages(b"%PDF-1.7\n<< /Type /Pages /Kids 9 0 R >> << /Type /Page >>"), None);
+        assert_eq!(pdf_pages(b"%PDF-1.7\n<< /Kids [3 0 R (]) 4 0 R] >> << /Type /Page >>"), None);
+        assert_eq!(pdf_pages(b"%PDF-1.7\n<< /Kids [3 0 R"), None);
     }
 
     #[test]
