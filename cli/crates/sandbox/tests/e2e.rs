@@ -410,6 +410,13 @@ fn e97_git_ignored_masked_and_git_exec_paths_read_only() {
         let o = sandboxed(&f, &["--git-writable"], &["write", &f.path(&format!("wt/{rel}"))]);
         assert!(has(&o, "write-fail"), "{rel} writable with git_writable: {}", o.stdout);
     }
+    // F21: a config holding a token reads empty inside (the mask beats the .git bind).
+    let cfg = wt.join(".git/config");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("[http \"https://github.com/\"]\n\textraheader = AUTHORIZATION: basic eC1hY2Nlc3M=\n");
+    std::fs::write(&cfg, text).unwrap();
+    let o = sandboxed(&f, &[], &["read", &f.path("wt/.git/config")]);
+    assert!(has(&o, "len=0"), "credential config visible: {}", o.stdout);
 }
 
 #[test]

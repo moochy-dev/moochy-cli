@@ -474,8 +474,6 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
         }
     }
 
-    // Mask secret-shaped / git-ignored files inside the worktree (§15.4).
-    apply_masks(&root, plan)?;
     // Git paths whose content the HOST later executes (hooks; `core.fsmonitor`,
     // `core.hooksPath`, aliases in config): read-only inside, so code written by
     // the agent can never run outside the sandbox on the user's next `git`.
@@ -485,6 +483,9 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     if let Some(l) = &plan.git.linked {
         bind_linked_gitdir(&root, l)?;
     }
+    // Mask secret-shaped / git-ignored files (§15.4) and credential-bearing git configs
+    // (F21): after the git binds, which would otherwise cover a mask inside a git dir.
+    apply_masks(&root, plan)?;
 
 
     // Minimal /dev, with a private /dev/shm (POSIX shm, Python multiprocessing).

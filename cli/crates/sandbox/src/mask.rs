@@ -5,6 +5,7 @@
 //! Fails closed: a worktree too large to scan completely, or with more secrets
 //! than the mask budget, refuses the run instead of leaving the rest readable.
 
+use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,8 @@ const BUILD_DIRS: &[&str] = &[
 // keyed on dir mtimes if huge monorepos make that felt.
 const WALK_LIMIT: usize = 1_000_000;
 const MASK_LIMIT: usize = 16_384;
+/// Git configs are read whole up to this size; a larger (or unreadable) one is masked.
+const CONFIG_MAX: u64 = 1 << 20;
 
 /// What one scan of the worktree found.
 #[derive(Debug, Default)]
@@ -85,6 +88,15 @@ pub fn collect(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
 pub fn scan(worktree: &Path) -> Result<Scan, Error> {
     let mut s = walk_tree(worktree, true)?;
     git_ignored(worktree, &mut s.masks)?;
+    // F21: a git config holding a credential (token in a remote URL, CI extraheader) is masked
+    // like any secret file; also one too large to check.
+    for c in s.dotgits.iter().flat_map(|g| crate::git::config_files(g)) {
+        let mut v = Vec::new();
+        let big = std::fs::File::open(&c).and_then(|f| f.take(CONFIG_MAX + 1).read_to_end(&mut v)).map_or(true, |n| n as u64 > CONFIG_MAX);
+        if big || crate::git::holds_credentials(&v) {
+            s.masks.push(c);
+        }
+    }
     s.masks.sort();
     s.masks.dedup();
     Ok(s)
@@ -261,6 +273,24 @@ mod tests {
         assert_eq!(got, [Path::new("/w/apps/api"), Path::new("/w/apps")], "F03: every dir a rename could move it with");
         assert_eq!(ancestors_below(wt, Path::new("/w/.env")).count(), 0, "top level: only the worktree root, which stays");
         assert_eq!(ancestors_below(wt, Path::new("/elsewhere/config")).count(), 0);
+    }
+
+    #[test]
+    fn git_config_with_a_token_is_masked() {
+        let wt = std::env::temp_dir().join(format!("moochy-mask-gitcfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        std::fs::create_dir_all(&wt).unwrap();
+        let ok = std::process::Command::new("git").arg("-C").arg(&wt).args(["init", "-q"]).status().is_ok_and(|s| s.success());
+        if !ok {
+            return; // no git here: nothing to check
+        }
+        let cfg = wt.join(".git/config");
+        assert!(!scan(&wt).unwrap().masks.contains(&cfg), "a plain config stays visible");
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        text.push_str("[http \"https://github.com/\"]\n\textraheader = AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hzX3g=\n");
+        std::fs::write(&cfg, text).unwrap();
+        assert!(scan(&wt).unwrap().masks.contains(&cfg), "F21: a config holding a CI token is masked");
+        std::fs::remove_dir_all(&wt).unwrap();
     }
 
     #[test]

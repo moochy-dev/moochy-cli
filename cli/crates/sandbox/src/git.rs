@@ -123,6 +123,42 @@ fn top_view(worktree: &Path, git_writable: bool) -> GitView {
     }
 }
 
+/// The config files git reads for one `.git` entry (a dir, or a `gitdir:` file): `config` and
+/// `config.worktree`, plus the shared repository's `config` behind a `commondir`.
+#[must_use]
+pub fn config_files(dotgit: &Path) -> Vec<PathBuf> {
+    let dir = if dotgit.is_dir() {
+        Some(dotgit.to_path_buf())
+    } else {
+        read_small(dotgit)
+            .and_then(|t| Some(t.lines().next()?.strip_prefix("gitdir:")?.trim().to_owned()))
+            .and_then(|rel| dotgit.parent()?.join(rel).canonicalize().ok())
+    };
+    let Some(dir) = dir.filter(|d| looks_like_gitdir(d)) else { return Vec::new() };
+    let common = read_small(&dir.join("commondir")).and_then(|c| dir.join(c.trim()).canonicalize().ok()).filter(|c| looks_like_gitdir(c));
+    [dir.join("config"), dir.join("config.worktree")].into_iter().chain(common.map(|c| c.join("config"))).filter(|p| p.is_file()).collect()
+}
+
+/// A git config that can carry a credential (F21): a URL with a user part
+/// (`https://x-access-token:…@host`), an `extraheader` (actions/checkout's
+/// `AUTHORIZATION: basic …`), or a `credential` section or key. ASCII case-insensitive.
+#[must_use]
+pub fn holds_credentials(cfg: &[u8]) -> bool {
+    let low = cfg.to_ascii_lowercase();
+    let has = |n: &[u8]| low.windows(n.len()).any(|w| w == n);
+    if has(b"extraheader") || has(b"[credential") || has(b"credential.") {
+        return true;
+    }
+    // `scheme://user[:pass]@host`: an `@` before the end of the authority.
+    low.windows(3).enumerate().filter(|(_, w)| *w == b"://").any(|(i, _)| {
+        low.get(i.saturating_add(3)..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|c| !matches!(c, b'/' | b'"' | b'\'' | b' ' | b'\t' | b'\r' | b'\n'))
+            .any(|c| *c == b'@')
+    })
+}
+
 /// What the host's git would trust, per `.git`: its kind, and for a dir the
 /// files that make git run code or redirect (`config`, `config.worktree`,
 /// `commondir`) plus the `hooks/` listing. Sorted by path.
@@ -210,6 +246,21 @@ mod tests {
         let v = top_view(&root.join("wt").canonicalize().unwrap(), false);
         assert!(v.linked.is_none(), "{v:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn credential_bearing_configs() {
+        for cfg in [
+            "[remote \"origin\"]\n\turl = https://x-access-token:ghs_abc@github.com/o/r\n",
+            "[http \"https://github.com/\"]\n\textraheader = AUTHORIZATION: basic eC1hY2Nlc3M=\n",
+            "[remote \"o\"]\n\turl = https://gitlab-ci-token:glcbt-x@gitlab.com/g/p.git\n",
+            "[credential]\n\thelper = store\n",
+        ] {
+            assert!(holds_credentials(cfg.as_bytes()), "{cfg}");
+        }
+        for cfg in ["[core]\n\tbare = false\n", "[remote \"o\"]\n\turl = git@github.com:o/r.git\n", "[remote \"o\"]\n\turl = https://github.com/o/r@v1\n"] {
+            assert!(!holds_credentials(cfg.as_bytes()), "{cfg}");
+        }
     }
 
     #[test]
