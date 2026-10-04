@@ -59,8 +59,9 @@ COMMANDS:
                                   Boxes enrolled for your projects; revoke one, or a token and all
                                   its boxes
   keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
-                                  Add a provider API key (xai = Grok). It is checked with the
-                                  provider's free models call and never leaves this machine
+                                  Add a provider API key (xai = Grok), read from stdin, never
+                                  from the command line. It is checked with the provider's free
+                                  models call and never leaves this machine (`local`: below)
   keys add local --base-url http://127.0.0.1:11434 --model local/<slug>=<server id> [--key-stdin]
                                   Donate your own GPU: an OpenAI-compatible server on this
                                   machine or your LAN (Ollama, LM Studio, vLLM, llama.cpp)
@@ -469,6 +470,8 @@ fn run() -> Result<()> {
             restart_note(&home, "key");
             Ok(())
         }
+        // Never echo the extra word: it is likely the key itself.
+        ["keys", "add", _, _, ..] => Err(usage("the key is read from stdin, never from the command line (it would stay in your shell history and the process list): printf %s \"$KEY\" | moochy keys add <provider> --key-stdin")),
         ["keys", "remove", _] => {
             keys_cmd(&home, &w)?;
             restart_note(&home, "keys");
@@ -1317,7 +1320,7 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
         return stored_where(home);
     }
     if !crate::keycheck::PROVIDERS.contains(&provider) {
-        return Err(usage(format!("provider must be one of: {}", crate::keycheck::PROVIDERS.join(", "))));
+        return Err(usage(format!("provider must be one of: {}, local (your own model server: see --help)", crate::keycheck::PROVIDERS.join(", "))));
     }
     if !o.has("key-stdin") {
         return Err(usage("pass the key on stdin with --key-stdin (never as an argument)"));
