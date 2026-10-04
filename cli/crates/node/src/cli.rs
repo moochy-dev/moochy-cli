@@ -517,7 +517,18 @@ fn run() -> Result<()> {
             // cap, accepted donors, covered projects) are actions, not things waiting: `members remove` /
             // `members add --device` / `approve --revoke` / `org remove` use them.
             for q in r.requests.iter().filter(|q| !STANDING.iter().any(|p| q.request_id.starts_with(p))) {
-                emit(&sign_json(q));
+                let mut v = sign_json(q);
+                // A228: a REPO_CLAIMED signs within an hour of its code-host check; the relay
+                // pushed this one more than an hour ago, so that check has expired.
+                let pushed = u64::try_from(q.issued_at_ms).unwrap_or(0);
+                if q.kind == "REPO_CLAIMED"
+                    && crate::util::now_ms().saturating_sub(pushed) > 3_600_000
+                    && let Some(o) = v.as_object_mut()
+                {
+                    o.insert("expired".into(), json!(true));
+                    eprintln!("{}: this claim's code-host check expired (1 hour): do the web step again (Add a repository on moochy.dev), then run `moochy claim {}` within one hour", clean(&q.repo_slug), clean(&q.repo_slug));
+                }
+                emit(&v);
             }
             Ok(())
         }),

@@ -510,6 +510,16 @@ pub(crate) fn own_handle(cfg: &crate::config::Config, label: &str) -> Option<Str
     cfg.handle.clone().or_else(|| crate::config::plain_handle(label).then(|| label.to_owned()))
 }
 
+/// A REPO_CLAIMED the server no longer accepts (A228): its code-host check is valid for an hour.
+fn stale_claim(slug: &str, e: crate::util::Error) -> crate::util::Error {
+    let host = if slug.starts_with("gitlab/") { "GitLab" } else { "GitHub" };
+    let code = e.msg.rsplit_once("refused the entry: ").map(|(_, c)| c.trim());
+    if matches!(code, Some("claim_not_verified" | "not_found" | "expired")) || e.msg.starts_with("no pending REPO_CLAIMED") {
+        return usage(format!("this claim's {host} check expired (1 hour), or it was never started: do the web step again (Add a repository on moochy.dev), then run this command within one hour"));
+    }
+    e
+}
+
 /// Build the owner-signed body from the BOUND fields only and hand it to the Node. `after`: the
 /// time of an entry just signed for the same project (the claim before its first approval): the
 /// log refuses an entry not issued after it (`replay`), even within the same millisecond.
@@ -643,7 +653,8 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
             _ => c.claim(ClaimRequest { repo: slug.into(), dry_run: true, ..ClaimRequest::default() }).await,
         };
         r.map(tonic::Response::into_inner).map_err(|s| status(&s))
-    })?;
+    })
+    .map_err(|e| if words.first() == Some(&"claim") { stale_claim(slug, e) } else { e })?;
     let want = match words {
         ["approve", donor] => Ask { kind: if revoke { Kind::DonorRevoked } else { Kind::DonorApproved }, repo_slug: slug, subject: Some(donor), device: false, device_owner: None },
         ["members", op, user] => Ask { kind: if *op == "add" { Kind::MemberAdded } else { Kind::MemberRemoved }, repo_slug: slug, subject: Some(user), device, device_owner: device_owner.as_deref() },
@@ -703,11 +714,11 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
     confirm(&main, &signer, &extra, yes)?;
     let mut after = 0;
     if let Some((b, p)) = &claim {
-        let d = sign_one(home, &rt, &key, b, p, 0)?;
+        let d = sign_one(home, &rt, &key, b, p, 0).map_err(|e| stale_claim(slug, e))?;
         after = u64::try_from(d.issued_at_ms).unwrap_or(0);
         emit_signed(&d, b);
     }
-    let done = sign_one(home, &rt, &key, &main, &preview, after)?;
+    let done = sign_one(home, &rt, &key, &main, &preview, after).map_err(|e| if main.claim.is_some() { stale_claim(slug, e) } else { e })?;
     drop(key);
     emit_signed(&done, &main);
     Ok(())
@@ -805,6 +816,14 @@ pub fn trust(home: &Home, id: &str, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_claims_say_what_to_do() {
+        let e = |m: &str| stale_claim("gitlab/g/p", usage(m.to_owned())).msg;
+        assert!(e("relay refused the entry: claim_not_verified").starts_with("this claim's GitLab check expired (1 hour)"));
+        assert!(e("no pending REPO_CLAIMED request for gitlab/g/p (requests appear here after the relay pushes them)").contains("Add a repository on moochy.dev"));
+        assert_eq!(e("relay refused the entry: replay"), "relay refused the entry: replay");
+    }
 
     #[test]
     fn own_account_by_handle() {
