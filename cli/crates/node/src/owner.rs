@@ -153,14 +153,18 @@ pub(crate) fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&
     };
     // Only now (the log answered with its index) is the key kept and reported.
     store(home, cfg.relay.as_deref(), &new, &pass)?;
-    // How the log bound it, from this machine's verified copy (it may lag the answer a little).
-    let mut row = None;
-    for _ in 0..20 {
-        row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &pseudonym, &id);
-        if !matches!(row, Some(None)) {
-            break;
+    // How the log bound it, from this machine's verified copy. The app updates that copy on the
+    // next pushed checkpoint or its once-a-minute poll: wait that long rather than guess.
+    let mut row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &pseudonym, &id);
+    if matches!(row, Some(None)) {
+        eprintln!("Waiting for this machine's copy of the public key log to show how it was bound (up to a minute)…");
+        for _ in 0..140 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            row = crate::keylog::KeyLog::owner_key_row(home, &cfg, &pseudonym, &id);
+            if !matches!(row, Some(None)) {
+                break;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let proof = match row {
         Some(Some(k)) => Some(proof_name(k.proof)),
@@ -170,10 +174,15 @@ pub(crate) fn register(home: &Home, rt: &tokio::runtime::Runtime, prev: Option<&
         Some(Some(k)) => eprintln!("Owner key {id} is in the public key log at #{}: {}.", k.idx, proof_text(k.proof)),
         _ => eprintln!("Owner key {id} is in the public key log at #{} (`moochy owner status` shows how it was bound once this machine's copy of the log has it).", r.log_index),
     }
-    // A224: unless this machine's log shows the proof, the residual is said plainly.
-    let proven = matches!(row, Some(Some(k)) if k.proof != OwnerKeyProof::None);
-    if prev.is_none() && !proven {
-        eprintln!("Unless the server bound it with your confirmed email, it took this key on this device's word alone (trust on first use).");
+    // A224: the trust-on-first-use residual, said when it is real: the log shows no proof, or this
+    // machine has no key log to look in.
+    let tofu = match row {
+        Some(Some(k)) if k.proof == OwnerKeyProof::None => Some("The server took this key on this device's word alone (trust on first use): no confirmed email or passkey bound it."),
+        None => Some("This machine has no public key log (log_key) to check how the server bound this key: unless it was your confirmed email, the server took it on this device's word alone (trust on first use)."),
+        Some(_) => None,
+    };
+    if let (None, Some(t)) = (prev, tofu) {
+        eprintln!("{t}");
         eprintln!("Check on moochy.dev that your account lists exactly this owner key; your other devices alert on any owner key they did not see created.");
     }
     crate::util::emit(&json!({"event": if prev.is_some() { "owner_key_rotated" } else { "owner_key_added" }, "owner_key": id, "log_index": r.log_index, "first": prev.is_none(), "proof": proof}));
