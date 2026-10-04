@@ -26,7 +26,7 @@ fn message(f: &Failure) -> String {
     // Plain words first (docs/brand/VOICE.md), then the machine code for agents and scripts.
     let text = match f.code.as_str() {
         "over_task_cap" => "this request could cost more than the donors' limit per request; lower max_tokens",
-        "quota_exceeded" => "your monthly limit for this project, or its donations for the month, are used up",
+        "quota_exceeded" => "your monthly limit for this project, or its donations' monthly, weekly or daily limits, are used up",
         "firewall" => "request refused by the safety checks",
         "route_mismatch" => "the route header does not match the request body",
         "rate_limited" => "the donor's provider is rate limited; retry later",
