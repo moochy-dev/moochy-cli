@@ -548,10 +548,21 @@ async fn admit(node: &Arc<Node>, keys: &Keys, assign: &pb::Assign, body: &[pb::C
     let cat = node.catalog_v(assign.catalog_version).ok_or_else(|| with_ck("model_unavailable", true, Some("unknown price list version".into())))?;
     // F11: the donor's limits are counted with this price list: only the one the key log shows.
     // D14: relay-asserted only without a verified key log and in insecure dev mode.
-    let ok = match node.keylog.as_ref().filter(|l| l.verified()) {
+    let logged = || match node.keylog.as_ref().filter(|l| l.verified()) {
         Some(l) => cat.logged(l.catalog_sha256(cat.version)),
         None => node.insecure_dev,
     };
+    // A new price list can reach this node just before the checkpoint that logs it: give the
+    // mirror a moment instead of refusing every task right after a publish.
+    // ponytail: 3 s poll, a key-log update notification if this ever shows in latency.
+    let mut ok = logged();
+    for _ in 0..30 {
+        if ok {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ok = logged();
+    }
     if !ok {
         return Err(with_ck("model_unavailable", true, Some("price list not in the key log".into())));
     }
