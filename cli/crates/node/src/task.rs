@@ -572,10 +572,21 @@ impl Driver {
                 // The relay sends a fresh PoolSync right before NeedWraps: wrap from the live pool,
                 // not the snapshot taken at submit (E27), filtered by the key-log seal rule (A174):
                 // never the raw `node.pools` on the submit path.
-                if let Some(p) = self.node.sealable_pool(&self.repo_id) {
-                    self.pool = p;
+                // A worker enrolled a moment ago may not be in this node's key log yet: give the
+                // mirror up to 3 s of the relay's 5 s routing window before sealing to none.
+                let mut ws: Vec<PoolWorker> = Vec::new();
+                for i in 0..30 {
+                    if i > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    if let Some(p) = self.node.sealable_pool(&self.repo_id) {
+                        self.pool = p;
+                    }
+                    ws = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
+                    if !ws.is_empty() {
+                        break;
+                    }
                 }
-                let ws: Vec<PoolWorker> = self.pool.workers.iter().filter(|w| n.workers.contains(&w.worker_device)).take(MAX_WRAPS).cloned().collect();
                 let w = wraps(&ws, &self.task, &self.route, &self.ck);
                 let _ = self.up.send(up(submit_up::Msg::Wraps(pb::Wraps { wraps: w }))).await;
                 Step::Continue
