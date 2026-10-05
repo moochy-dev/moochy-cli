@@ -12,7 +12,6 @@ use moochy_proto::msg::{self, RouteHeader};
 use moochy_worker::firewall::{self, Facts, Policy};
 use moochy_worker::{Effort, Flags};
 use serde_json::{Value, json};
-use sha2::Sha256;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,7 +213,9 @@ pub const MAX_DETAIL: usize = 1024;
 fn k_det(ck: &[u8; 32], r: &[u8; 32], task: &str, worker: &str, attempt: u32) -> Option<zeroize::Zeroizing<[u8; 32]>> {
     let info = lp(&[LABEL_DETAIL, task.as_bytes(), worker.as_bytes(), &u64::from(attempt).to_be_bytes()]);
     let mut k = zeroize::Zeroizing::new([0u8; 32]);
-    hkdf::Hkdf::<Sha256>::new(Some(r), ck).expand(&info, k.as_mut()).ok()?;
+    let info = [info.as_slice()];
+    let prk = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, r).extract(ck);
+    prk.expand(&info, ring::hkdf::HKDF_SHA256).and_then(|o| o.fill(k.as_mut())).ok()?;
     Some(k)
 }
 

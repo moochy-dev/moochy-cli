@@ -14,7 +14,6 @@
 use crate::gateway::{Body, Resp, json_resp};
 use crate::util::{Result, b64e, ct_eq, internal, usage};
 use bytes::Bytes;
-use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -58,7 +57,7 @@ pub fn check(token: &str) -> Option<Run> {
     if !token.starts_with(TOKEN_PREFIX) {
         return None;
     }
-    runs().get(&<[u8; 32]>::from(Sha256::digest(token.as_bytes()))).cloned()
+    runs().get(&moochy_proto::crypto::sha256(token.as_bytes())).cloned()
 }
 
 pub fn key_ok(presented: Option<&str>) -> bool {
@@ -135,7 +134,7 @@ pub fn open(slug: String, platform: bool, presented_key: Option<&str>, peer: Opt
     let pid = peer.and_then(|p| p.pid);
     let Ok(raw) = crate::util::rand_bytes::<32>() else { return json_resp(500, &serde_json::json!({"error": "internal"})) };
     let token = format!("{TOKEN_PREFIX}{}", b64e(&raw));
-    let digest = <[u8; 32]>::from(Sha256::digest(token.as_bytes()));
+    let digest = moochy_proto::crypto::sha256(token.as_bytes());
     {
         let mut r = runs();
         if r.len() >= MAX_RUNS {

@@ -39,8 +39,6 @@ moochy-keylog = { path = "../keylog", version = "0.1.6", features = ["http"] }
 moochy-sandbox = { path = "../sandbox", version = "0.1.6" }
 # CONTRACT §20: `moochy tui` (ratatui + crossterm, the only UI crates); NodeSource lives here.
 moochy-tui = { path = "../tui", version = "0.1.6" }
-# K_det for sealed refusal details (CONTRACT §3); same version moochy-proto already links.
-hkdf = { version = "0.12", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal", "process", "fs"] }
 hyper = { version = "1.7", default-features = false, features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.17", default-features = false, features = ["tokio", "service"] }
@@ -61,7 +59,6 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
 scrypt = { version = "0.11", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-sha2 = { version = "0.10", default-features = false }
 # HMAC-SHA256 for local tokens and affinity keys (Secrets::mac): ring is already in the tree
 # (rustls' crypto provider) and uses the CPU's SHA instructions; replaces the hmac crate.
 ring = { version = "0.17", default-features = false }

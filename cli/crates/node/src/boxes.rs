@@ -21,7 +21,6 @@ use crate::util::{Result, auth, b64e, clean, emit, fmt_dollars, internal, net, n
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 use tonic::Status;
 
@@ -47,7 +46,7 @@ pub struct BoxState {
 /// The machine fingerprint of the running system, when it has one.
 pub fn fingerprint() -> Option<String> {
     let m = machine_id()?;
-    Some(b64e(&Sha256::digest(crate::util::lp(&[b"moochy/v1/box-machine", m.trim().as_bytes()]))))
+    Some(b64e(&moochy_proto::crypto::sha256(&crate::util::lp(&[b"moochy/v1/box-machine", m.trim().as_bytes()]))))
 }
 
 #[cfg(target_os = "linux")]

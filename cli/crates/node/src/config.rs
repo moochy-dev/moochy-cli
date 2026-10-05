@@ -98,8 +98,7 @@ fn normalize_relay(r: &str) -> String {
 
 /// Short stable tag of a relay origin (file names, keychain entries).
 pub fn origin_tag(origin: &str) -> String {
-    use sha2::Digest as _;
-    sha2::Sha256::digest(origin.as_bytes()).iter().take(8).fold(String::new(), |mut s, b| {
+    moochy_proto::crypto::sha256(origin.as_bytes()).iter().take(8).fold(String::new(), |mut s, b| {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
         s
