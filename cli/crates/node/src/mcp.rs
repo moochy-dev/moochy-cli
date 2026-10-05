@@ -44,6 +44,9 @@ pub type Out = mpsc::Sender<Value>;
 pub struct Session {
     node: Arc<Node>,
     slug: String,
+    /// Streamable HTTP only: the caller's token digest, so a cancellation reaches only the
+    /// caller's own requests (G41).
+    caller: Option<[u8; 32]>,
     /// stdio only: server → client channel (notifications, roots requests).
     out: Option<Out>,
     inflight: Mutex<HashMap<String, AbortHandle>>,
@@ -65,9 +68,14 @@ fn tool_text(text: &str, is_error: bool) -> Value {
 
 impl Session {
     pub fn new(node: Arc<Node>, slug: String, out: Option<Out>) -> Arc<Self> {
+        Self::with_caller(node, slug, out, None)
+    }
+
+    fn with_caller(node: Arc<Node>, slug: String, out: Option<Out>, caller: Option<[u8; 32]>) -> Arc<Self> {
         Arc::new(Self {
             node,
             slug,
+            caller,
             out,
             inflight: Mutex::new(HashMap::new()),
             roots_capable: Mutex::new(false),
@@ -169,8 +177,8 @@ impl Session {
                     if let Some(h) = lock(&self.inflight).remove(&rid.to_string()) {
                         h.abort();
                     }
-                    if let Some(h) = lock(&HTTP_INFLIGHT).remove(&(self.slug.clone(), rid.to_string())) {
-                        h.abort();
+                    if let Some(c) = self.caller {
+                        cancel_http(c, &rid.to_string());
                     }
                 }
             }
@@ -568,7 +576,21 @@ pub async fn run_pipe(node: Arc<Node>, slug: String, cwd: PathBuf, mut input: mp
 
 // --------------------------------------------------------------- Streamable HTTP (/mcp)
 
-static HTTP_INFLIGHT: LazyLock<Mutex<HashMap<(String, String), AbortHandle>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// In-flight HTTP calls by (caller token digest, JSON-RPC id): a token cancels only its own.
+type HttpKey = ([u8; 32], String);
+static HTTP_INFLIGHT: LazyLock<Mutex<HashMap<HttpKey, AbortHandle>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cancel_http(caller: [u8; 32], rid: &str) {
+    if let Some(h) = lock(&HTTP_INFLIGHT).remove(&(caller, rid.to_owned())) {
+        h.abort();
+    }
+}
+
+/// The digest keying [`HTTP_INFLIGHT`]: the credential the gateway authenticated.
+fn caller_of(h: &hyper::HeaderMap) -> [u8; 32] {
+    let cred = h.get("x-api-key").or_else(|| h.get(header::AUTHORIZATION)).map_or(&b""[..], HeaderValue::as_bytes);
+    moochy_proto::crypto::sha256(cred)
+}
 
 /// `POST /mcp` (stateless server: no `Mcp-Session-Id`); `GET`/`DELETE` → 405.
 pub async fn http(node: Arc<Node>, slug: String, req: Request<Incoming>) -> Resp {
@@ -582,6 +604,7 @@ pub async fn http(node: Arc<Node>, slug: String, req: Request<Incoming>) -> Resp
     {
         return json_resp(400, &rpc_err(&Value::Null, -32600, "unsupported MCP-Protocol-Version"));
     }
+    let caller = caller_of(req.headers());
     let raw = match read_body(req.into_body(), crate::gateway::MAX_MCP_BODY).await {
         Ok(b) => b,
         Err(f) => return json_resp(413, &rpc_err(&Value::Null, -32600, &fail_text(&f))),
@@ -590,7 +613,7 @@ pub async fn http(node: Arc<Node>, slug: String, req: Request<Incoming>) -> Resp
         return json_resp(400, &rpc_err(&Value::Null, -32700, "parse error"));
     };
     let is_request = msg.get("method").is_some() && msg.get("id").is_some();
-    let sess = Session::new(node, slug.clone(), None);
+    let sess = Session::with_caller(node, slug, None, Some(caller));
     if !is_request {
         let _ = sess.handle(msg, None).await;
         let mut r = Response::new(Body::Full(None));
@@ -601,7 +624,7 @@ pub async fn http(node: Arc<Node>, slug: String, req: Request<Incoming>) -> Resp
     let wants_progress = msg.get("method").and_then(Value::as_str) == Some("tools/call") && msg.pointer("/params/_meta/progressToken").is_some();
     if !wants_progress {
         let job = tokio::spawn(async move { sess.handle(msg, None).await });
-        let key = (slug, id);
+        let key = (caller, id);
         lock(&HTTP_INFLIGHT).insert(key.clone(), job.abort_handle());
         let _guard = AbortOnDrop(job.abort_handle());
         let r = job.await;
@@ -614,7 +637,7 @@ pub async fn http(node: Arc<Node>, slug: String, req: Request<Incoming>) -> Resp
     // SSE: progress notifications, then the response, then close.
     let (out, mut out_rx) = mpsc::channel::<Value>(32);
     let (btx, brx) = mpsc::channel::<Bytes>(32);
-    let key = (slug, id);
+    let key = (caller, id);
     let job = {
         let out = out.clone();
         tokio::spawn(async move {
@@ -654,6 +677,24 @@ mod tests {
         assert!(!f.to_ascii_lowercase().contains("\n[moochy]"));
         assert!(!f.contains("Moochy Tripwire)"), "{f}");
         assert!(f.contains("source=\"moochy donor d&quot;o\""));
+    }
+
+    /// G41: a cancellation reaches only the cancelling token's own HTTP calls.
+    #[test]
+    fn http_cancel_is_per_caller() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job = tokio::spawn(std::future::pending::<()>());
+            let mut a = hyper::HeaderMap::new();
+            a.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer token-a"));
+            let mut b = hyper::HeaderMap::new();
+            b.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer token-b"));
+            lock(&HTTP_INFLIGHT).insert((caller_of(&b), "7".into()), job.abort_handle());
+            cancel_http(caller_of(&a), "7");
+            assert!(lock(&HTTP_INFLIGHT).contains_key(&(caller_of(&b), "7".into())), "another caller's call survives");
+            cancel_http(caller_of(&b), "7");
+            assert!(job.await.unwrap_err().is_cancelled(), "its own caller cancels it");
+        });
     }
 
     #[test]

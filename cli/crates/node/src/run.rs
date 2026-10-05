@@ -214,12 +214,22 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     rt.block_on(async {
         // The minting response stays open for the whole run: the token dies with it.
-        let (token, hold) = mint(&gw.state_dir.join("gateway.sock"), port, &gw.repo_token, key.trim(), false).await?;
+        let sock = gw.state_dir.join("gateway.sock");
+        let (token, hold) = mint(&sock, port, &gw.repo_token, key.trim(), false).await?;
+        // G42: Linux bridges the gateway's port inside the sandbox netns to its socket. macOS has
+        // no netns, and a run token counts only on the socket (A215): bridge a loopback port here.
+        let (agent_port, bridged) = if cfg!(target_os = "macos") {
+            let (local, task) = start_bridge(&sock, port).await?;
+            (local, Some(task))
+        } else {
+            (port, None)
+        };
+        let at = |url: &str| url.replacen(&format!(":{port}"), &format!(":{agent_port}"), 1);
         let mut spec = moochy_sandbox::Spec::new(worktree.clone());
         spec.cwd = cwd.starts_with(&worktree).then_some(cwd);
-        spec.gateway_socket = Some(gw.state_dir.join("gateway.sock"));
-        spec.gateway_loopback_port = Some(port);
-        for (k, v) in gateway_env(&gw.anthropic, &gw.openai, &gw.mcp, &token) {
+        spec.gateway_socket = Some(sock);
+        spec.gateway_loopback_port = Some(agent_port);
+        for (k, v) in gateway_env(&at(&gw.anthropic), &at(&gw.openai), &at(&gw.mcp), &token) {
             spec.env.insert(k.into(), v.into());
         }
         spec.run_token = Some(token);
@@ -237,6 +247,9 @@ pub fn run_sandboxed(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::pat
         }
         let (prog, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = (prog.into(), args.iter().map(Into::into).collect());
         let r = tokio::task::spawn_blocking(move || spec.run(&prog, &args)).await.map_err(|_| internal("sandbox launcher failed"))?;
+        if let Some(b) = bridged {
+            b.abort();
+        }
         drop(hold);
         r.map_err(|e| usage(format!("the sandbox could not be set up, nothing ran: {e}")))
     })
@@ -364,9 +377,7 @@ pub fn run_platform(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::path
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     rt.block_on(async {
         let (token, hold) = mint(&sock, port, &gw.repo_token, key.trim(), true).await?;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| internal(format!("bridge: {e}")))?;
-        let local = listener.local_addr().map_err(|e| internal(format!("bridge: {e}")))?.port();
-        let bridge = tokio::spawn(bridge(listener, sock, format!("127.0.0.1:{port}")));
+        let (local, bridge) = start_bridge(&sock, port).await?;
         let at = |url: &str| url.replacen(&format!(":{port}"), &format!(":{local}"), 1);
         let mut c = std::process::Command::new(prog);
         c.args(args).env_clear().current_dir(if cwd.starts_with(&worktree) { &cwd } else { &worktree });
@@ -385,6 +396,13 @@ pub fn run_platform(gw: &GatewayInfo, cmd: &[String], worktree: Option<std::path
         drop(hold);
         Ok(st.code().unwrap_or(1))
     })
+}
+
+/// A loopback port bridged to the gateway socket by [`bridge`]: the port and the bridge task.
+async fn start_bridge(sock: &Path, port: u16) -> Result<(u16, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| internal(format!("bridge: {e}")))?;
+    let local = listener.local_addr().map_err(|e| internal(format!("bridge: {e}")))?.port();
+    Ok((local, tokio::spawn(bridge(listener, sock.to_path_buf(), format!("127.0.0.1:{port}")))))
 }
 
 /// Loopback → gateway socket, request by request, with the gateway's own Host (DNS-rebinding
@@ -518,6 +536,42 @@ mod tests {
         assert!(guard_worktree(&link, &mh).is_err(), "symlinked spelling of a dir containing the home");
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// G42: the loopback bridge a macOS `moochy run` points the agent at reaches the gateway's
+    /// socket, with the gateway's own Host.
+    #[test]
+    fn bridge_reaches_the_gateway_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let dir = std::env::temp_dir().join(format!("moochy-bridge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("gateway.sock");
+        let _ = std::fs::remove_file(&sock);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let gw = tokio::net::UnixListener::bind(&sock).unwrap();
+            let fake = tokio::spawn(async move {
+                let (mut s, _) = gw.accept().await.unwrap();
+                let mut req = Vec::new();
+                while !req.ends_with(b"\r\n\r\n") {
+                    let mut b = [0u8; 1];
+                    s.read_exact(&mut b).await.unwrap();
+                    req.push(b[0]);
+                }
+                s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+                String::from_utf8(req).unwrap()
+            });
+            let (local, task) = start_bridge(&sock, 4242).await.unwrap();
+            let mut c = tokio::net::TcpStream::connect(("127.0.0.1", local)).await.unwrap();
+            c.write_all(format!("GET /v1/models HTTP/1.1\r\nhost: 127.0.0.1:{local}\r\n\r\n").as_bytes()).await.unwrap();
+            let mut resp = vec![0u8; 64];
+            let n = c.read(&mut resp).await.unwrap();
+            assert!(resp[..n].starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&resp[..n]));
+            let req = fake.await.unwrap().to_ascii_lowercase();
+            assert!(req.starts_with("get /v1/models") && req.contains("host: 127.0.0.1:4242"), "{req}");
+            task.abort();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
