@@ -53,8 +53,10 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let scan = mask::scan_kept(&worktree, spec.mask_record.as_deref())?;
+    mask::notice_frozen(scan.masks.len());
     let git = crate::git::view(&worktree, spec.git_writable, &scan.dotgits)?;
     let _placeholder = git.placeholder.clone().map(RmdirOnDrop);
+    let _commondir = git.commondir_dot.clone().map(RmCommondirOnDrop);
     let git_before = crate::git::snapshot(&scan.dotgits.iter().chain(&git.placeholder).cloned().collect::<Vec<_>>());
     let masks = scan.masks;
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
@@ -922,6 +924,17 @@ struct RmdirOnDrop(PathBuf);
 impl Drop for RmdirOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// The `commondir` of `.` made for `--git-writable` (G20), removed when the run ends if it
+/// still says `.`.
+struct RmCommondirOnDrop(PathBuf);
+impl Drop for RmCommondirOnDrop {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.0).is_ok_and(|t| t == crate::git::COMMONDIR_DOT) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }
 

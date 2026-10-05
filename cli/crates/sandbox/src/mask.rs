@@ -76,6 +76,8 @@ pub struct Scan {
     pub masks: Vec<PathBuf>,
     /// Every `.git` entry (dir or file) at any depth, the top-level one included.
     pub dotgits: Vec<PathBuf>,
+    /// Non-directory entries with more than one name (G21): `(inode, path)`.
+    links: Vec<(u64, PathBuf)>,
 }
 
 /// Collect absolute paths under `worktree` to overmount: secret-shaped names
@@ -99,7 +101,13 @@ pub fn scan_kept(worktree: &Path, record: Option<&Path>) -> Result<Scan, Error> 
     let Some(record) = record else { return scan(worktree) };
     let kept: HashSet<u64> = std::fs::read_to_string(record).unwrap_or_default().lines().filter_map(|l| l.parse().ok()).collect();
     let s = scan_with(worktree, &kept)?;
-    let text: Vec<String> = s.masks.iter().filter_map(|m| std::fs::symlink_metadata(m).ok()).map(|m| m.ino().to_string()).collect();
+    // G07: the record only grows. A kept inode this walk did not reach (under a directory masked
+    // whole, or unreadable) stays kept. ponytail: a deleted secret's reused inode stays masked
+    // (fail closed); removing the record file resets it.
+    let mut inos: Vec<u64> = s.masks.iter().filter_map(|m| std::fs::symlink_metadata(m).ok()).map(|m| m.ino()).chain(kept).collect();
+    inos.sort_unstable();
+    inos.dedup();
+    let text: Vec<String> = inos.iter().map(u64::to_string).collect();
     let text = text.join("\n");
     let tmp = record.with_extension("tmp");
     record
@@ -123,9 +131,31 @@ fn scan_with(worktree: &Path, kept: &HashSet<u64>) -> Result<Scan, Error> {
             s.masks.push(c);
         }
     }
+    // G21: a hard link is the same file under another name, so every name of a masked inode is
+    // masked, including one inside a masked directory or `.git`.
+    let masked: HashSet<&Path> = s.masks.iter().map(PathBuf::as_path).collect();
+    let under = |p: &Path| p.ancestors().any(|a| masked.contains(a));
+    let inos: HashSet<u64> = s.links.iter().filter(|(_, p)| under(p)).map(|(i, _)| *i).collect();
+    let aliases: Vec<PathBuf> = s.links.iter().filter(|(i, p)| inos.contains(i) && !under(p)).map(|(_, p)| p.clone()).collect();
+    for p in aliases {
+        push_mask(&mut s.masks, p)?;
+    }
     s.masks.sort();
     s.masks.dedup();
     Ok(s)
+}
+
+fn push_mask(masks: &mut Vec<PathBuf>, p: PathBuf) -> Result<(), Error> {
+    if masks.len() >= MASK_LIMIT {
+        return Err(too_big("mask limit"));
+    }
+    masks.push(p);
+    Ok(())
+}
+
+/// G37: masks are computed once, before the run; say so when the run starts.
+pub fn notice_frozen(n: usize) {
+    eprintln!("moochy: {n} secret path(s) hidden from the agent; a secret added to the worktree during the run is not");
 }
 
 /// Only the `.git` entries (no masks, no `git`): for the post-run check.
@@ -144,33 +174,61 @@ fn too_big(what: &'static str) -> Error {
     Error::Setup { what, err: std::io::Error::other("worktree too large to scan for secrets (fail closed)") }
 }
 
+/// Walk every entry under `root`. `masks`: also collect masks, failing closed: an entry that
+/// cannot be inspected is masked whole (G07: the agent owns the tree and may `chmod 000` a
+/// directory, then `chmod` it back inside the jail). `.git` dirs are walked too (G06: a secret
+/// moved under a nested `.git` stays masked), and so is every masked directory, only to find
+/// the hard links of the files inside (G21).
 fn walk_tree(root: &Path, masks: bool, kept: &HashSet<u64>) -> Result<Scan, Error> {
-    use std::os::unix::fs::DirEntryExt as _;
+    use std::os::unix::fs::{DirEntryExt as _, MetadataExt as _};
     let mut s = Scan::default();
     let mut seen = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue }; // unreadable: also unreadable inside
-        for entry in rd.flatten() {
+    // (directory, inside a mask)
+    let mut stack = vec![(root.to_path_buf(), false)];
+    while let Some((dir, inside)) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) if inside => continue, // masked whole already
+            Err(err) if dir == root => return Err(Error::Setup { what: "read the worktree", err }),
+            Err(_) if masks => {
+                push_mask(&mut s.masks, dir)?;
+                continue;
+            }
+            // Post-run check: only a directory of another user than the worktree's owner is
+            // unreadable for the agent too.
+            Err(err) => match (std::fs::symlink_metadata(&dir), std::fs::metadata(root)) {
+                (Ok(m), Ok(r)) if m.uid() != r.uid() => continue,
+                _ => return Err(Error::Setup { what: "read a worktree directory", err }),
+            },
+        };
+        for entry in rd {
+            let entry = entry.map_err(|err| Error::Setup { what: "read a worktree directory", err })?;
             seen = seen.saturating_add(1);
             if seen > WALK_LIMIT {
                 return Err(too_big("mask walk limit"));
             }
-            let name = entry.file_name();
             let path = entry.path();
-            if name.as_bytes().eq_ignore_ascii_case(b".git") {
-                s.dotgits.push(path);
-                continue; // its contents are handled by git::view
+            if entry.file_name().as_bytes().eq_ignore_ascii_case(b".git") {
+                s.dotgits.push(path.clone());
             }
-            if masks && (kept.contains(&entry.ino()) || matches_secret(root, &path)) {
-                if s.masks.len() >= MASK_LIMIT {
-                    return Err(too_big("mask limit"));
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if masks && !is_dir {
+                match entry.metadata() {
+                    Ok(m) if m.nlink() > 1 => s.links.push((m.ino(), path.clone())),
+                    Ok(_) => {}
+                    Err(_) if inside => {}
+                    Err(_) => {
+                        push_mask(&mut s.masks, path)?;
+                        continue;
+                    }
                 }
-                s.masks.push(path);
-                continue; // whole subtree masked; no need to descend
             }
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                stack.push(path);
+            let hit = masks && !inside && (kept.contains(&entry.ino()) || matches_secret(root, &path));
+            if hit {
+                push_mask(&mut s.masks, path.clone())?;
+            }
+            if is_dir {
+                stack.push((path, inside || hit));
             }
         }
     }
@@ -340,6 +398,72 @@ mod tests {
         assert!(scan(&wt).unwrap().masks.is_empty(), "without a record the file is visible");
         let masks = scan_kept(&wt, Some(&record)).unwrap().masks;
         assert!(masks.contains(&wt.join("conf2/local_settings.py")), "F09: {masks:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A worktree with `config/local_settings.py` git-ignored, masked once into `record`.
+    fn masked_once(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let root = std::env::temp_dir().join(format!("moochy-mask-{name}-{}", std::process::id()));
+        let (wt, record) = (root.join("wt"), root.join("state/masks/wt"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(wt.join("config")).unwrap();
+        if !std::process::Command::new("git").arg("-C").arg(&wt).args(["init", "-q"]).status().is_ok_and(|s| s.success()) {
+            return None; // no git here: nothing to check
+        }
+        std::fs::write(wt.join(".gitignore"), "config/local_settings.py\n").unwrap();
+        std::fs::write(wt.join("config/local_settings.py"), "SECRET = 1\n").unwrap();
+        std::fs::write(wt.join("config/settings.py"), "DEBUG = 0\n").unwrap();
+        assert!(scan_kept(&wt, Some(&record)).unwrap().masks.contains(&wt.join("config/local_settings.py")));
+        Some((root, wt, record))
+    }
+
+    #[test]
+    fn g06_a_secret_moved_under_a_nested_dotgit_stays_masked() {
+        let Some((root, wt, record)) = masked_once("g06") else { return };
+        // Run 1's agent: the parent of the mask moves into a new nested `.git`.
+        std::fs::create_dir_all(wt.join("sub/.git")).unwrap();
+        std::fs::rename(wt.join("config"), wt.join("sub/.git/config")).unwrap();
+        let s = scan_kept(&wt, Some(&record)).unwrap();
+        assert!(s.masks.contains(&wt.join("sub/.git/config/local_settings.py")), "{:?}", s.masks);
+        assert!(s.dotgits.contains(&wt.join("sub/.git")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn g07_an_unreadable_directory_is_masked_and_its_record_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some((root, wt, record)) = masked_once("g07") else { return };
+        let cfg = wt.join("config");
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&cfg).is_ok() {
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            return; // root ignores modes: nothing to check
+        }
+        let masks = scan_kept(&wt, Some(&record)).unwrap().masks;
+        assert!(masks.contains(&cfg), "fail closed: the unreadable dir is masked whole: {masks:?}");
+        // Inside the jail the agent chmods it back: the secret is still masked by its inode.
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(wt.join(".gitignore"), "").unwrap();
+        let masks = scan_kept(&wt, Some(&record)).unwrap().masks;
+        assert!(cfg.join("local_settings.py").ancestors().any(|a| masks.iter().any(|m| m == a)), "the record kept the inode: {masks:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn g21_every_hard_link_of_a_masked_file_is_masked() {
+        let root = std::env::temp_dir().join(format!("moochy-mask-g21-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/.ssh")).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::hard_link(root.join(".env"), root.join("notes.txt")).unwrap();
+        std::fs::write(root.join("a/.ssh/key"), "k\n").unwrap();
+        std::fs::hard_link(root.join("a/.ssh/key"), root.join("a/readme")).unwrap();
+        let masks = scan(&root).unwrap().masks;
+        for p in ["notes.txt", "a/readme"] {
+            assert!(masks.contains(&root.join(p)), "{p}: {masks:?}");
+        }
+        assert!(!masks.contains(&root.join("a/.ssh/key")), "inside a masked dir: covered by it");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

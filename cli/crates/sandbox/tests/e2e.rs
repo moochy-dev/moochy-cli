@@ -406,10 +406,13 @@ fn e97_git_ignored_masked_and_git_exec_paths_read_only() {
     // Opt-in git_writable: git can write its own files, hooks/config stay read-only.
     let o = sandboxed(&f, &["--git-writable"], &["write", &f.path("wt/.git/HEAD.new")]);
     assert!(has(&o, "write-ok"), "{}", o.stdout);
-    for rel in [".git/hooks/pre-commit", ".git/config"] {
+    // G20: also every path git reads config, hooks or a redirect from, existing or not.
+    for rel in [".git/hooks/pre-commit", ".git/config", ".git/commondir", ".git/config.worktree", ".git/info/attributes", ".git/modules/m/config", ".git/worktrees/w/commondir", ".git/remotes/origin"] {
         let o = sandboxed(&f, &["--git-writable"], &["write", &f.path(&format!("wt/{rel}"))]);
         assert!(has(&o, "write-fail"), "{rel} writable with git_writable: {}", o.stdout);
     }
+    assert!(!wt.join(".git/commondir").exists(), "the `.` commondir is removed after the run");
+    assert_eq!(git(&["status", "--short"]).ok(), Some(true), "the host's git still works");
     // F21: a config holding a token reads empty inside (the mask beats the .git bind).
     let cfg = wt.join(".git/config");
     let mut text = std::fs::read_to_string(&cfg).unwrap();
