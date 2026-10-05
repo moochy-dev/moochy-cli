@@ -18,10 +18,10 @@
 //! by default and `process-exec*`/`process-fork` on the donor side.
 
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
+use crate::macos_profile::{donor_profile, maintainer_profile};
 use crate::{DonorPolicy, Error, LockdownReport, Spec, Validator, mask};
 
 fn setup(what: &'static str, err: std::io::Error) -> Error {
@@ -42,6 +42,12 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         .canonicalize()
         .map_err(|e| setup("canonicalize worktree", e))?;
     let scan = mask::scan_kept(&worktree, spec.mask_record.as_deref())?;
+    crate::mask::notice_frozen(scan.masks.len());
+    // G39: Seatbelt has no process cap, RLIMIT_NPROC is per user and RLIMIT_AS is not enforced.
+    let d = crate::Limits::default();
+    if spec.limits.processes != d.processes || spec.limits.memory_bytes != d.memory_bytes {
+        eprintln!("moochy: note: the process and memory limits are not enforced on macOS");
+    }
     let git_before = crate::git::snapshot(&scan.dotgits);
     // A private scratch dir per run: the shared /tmp and the per-user
     // /var/folders stay out of reach (other apps' files live there).
@@ -63,7 +69,9 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
         }
     };
     let proxy_port = proxy.as_ref().and_then(crate::proxy::Proxy::port);
-    let profile = maintainer_profile(spec, &worktree, &scan.masks, &scratch, proxy_port);
+    // G23: the run's own terminal, the only one the profile opens.
+    let ttys: Vec<std::path::PathBuf> = (0..3).filter_map(crate::sys_macos::ttyname).collect();
+    let profile = maintainer_profile(spec, &worktree, &scan.masks, &scratch, proxy_port, &ttys);
     let profile = match profile {
         Ok(p) => p,
         Err(e) => {
@@ -131,12 +139,6 @@ fn make_scratch() -> Result<std::path::PathBuf, Error> {
     dir.canonicalize().map_err(|e| setup("canonicalize scratch dir", e))
 }
 
-/// Seatbelt matches resolved paths (`/var` is `/private/var`, `/tmp` is
-/// `/private/tmp`): every path in a profile goes through here first.
-fn real(p: &Path) -> String {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
-}
-
 fn apply_env(cmd: &mut Command, spec: &Spec, scratch: &Path, home: &Path, proxy_port: Option<u16>) {
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     // A private home in the scratch dir: tools' creds/history never land in
@@ -164,143 +166,6 @@ fn code(s: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     s.code()
         .unwrap_or_else(|| s.signal().map_or(-1, |sig| 128i32.saturating_add(sig)))
-}
-
-/// Deny-by-default maintainer profile: read system paths, read-write the
-/// worktree + scratch, deny the masked secret files explicitly, network only to
-/// the gateway loopback port, no exec of setuid helpers, no mach services.
-pub fn maintainer_profile(
-    spec: &Spec,
-    worktree: &Path,
-    masks: &[std::path::PathBuf],
-    scratch: &Path,
-    proxy_port: Option<u16>,
-) -> Result<String, Error> {
-    let wt = sbpl_quote(&worktree.to_string_lossy());
-    let wt_re = regex_escape(&worktree.to_string_lossy())
-        .ok_or(Error::Unsupported("worktree path has characters the macOS profile cannot express"))?;
-    let mut p = String::new();
-    // Rules are matched last-wins: `deny default` first, allows after, the
-    // secret masks last so they beat the worktree allow.
-    p.push_str("(version 1)\n(deny default)\n");
-    // Diagnostics off; we never want the sandbox to prompt.
-    p.push_str("(deny file-write* file-read* (with no-report))\n");
-    // An agent runs tools: it may fork and exec, and signal its own processes only.
-    p.push_str("(allow process-fork)\n");
-    p.push_str("(allow signal (target same-sandbox))\n");
-    p.push_str("(allow sysctl-read)\n");
-    p.push_str("(allow file-read-metadata)\n");
-    // System paths (and dyld): read + exec.
-    p.push_str("(allow process-exec* file-read* (regex #\"^/(usr|bin|sbin|opt|System|Library|Applications)/\"))\n");
-    // F23: not the package managers' own data and config (Homebrew, MacPorts): user-owned
-    // local databases and service configs live there. Their CA bundles stay readable.
-    p.push_str(HOMEBREW_DATA_DENY);
-    p.push_str("(allow file-read* (regex #\"^/(private/etc|private/var/db|etc)/\") (literal \"/\") (literal \"/private\"))\n");
-    // Basic devices and the terminal (interactive agents).
-    p.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\") (literal \"/dev/dtracehelper\"))\n");
-    p.push_str("(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\"))\n");
-    // getpwuid() etc.; every other mach service (keychain, pasteboard, launchd
-    // services, Apple Events) stays denied.
-    p.push_str("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
-    // Tool directories the caller allows (read + exec), worktree read-write, scratch.
-    for ro in &spec.ro_paths {
-        let _ = writeln!(p, "(allow process-exec* file-read* (subpath {}))", sbpl_quote(&real(ro)));
-    }
-    let _ = writeln!(p, "(allow process-exec* file-read* file-write* (subpath {wt}))");
-    let _ = writeln!(p, "(allow file-read* file-write* (subpath {}))", sbpl_quote(&real(scratch)));
-    for p2 in &spec.rw_paths {
-        let _ = writeln!(p, "(allow file-read* file-write* (subpath {}))", sbpl_quote(&real(p2)));
-    }
-    // Network: the gateway only (loopback port and/or its Unix socket).
-    for port in spec.gateway_loopback_port.into_iter().chain(proxy_port) {
-        let _ = writeln!(p, "(allow network-outbound (remote ip \"localhost:{port}\"))");
-    }
-    if let Some(sock) = &spec.gateway_socket {
-        let q = sbpl_quote(&real(sock));
-        let _ = writeln!(p, "(allow network-outbound (remote unix-socket (path-literal {q})))");
-        let _ = writeln!(p, "(allow file-read* file-write* (literal {q}))");
-    }
-    // Mask secret-shaped / git-ignored files last: they beat every allow above. A deny is a
-    // path, fixed at start: renaming a directory above a mask would move the secret out from
-    // under it (F03), so no directory between the worktree and a mask may be renamed or removed.
-    let mut ancestors = std::collections::BTreeSet::new();
-    for m in masks {
-        let _ = writeln!(p, "(deny file-read* file-write* process-exec* (subpath {}))", sbpl_quote(&m.to_string_lossy()));
-        ancestors.extend(mask::ancestors_below(worktree, m));
-    }
-    for a in ancestors {
-        let _ = writeln!(p, "(deny file-write-unlink (literal {}))", sbpl_quote(&a.to_string_lossy()));
-    }
-    // Git metadata the host's git later trusts (A191): no write to any `.git`
-    // at any depth — which also blocks creating one (`git init`, a nested repo).
-    // `git_writable` reopens the top-level one except the files that make the
-    // host run code or redirect.
-    let git_re = "\\.[gG][iI][tT]";
-    if spec.git_writable {
-        let _ = writeln!(p, "(deny file-write* (regex #\"^{wt_re}/.+/{git_re}(/|$)\"))");
-        let _ = writeln!(
-            p,
-            "(deny file-write* (regex #\"^{wt_re}/{git_re}/(hooks|config|config\\.worktree|modules|commondir)(/|$)\"))"
-        );
-    } else {
-        let _ = writeln!(p, "(deny file-write* (regex #\"^{wt_re}/(.+/)?{git_re}(/|$)\"))");
-    }
-    Ok(p)
-}
-
-const HOMEBREW_DATA_DENY: &str = "(deny file-read* file-write* process-exec* (regex #\"^/(opt/homebrew|opt/local|usr/local)/(var|etc)(/|$)\"))\n\
-    (allow file-read* (regex #\"^/(opt/homebrew|opt/local|usr/local)/etc/(openssl[^/]*|ca-certificates)/\"))\n";
-
-/// A path as a literal inside an SBPL `#"…"` regex; `None` for characters we
-/// can't express safely there (quote, backslash, control).
-fn regex_escape(s: &str) -> Option<String> {
-    let mut out = String::with_capacity(s.len().saturating_mul(2));
-    for c in s.chars() {
-        if c == '"' || c == '\\' || c.is_control() {
-            return None;
-        }
-        if ".^$*+?()[]{}|".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    Some(out)
-}
-
-/// Donor self-lockdown profile (§15.2a): deny process-exec/process-fork, limit
-/// files to the state dir (rw) + CA roots (ro), network outbound to 443 + relay
-/// (+ loopback gateway bind).
-pub fn donor_profile(policy: &DonorPolicy) -> String {
-    let state = sbpl_quote(&real(&policy.state_dir));
-    let mut p = String::new();
-    p.push_str("(version 1)\n(deny default)\n");
-    p.push_str("(deny process-exec*)\n(deny process-fork)\n");
-    let _ = writeln!(p, "(allow file-read* file-write* (subpath {state}))");
-    for ro in &policy.ro_paths {
-        let _ = writeln!(p, "(allow file-read* (subpath {}))", sbpl_quote(&real(ro)));
-    }
-    p.push_str("(allow file-read* (regex #\"^/(usr/lib|System/Library)/\"))\n");
-    // Name resolution for provider hosts: getaddrinfo goes through libinfo and
-    // mDNSResponder (mach service + its Unix socket) and reads /etc/hosts.
-    p.push_str("(allow mach-lookup (global-name \"com.apple.dnssd.service\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
-    p.push_str("(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n");
-    p.push_str("(allow file-read-metadata)\n");
-    p.push_str("(allow file-read* (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/var/run/resolv.conf\") (literal \"/Library/Preferences/com.apple.networkd.plist\"))\n");
-    p.push_str("(allow sysctl-read)\n");
-    let _ = writeln!(p, 
-        "(allow network-outbound (remote tcp \"*:443\") (remote tcp \"*:{}\"))",
-        policy.relay_port
-    );
-    // Dev/e2e only: fake providers on loopback ports (empty in production).
-    for port in &policy.connect_ports {
-        let _ = writeln!(p, "(allow network-outbound (remote tcp \"*:{port}\"))");
-    }
-    if let Some(gw) = policy.gateway_port {
-        let _ = writeln!(p, 
-            "(allow network-inbound (local tcp \"localhost:{gw}\"))"
-        );
-    }
-    p
 }
 
 /// Apply a Seatbelt profile to the current process via `sandbox_init(3)`.
@@ -376,30 +241,4 @@ pub fn lockdown_zygote() -> Result<(), Error> {
     crate::sys_macos::apply_profile(ZYGOTE_PROFILE).map_err(|e| setup("sandbox_init (zygote)", e))?;
     ZYGOTE_CAGED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
-}
-
-/// SBPL string literal with escaping of `"` and `\`.
-fn sbpl_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len().saturating_add(2));
-    out.push('"');
-    for c in s.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    #[test]
-    fn package_manager_data_is_not_a_system_path() {
-        let wt = std::env::temp_dir();
-        let p = super::maintainer_profile(&crate::Spec::new(wt.clone()), &wt, &[], &wt, None).unwrap();
-        let (sys, deny) = (p.find("(usr|bin|sbin|opt|").unwrap(), p.find(super::HOMEBREW_DATA_DENY).unwrap());
-        assert!(deny > sys, "F23: the deny follows (beats) the system-path allow");
-    }
 }

@@ -52,6 +52,19 @@ pub fn fork() -> io::Result<Fork> {
     }
 }
 
+/// The terminal device open on `fd`, if it is one (G23: the profile opens only that one).
+pub fn ttyname(fd: i32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = [0 as libc::c_char; 128];
+    // SAFETY: `buf` is writable for `buf.len()` bytes; ttyname_r NUL-terminates on success.
+    if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    // SAFETY: on success `buf` holds a NUL-terminated C string.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    Some(std::ffi::OsStr::from_bytes(name.to_bytes()).into())
+}
+
 pub fn exit_immediately(code: i32) -> ! {
     // SAFETY: _exit never returns and touches no user memory.
     unsafe { libc::_exit(code) }

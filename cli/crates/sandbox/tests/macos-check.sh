@@ -43,6 +43,14 @@ R deny /bin/sh -c "curl -s -m 3 https://example.com"
 R deny /bin/sh -c "cat ~/.zshrc"
 R deny /usr/bin/osascript -e "tell application \"System Events\" to get name of every process"
 R deny /usr/bin/pbpaste
+# Round 2 (G08 process table, G33 gateway door, G38 setuid helpers, G09 --git-writable names).
+R deny /bin/ps -p $GW -o pid=
+R deny /bin/rm -f $J/gw.sock
+[ -S $J/gw.sock ] && { pass=$((pass+1)); echo "PASS  gateway socket still there"; } || { fail=$((fail+1)); echo "FAIL  gateway socket unlinked"; }
+R deny /usr/bin/sudo -n true
+for n in COMMONDIR Hooks/pre-commit config.WORKTREE Info/attributes; do
+  if "$B" run $J/wt --ro $BD --git-writable -- "$B" write "$J/wt/.git/$n" >/dev/null 2>&1; then fail=$((fail+1)); echo "FAIL  git-writable created .git/$n"; else pass=$((pass+1)); echo "PASS  git-writable denies .git/$n"; fi
+done
 # --allow-host (CONNECT proxy on an ephemeral loopback port; only that port is reachable).
 RA() { exp=$1; shift; out=$("$B" run $J/wt --ro $BD --allow-host example.com -- "$@" 2>&1); rc=$?; if [ $rc -eq 125 ] || echo "$out" | grep -q "sandbox-exec:"; then v=SETUP; elif [ "$exp" = ok ]; then [ $rc -eq 0 ] && v=PASS || v=FAIL; else [ $rc -ne 0 ] && v=PASS || v=FAIL; fi; [ $v = PASS ] && pass=$((pass+1)) || fail=$((fail+1)); printf "%-5s %-4s rc=%-3s %-50s | %s\n" $v $exp $rc "allow-host: $(echo "$*" | sed "s|$BD/||g" | cut -c1-38)" "$(echo $out | cut -c1-90)"; }
 RA ok   $B env HTTPS_PROXY

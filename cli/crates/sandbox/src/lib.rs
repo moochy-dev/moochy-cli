@@ -53,6 +53,8 @@ mod sys;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_profile;
 #[cfg(target_os = "macos")]
 mod sys_macos;
 
@@ -101,10 +103,10 @@ pub struct Spec {
     pub protected: Vec<PathBuf>,
     /// Resource limits. Defaults are generous but finite (fork-bomb / OOM safe).
     pub limits: Limits,
-    /// Let the agent write `.git` (commit inside). `hooks/`, `config` and
-    /// `modules/` stay read-only, but a created `.git/commondir` would redirect
-    /// the host's git to agent-written config (DESIGN.md). Default `false`:
-    /// `.git` is read-only inside. Linked worktrees are always read-only.
+    /// Let the agent write `.git` (commit inside). Every path git reads config, hooks or a
+    /// redirect from ([`git::GIT_TRUSTED`]: `hooks/`, `config`, `commondir`, …) stays read-only,
+    /// existing or not (G20). Default `false`: `.git` is read-only inside. Linked worktrees are
+    /// always read-only.
     pub git_writable: bool,
     /// File keeping this worktree's masked inodes from one run to the next (F09): a file
     /// masked once stays masked after an agent edits a `.gitignore` or renames its directory.
@@ -118,14 +120,16 @@ pub struct Spec {
 /// Resource limits applied with `setrlimit` (and cgroup v2 when delegated).
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Max address space per process, bytes (`RLIMIT_AS`). 0 = unlimited.
+    /// Max address space per process, bytes (`RLIMIT_AS`). 0 = unlimited. Linux only: macOS
+    /// does not enforce `RLIMIT_AS`.
     pub memory_bytes: u64,
     /// Max CPU seconds (`RLIMIT_CPU`). 0 = unlimited.
     pub cpu_seconds: u64,
     /// Max open files (`RLIMIT_NOFILE`).
     pub open_files: u64,
     /// Max processes/threads for this user inside the userns (`RLIMIT_NPROC`;
-    /// also the sandbox-wide cgroup `pids.max`).
+    /// also the sandbox-wide cgroup `pids.max`). Linux only: on macOS `RLIMIT_NPROC` counts
+    /// the user's whole session and Seatbelt has no process cap.
     pub processes: u64,
     /// Memory for the whole sandbox, bytes (cgroup `memory.max`, swap 0). 0 =
     /// no cgroup memory limit (`memory_bytes` still caps each process).
