@@ -313,6 +313,10 @@ fn e96_donor_lockdown_zero_commands_fs_net() {
     assert!(!o.stdout.contains("SUCCEEDED"), "{}", o.stdout);
     assert!(has(&o, "canary-read-fail"), "{}", o.stdout);
     assert!(has(&o, "state-write-ok"), "{}", o.stdout);
+    // G22: no pathname Unix socket (D-Bus, ssh-agent, docker.sock) on any Landlock ABI.
+    for line in ["unix-connect-fail", "unix-dgram-fail", "unix-dgram-pair-fail", "unix-pair-ok"] {
+        assert!(has(&o, line), "{line}: {}", o.stdout);
+    }
     // The loopback gateway port may be bound; any other port may not.
     assert!(has(&o, "gw-bind-ok"), "{}", o.stdout);
     // Port rules need the Landlock network ABI (>= 4, Linux 6.7): older kernels

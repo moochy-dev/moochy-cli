@@ -196,11 +196,21 @@ pub fn agent_filter() -> Result<Vec<BpfProgram>, Error> {
 }
 
 /// Donor self-lockdown deny-list: everything [`agent_filter`] denies, **plus**
-/// `execve`/`execveat` — "zero commands on donors" (§15.2a).
+/// `execve`/`execveat` — "zero commands on donors" (§15.2a) — **plus** new Unix sockets (G22):
+/// below Landlock ABI 9 nothing else stops a `connect()` to a pathname socket (the user D-Bus,
+/// whose systemd `StartTransientUnit` runs commands; ssh-agent; docker.sock). The donor binds its
+/// own sockets before the lockdown and gets validator channels over SCM_RIGHTS, so it needs no
+/// new ones: `socket(AF_UNIX)` is refused, and `socketpair(AF_UNIX)` (tokio's signal pipe, the
+/// zygote's validator channels) only for connected stream types, since a datagram socket can be
+/// re-aimed with `sendto()`. Name resolution falls back from nss-resolve to DNS on loopback.
 pub fn donor_filter() -> Result<Vec<BpfProgram>, Error> {
     let mut m = deny_common()?;
     m.insert(libc::SYS_execve, Vec::new());
     m.insert(libc::SYS_execveat, Vec::new());
+    let af_unix = |arg| SeccompCondition::new(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, libc::AF_UNIX as u64).map_err(|e| setup("seccomp condition", e));
+    m.insert(libc::SYS_socket, vec![SeccompRule::new(vec![af_unix(0)?]).map_err(|e| setup("seccomp rule", e))?]);
+    let dgram = SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::MaskedEq(0xf), libc::SOCK_DGRAM as u64).map_err(|e| setup("seccomp condition", e))?;
+    m.insert(libc::SYS_socketpair, vec![SeccompRule::new(vec![af_unix(0)?, dgram]).map_err(|e| setup("seccomp rule", e))?]);
     deny_stack(m)
 }
 

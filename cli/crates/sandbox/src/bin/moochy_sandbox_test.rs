@@ -232,6 +232,10 @@ fn donor_selftest(a: &[String]) -> ExitCode {
     let _ = std::fs::copy("/bin/true", &copy);
     let mut policy = moochy_sandbox::DonorPolicy::new(PathBuf::from(&state), relay_port);
     policy.gateway_port = gw_port;
+    // G22: a pathname socket like the user D-Bus, here in the (Landlock-writable) state dir.
+    let bus = format!("{state}/bus.sock");
+    let _ = std::fs::remove_file(&bus);
+    let _bus = std::os::unix::net::UnixListener::bind(&bus);
     match moochy_sandbox::lockdown_self(&policy) {
         Ok(r) => println!(
             "lockdown-ok nnp={} seccomp={} fs={} net={:?} abi={}",
@@ -255,6 +259,23 @@ fn donor_selftest(a: &[String]) -> ExitCode {
     match std::fs::read(&canary) {
         Ok(_) => println!("canary-read-ok (BAD) {canary}"),
         Err(e) => println!("canary-read-fail {e}"),
+    }
+    // No new Unix socket reaches a pathname socket; connected pairs still work.
+    match std::os::unix::net::UnixStream::connect(&bus) {
+        Ok(_) => println!("unix-connect-ok (BAD)"),
+        Err(e) => println!("unix-connect-fail {e}"),
+    }
+    match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(_) => println!("unix-dgram-ok (BAD)"),
+        Err(e) => println!("unix-dgram-fail {e}"),
+    }
+    match std::os::unix::net::UnixDatagram::pair() {
+        Ok(_) => println!("unix-dgram-pair-ok (BAD)"),
+        Err(e) => println!("unix-dgram-pair-fail {e}"),
+    }
+    match std::os::unix::net::UnixStream::pair() {
+        Ok(_) => println!("unix-pair-ok"),
+        Err(e) => println!("unix-pair-fail (BAD) {e}"),
     }
     // Writing inside the state dir still works (outbox).
     match std::fs::write(format!("{state}/outbox.probe"), b"x") {

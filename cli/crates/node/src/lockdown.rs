@@ -144,7 +144,7 @@ pub fn apply(home: &Home, boot: &mut Boot, unsafe_no_lockdown: bool) -> Result<(
         log("warn", "kernel without Landlock network rules (ABI < 4): outbound connections are not limited by moochy; use the systemd unit's RestrictAddressFamilies", &json!({"landlock_abi": r.abi}));
     }
     if cfg!(target_os = "linux") && !unsafe_no_lockdown && rep.get("landlock_scope") != Some(&json!(true)) {
-        log("warn", "kernel without Landlock scoping (ABI < 6): abstract Unix sockets and signals are not confined by moochy", &json!({"landlock_abi": r.abi}));
+        log("warn", "kernel without Landlock scoping (ABI < 6): signals are not confined by moochy (new Unix sockets are refused by seccomp)", &json!({"landlock_abi": r.abi}));
     }
     if validator == Some(false) {
         log("error", "request validator cage not applied: not donating until the app restarts", &json!({}));
