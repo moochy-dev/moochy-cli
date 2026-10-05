@@ -29,12 +29,23 @@ pub(crate) const SYS_KEXEC_FILE_LOAD: i64 = 294; // asm-generic
 #[cfg(target_env = "gnu")]
 const _: () = assert!(SYS_KEXEC_FILE_LOAD == libc::SYS_kexec_file_load);
 
-// ioctl requests that inject into a terminal; compared as 32-bit (low word).
+// ioctl requests that inject into a terminal or swap its line discipline (a kernel
+// module autoload, and a tty the user still types into); compared as 32-bit (low word).
 const TIOCSTI: u64 = 0x5412;
 const TIOCLINUX: u64 = 0x541C;
-// clone(2) namespace flags we refuse (block nested-userns escape surface).
-const CLONE_NEWUSER: u64 = 0x1000_0000;
-const CLONE_NEWNS: u64 = 0x0002_0000;
+const TIOCSETD: u64 = 0x5423;
+// clone(2) namespace flags we refuse, every CLONE_NEW* (NEWUSER, NEWNS, NEWNET, NEWPID, NEWIPC,
+// NEWUTS, NEWCGROUP): no nested namespace, whatever caps the kernel would ask for.
+pub(crate) const CLONE_NEW: [u64; 7] = [0x1000_0000, 0x0002_0000, 0x4000_0000, 0x2000_0000, 0x0800_0000, 0x0400_0000, 0x0200_0000];
+// Socket families the agent may open (jail review #1): Unix, IPv4, IPv6, netlink. Any other
+// (AF_VSOCK to the hypervisor, AF_ALG, AF_PACKET, Bluetooth, …) is EPERM, which also stops the
+// kernel autoloading its protocol module.
+pub(crate) const SOCKET_FAMILIES: [u64; 4] = [libc::AF_UNIX as u64, libc::AF_INET as u64, libc::AF_INET6 as u64, libc::AF_NETLINK as u64];
+// personality(2): only PER_LINUX (0) and the 0xffffffff query stay allowed.
+const PER_QUERY: u64 = 0xffff_ffff;
+/// `statmount`/`listmount` (Linux 6.8), not in the `libc` crate: one number on every arch.
+pub(crate) const SYS_STATMOUNT: i64 = 457;
+pub(crate) const SYS_LISTMOUNT: i64 = 458;
 // mmap/mprotect PROT_EXEC bit (validator must never map executable memory).
 const PROT_EXEC: u64 = 0x4;
 
@@ -127,27 +138,39 @@ fn deny_common() -> Result<BTreeMap<i64, Vec<SeccompRule>>, Error> {
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
+        // Jail review #6: another process's fds, kernel pointer comparison, other processes'
+        // memory advice, superblock reconfiguration, quotas, clock steering, the mount tree
+        // listing and the kernel log.
+        libc::SYS_pidfd_getfd,
+        libc::SYS_kcmp,
+        libc::SYS_process_madvise,
+        libc::SYS_fspick,
+        libc::SYS_quotactl_fd,
+        libc::SYS_clock_adjtime,
+        SYS_LISTMOUNT,
+        SYS_STATMOUNT,
+        libc::SYS_syslog,
     ];
     for nr in unconditional {
         m.insert(nr, Vec::new());
     }
-    // ioctl(TIOCSTI)/ioctl(TIOCLINUX): compare the low 32 bits only.
+    // ioctl(TIOCSTI/TIOCLINUX/TIOCSETD): compare the low 32 bits only.
     m.insert(
         libc::SYS_ioctl,
         vec![
             eq(1, SeccompCmpArgLen::Dword, TIOCSTI)?,
             eq(1, SeccompCmpArgLen::Dword, TIOCLINUX)?,
+            eq(1, SeccompCmpArgLen::Dword, TIOCSETD)?,
         ],
     );
-    // clone(CLONE_NEWUSER|CLONE_NEWNS): block nested namespaces (keep plain
-    // thread/process clone for the agent's tools).
-    m.insert(
-        libc::SYS_clone,
-        vec![
-            masked_match(0, SeccompCmpArgLen::Qword, CLONE_NEWUSER, CLONE_NEWUSER)?,
-            masked_match(0, SeccompCmpArgLen::Qword, CLONE_NEWNS, CLONE_NEWNS)?,
-        ],
-    );
+    // clone(CLONE_NEW*): block nested namespaces (keep plain thread/process clone for the
+    // agent's tools).
+    m.insert(libc::SYS_clone, CLONE_NEW.iter().map(|f| masked_match(0, SeccompCmpArgLen::Qword, *f, *f)).collect::<Result<_, _>>()?);
+    // One rule, all conditions true: a family outside the list, or a persona other than the default.
+    let ne = |arg, val| SeccompCondition::new(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, val).map_err(|e| setup("seccomp condition", e));
+    let socket = SOCKET_FAMILIES.iter().map(|f| ne(0, *f)).collect::<Result<_, _>>()?;
+    m.insert(libc::SYS_socket, vec![SeccompRule::new(socket).map_err(|e| setup("seccomp rule", e))?]);
+    m.insert(libc::SYS_personality, vec![SeccompRule::new(vec![ne(0, 0)?, ne(0, PER_QUERY)?]).map_err(|e| setup("seccomp rule", e))?]);
     Ok(m)
 }
 
@@ -208,7 +231,7 @@ pub fn donor_filter() -> Result<Vec<BpfProgram>, Error> {
     m.insert(libc::SYS_execve, Vec::new());
     m.insert(libc::SYS_execveat, Vec::new());
     let af_unix = |arg| SeccompCondition::new(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, libc::AF_UNIX as u64).map_err(|e| setup("seccomp condition", e));
-    m.insert(libc::SYS_socket, vec![SeccompRule::new(vec![af_unix(0)?]).map_err(|e| setup("seccomp rule", e))?]);
+    m.entry(libc::SYS_socket).or_default().push(SeccompRule::new(vec![af_unix(0)?]).map_err(|e| setup("seccomp rule", e))?);
     let dgram = SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::MaskedEq(0xf), libc::SOCK_DGRAM as u64).map_err(|e| setup("seccomp condition", e))?;
     m.insert(libc::SYS_socketpair, vec![SeccompRule::new(vec![af_unix(0)?, dgram]).map_err(|e| setup("seccomp rule", e))?]);
     deny_stack(m)

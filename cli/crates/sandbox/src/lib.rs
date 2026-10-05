@@ -67,7 +67,8 @@ pub struct Spec {
     /// The one read-write project directory (the git worktree). Required.
     pub worktree: PathBuf,
     /// Extra read-only paths made visible inside (tool binaries, runtimes).
-    /// Defaults cover the usual system dirs; add language toolchains here.
+    /// Defaults cover the usual system dirs (Linux: a curated part of `/etc`); add language
+    /// toolchains here. A directory outside the defaults gets the secret-name scan.
     pub ro_paths: Vec<PathBuf>,
     /// Extra read-write paths (rare; e.g. a shared cache). Empty by default.
     pub rw_paths: Vec<PathBuf>,
@@ -131,14 +132,17 @@ pub struct Limits {
     /// also the sandbox-wide cgroup `pids.max`). Linux only: on macOS `RLIMIT_NPROC` counts
     /// the user's whole session and Seatbelt has no process cap.
     pub processes: u64,
-    /// Memory for the whole sandbox, bytes (cgroup `memory.max`, swap 0). 0 =
-    /// no cgroup memory limit (`memory_bytes` still caps each process).
+    /// Memory for the whole sandbox, bytes (cgroup `memory.max`, swap 0, where a delegated cgroup
+    /// exists; tmpfs pages count). Default 8 GiB. 0 = no cgroup memory limit (`memory_bytes`
+    /// still caps each process).
     pub memory_total_bytes: u64,
     /// CPU for the whole sandbox in percent of one CPU (cgroup `cpu.max`; 250 =
     /// 2.5 CPUs). 0 = unlimited.
     pub cpu_percent: u32,
     /// Max core dump size (`RLIMIT_CORE`); 0 disables cores.
     pub core_bytes: u64,
+    /// Max size of one file the sandbox writes (`RLIMIT_FSIZE`). 0 = unlimited. Linux only.
+    pub file_bytes: u64,
     /// Wall-clock deadline for the whole run, seconds. 0 = no deadline. On
     /// expiry the whole sandbox is killed and `run` returns 124.
     pub wall_seconds: u64,
@@ -151,9 +155,10 @@ impl Default for Limits {
             cpu_seconds: 0,
             open_files: 1024,
             processes: 512,
-            memory_total_bytes: 0,
+            memory_total_bytes: 8 << 30, // 8 GiB
             cpu_percent: 0,
             core_bytes: 0,
+            file_bytes: 16 << 30, // 16 GiB
             wall_seconds: 0,
         }
     }
@@ -253,12 +258,18 @@ impl Spec {
 
 impl Spec {
     /// A197: refuse a view that would expose `/`, the real home or the Moochy
-    /// home (keystore, run key, other repos) inside the sandbox.
+    /// home (keystore, run key, other repos) inside the sandbox. A visible path may sit inside
+    /// the real home (`~/.local/bin`), never inside another protected dir (jail review #12).
     fn check_exposure(&self) -> Result<(), Error> {
         let protected: Vec<PathBuf> = self.protected.iter().filter_map(|p| p.canonicalize().ok()).collect();
+        let home = home().and_then(|h| h.canonicalize().ok());
         let visible = std::iter::once(&self.worktree).chain(&self.rw_paths).chain(&self.ro_paths);
         for p in visible.filter_map(|p| p.canonicalize().ok()) {
-            let hit = if p.parent().is_none() { Some(p.clone()) } else { protected.iter().find(|q| q.starts_with(&p)).cloned() };
+            let hit = if p.parent().is_none() {
+                Some(p.clone())
+            } else {
+                protected.iter().find(|q| q.starts_with(&p) || (Some(*q) != home.as_ref() && p.starts_with(q))).cloned()
+            };
             if let Some(q) = hit {
                 return Err(Error::Setup {
                     what: "sandbox view check",
@@ -283,11 +294,19 @@ pub fn delegated_cgroup() -> Option<PathBuf> {
     cgroup::delegated_parent()
 }
 
-/// `$HOME` and every default location of the Moochy home (mirrors the node's
+/// `$HOME`, else (unset) the password database's home for this uid (Linux).
+fn home() -> Option<PathBuf> {
+    let env = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
+    #[cfg(target_os = "linux")]
+    let env = env.or_else(sys::passwd_home);
+    env
+}
+
+/// The real home and every default location of the Moochy home (mirrors the node's
 /// `Home::resolve`). Nonexistent entries are harmless (skipped by the check).
 fn default_protected() -> Vec<PathBuf> {
     let env = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let home = env("HOME");
+    let home = home();
     [
         home.clone(),
         env("MOOCHY_HOME"),
@@ -301,10 +320,41 @@ fn default_protected() -> Vec<PathBuf> {
 
 /// Default read-only system roots. These exist on virtually every Unix host and
 /// carry no user secrets. The integrator appends language toolchains.
-fn default_ro_paths() -> Vec<PathBuf> {
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn default_ro_paths() -> Vec<PathBuf> {
     ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
         .iter()
         .map(PathBuf::from)
+        .collect()
+}
+
+/// What of `/etc` the jail shows (jail review #2): the loader, CA roots, user and host name
+/// lookup, time zone, `alternatives` links, OS identification, fonts, and the per-toolchain
+/// config dirs (`java-*`, `python3*`, `perl`). Not shown: `shadow`, `sudoers`, `ssh`,
+/// `ssl/private`, `machine-id`, `environment`, `profile.d`, `pip.conf`, `gitconfig`, `resolv.conf`
+/// (no network inside), and everything else.
+#[cfg(target_os = "linux")]
+const ETC: &[&str] = &[
+    "ld.so.cache", "ld.so.conf", "ld.so.conf.d", "ssl/certs", "ssl/openssl.cnf", "ca-certificates", "ca-certificates.conf",
+    "pki/tls/certs", "pki/tls/cert.pem", "pki/tls/openssl.cnf", "pki/ca-trust", "passwd", "group", "nsswitch.conf", "hosts",
+    "host.conf", "gai.conf", "localtime", "timezone", "alternatives", "services", "protocols", "mime.types", "os-release",
+    "lsb-release", "debian_version", "fonts", "perl",
+];
+
+/// Default read-only roots on Linux: the system dirs and the curated `/etc`. Missing ones are
+/// skipped when the view is built.
+#[cfg(target_os = "linux")]
+pub(crate) fn default_ro_paths() -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let toolchains = std::fs::read_dir("/etc").into_iter().flatten().flatten().map(|e| e.file_name()).filter(|n| {
+        let n = n.as_bytes();
+        n.starts_with(b"java-") || n.starts_with(b"python3")
+    });
+    ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+        .iter()
+        .map(PathBuf::from)
+        .chain(ETC.iter().map(|e| PathBuf::from("/etc").join(e)))
+        .chain(toolchains.map(|n| PathBuf::from("/etc").join(n)))
         .collect()
 }
 

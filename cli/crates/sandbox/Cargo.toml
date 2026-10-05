@@ -20,7 +20,7 @@ path = "src/bin/moochy_sandbox_test.rs"
 # pivot_root, capabilities, prctl (no_new_privs / pdeathsig), rlimits, setsid,
 # socketpair. Everything here is memory-safe; see src/sys.rs for the only unsafe.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "mount", "process", "thread", "net", "pipe", "runtime", "system", "event"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "mount", "process", "thread", "net", "pipe", "runtime", "system", "event", "termios"] }
 # Safe Landlock LSM wrapper (best-effort ABI negotiation). Second FS/NET layer.
 landlock = { version = "0.4", default-features = false }
 # Safe seccomp-bpf compiler (from Firecracker). Deny-list + arch guard.
@@ -32,7 +32,7 @@ seccompiler = { version = "0.5", default-features = false }
 libc = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "pty", "termios"] }
 
 [lints.rust]
 # CONTRACT §15 exception: unsafe is permitted, confined to src/sys.rs and gated there.

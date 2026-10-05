@@ -53,16 +53,7 @@ fn host() -> Vec<Line> {
         Err(e) => line(Level::Fail, "sandbox", e.to_string()),
     });
     let abi = crate::sys::landlock_abi();
-    let has = |n: i32, what: &str| if abi >= n { None } else { Some(format!("{what} (ABI {n})")) };
-    let missing: Vec<String> = [
-        has(4, "TCP port rules"),
-        has(6, "abstract-socket and signal scoping"),
-        has(8, "all-thread enforcement for the donor"),
-        has(9, "pathname UNIX socket rules"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let missing = missing_layers(abi, true);
     v.push(match (abi, missing.is_empty()) {
         (0, _) => line(Level::Fail, "landlock", "Landlock unavailable: `moochy run` and the donor lockdown refuse"),
         (_, true) => line(Level::Ok, "landlock", format!("ABI {abi}: every layer the sandbox uses")),
@@ -77,6 +68,16 @@ fn host() -> Vec<Line> {
         ),
     });
     v
+}
+
+/// The Landlock layers above ABI 1 this kernel lacks; `donor` adds the donor-only one.
+#[cfg(target_os = "linux")]
+pub(crate) fn missing_layers(abi: i32, donor: bool) -> Vec<String> {
+    [(4, "TCP port rules", false), (6, "abstract-socket and signal scoping", false), (8, "all-thread enforcement for the donor", true), (9, "pathname UNIX socket rules", false)]
+        .into_iter()
+        .filter(|(n, _, d)| abi < *n && (donor || !d))
+        .map(|(n, what, _)| format!("{what} (ABI {n})"))
+        .collect()
 }
 
 #[cfg(target_os = "macos")]

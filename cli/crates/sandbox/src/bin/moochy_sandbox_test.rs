@@ -47,6 +47,16 @@ fn main() -> ExitCode {
         "memhog" => probe_memhog(),
         #[cfg(target_os = "linux")]
         "ptrace" => probe_ptrace(rest),
+        #[cfg(target_os = "linux")]
+        "sys" => probe_sys(),
+        #[cfg(target_os = "linux")]
+        "statfs" => probe_statfs(rest),
+        #[cfg(target_os = "linux")]
+        "landlock-abi" => probe_landlock_abi(),
+        #[cfg(target_os = "linux")]
+        "keyring-run" => keyring_run(rest),
+        "unix-connect" => probe_unix_connect(rest),
+        "rawtty" => probe_rawtty(),
         "run" => run_sandbox(rest),
         #[cfg(target_os = "linux")]
         "donor" => donor_selftest(rest),
@@ -215,6 +225,128 @@ fn probe_env(a: &[String]) -> ExitCode {
             no()
         }
     }
+}
+
+/// `sys`: try each call the jail's seccomp must refuse, with harmless arguments, and print the
+/// errno (0 = it ran). Unfiltered, none of these fails with EPERM for an unprivileged process
+/// (except `fspick`, which needs CAP_SYS_ADMIN): EPERM here means the filter answered.
+#[cfg(target_os = "linux")]
+fn probe_sys() -> ExitCode {
+    fn report(name: &str, r: libc::c_long) {
+        let e = if r < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) } else { 0 };
+        println!("sys {name} errno={e}");
+    }
+    // SAFETY: every call gets invalid fds, an invalid type or a NULL buffer the kernel rejects
+    // before touching memory; personality only changes this short-lived probe; a socket that
+    // opens is closed at once; clone with CLONE_THREAD but no CLONE_SIGHAND creates nothing.
+    unsafe {
+        report("pidfd_getfd", libc::syscall(libc::SYS_pidfd_getfd, -1, -1, 0));
+        let me = libc::getpid();
+        report("kcmp", libc::syscall(libc::SYS_kcmp, me, me, 99, 0, 0));
+        report("personality", libc::syscall(libc::SYS_personality, 0x0040_0000)); // ADDR_NO_RANDOMIZE
+        report("personality-query", libc::syscall(libc::SYS_personality, 0xFFFF_FFFFu32));
+        report("process_madvise", libc::syscall(libc::SYS_process_madvise, -1, 0, 0, 0, 0));
+        report("fspick", libc::syscall(libc::SYS_fspick, -1, c"".as_ptr(), 0));
+        report("quotactl_fd", libc::syscall(libc::SYS_quotactl_fd, -1, 0, 0, 0));
+        let mut tx = [0u8; 512];
+        report("clock_adjtime", libc::syscall(libc::SYS_clock_adjtime, 999, tx.as_mut_ptr()));
+        report("listmount", libc::syscall(458, 0, 0, 0, 0));
+        report("statmount", libc::syscall(457, 0, 0, 0, 0));
+        report("syslog", libc::syscall(libc::SYS_syslog, 10, 0, 0)); // SYSLOG_ACTION_SIZE_BUFFER
+        let ldisc: libc::c_int = 0;
+        report("tiocsetd", libc::c_long::from(libc::ioctl(0, 0x5423, &raw const ldisc)));
+        for (name, flag) in [("newnet", 0x4000_0000), ("newpid", 0x2000_0000), ("newipc", 0x0800_0000), ("newuts", 0x0400_0000), ("newcgroup", 0x0200_0000)] {
+            report(&format!("clone-{name}"), libc::syscall(libc::SYS_clone, flag | libc::CLONE_THREAD, 0, 0, 0, 0));
+        }
+        for (name, domain, ty) in [
+            ("vsock", 40, libc::SOCK_STREAM),
+            ("alg", 38, libc::SOCK_SEQPACKET),
+            ("inet", libc::AF_INET, libc::SOCK_STREAM),
+            ("unix", libc::AF_UNIX, libc::SOCK_STREAM),
+            ("netlink", libc::AF_NETLINK, libc::SOCK_RAW),
+        ] {
+            let fd = libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0);
+            report(&format!("socket-{name}"), libc::c_long::from(fd));
+            if fd >= 0 {
+                libc::close(fd);
+            }
+        }
+    }
+    ok()
+}
+
+/// `statfs <path>`: size in bytes and inode count of the filesystem holding `path`.
+#[cfg(target_os = "linux")]
+fn probe_statfs(a: &[String]) -> ExitCode {
+    let Some(p) = a.first() else { return ExitCode::from(2) };
+    let c = std::ffi::CString::new(p.as_str()).unwrap_or_default();
+    // SAFETY: statvfs fills a zeroed, properly sized struct from a valid C string.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &raw mut st) } != 0 {
+        println!("statfs-fail {p} {}", std::io::Error::last_os_error());
+        return no();
+    }
+    println!("statfs {p} bytes={} files={}", st.f_blocks * st.f_frsize, st.f_files);
+    ok()
+}
+
+/// `landlock-abi`: this kernel's Landlock ABI (0 = none).
+#[cfg(target_os = "linux")]
+fn probe_landlock_abi() -> ExitCode {
+    // SAFETY: NULL attr, size 0, LANDLOCK_CREATE_RULESET_VERSION: the kernel reads no memory.
+    let r = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<libc::c_void>(), 0usize, 1u32) };
+    println!("landlock-abi {}", r.max(0));
+    ok()
+}
+
+/// `keyring-run <run args…>`: in a fresh session keyring, add a key only its possessors may
+/// see (perm 0x3f000000), then act as `run`: a jail that keeps the session shows it in
+/// /proc/keys.
+#[cfg(target_os = "linux")]
+fn keyring_run(a: &[String]) -> ExitCode {
+    // SAFETY: keyctl/add_key with valid C strings and a 1-byte payload.
+    let id = unsafe {
+        libc::syscall(libc::SYS_keyctl, 1, std::ptr::null::<libc::c_char>()); // KEYCTL_JOIN_SESSION_KEYRING
+        libc::syscall(libc::SYS_add_key, c"user".as_ptr(), c"moochy-probe-key".as_ptr(), b"x".as_ptr(), 1usize, -3) // KEY_SPEC_SESSION_KEYRING
+    };
+    // SAFETY: KEYCTL_SETPERM on the key just made.
+    if id < 0 || unsafe { libc::syscall(libc::SYS_keyctl, 5, id, 0x3f00_0000u32) } < 0 {
+        println!("keyring-unavailable {}", std::io::Error::last_os_error());
+        return ok();
+    }
+    run_sandbox(a.get(1..).unwrap_or_default())
+}
+
+/// `unix-connect <path>`: connect to a pathname Unix socket.
+fn probe_unix_connect(a: &[String]) -> ExitCode {
+    let Some(p) = a.first() else { return ExitCode::from(2) };
+    match std::os::unix::net::UnixStream::connect(p) {
+        Ok(_) => {
+            println!("unix-connect-ok {p}");
+            ok()
+        }
+        Err(e) => {
+            println!("unix-connect-fail {p} {e}");
+            no()
+        }
+    }
+}
+
+/// `rawtty`: put the terminal on stdin in raw mode without echo, as a TUI agent does, and exit.
+fn probe_rawtty() -> ExitCode {
+    // SAFETY: tcgetattr/tcsetattr on fd 0 with a zeroed termios the call fills in.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &raw mut t) } != 0 {
+        println!("rawtty-fail {}", std::io::Error::last_os_error());
+        return no();
+    }
+    t.c_lflag &= !(libc::ECHO | libc::ICANON);
+    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw const t) } != 0 {
+        println!("rawtty-fail {}", std::io::Error::last_os_error());
+        return no();
+    }
+    println!("rawtty-ok");
+    ok()
 }
 
 // ───────────────────────── self-tests (Linux) ─────────────────────────

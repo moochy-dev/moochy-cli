@@ -115,6 +115,46 @@ pub fn capbset_drop(cap: u32) -> bool {
     r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
 }
 
+/// `prctl(PR_CAPBSET_READ, cap)`: is `cap` still in the bounding set? An error other than EINVAL
+/// (a cap number past the kernel's last) counts as present: the caller fails closed.
+pub fn capbset_has(cap: u32) -> bool {
+    const PR_CAPBSET_READ: i32 = 23;
+    // SAFETY: prctl with these arguments only reads this process's bounding set.
+    let r = unsafe { libc::prctl(PR_CAPBSET_READ, libc::c_ulong::from(cap), 0, 0, 0) };
+    r == 1 || (r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL))
+}
+
+/// `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`: join a new anonymous session keyring, so the
+/// keys of the inherited session are no longer possessed. A kernel without keys (ENOSYS) has
+/// none to hide.
+pub fn join_anon_session_keyring() -> io::Result<()> {
+    const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+    // SAFETY: a NULL name asks for an anonymous keyring; the kernel reads no user memory.
+    let r = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, std::ptr::null::<libc::c_char>()) };
+    match r {
+        r if r >= 0 => Ok(()),
+        _ if io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// The home directory of this uid in the password database (`getpwuid_r`), for when `$HOME` is
+/// unset. Launcher only (never in a forked child).
+pub fn passwd_home() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: passwd is plain data the call fills in; buf outlives every pointer it holds.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the sizes given; on success pw's strings point into buf.
+    let r = unsafe { libc::getpwuid_r(libc::getuid(), &raw mut pw, buf.as_mut_ptr(), buf.len(), &raw mut out) };
+    if r != 0 || out.is_null() || pw.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir is a NUL-terminated string inside buf, still alive here.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+    (!dir.is_empty()).then(|| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
 
 /// The fd the validator child talks on after [`isolate_fds`].
 pub const CHANNEL_FD: i32 = 3;

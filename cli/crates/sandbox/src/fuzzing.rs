@@ -97,6 +97,15 @@ mod bpf {
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
+        libc::SYS_pidfd_getfd,
+        libc::SYS_kcmp,
+        libc::SYS_process_madvise,
+        libc::SYS_fspick,
+        libc::SYS_quotactl_fd,
+        libc::SYS_clock_adjtime,
+        crate::seccomp::SYS_LISTMOUNT,
+        crate::seccomp::SYS_STATMOUNT,
+        libc::SYS_syslog,
     ];
 
     /// Policy: the validator's unconditional allowlist.
@@ -141,6 +150,8 @@ mod bpf {
         libc::SYS_fcntl,
         libc::SYS_openat,
         libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_personality,
         libc::SYS_connect,
     ];
 
@@ -220,9 +231,14 @@ mod bpf {
             return errno(libc::ENOSYS);
         }
         let exec = n == libc::SYS_execve || n == libc::SYS_execveat;
-        let tty = n == libc::SYS_ioctl && matches!(args[1] as u32, 0x5412 | 0x541C); // TIOCSTI, TIOCLINUX
-        let ns = n == libc::SYS_clone && args[0] & 0x1002_0000 != 0; // CLONE_NEWUSER | CLONE_NEWNS
-        if DENY.contains(&n) || (donor && exec) || tty || ns { errno(libc::EPERM) } else { RET_ALLOW }
+        let tty = n == libc::SYS_ioctl && matches!(args[1] as u32, 0x5412 | 0x541C | 0x5423); // TIOCSTI, TIOCLINUX, TIOCSETD
+        let ns = n == libc::SYS_clone && args[0] & 0x7E02_0000 != 0; // every CLONE_NEW*
+        // Unix, IPv4, IPv6, netlink only; the donor no new Unix socket and no Unix datagram pair.
+        let family = args[0] as u32;
+        let socket = n == libc::SYS_socket && (!matches!(family, 1 | 2 | 10 | 16) || (donor && family == 1));
+        let pair = donor && n == libc::SYS_socketpair && family == 1 && args[1] as u32 & 0xf == 2;
+        let persona = n == libc::SYS_personality && !matches!(args[0] as u32, 0 | 0xFFFF_FFFF);
+        if DENY.contains(&n) || (donor && exec) || tty || ns || socket || pair || persona { errno(libc::EPERM) } else { RET_ALLOW }
     }
 
     fn validator_policy(nr: u32, args: &[u64; 6]) -> u32 {
@@ -316,12 +332,18 @@ mod tests {
     #[test]
     fn seccomp_tables_oracle() {
         // Every listed number, with the arguments that flip each rule.
-        let edges: [[u8; 8]; 6] = [
+        let edges: [[u8; 8]; 12] = [
             [0; 8],
             0x5412u64.to_le_bytes(),                // TIOCSTI
             (0x5412u64 | 0xFFFF_0000_0000).to_le_bytes(), // TIOCSTI + high bits
+            0x5423u64.to_le_bytes(),                // TIOCSETD
             0x1000_0000u64.to_le_bytes(),           // CLONE_NEWUSER
+            0x4000_0000u64.to_le_bytes(),           // CLONE_NEWNET
             0x4u64.to_le_bytes(),                   // PROT_EXEC
+            1u64.to_le_bytes(),                     // AF_UNIX
+            2u64.to_le_bytes(),                     // AF_INET, SOCK_DGRAM
+            40u64.to_le_bytes(),                    // AF_VSOCK
+            0x0040_0000u64.to_le_bytes(),           // ADDR_NO_RANDOMIZE
             [0xFF; 8],
         ];
         for sel in 0u8..0x80 {

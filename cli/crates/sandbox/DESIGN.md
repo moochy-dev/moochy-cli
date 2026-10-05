@@ -68,10 +68,14 @@ on: re-run the e2e suite on one). `moochy doctor` names the layers the host lack
    `unshare(CLONE_NEWPID)` the kernel refuses `CLONE_THREAD` (EINVAL; found in testing).
 4. **Syscalls (seccomp deny-list).** Removes kernel attack surface and escape primitives
    (§4) while the agent keeps `execve`.
-5. **Privilege.** `no_new_privs`, the bounding set dropped, uid ≠ 0 inside, `setsid`.
+5. **Privilege.** `no_new_privs`, the bounding set dropped and checked empty, the caller's
+   own uid and gid inside (never root), `setsid` (fail closed), an anonymous session keyring.
+   Supplementary groups stay: an unprivileged process must deny `setgroups` to write its
+   gid map, so it cannot drop them; the curated `/etc` leaves them little to open.
 6. **Resources.** rlimits: `RLIMIT_NPROC` is accounted per user namespace (ucounts), so
-   it caps a fork bomb inside the sandbox; plus `RLIMIT_AS`, `RLIMIT_NOFILE`, no core, and
-   a wall deadline enforced by the reaper through a pidfd.
+   it caps a fork bomb inside the sandbox; plus `RLIMIT_AS`, `RLIMIT_NOFILE`, `RLIMIT_FSIZE`,
+   no core, and a wall deadline enforced by the reaper through a pidfd. Every tmpfs has a
+   `size=` (RAM), and the cgroup `memory.max` defaults to 8 GiB where one is delegated.
 7. **Lifetime.** A `PDEATHSIG` chain plus PID-namespace teardown.
 
 **Donor side.** The background process can't exec at all (seccomp TSYNC), and Landlock
@@ -128,8 +132,19 @@ with an allowlist where any other syscall kills it.
 | ptrace / `process_vm_*` of other processes | seccomp + Yama + separate PID ns | `e95_terminal_injection…` |
 | `/proc/<pid>` of host processes | Own PID ns and own procfs | covered by `e93`/`e95` (host processes don't exist inside) |
 | Mount tricks, mount propagation back to the host | `MS_PRIVATE` recursive; mount syscalls denied after setup | seccomp table; host unaffected in `e93` |
-| Nested user namespaces (kernel bug surface: e.g. nf_tables) | `unshare`/`setns`/`clone(NEWUSER|NEWNS)` denied, `clone3` ENOSYS | seccomp table |
-| setuid binaries regaining privilege | `no_new_privs`, bounding set dropped, `nosuid` | — |
+| Nested user namespaces (kernel bug surface: e.g. nf_tables) | `unshare`/`setns`/`clone(CLONE_NEW*)` denied, `clone3` ENOSYS | seccomp table |
+| setuid binaries regaining privilege | `no_new_privs`, bounding set dropped and checked, own uid, `nosuid` on every read-only bind, read-only root | `jail7_own_uid_inside_and_no_capabilities`, `jail8_read_only_binds_nosuid_nodev_and_root_read_only` |
+| Host config and group-readable files under `/etc` | Curated `/etc` | `jail2_curated_etc_and_masks_resolved_inside_the_view` |
+| A secret-named symlink pointing elsewhere in the worktree | Masks resolved inside the view (`openat2` `RESOLVE_IN_ROOT`) | `jail2_…` |
+| RAM or disk exhaustion through tmpfs or one huge file | tmpfs `size=`/`nr_inodes=`, `RLIMIT_FSIZE`, cgroup default 8 GiB | `jail3_tmpfs_bounded_fsize_and_total_memory_default` |
+| Executables planted in git-ignored build dirs for the host to run | Post-run notice (new/changed, executable or under `bin/`) | `jail4_new_executables_in_ignored_build_dirs_noticed` |
+| Pathname Unix sockets in the worktree (ssh-agent, dev servers) | Masked; Landlock `ResolveUnix` only for the jail's own dirs (ABI ≥ 9) | `jail5_unix_sockets_in_the_worktree_masked` |
+| Kernel surface: other socket families (vsock, AF_ALG, …), `pidfd_getfd`, `kcmp`, `personality`, `syslog`, mount listing, `TIOCSETD`, every `CLONE_NEW*` | seccomp deny | `jail1_…`, `jail6_…`, `fuzzing::tests` |
+| The agent leaving the user's terminal raw | Launcher saves and restores termios | `jail9_terminal_modes_restored_after_the_run` |
+| Host session keyring keys visible or possessed | Anonymous session keyring before seccomp | `jail10_host_session_keys_not_possessed_inside` |
+| Secrets inside an agent's install dir (`~/.local/bin`) | Secret-name scan of every non-default ro/rw dir | `jail11_secrets_in_tool_install_dirs_masked` |
+| A ro/rw path inside the Moochy home; `$HOME` unset | Refused; password-database home | `jail12_…` |
+| Reaper core dump or ptrace/`/proc` reach | Not dumpable, `RLIMIT_CORE` 0 | `jail14_reaper_not_dumpable_and_no_core` |
 | fd leaks across exec | std `Command` is CLOEXEC; bridge fds are opened in the reaper only | — |
 | Abstract Unix sockets (X11, D-Bus, …) | Per-netns namespace (empty) + Landlock scope (ABI ≥ 6) | — |
 | Kernel attack surface (bpf, perf, userfaultfd, keyctl, modules, kexec) | seccomp deny | seccomp table |

@@ -88,10 +88,11 @@ pub fn run(spec: &Spec, program: &std::ffi::OsStr, args: &[OsString]) -> Result<
     // Own session (no controlling terminal: no TIOCSTI into the user's shell,
     // A192) + rlimits, set between fork and exec.
     crate::sys_macos::session_and_limits(&mut cmd, &spec.limits);
+    let since = std::time::SystemTime::now();
     let status = supervise(&mut cmd, spec.limits.wall_seconds);
     drop(proxy);
     let _ = std::fs::remove_dir_all(&scratch);
-    crate::git::notice_if_changed(&worktree, &git_before);
+    crate::git::notice_if_changed(&worktree, &git_before, since);
     status
 }
 

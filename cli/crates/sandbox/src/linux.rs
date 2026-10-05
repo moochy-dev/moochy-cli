@@ -4,6 +4,7 @@
 //! rlimits and `no_new_privs`. Fails closed.
 
 use std::ffi::{OsStr, OsString};
+use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,7 +59,15 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     let _placeholder = git.placeholder.clone().map(RmdirOnDrop);
     let _commondir = git.commondir_dot.clone().map(RmCommondirOnDrop);
     let git_before = crate::git::snapshot(&scan.dotgits.iter().chain(&git.placeholder).cloned().collect::<Vec<_>>());
-    let masks = scan.masks;
+    let mut masks = scan.masks;
+    // Jail review #11: a visible dir outside the system defaults (an agent's install dir such as
+    // ~/.local/bin, an rw cache) gets the same secret-name and socket scan as the worktree.
+    let defaults = crate::default_ro_paths();
+    for p in spec.ro_paths.iter().chain(&spec.rw_paths).filter(|p| !defaults.contains(p)) {
+        if let Some(real) = p.canonicalize().ok().filter(|r| r.is_dir()) {
+            masks.extend(mask::scan_names(&real)?);
+        }
+    }
     let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
     // Served from before the spawn: `spawn` returns only when the reaper exits
     // (it never execs). The thread is parked in accept(), holding no lock, at
@@ -106,6 +115,11 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     // branch chdirs itself below.
 
     let agent_filter = seccomp::agent_filter()?;
+    notice_landlock();
+    // Jail review #9: the agent shares the user's terminal and may leave it raw or without echo.
+    let stdio = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    let tty = [stdio.0.as_fd(), stdio.1.as_fd(), stdio.2.as_fd()].into_iter().find_map(|fd| rustix::termios::tcgetattr(fd).ok().map(|t| (fd, t)));
+    let since = std::time::SystemTime::now();
     // The closure runs in the forked child. Up to the inner fork it only performs
     // namespace/mount syscalls; the agent branch applies pre-built seccomp/
     // Landlock then returns to let std `execve`. The parent branch waits and
@@ -113,11 +127,35 @@ pub fn run(spec: &Spec, program: &OsStr, args: &[OsString]) -> Result<i32, Error
     sys::set_pre_exec(&mut cmd, move || child_main(&plan, &agent_filter));
 
     let status = cmd.spawn().and_then(|mut child| child.wait());
+    if let Some((fd, saved)) = &tty {
+        restore_termios(*fd, saved);
+    }
     drop(proxy);
     drop(cgroup);
     drop(base);
-    crate::git::notice_if_changed(&worktree, &git_before);
+    crate::git::notice_if_changed(&worktree, &git_before, since);
     Ok(exit_code(status.map_err(Error::Exec)?))
+}
+
+/// Put back the terminal modes saved before the run, only when the agent changed them (a write
+/// from a background process group would stop the launcher with SIGTTOU).
+fn restore_termios(fd: std::os::fd::BorrowedFd<'_>, saved: &rustix::termios::Termios) {
+    use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
+    let same = |t: &rustix::termios::Termios| {
+        (t.input_modes, t.output_modes, t.control_modes, t.local_modes) == (saved.input_modes, saved.output_modes, saved.control_modes, saved.local_modes)
+    };
+    if !tcgetattr(fd).is_ok_and(|now| same(&now)) {
+        let _ = tcsetattr(fd, OptionalActions::Now, saved);
+    }
+}
+
+/// Jail review #13: one stderr note when this kernel's Landlock lacks a layer the jail uses.
+fn notice_landlock() {
+    let abi = sys::landlock_abi();
+    let missing = crate::doctor::missing_layers(abi, false);
+    if abi > 0 && !missing.is_empty() {
+        eprintln!("moochy: note: Landlock ABI {abi} on this kernel lacks {}; the namespaces and seccomp still apply", missing.join(", "));
+    }
 }
 
 fn exit_code(s: std::process::ExitStatus) -> i32 {
@@ -174,6 +212,14 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
         sys::Fork::Parent(agent_pid) => {
             // Reaper: serve the gateway bridge, wait for the agent, propagate its
             // code. Never returns.
+            if let Err(e) = harden_reaper() {
+                let _ = to_io(e);
+                if let Some(pid) = rustix::process::Pid::from_raw(agent_pid) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+                let _ = crate::donor::wait_raw(agent_pid);
+                sys::exit_immediately(125);
+            }
             let timed_out = supervise(&listeners, agent_pid, plan.limits.wall_seconds);
             if timed_out {
                 let _ = rustix::process::kill_process(
@@ -192,6 +238,14 @@ fn child_main(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> std::io::Resul
             Ok(()) // → std performs execve(program, argv, envp)
         }
     }
+}
+
+/// Jail review #14: the reaper (outside the seccomp/Landlock cage, holding the bridge) writes no
+/// core file and is not dumpable: no ptrace or /proc reach into it from the user's processes.
+fn harden_reaper() -> Result<(), Error> {
+    use rustix::process::{DumpableBehavior, Resource, Rlimit, set_dumpable_behavior, setrlimit};
+    set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(io("reaper not dumpable"))?;
+    setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(io("reaper rlimit core"))
 }
 
 // ───────────────────────── gateway bridge ─────────────────────────
@@ -448,11 +502,13 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     let root = plan.base.join("root");
     mkdir(&root)?;
     // tmpfs as the new root skeleton.
-    tmpfs(&root, c"mode=0755")?;
+    tmpfs(&root, c"mode=0755,size=64m")?;
 
     // Private tmpfs home + tmp FIRST, so a worktree that lives under /tmp (or
     // any bind below) is mounted on top of them, not hidden underneath.
-    for (dir, opts) in [("tmp", c"mode=1777"), ("home/sandbox", c"mode=0700"), ("run/moochy", c"mode=0755")] {
+    // Jail review #3: every tmpfs is bounded (it is RAM): 2 GiB and 1M inodes where the agent
+    // writes, 64 MiB for the skeletons.
+    for (dir, opts) in [("tmp", c"mode=1777,size=2g,nr_inodes=1m"), ("home/sandbox", c"mode=0700,size=2g,nr_inodes=1m"), ("run/moochy", c"mode=0755,size=64m")] {
         let t = root.join(dir);
         mkdir_p(&t)?;
         tmpfs(&t, opts)?;
@@ -494,7 +550,7 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     setup_dev(&root)?;
     let shm = root.join("dev/shm");
     mkdir_p(&shm)?;
-    tmpfs(&shm, c"mode=1777")?;
+    tmpfs(&shm, c"mode=1777,size=2g,nr_inodes=1m")?;
 
     // Gateway Unix socket bridged in read-write (the one allowed channel).
     if let Some(sock) = &plan.gateway_socket {
@@ -517,13 +573,16 @@ fn build_view(plan: &Plan) -> Result<(), Error> {
     pivot_into(&root)
 }
 
-/// Write single-entry uid/gid maps for the new user namespace (identity-map the
-/// caller's uid/gid to 0 inside). `setgroups` must be denied before gid_map.
+/// Write single-entry uid/gid maps for the new user namespace: the caller's own uid/gid, never
+/// root (jail review #7). The setup keeps the namespace's capabilities until execve, which then
+/// clears them for a non-root uid. `setgroups` must be denied before gid_map, so the caller's
+/// supplementary groups stay (an unprivileged process cannot drop them); the curated view
+/// leaves them little to open.
 fn write_id_maps(uid: u32, gid: u32) -> Result<(), Error> {
     std::fs::write("/proc/self/setgroups", b"deny").map_err(|e| setup("setgroups deny", e))?;
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1").as_bytes())
+    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1").as_bytes())
         .map_err(|e| setup("uid_map", e))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1").as_bytes())
+    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1").as_bytes())
         .map_err(|e| setup("gid_map", e))?;
     Ok(())
 }
@@ -539,12 +598,12 @@ fn bind_linked_gitdir(root: &Path, l: &crate::git::Linked) -> Result<(), Error> 
             let t = root.join(wts.strip_prefix("/").unwrap_or(wts));
             tmpfs(&t, c"mode=0755")?;
             bind_into(root, &l.gitdir, false)?;
-            mount_remount(&t, MountFlags::RDONLY, "").map_err(io("remount worktrees ro"))?;
+            remount_ro(&t)?;
         }
         Some(wts) => {
             let t = root.join(wts.strip_prefix("/").unwrap_or(wts));
             tmpfs(&t, c"mode=0755")?;
-            mount_remount(&t, MountFlags::RDONLY, "").map_err(io("remount worktrees ro"))?;
+            remount_ro(&t)?;
             bind_into(root, &l.gitdir, false)?;
         }
         None => bind_into(root, &l.gitdir, false)?,
@@ -603,9 +662,21 @@ fn bind_into(root: &Path, src: &Path, writable: bool) -> Result<(), Error> {
     mount_bind_recursive(src, &dst).map_err(io("bind"))?;
     if !writable {
         // Mount-level read-only too (defense in depth atop Landlock).
-        mount_remount(&dst, MountFlags::RDONLY | MountFlags::BIND, "").map_err(io("remount ro"))?;
+        remount_ro(&dst)?;
     }
     Ok(())
+}
+
+/// Jail review #8: remount a mount read-only, nosuid and nodev, adding the source's noexec: a
+/// flag the source mount has and the remount drops is EPERM in a user namespace (locked).
+/// Without an atime flag the kernel keeps the source's (noatime, relatime).
+fn remount_ro(dst: &Path) -> Result<(), Error> {
+    let src = rustix::fs::statvfs(dst).map_err(io("statvfs"))?.f_flag;
+    let mut flags = MountFlags::RDONLY | MountFlags::BIND | MountFlags::NOSUID | MountFlags::NODEV;
+    if src.contains(rustix::fs::StatVfsMountFlags::NOEXEC) {
+        flags |= MountFlags::NOEXEC;
+    }
+    mount_remount(dst, flags, "").map_err(io("remount ro"))
 }
 
 /// Overmount each masked path with an empty read-only file/dir so neither the
@@ -617,22 +688,31 @@ fn apply_masks(root: &Path, plan: &Plan) -> Result<(), Error> {
     }
     let empty_dir = plan.base.join("empty");
     let empty_file = plan.base.join("empty_file");
-    for (target_is_dir, p) in plan
-        .masks
-        .iter()
-        .map(|p| (p.is_dir(), p))
-        .collect::<Vec<_>>()
-    {
-        let rel = p.strip_prefix("/").unwrap_or(p);
-        let dst = root.join(rel);
-        if !dst.exists() {
-            continue; // not in the view
-        }
-        let src: &Path = if target_is_dir { &empty_dir } else { &empty_file };
+    let view = rustix::fs::open(root, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io("open view root"))?;
+    // The root as the kernel spells it (a symlinked $TMPDIR resolved), to compare against.
+    let root = &fd_path(&view).ok_or_else(|| setup("resolve view root", std::io::Error::other("no path")))?;
+    for p in &plan.masks {
+        let Some(dst) = in_view(&view, root, p) else { continue }; // not in the view
+        let src: &Path = if dst.is_dir() { &empty_dir } else { &empty_file };
         mount_bind_recursive(src, &dst).map_err(io("bind mask"))?;
-        mount_remount(&dst, MountFlags::RDONLY | MountFlags::BIND, "").map_err(io("remount mask ro"))?;
+        remount_ro(&dst)?;
     }
     Ok(())
+}
+
+/// Where host path `p` lands in the view under `root`, symlinks followed as the agent will follow
+/// them: inside the view, never against the host root (jail review #2: an absolute link would
+/// otherwise put the mask on a host path and leave the view's file readable). `None` when it
+/// does not resolve inside the view.
+fn in_view(view: &std::os::fd::OwnedFd, root: &Path, p: &Path) -> Option<PathBuf> {
+    use rustix::fs::ResolveFlags;
+    let rel = p.strip_prefix("/").unwrap_or(p);
+    let fd = rustix::fs::openat2(view, rel, OFlags::PATH | OFlags::CLOEXEC, Mode::empty(), ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS).ok()?;
+    fd_path(&fd).filter(|real| real.starts_with(root))
+}
+
+fn fd_path(fd: &std::os::fd::OwnedFd) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
 }
 
 /// Private tmpfs with an explicit mode (the default would be a sticky 1777).
@@ -643,7 +723,7 @@ fn tmpfs(target: &Path, opts: &std::ffi::CStr) -> Result<(), Error> {
 fn setup_dev(root: &Path) -> Result<(), Error> {
     let dev = root.join("dev");
     mkdir_p(&dev)?;
-    tmpfs(&dev, c"mode=0755")?;
+    tmpfs(&dev, c"mode=0755,size=64m")?;
     for node in ["null", "zero", "full", "random", "urandom"] {
         let src = PathBuf::from("/dev").join(node);
         let dst = dev.join(node);
@@ -662,7 +742,8 @@ fn pivot_into(root: &Path) -> Result<(), Error> {
     rustix::mount::unmount("/.oldroot", rustix::mount::UnmountFlags::DETACH)
         .map_err(io("detach oldroot"))?;
     let _ = std::fs::remove_dir("/.oldroot");
-    Ok(())
+    // Jail review #8: the skeleton is read-only; only the tmpfs and binds above it are writable.
+    remount_ro(Path::new("/"))
 }
 
 /// Agent branch (PID 1 in the new ns): /proc, rlimits, pdeathsig, new session,
@@ -675,11 +756,14 @@ fn harden_agent(plan: &Plan, filter: &[seccompiler::BpfProgram]) -> Result<(), E
     // TIOCSTI injection into the launching shell).
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
         .map_err(io("pdeathsig"))?;
-    let _ = rustix::process::setsid();
+    rustix::process::setsid().map_err(io("setsid"))?;
 
     // Nothing the launcher held may leak into the agent across execve.
     sys::cloexec_from_3().map_err(|e| setup("cloexec fds", e))?;
-    drop_all_caps();
+    drop_all_caps()?;
+    // Jail review #10: a new anonymous session keyring, so the agent possesses none of the
+    // host session's keys (keyctl itself is denied below).
+    sys::join_anon_session_keyring().map_err(|e| setup("session keyring", e))?;
     landlock_agent(plan)?;
     rustix::thread::set_no_new_privs(true).map_err(io("no_new_privs"))?;
     for prog in filter {
@@ -708,27 +792,22 @@ fn apply_rlimits(l: &crate::Limits) -> Result<(), Error> {
     set(Resource::Nofile, l.open_files, "rlimit nofile")?;
     set(Resource::Nproc, l.processes, "rlimit nproc")?;
     set(Resource::Core, l.core_bytes, "rlimit core")?;
+    if l.file_bytes > 0 {
+        set(Resource::Fsize, l.file_bytes, "rlimit fsize")?;
+    }
     Ok(())
 }
 
-/// Drop every capability from the bounding set so no exec can regain privilege.
-fn drop_all_caps() {
-    // Best-effort: iterate the known capability range and drop each.
+/// Drop every capability from the bounding set so no exec can regain privilege, then check it
+/// is empty: fail closed (jail review #7).
+fn drop_all_caps() -> Result<(), Error> {
     for cap in 0..64u32 {
-        let _ = drop_bounding_cap(cap);
+        let _ = sys::capbset_drop(cap);
     }
-}
-
-fn drop_bounding_cap(cap: u32) -> std::io::Result<()> {
-    // PR_CAPBSET_DROP = 24. rustix exposes this via remove_capability_from_bounding_set
-    // but keyed by its Capability enum; iterating raw is simpler and total.
-    let r = unsafe_prctl_capbset_drop(cap);
-    if r { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-}
-
-// Thin shim so the raw prctl stays out of the hot modules; defined in sys.
-fn unsafe_prctl_capbset_drop(cap: u32) -> bool {
-    sys::capbset_drop(cap)
+    match (0..64u32).find(|c| sys::capbset_has(*c)) {
+        Some(cap) => Err(setup("drop capabilities", std::io::Error::other(format!("capability {cap} is still in the bounding set")))),
+        None => Ok(()),
+    }
 }
 
 fn landlock_agent(plan: &Plan) -> Result<(), Error> {
@@ -763,12 +842,16 @@ fn landlock_agent(plan: &Plan) -> Result<(), Error> {
             AccessFs::from_read(abi),
         ))
         .map_err(ll("ro root rule"))?;
+    // ResolveUnix (connect to a pathname socket, ABI >= 9) only where the jail's own sockets live
+    // (jail review #5): not the worktree or the rw extras, whose host sockets are masked anyway.
     let rw: Vec<PathBuf> = std::iter::once(plan.worktree.clone())
         .chain(plan.rw_paths.iter().map(|b| b.real.clone()))
-        .chain(["/tmp", "/home/sandbox", "/run/moochy", "/dev/shm", "/dev/null", "/dev/zero", "/dev/full"].map(PathBuf::from))
+        .chain(["/dev/shm", "/dev/null", "/dev/zero", "/dev/full"].map(PathBuf::from))
         .collect();
     let created = created
-        .add_rules(path_beneath_rules(rw, AccessFs::from_all(abi)))
+        .add_rules(path_beneath_rules(rw, AccessFs::from_all(abi) & !AccessFs::ResolveUnix))
+        .map_err(ll("rw rule"))?
+        .add_rules(path_beneath_rules(["/tmp", "/home/sandbox", "/run/moochy"].map(PathBuf::from), AccessFs::from_all(abi)))
         .map_err(ll("rw rule"))?;
     let status = created
         .no_new_privs(false) // we set it ourselves right after

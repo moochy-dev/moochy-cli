@@ -158,6 +158,12 @@ pub fn notice_frozen(n: usize) {
     eprintln!("moochy: {n} secret path(s) hidden from the agent; a secret added to the worktree during the run is not");
 }
 
+/// Secret-shaped names and sockets under a visible directory other than the worktree (an
+/// agent's install dir): the walk only, no `git` (jail review #11).
+pub fn scan_names(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    walk_tree(dir, true, &HashSet::new()).map(|s| s.masks)
+}
+
 /// Only the `.git` entries (no masks, no `git`): for the post-run check.
 pub fn dotgits(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
     walk_tree(worktree, false, &HashSet::new()).map(|s| s.dotgits)
@@ -223,7 +229,10 @@ fn walk_tree(root: &Path, masks: bool, kept: &HashSet<u64>) -> Result<Scan, Erro
                     }
                 }
             }
-            let hit = masks && !inside && (kept.contains(&entry.ino()) || matches_secret(root, &path));
+            // Jail review #5: a pathname socket (an ssh-agent, a dev server's control socket) is
+            // masked too: connect() then meets an empty file.
+            let socket = entry.file_type().is_ok_and(|t| std::os::unix::fs::FileTypeExt::is_socket(&t));
+            let hit = masks && !inside && (kept.contains(&entry.ino()) || socket || matches_secret(root, &path));
             if hit {
                 push_mask(&mut s.masks, path.clone())?;
             }
@@ -291,6 +300,21 @@ fn git_ignored(worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
 }
 
 fn ls_ignored(git: &str, worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+    for (p, is_dir) in ignored(git, worktree)? {
+        if is_dir && p.file_name().is_some_and(|n| BUILD_DIRS.iter().any(|b| n.as_bytes() == b.as_bytes())) {
+            continue;
+        }
+        if out.len() >= MASK_LIMIT {
+            return Err(too_big("mask limit"));
+        }
+        out.push(p);
+    }
+    Ok(())
+}
+
+/// Every git-ignored entry of `worktree` (`--directory`: an ignored dir as one entry), with
+/// whether it is a dir.
+fn ignored(git: &str, worktree: &Path) -> Result<Vec<(PathBuf, bool)>, Error> {
     let output = std::process::Command::new(git)
         .arg("-C")
         .arg(worktree)
@@ -307,7 +331,7 @@ fn ls_ignored(git: &str, worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
         failed => {
             let dotgit = worktree.join(".git");
             if !(dotgit.is_file() || dotgit.join("HEAD").exists()) {
-                return Ok(()); // not a repo (or an empty placeholder left by a killed run)
+                return Ok(Vec::new()); // not a repo (or an empty placeholder left by a killed run)
             }
             let err = match failed {
                 Ok(o) => std::io::Error::other(format!("git exited with {}", o.status)),
@@ -316,21 +340,43 @@ fn ls_ignored(git: &str, worktree: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
             return Err(Error::Setup { what: "git ls-files (git-ignored masks)", err });
         }
     };
-    for rel in output.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-        let (rel, is_dir) = match rel.strip_suffix(b"/") {
-            Some(r) => (r, true),
-            None => (rel, false),
-        };
-        let p = worktree.join(std::ffi::OsStr::from_bytes(rel));
-        if is_dir && p.file_name().is_some_and(|n| BUILD_DIRS.iter().any(|b| n.as_bytes() == b.as_bytes())) {
-            continue;
+    Ok(output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|r| !r.is_empty())
+        .map(|rel| match rel.strip_suffix(b"/") {
+            Some(r) => (worktree.join(std::ffi::OsStr::from_bytes(r)), true),
+            None => (worktree.join(std::ffi::OsStr::from_bytes(rel)), false),
+        })
+        .collect())
+}
+
+/// Jail review #4: files under git-ignored paths (build dirs such as `node_modules`, `.venv`,
+/// `target`) created or changed since `since` (ctime, which the agent cannot set back) that the
+/// host may run later: executable, or under a `bin`/`.bin` dir. `git status` shows none of them.
+/// Walks the ignored paths only, bounded like the mask walk.
+pub fn new_executables(worktree: &Path, since: std::time::SystemTime) -> Result<Vec<PathBuf>, Error> {
+    use std::os::unix::fs::MetadataExt as _;
+    let t = since.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let since = (i64::try_from(t.as_secs()).unwrap_or(i64::MAX), i64::from(t.subsec_nanos()));
+    let under_bin = |p: &Path| p.parent().is_some_and(|d| d.strip_prefix(worktree).is_ok_and(|r| r.iter().any(|c| c == "bin" || c == ".bin")));
+    let mut found = Vec::new();
+    let mut stack: Vec<PathBuf> = ignored("git", worktree)?.into_iter().map(|(p, _)| p).collect();
+    let mut seen = 0usize;
+    while let Some(p) = stack.pop() {
+        seen = seen.saturating_add(1);
+        if seen > WALK_LIMIT {
+            return Err(too_big("ignored-files walk limit"));
         }
-        if out.len() >= MASK_LIMIT {
-            return Err(too_big("mask limit"));
+        let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
+        if m.is_dir() {
+            stack.extend(std::fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+        } else if (m.ctime(), m.ctime_nsec()) >= since && ((m.is_file() && m.mode() & 0o111 != 0) || under_bin(&p)) {
+            found.push(p);
         }
-        out.push(p);
     }
-    Ok(())
+    found.sort();
+    Ok(found)
 }
 
 #[cfg(test)]

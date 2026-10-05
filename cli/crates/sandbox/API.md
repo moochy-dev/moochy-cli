@@ -30,16 +30,16 @@ let code = spec.run(program, &args)?;                // blocks; returns the agen
 | `Spec` field | Default | Meaning |
 |---|---|---|
 | `worktree` | required | The only read-write project dir. Mounted at the same absolute path inside. |
-| `ro_paths` | `/usr /bin /sbin /lib /lib64 /etc` (those that exist) | Visible read-only (mount-level ro **and** Landlock read-only). Add toolchains. |
+| `ro_paths` | `/usr /bin /sbin /lib /lib64` and a curated `/etc` on Linux (loader, CA roots, `passwd`/`group`/`nsswitch.conf`/`hosts`, time zone, `alternatives`, OS release, fonts, `java-*`/`python3*`/`perl`); `/etc` whole on macOS (those that exist) | Visible read-only (mount-level ro, nosuid, nodev **and** Landlock read-only). Add toolchains. A dir outside the defaults gets the secret-name and socket scan (§1.5). |
 | `rw_paths` | empty | Extra read-write dirs (rare, e.g. a shared build cache). |
 | `gateway_socket` | `None` | Host Unix socket of the gateway, bind-mounted at `/run/moochy/gateway.sock`. |
 | `gateway_loopback_port` | `None` | Loopback TCP port inside the empty netns, bridged to `gateway_socket`. Requires it. |
 | `env` | empty | The **only** variables passed (plus `PATH`, `HOME=/home/sandbox`, `TMPDIR=/tmp`, `USER`, `TERM`). Nothing is inherited. |
 | `cwd` | worktree | Working directory inside. |
 | `run_token` | `None` | Exported as `MOOCHY_RUN_TOKEN` inside the sandbox only. |
-| `limits` | 4 GiB AS, 1024 fds, 512 procs, no core, no CPU/wall cap | rlimits (every one applied or the run fails); `wall_seconds` kills the whole sandbox (exit 124). cgroup v2 (§1.8): `processes` → `pids.max`, `memory_total_bytes` → `memory.max` + swap 0, `cpu_percent` → `cpu.max` (0 = unset). |
+| `limits` | 4 GiB AS, 1024 fds, 512 procs, no core, 16 GiB per file (`RLIMIT_FSIZE`, Linux), 8 GiB sandbox memory (cgroup), no CPU/wall cap | rlimits (every one applied or the run fails); `wall_seconds` kills the whole sandbox (exit 124). cgroup v2 (§1.8): `processes` → `pids.max`, `memory_total_bytes` → `memory.max` + swap 0, `cpu_percent` → `cpu.max` (0 = unset). |
 | `allow_hosts` | empty | `--allow-host`: exact host names reachable on :443 through the CONNECT proxy (§1.2b). Linux and macOS. |
-| `protected` | `$HOME`, `$MOOCHY_HOME`, `$XDG_CONFIG_HOME/moochy`, `~/.config/moochy` | No visible path (worktree, `ro_paths`, `rw_paths`) may be `/` or contain one of these. The defaults mirror the node's `Home::resolve`; **mo-node: also push `home.dir`** (covers `--home`). |
+| `protected` | `$HOME`, `$MOOCHY_HOME`, `$XDG_CONFIG_HOME/moochy`, `~/.config/moochy` | No visible path (worktree, `ro_paths`, `rw_paths`) may be `/` or contain one of these, nor lie inside one other than the real home. `$HOME` unset: the password database's home (Linux). The defaults mirror the node's `Home::resolve`; **mo-node: also push `home.dir`** (covers `--home`). |
 | `git_writable` | `false` | Top-level `.git` writable except `hooks/ config config.worktree modules/ commondir` (§1.6). |
 | `unsafe_no_sandbox` | `false` | `--unsafe-no-sandbox`: runs **without** a sandbox after a loud stderr warning. Debug only. |
 
@@ -49,20 +49,32 @@ Exit code: the agent's own code, `128+N` if killed by signal N, `124` on wall de
 ### 1.1 What the agent sees (Linux)
 
 - New user, mount, PID, net, IPC and UTS namespaces. The agent is PID 1 of its own
-  namespace, its uid maps to the caller's, and it holds no capabilities after exec.
+  namespace, its uid and gid are the caller's own (never root), it holds no capabilities
+  after exec (the setup checks the bounding set is empty), and it has its own anonymous
+  session keyring (the host session's keys are not possessed).
 - `pivot_root` into a tmpfs root holding only: `ro_paths`, the worktree (rw), `rw_paths`,
-  private tmpfs `/tmp` (1777), `/home/sandbox` (`$HOME`, 0700) and `/run/moochy`, a minimal
-  `/dev` (`null zero full random urandom`), and its own `/proc`. The real home, `~/.ssh`,
+  private tmpfs `/tmp` (1777), `/home/sandbox` (`$HOME`, 0700), `/dev/shm` (2 GiB and 1M inodes
+  each) and `/run/moochy` (64 MiB), a minimal `/dev` (`null zero full random urandom`), and its
+  own `/proc`. The root itself is a read-only 64 MiB tmpfs; read-only binds are nosuid and nodev
+  and keep the source's noexec. The real home, `~/.ssh`,
   `~/.aws`, other repos and the Moochy keystore/state **do not exist** inside.
-- Secret-shaped and git-ignored files in the worktree are overmounted with an empty
-  read-only file or dir (§1.5). Every `.git` is read-only (§1.6).
+- Secret-shaped and git-ignored files and pathname sockets in the worktree are overmounted with
+  an empty read-only file or dir (§1.5), the path resolved inside the view (a symlink is
+  followed as the agent would follow it). Every `.git` is read-only (§1.6).
 - Network: an empty netns with only `lo`. The agent's only route is
   `127.0.0.1:<gateway_loopback_port>` → bridge → gateway socket. Landlock (ABI ≥ 4) also
   restricts TCP `connect` to that port.
 - Landlock FS (`/` read-only plus the rw set), abstract-socket and signal scoping
   (ABI ≥ 6), `no_new_privs`, the bounding set dropped, seccomp deny-list (§3), and
   `setsid` (no controlling terminal: TIOCSTI injection into your shell is impossible,
-  and seccomp blocks it as well).
+  and seccomp blocks it as well; a failed `setsid` refuses the run). The launcher saves the
+  terminal modes and puts them back after the run. Pathname-socket `connect` (Landlock
+  ABI ≥ 9) only beneath `/run/moochy`, `/tmp` and `/home/sandbox`. When the kernel's Landlock
+  lacks a layer, the run prints one `moochy: note:` line naming it.
+- After the run: a notice lists files in git-ignored paths (`node_modules/.bin`, `.venv/bin`,
+  `target`) that are new or changed and executable or under a `bin` dir; `git status` does not
+  show them.
+- The reaper (outside the cage) is not dumpable and has `RLIMIT_CORE` 0.
 - Lifetime: the launcher → reaper → PID 1 chain uses `PR_SET_PDEATHSIG(SIGKILL)` at each
   step, so killing `moochy run` (even with `kill -9`) kills every process in the sandbox.
 - Own cgroup namespace; terminal resizes (`SIGWINCH`) are forwarded by the reaper to the
@@ -236,9 +248,11 @@ and seccomp TSYNC, so existing threads are covered too. It is irreversible:
 - seccomp (TSYNC): `execve`/`execveat` → EPERM (kernel-enforced "zero commands"). Also
   denied: `ptrace`, `process_vm_*`, all mount APIs, `bpf`, `keyctl`/`add_key`/`request_key`,
   `perf_event_open`, `userfaultfd`, `kexec*`, module syscalls, `unshare`, `setns`,
-  `clone(CLONE_NEWUSER|CLONE_NEWNS)`, `clone3` (ENOSYS so libc falls back to `clone`),
-  `open_by_handle_at`, `ioctl(TIOCSTI|TIOCLINUX)`, `reboot`, `swap*`, `acct`, clock setting,
-  `io_uring_*`, and on x86_64 every x32-ABI number (`nr ≥ 0x4000_0000` → EPERM).
+  `clone(CLONE_NEW*)` (every namespace flag), `clone3` (ENOSYS so libc falls back to `clone`),
+  `open_by_handle_at`, `ioctl(TIOCSTI|TIOCLINUX|TIOCSETD)`, `reboot`, `swap*`, `acct`, clock
+  setting and `clock_adjtime`, `io_uring_*`, `pidfd_getfd`, `kcmp`, `process_madvise`, `fspick`,
+  `quotactl_fd`, `listmount`, `statmount`, `syslog`, `personality` other than `PER_LINUX` or the
+  query, `socket` outside `AF_UNIX`/`AF_INET`/`AF_INET6`/`AF_NETLINK`, and on x86_64 every x32-ABI number (`nr ≥ 0x4000_0000` → EPERM).
 - Landlock FS: `state_dir` rw, `ro_paths` ro, nothing else exists. **Required**: without
   Landlock, `lockdown_self` fails.
 - Landlock net (ABI ≥ 4): TCP connect only to 443 and `relay_port`; bind only

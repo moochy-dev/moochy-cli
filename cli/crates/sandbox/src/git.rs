@@ -252,10 +252,26 @@ pub fn changed(before: &Snapshot, after: &Snapshot) -> Option<PathBuf> {
         .cloned()
 }
 
-/// Print the A191 notice (one line) when git metadata changed during the run.
-/// The path is agent-chosen: printed escaped (`{:?}`), never raw.
+/// New or changed executables in git-ignored paths listed in the notice, at most.
+const EXEC_SHOWN: usize = 5;
+
+/// Print the A191 notice (one line) when git metadata changed during the run, and one when
+/// executables appeared in git-ignored paths since `since` (jail review #4).
+/// Paths are agent-chosen: printed escaped (`{:?}`), never raw.
 #[allow(clippy::unnecessary_debug_formatting)] // Debug = escaped: the path is agent-chosen
-pub fn notice_if_changed(worktree: &Path, before: &Snapshot) {
+pub fn notice_if_changed(worktree: &Path, before: &Snapshot, since: std::time::SystemTime) {
+    match crate::mask::new_executables(worktree, since) {
+        Ok(v) if v.is_empty() => {}
+        Ok(v) => {
+            let shown: Vec<_> = v.iter().take(EXEC_SHOWN).map(|p| p.strip_prefix(worktree).unwrap_or(p)).collect();
+            let more = if v.len() > EXEC_SHOWN { ", …" } else { "" };
+            eprintln!(
+                "moochy: notice: {} new or changed executable file(s) in git-ignored paths ({shown:?}{more}); git status does not show them: review them before running anything from {worktree:?}",
+                v.len()
+            );
+        }
+        Err(e) => eprintln!("moochy: notice: could not check git-ignored paths for new executables ({e}); review {worktree:?} before running anything from it"),
+    }
     let after = crate::mask::dotgits(worktree).map(|d| snapshot(&d));
     let what = match &after {
         Ok(after) => changed(before, after),
