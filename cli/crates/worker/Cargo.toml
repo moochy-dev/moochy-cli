@@ -37,7 +37,7 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
 # Test-only: an HTTP/2 + TLS fake provider to exercise the production h2 path.
 hyper = { version = "1.7", default-features = false, features = ["server", "http1", "http2"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 # Test-only: interop with the C encoder the gateway (moochy-proto) compresses with.
 zstd = { version = "0.14", default-features = false }
 
