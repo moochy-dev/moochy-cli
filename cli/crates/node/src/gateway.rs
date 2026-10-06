@@ -322,7 +322,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let hdr: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     // The body is re-serialized only when it can hold a stripped member (CONTRACT §13: no extra
     // pass over a large body otherwise); headers are always filtered.
-    let strip_body = body.windows(12).any(|w| w == b"\"safeguards\"");
+    let strip_body = memchr::memmem::find(&body, b"\"safeguards\"").is_some();
     let pool = moochy_worker::firewall::pool_compatible(dialect.worker(), if strip_body { &body } else { b"{}" }, &hdr)
         .map_err(|r| Failure::new("firewall", false, format!("moochy: {r} (refused before leaving this machine)")))?;
     drop(hdr);
@@ -347,7 +347,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         // top-level automatic caching (5 m): cache reads cost donors a fraction of input.
         let turns = root.get("messages").map_or(0, |m| m.items().count());
         // Both the repo setting and the local config must allow it.
-        let cache = dialect == Dialect::Anthropic && turns >= 2 && node.cfg.auto_cache() && !body.windows(15).any(|w| w == b"\"cache_control\"") && node.repo_auto_cache(&slug);
+        let cache = dialect == Dialect::Anthropic && turns >= 2 && node.cfg.auto_cache() && memchr::memmem::find(&body, b"\"cache_control\"").is_none() && node.repo_auto_cache(&slug);
         // Affinity key over system, tools and the first user message (04 §5), each re-serialized
         // canonically (`Val::raw` is empty for objects and arrays, which made every key equal).
         // The members injected below are top-level and change none of them.

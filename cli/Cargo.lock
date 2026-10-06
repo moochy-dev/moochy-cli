@@ -1296,6 +1296,7 @@ dependencies = [
  "hyper-util",
  "keyring",
  "lexopt",
+ "memchr",
  "moochy-keylog",
  "moochy-proto",
  "moochy-sandbox",
