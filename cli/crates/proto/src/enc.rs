@@ -62,6 +62,16 @@ pub fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// [`b64`] appended to `out` in place (no temporary `String`).
+pub(crate) fn b64_extend(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let start = out.len();
+    let end = base64::encoded_len(bytes.len(), false).and_then(|n| start.checked_add(n)).ok_or(Error::TooLarge)?;
+    out.resize(end, 0);
+    let dst = out.get_mut(start..).ok_or(Error::Malformed)?;
+    URL_SAFE_NO_PAD.encode_slice(bytes, dst).map_err(|_| Error::Malformed)?;
+    Ok(())
+}
+
 /// Strict base64url-no-pad: rejects padding, `+/`, whitespace and non-canonical trailing bits.
 pub fn unb64(s: &str) -> Result<Vec<u8>, Error> {
     URL_SAFE_NO_PAD.decode(s).map_err(|_| Error::Malformed)

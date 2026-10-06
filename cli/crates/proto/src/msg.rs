@@ -133,8 +133,31 @@ impl InnerPayload {
         }
         Ok(p)
     }
+    /// The same bytes as `serde_json::to_vec(self)`, built without the body's temporary base64
+    /// `String` and without serde_json's escape pass over it (base64url never needs escaping):
+    /// the body is most of the payload and this runs on every request (CONTRACT §13).
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        serde_json::to_vec(self).map_err(|_| Error::Malformed)
+        #[derive(Serialize)]
+        struct Tail<'a> {
+            body_sha256: &'a B<32>,
+            headers: &'a BTreeMap<String, String>,
+            #[serde(rename = "S")]
+            s: &'a B<32>,
+            gateway_device: &'a DeviceId,
+            task_sig: &'a Sig,
+        }
+        let tail = serde_json::to_vec(&Tail { body_sha256: &self.body_sha256, headers: &self.headers, s: &self.s, gateway_device: &self.gateway_device, task_sig: &self.task_sig })
+            .map_err(|_| Error::Malformed)?;
+        let tail = tail.get(1..).ok_or(Error::Malformed)?; // without its `{`
+        let cap = self.body_b64.0.len().div_ceil(3).saturating_mul(4).saturating_add(tail.len()).saturating_add(32);
+        let mut out = Vec::with_capacity(cap);
+        out.extend_from_slice(b"{\"v\":");
+        serde_json::to_writer(&mut out, &self.v).map_err(|_| Error::Malformed)?;
+        out.extend_from_slice(b",\"body_b64\":\"");
+        crate::enc::b64_extend(&self.body_b64.0, &mut out)?;
+        out.extend_from_slice(b"\",");
+        out.extend_from_slice(tail);
+        Ok(out)
     }
 }
 

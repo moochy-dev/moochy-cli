@@ -319,6 +319,16 @@ fn signatures_and_inner_payload() {
     p.verify(&ctx, &gw_pub).unwrap();
     let bytes = p.to_bytes().unwrap();
     assert_eq!(InnerPayload::parse(&bytes).unwrap(), p);
+    // to_bytes writes the body's base64 by hand: byte-identical to serde_json, for every body
+    // length mod 3 and for header values that need JSON escapes.
+    assert_eq!(bytes, serde_json::to_vec(&p).unwrap());
+    for n in [0usize, 1, 2, 3, 4, 5, 1000, 100_001] {
+        let mut h = BTreeMap::new();
+        h.insert("x-q".to_owned(), "a \"quoted\" \\ value é".to_owned());
+        let body: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
+        let q = InnerPayload::build(&ctx, body, h, [6; 32], dev("d_01K6A0000000000000000000G1"), &gw).unwrap();
+        assert_eq!(q.to_bytes().unwrap(), serde_json::to_vec(&q).unwrap(), "body of {n} bytes");
+    }
     // Tamper: body, headers, route, repo, wrong key, extra field, v != 1.
     let mut q = p.clone();
     q.body_b64.0.push(b' ');
