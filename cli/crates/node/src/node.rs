@@ -175,6 +175,21 @@ const MAX_CATALOGS: usize = 8;
 /// Relays ask workers to reconnect within 10 s of a drain (jitter), plus backoff.
 const POOL_REFILL_MS: u64 = 20_000;
 const JOURNAL_KEEP: usize = 512;
+/// `moochy report` evidence: the newest 32 consumed tasks, and at most 8 MiB of response text
+/// together (each one holds up to 1 MiB: 32 of them would keep an idle node far above its
+/// 20 MB budget). The newest one is always kept.
+pub const EVIDENCE_KEEP: usize = 32;
+pub const EVIDENCE_BYTES: usize = 8 << 20;
+
+/// Drop the oldest entries until at most `keep` remain and their `size` adds up to at most
+/// `bytes`, never the newest one.
+fn evict_oldest<T>(v: &mut VecDeque<T>, keep: usize, bytes: usize, size: impl Fn(&T) -> usize) {
+    let mut total = v.iter().fold(0usize, |n, e| n.saturating_add(size(e)));
+    while v.len() > keep || (total > bytes && v.len() > 1) {
+        let Some(old) = v.pop_front() else { break };
+        total = total.saturating_sub(size(&old));
+    }
+}
 
 impl Node {
     pub fn new(home: Home, cfg: Config, secrets: Secrets, keys: Option<Keys>, w: WorkerParts, offline: bool) -> Arc<Self> {
@@ -494,10 +509,8 @@ impl Node {
 
     pub fn keep_evidence(&self, e: crate::task::Evidence) {
         let mut v = lock(&self.evidence);
-        if v.len() >= 32 {
-            v.pop_front();
-        }
         v.push_back(e);
+        evict_oldest(&mut v, EVIDENCE_KEEP, EVIDENCE_BYTES, |e| e.response.iter().fold(0usize, |n, c| n.saturating_add(c.len())));
     }
 
     /// Record a finished task in the local journal (metadata only, never content).
@@ -546,5 +559,23 @@ impl<'a> Busy<'a> {
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    #[test]
+    fn evict_oldest_bounds_count_and_bytes() {
+        let mut v: VecDeque<usize> = (0..40).map(|_| 10).collect();
+        super::evict_oldest(&mut v, 32, 1000, |n| *n);
+        assert_eq!(v.len(), 32, "count bound");
+        let mut v: VecDeque<usize> = VecDeque::from([400, 300, 200, 500]);
+        super::evict_oldest(&mut v, 32, 800, |n| *n);
+        assert_eq!(v, [200, 500], "oldest first until the total fits");
+        let mut v: VecDeque<usize> = VecDeque::from([10, 5000]);
+        super::evict_oldest(&mut v, 32, 1000, |n| *n);
+        assert_eq!(v, [5000], "the newest stays even when it alone is over");
     }
 }

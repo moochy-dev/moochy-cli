@@ -407,7 +407,7 @@ impl LocalControl for Ctl {
     async fn report(&self, r: Request<ReportRequest>) -> std::result::Result<Response<ReportResponse>, Status> {
         let r = r.into_inner();
         let ev = lock(&self.node.evidence);
-        let e = ev.iter().find(|e| e.task == r.task).ok_or_else(|| Status::not_found("no evidence kept for that task (only the last 32 consumed tasks, while the node runs)"))?;
+        let e = ev.iter().find(|e| e.task == r.task).ok_or_else(|| Status::not_found("no evidence kept for that task (only the last 32 consumed tasks, at most 8 MiB of responses, while the node runs)"))?;
         Ok(Response::new(ReportResponse { bundle: e.bundle(&r.reason).to_string().into_bytes() }))
     }
 
