@@ -82,6 +82,20 @@ fn request_roundtrip_multi_chunk() {
     assert_eq!(one.chunks.len(), 1);
 }
 
+/// seal_request reuses zstd contexts across calls and levels: the frames stay those of a fresh
+/// context (level 3, then level 1 above 4 MiB, then level 3 again on a reused context).
+#[test]
+fn pooled_zstd_contexts_compress_like_fresh_ones() {
+    let t = task();
+    let text: Vec<u8> = (0..(4 << 20) + 1000).map(|i: usize| b"the quick brown fox "[i % 20] ^ u8::from(i.is_multiple_of(7919))).collect();
+    for payload in [&text[..20_000], &text[..], &text[..300]] {
+        let s = crypto::seal_request(&ck(), &t, payload).unwrap();
+        let mut d = crypto::RequestDecryptor::new(&ck(), &t).unwrap();
+        s.chunks.iter().for_each(|c| d.push(c).unwrap());
+        assert_eq!(d.finish().unwrap(), zstd::bulk::compress(payload, crypto::zstd_level(payload.len())).unwrap(), "{} bytes", payload.len());
+    }
+}
+
 /// Production split (CONTRACT §15.2): parent decrypts only, validator child inflates + parses.
 #[test]
 fn decrypt_only_then_inflate() {

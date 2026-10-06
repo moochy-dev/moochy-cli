@@ -260,8 +260,32 @@ pub fn seal_request(ck: &ContentKey, task: &TaskId, payload: &[u8]) -> Result<Se
     if payload.len() > MAX_PAYLOAD {
         return Err(Error::TooLarge);
     }
-    let z = zstd::bulk::compress(payload, zstd_level(payload.len())).map_err(|_| Error::Malformed)?;
+    let z = compress(payload)?;
     seal_compressed(ck, task, &z)
+}
+
+/// Reused zstd compression contexts, at most [`CCTX_KEEP`]. A fresh context per request
+/// allocates and frees ~1 MiB; each such free makes glibc raise its mmap and trim thresholds,
+/// after which every malloc arena keeps up to 2 MiB of freed memory (measured on a gateway
+/// after 200 requests of 100 KB: idle RSS several MiB higher). The output is the same: one-shot
+/// `compress2` with the level set before each call.
+static CCTX: std::sync::Mutex<Vec<zstd::bulk::Compressor<'static>>> = std::sync::Mutex::new(Vec::new());
+const CCTX_KEEP: usize = 2;
+
+fn compress(payload: &[u8]) -> Result<Vec<u8>, Error> {
+    let level = zstd_level(payload.len());
+    let mut c = match CCTX.lock().ok().and_then(|mut v| v.pop()) {
+        Some(c) => c,
+        None => zstd::bulk::Compressor::new(level).map_err(|_| Error::Malformed)?,
+    };
+    c.set_compression_level(level).map_err(|_| Error::Malformed)?;
+    let z = c.compress(payload).map_err(|_| Error::Malformed)?;
+    if let Ok(mut v) = CCTX.lock()
+        && v.len() < CCTX_KEEP
+    {
+        v.push(c);
+    }
+    Ok(z)
 }
 
 /// Seal already-compressed bytes as-is. Only for test vectors (bombs, trailing data); a
