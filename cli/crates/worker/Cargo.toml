@@ -1,6 +1,6 @@
 [package]
 name = "moochy-worker"
-version = "0.1.7"
+version = "0.1.8"
 description = "Moochy worker: provider firewall, safe mutations, adapters, SSE/usage parsing, tool-call inspection, outbox"
 edition.workspace = true
 license.workspace = true

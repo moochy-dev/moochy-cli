@@ -1,6 +1,6 @@
 [package]
 name = "moochy-sandbox"
-version = "0.1.7"
+version = "0.1.8"
 description = "Moochy sandbox: maintainer-side `moochy run` jail (Linux namespaces + Landlock + seccomp; macOS Seatbelt) and donor-side Worker privilege separation (CONTRACT §15)"
 edition.workspace = true
 license.workspace = true
