@@ -79,17 +79,35 @@ user-id = 209038 # Daniel McCarney (cpu)
 start = "2023-07-04"
 end = "2027-10-03"
 
+[[trusted.ruzstd]]
+criteria = "safe-to-deploy"
+user-id = 61599 # Moritz Borcherding (KillingSpark)
+start = "2019-11-04"
+end = "2027-10-28"
+
 [[trusted.scrypt]]
 criteria = "safe-to-deploy"
 user-id = 267 # Tony Arcieri (tarcieri)
 start = "2020-08-18"
 end = "2027-10-03"
 
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-10-28"
+
 [[trusted.tokio-rustls]]
 criteria = "safe-to-deploy"
 user-id = 4556 # Dirkjan Ochtman (djc)
 start = "2023-06-09"
 end = "2027-10-03"
+
+[[trusted.webpki-roots]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-07-21"
+end = "2027-10-28"
 
 [[trusted.x25519-dalek]]
 criteria = "safe-to-deploy"
@@ -102,3 +120,21 @@ criteria = "safe-to-deploy"
 user-id = 267 # Tony Arcieri (tarcieri)
 start = "2021-11-05"
 end = "2027-10-03"
+
+[[trusted.zstd]]
+criteria = "safe-to-deploy"
+user-id = 3203 # Alexandre Bury (gyscos)
+start = "2019-04-16"
+end = "2027-10-28"
+
+[[trusted.zstd-safe]]
+criteria = "safe-to-deploy"
+user-id = 3203 # Alexandre Bury (gyscos)
+start = "2019-04-16"
+end = "2027-10-28"
+
+[[trusted.zstd-sys]]
+criteria = "safe-to-deploy"
+user-id = 3203 # Alexandre Bury (gyscos)
+start = "2019-04-16"
+end = "2027-10-28"

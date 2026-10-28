@@ -602,10 +602,6 @@ criteria = "safe-to-deploy"
 version = "1.0.23"
 criteria = "safe-to-deploy"
 
-[[exemptions.ruzstd]]
-version = "0.9.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.ryu]]
 version = "1.0.23"
 criteria = "safe-to-deploy"
@@ -730,10 +726,6 @@ criteria = "safe-to-deploy"
 version = "0.3.55"
 criteria = "safe-to-deploy"
 
-[[exemptions.tokio]]
-version = "1.53.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.tokio-macros]]
 version = "2.7.2"
 criteria = "safe-to-deploy"
@@ -812,10 +804,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.wasi]]
 version = "0.11.0+wasi-snapshot-preview1"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-roots]]
-version = "1.0.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.winapi]]
@@ -920,18 +908,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]
 version = "1.0.23"
-criteria = "safe-to-deploy"
-
-[[exemptions.zstd]]
-version = "0.14.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zstd-safe]]
-version = "8.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zstd-sys]]
-version = "2.1.0+zstd.1.5.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.zvariant]]
