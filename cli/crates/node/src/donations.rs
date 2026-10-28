@@ -106,9 +106,8 @@ fn dollars(uusd: i64) -> String {
 
 /// `moochy donations [--json]`: this account's donations.
 pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
-    let b = call(home, "list", ListDonationsRequest::default().encode_to_vec())?;
-    let r = ListDonationsResponse::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
-    for d in &r.donations {
+    let donations = mine(home)?;
+    for d in &donations {
         if json_out {
             emit(&donation_json(d));
         } else {
@@ -116,10 +115,16 @@ pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
             println!("{:<28} {:<9} {} of {} this month{}  ({})", target(d), clean(&d.status), dollars(d.spent_uusd), dollars(d.budget_uusd), windows.extra(), clean(&d.pledge_id));
         }
     }
-    if r.donations.is_empty() && !json_out {
-        println!("No donations yet: `moochy donate --repo OWNER/NAME --cap $20` (or --org github/ORG, --person github/LOGIN)");
+    if donations.is_empty() && !json_out {
+        println!("No donations yet: `moochy donate --repo OWNER/NAME --cap 20` (or --org github/ORG, --person github/LOGIN)");
     }
     Ok(())
+}
+
+/// This account's donations, as the relay lists them (`moochy start` skips donating when one exists).
+pub(crate) fn mine(home: &crate::config::Home) -> Result<Vec<Donation>> {
+    let b = call(home, "list", ListDonationsRequest::default().encode_to_vec())?;
+    Ok(ListDonationsResponse::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?.donations)
 }
 
 /// A new donation's limits in µ$ (CONTRACT D19a): monthly required, weekly and daily optional.
@@ -132,7 +137,7 @@ pub struct Limits {
 
 impl Limits {
     /// Positive amounts, daily ≤ weekly ≤ monthly (the relay checks the same).
-    fn check(self) -> Result<()> {
+    pub(crate) fn check(self) -> Result<()> {
         if self.monthly <= 0 {
             return Err(usage("set a monthly limit: --cap $20 (or --budget-uusd N)"));
         }
