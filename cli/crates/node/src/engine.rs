@@ -124,6 +124,12 @@ impl Catalog {
             .or_else(|| self.entries.iter().find(|e| e.provider_model_id == model || e.aliases.iter().any(|a| a == model)))
     }
 
+    /// Plan 14 §4.1: pool models cheapest first (in + out of the model's cheapest entry); the
+    /// sort is stable, so equal prices keep their (name) order and unpriced models go last.
+    pub fn by_price<T>(&self, models: &mut [(String, T)]) {
+        models.sort_by_key(|(m, _)| self.entries.iter().filter(|e| e.model == *m).map(|e| e.input.saturating_add(e.out)).min().unwrap_or(u64::MAX));
+    }
+
     pub fn entry(&self, model: &str, provider: &str) -> Option<&CatalogEntry> {
         self.entries.iter().find(|e| e.model == model && e.provider == provider)
     }
@@ -345,6 +351,17 @@ mod tests {
         assert!(open_detail(&c2, "firewall", &s).is_none(), "attempt bound in key");
         let long = "é".repeat(800);
         assert!(open_detail(&c, "x", &seal_detail(&c, "x", &long)).unwrap().len() <= MAX_DETAIL);
+    }
+
+    #[test]
+    fn pool_models_cheapest_first() {
+        let e = |model: &str, provider: &str, input: u64, out: u64| format!(r#"{{"model":"{model}","provider":"{provider}","provider_model_id":"x","dialects":["openai.chat"],"in":{input},"out":{out},"cache_write_5m":0,"cache_write_1h":0,"cache_read":0,"max_image_tokens":0,"max_page_tokens":0,"default_effort":"none","max_output":10}}"#);
+        let entries = [e("a/opus", "anthropic", 5, 25), e("a/opus", "openrouter", 4, 20), e("d/chat", "deepseek", 1, 1), e("z/free", "local", 0, 0), e("b/same", "openai", 1, 1)];
+        let c = Catalog::parse(format!(r#"{{"version":1,"entries":[{}]}}"#, entries.join(",")).as_bytes()).unwrap();
+        let mut ms: Vec<(String, ())> = ["a/opus", "b/same", "d/chat", "u/unpriced", "z/free"].iter().map(|m| ((*m).to_owned(), ())).collect();
+        c.by_price(&mut ms);
+        let got: Vec<&str> = ms.iter().map(|(m, ())| m.as_str()).collect();
+        assert_eq!(got, ["z/free", "b/same", "d/chat", "a/opus", "u/unpriced"], "cheapest entry, ties by name, unpriced last");
     }
 
     #[test]

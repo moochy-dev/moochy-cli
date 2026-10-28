@@ -140,9 +140,10 @@ impl Secrets {
         bool::from(want.as_slice().ct_eq(&given)).then_some(slug)
     }
 
-    /// Session-affinity key: HMAC(per-device secret, lp(label, system, tools, first user message)), 16 bytes.
-    pub fn affinity(&self, system: &[u8], tools: &[u8], first_user: &[u8]) -> [u8; 16] {
-        let m = self.mac(&[b"moochy/affinity", system, tools, first_user]);
+    /// Session-affinity key: HMAC(per-device secret, lp(label, project, system, tools, first user
+    /// message)), 16 bytes. Per project: it is also the provider's `prompt_cache_key` (plan 14 §4.4).
+    pub fn affinity(&self, project: &[u8], system: &[u8], tools: &[u8], first_user: &[u8]) -> [u8; 16] {
+        let m = self.mac(&[b"moochy/affinity", project, system, tools, first_user]);
         let mut out = [0u8; 16];
         out.copy_from_slice(m.get(..16).unwrap_or(&[0u8; 16]));
         out

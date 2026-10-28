@@ -42,6 +42,15 @@ pub const CLIENTS: &[&str] = &[
     "generic-anthropic",
 ];
 
+/// The dialect a tool's API door speaks (plan 14 §4.1: `connect` offers it only models it can use).
+pub fn dialect(client: &str) -> &'static str {
+    match client {
+        "claude-code" | "goose" | "generic-anthropic" => "anthropic.messages",
+        "codex" => "openai.responses",
+        _ => "openai.chat",
+    }
+}
+
 /// `url` = gateway base URL (`http://127.0.0.1:PORT`), `main`/`small` = pool models.
 pub fn snippet(client: &str, url: &str, repo: &str, main: &str, small: &str) -> Option<String> {
     let token = format!("export MOOCHY_TOKEN=\"$(moochy env --repo {repo} --json | jq -r .token)\"\n");

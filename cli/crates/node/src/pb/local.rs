@@ -78,6 +78,9 @@ pub struct PoolSummary {
     pub workers: u32,
     #[prost(string, repeated, tag = "4")]
     pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The dialects of models\[i\], comma-separated (plan 14 §4.1: `connect` picks models its tool can speak).
+    #[prost(string, repeated, tag = "5")]
+    pub model_dialects: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PauseRequest {}

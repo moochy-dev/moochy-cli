@@ -1279,11 +1279,20 @@ fn connect(home: &Home, o: &Opts, client: &str) -> Result<()> {
     let (url, models) = rt_small()?.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;
         let st = c.status(StatusRequest {}).await.map_err(|s| internal(s.message().to_owned()))?.into_inner();
-        let models: Vec<String> = st.pools.iter().find(|p| p.slug.eq_ignore_ascii_case(&slug)).map(|p| p.models.clone()).unwrap_or_default();
+        // Cheapest first; only the models this tool's API door speaks (an older app sends no dialects).
+        let dialect = crate::connect::dialect(client);
+        let models: Vec<String> = st
+            .pools
+            .iter()
+            .find(|p| p.slug.eq_ignore_ascii_case(&slug))
+            .map(|p| p.models.iter().enumerate().filter(|(i, _)| p.model_dialects.get(*i).is_none_or(|ds| ds.split(',').any(|d| d == dialect))).map(|(_, m)| m.clone()).collect())
+            .unwrap_or_default();
         Ok::<_, Error>((st.gateway_url, models))
     })?;
-    let main = clean(models.first().map_or("MODEL", String::as_str)).into_owned();
-    let small = clean(models.get(1).map_or(main.as_str(), String::as_str)).into_owned();
+    // Plan 14 §4.1: small = the cheapest model, main = the next price tier (the project sets no
+    // model preference and the catalog marks no model "small", so price rank is the signal).
+    let small = clean(models.first().map_or("MODEL", String::as_str)).into_owned();
+    let main = clean(models.get(1).map_or(small.as_str(), String::as_str)).into_owned();
     if !o.has("write") {
         let s = crate::connect::snippet(client, &url, &slug, &main, &small).ok_or_else(|| usage(format!("unknown client; one of: {}", crate::connect::CLIENTS.join(", "))))?;
         print!("{s}");
