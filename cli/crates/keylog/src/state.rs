@@ -417,26 +417,41 @@ impl State {
                 signer,
                 issued_at_ms,
             } => {
-                let owner = self
-                    .repos
-                    .get(repo_id)
-                    .ok_or(Code::Unclaimed)?
-                    .owner
-                    .clone();
+                // Personal (plan 15): a pseudonym target is owned by that pseudonym from the
+                // start (no claim, no owner change); its record appears with its first grant.
+                let personal = crate::entry::is_pseudonym(repo_id);
+                let owner = match self.repos.get(repo_id) {
+                    Some(r) => r.owner.clone(),
+                    None if personal => repo_id.to_owned(),
+                    None => return Err(Code::Unclaimed),
+                };
                 let ctr = self.check_signer(signer, &owner, e, check_sigs)?;
                 let member = matches!(e.kind, Kind::MemberAdded | Kind::MemberRemoved);
-                let r = self.repos.get(repo_id).ok_or(Code::Unclaimed)?;
-                let grants = if member { &r.members } else { &r.donors };
-                // A265: nothing signed before the current owner's claim.
-                if issued_at_ms <= r.since
-                    || grants
-                        .get(subject)
-                        .is_some_and(|g| issued_at_ms <= g.issued)
-                {
-                    return Err(Code::Replay);
+                if let Some(r) = self.repos.get(repo_id) {
+                    let grants = if member { &r.members } else { &r.donors };
+                    // A265: nothing signed before the current owner's claim.
+                    if issued_at_ms <= r.since
+                        || grants
+                            .get(subject)
+                            .is_some_and(|g| issued_at_ms <= g.issued)
+                    {
+                        return Err(Code::Replay);
+                    }
                 }
                 self.bump(signer, ctr);
-                let r = self.repos.get_mut(repo_id).ok_or(Code::Unclaimed)?;
+                let r = self
+                    .repos
+                    .entry(repo_id.to_owned())
+                    .or_insert_with(|| Repo {
+                        provider: String::new(),
+                        provider_repo_id: String::new(),
+                        owner,
+                        issued: 0,
+                        since: 0,
+                        donors: HashMap::new(),
+                        members: HashMap::new(),
+                        covers: HashMap::new(),
+                    });
                 let grants = if member {
                     &mut r.members
                 } else {
@@ -1016,6 +1031,66 @@ impl State {
             key_idx: w.idx,
             approval_idx,
         })
+    }
+
+    /// The personal rule (plan 15, the recipient's own use): may a Gateway seal a personal task
+    /// (route repo id = the requester's own pseudonym) from device `gateway` to `worker`? Both
+    /// devices pass the device checks for the personal id (worker / gateway role; a device scoped
+    /// to a repo never serves or sends one); the target P is the gateway's own pseudonym, and P
+    /// holds an active DONOR_APPROVED for the worker's pseudonym, signed by one of P's owner keys
+    /// (`not_approved` otherwise). No repo id plays a part; a repo, org or person approval never
+    /// satisfies it. `approval_idx` is P's approval. The relay's `PersonalSealable`.
+    pub fn personal_sealable(&self, worker: &str, gateway: &str) -> Result<Sealable, Code> {
+        self.personal_sealable_at(worker, gateway, now_ms())
+    }
+
+    /// [`Self::personal_sealable`] at wall-clock time `now_ms` (box expiry).
+    pub fn personal_sealable_at(
+        &self,
+        worker: &str,
+        gateway: &str,
+        now_ms: u64,
+    ) -> Result<Sealable, Code> {
+        let p = &self
+            .devices
+            .get(gateway)
+            .ok_or(Code::UnknownDevice)?
+            .pseudonym;
+        let w = self.usable_device(worker, true, p, now_ms)?;
+        self.usable_device(gateway, false, p, now_ms)?;
+        let approval_idx = self
+            .repos
+            .get(p.as_str())
+            .and_then(|r| r.donors.get(w.pseudonym.as_str()))
+            .filter(|a| a.active)
+            .ok_or(Code::NotApproved)?
+            .idx;
+        Ok(Sealable {
+            enc_pub: w.enc_pub,
+            key_idx: w.idx,
+            approval_idx,
+        })
+    }
+
+    /// May `gateway` submit a personal task for `target` (plan 15)? Device checks with role
+    /// gateway, then `target` is the device's own pseudonym (`not_member` otherwise). Separate
+    /// from [`Self::gateway_allowed`], never a widening of it.
+    pub fn personal_gateway_allowed(&self, gateway: &str, target: &str) -> Result<&Device, Code> {
+        self.personal_gateway_allowed_at(gateway, target, now_ms())
+    }
+
+    /// [`Self::personal_gateway_allowed`] at wall-clock time `now_ms`.
+    pub fn personal_gateway_allowed_at(
+        &self,
+        gateway: &str,
+        target: &str,
+        now_ms: u64,
+    ) -> Result<&Device, Code> {
+        let d = self.usable_device(gateway, false, target, now_ms)?;
+        if !crate::entry::is_pseudonym(target) || d.pseudonym != target {
+            return Err(Code::NotMember);
+        }
+        Ok(d)
     }
 
     /// [`Self::sealable`] when it allows, else [`Self::person_sealable`] (the relay's
