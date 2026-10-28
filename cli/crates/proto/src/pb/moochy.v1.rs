@@ -807,6 +807,10 @@ pub struct DonateRequest {
     pub weekly_limit_uusd: i64,
     #[prost(int64, tag = "12")]
     pub daily_limit_uusd: i64,
+    /// Plan 15 §5: pay from the donor's Moochy Credits balance instead of their own key. budget_uusd
+    /// is then a one-off amount (a total), served by Moochy Credits; schedule and windows are ignored.
+    #[prost(bool, tag = "13")]
+    pub credits: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DonationActionRequest {
@@ -886,6 +890,22 @@ pub struct Donation {
     /// 0 = none
     #[prost(int64, tag = "23")]
     pub daily_limit_uusd: i64,
+    /// Plan 15 §4: a total donation (gifts, credits): budget_uusd is the lifetime total, it never
+    /// rolls over, and it ends at ends_at_ms.
+    #[prost(bool, tag = "24")]
+    pub total: bool,
+    #[prost(int64, tag = "25")]
+    pub ends_at_ms: i64,
+    /// "gf\_…": the gift this donation came from
+    #[prost(string, tag = "26")]
+    pub gift_id: ::prost::alloc::string::String,
+    /// served by Moochy Credits (plan 15 §5)
+    #[prost(bool, tag = "27")]
+    pub credits: bool,
+    /// The recipient's own use (plan 15, product owner 2026-10-28): set (repo_slug, org and person
+    /// empty) when the target is an account itself; it serves that account's own devices on any repo.
+    #[prost(bool, tag = "28")]
+    pub personal: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RepoSpend {
@@ -1134,6 +1154,179 @@ pub struct LookupResponse {
     /// handle lookups only
     #[prost(string, tag = "4")]
     pub pseudonym: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateGiftRequest {
+    /// idempotency key (ULID); the gift id is "gf\_" + request_id
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// tokens (the giver's own key) | credits (the giver's balance)
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    /// tokens: $1 .. $1,000; credits: up to the available balance
+    #[prost(int64, tag = "3")]
+    pub amount_uusd: i64,
+    /// 0 = the default
+    #[prost(int64, tag = "4")]
+    pub per_task_cap_uusd: i64,
+    /// empty = any in the catalog
+    #[prost(string, repeated, tag = "5")]
+    pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub max_effort: ::prost::alloc::string::String,
+    /// public (default) | pseudonymous | anonymous
+    #[prost(string, tag = "7")]
+    pub visibility: ::prost::alloc::string::String,
+    /// \<= 140 characters, shown to the claimer
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
+    /// 0 = 30; at most 90
+    #[prost(uint32, tag = "9")]
+    pub expires_days: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Gift {
+    /// "gf\_" + ULID
+    #[prost(string, tag = "1")]
+    pub gift_id: ::prost::alloc::string::String,
+    /// the link: CreateGift and RevokeGift{replace} only, never stored
+    #[prost(string, tag = "2")]
+    pub url: ::prost::alloc::string::String,
+    /// tokens | credits
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub amount_uusd: i64,
+    #[prost(int64, tag = "5")]
+    pub per_task_cap_uusd: i64,
+    #[prost(string, repeated, tag = "6")]
+    pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "7")]
+    pub max_effort: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub visibility: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub note: ::prost::alloc::string::String,
+    /// open | claimed | revoked | expired
+    #[prost(string, tag = "10")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(int64, tag = "11")]
+    pub created_at_ms: i64,
+    #[prost(int64, tag = "12")]
+    pub expires_at_ms: i64,
+    #[prost(int64, tag = "13")]
+    pub claimed_at_ms: i64,
+    /// the claimer's handle (claimed only)
+    #[prost(string, tag = "14")]
+    pub claimer: ::prost::alloc::string::String,
+    /// provider-qualified project, org/…, people/… or "personal"
+    #[prost(string, tag = "15")]
+    pub target: ::prost::alloc::string::String,
+    /// the donation the claim made
+    #[prost(string, tag = "16")]
+    pub pledge_id: ::prost::alloc::string::String,
+    /// a retried CreateGift: the link cannot be shown again
+    #[prost(bool, tag = "17")]
+    pub existing: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListGiftsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListGiftsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub gifts: ::prost::alloc::vec::Vec<Gift>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevokeGiftRequest {
+    #[prost(string, tag = "1")]
+    pub gift_id: ::prost::alloc::string::String,
+    /// rotate the token instead: the old link dies, Gift.url is the new one
+    #[prost(bool, tag = "2")]
+    pub replace: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClaimGiftRequest {
+    /// the 22-character token, or the whole <https://…/g/{token}> link
+    #[prost(string, tag = "1")]
+    pub token: ::prost::alloc::string::String,
+    /// Exactly one target: a project, an organisation or a person profile the user owns, or personal.
+    #[prost(string, tag = "2")]
+    pub repo_slug: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub org: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub person: ::prost::alloc::string::String,
+    /// for the user's own use (any repo, their own devices)
+    #[prost(bool, tag = "5")]
+    pub personal: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCreditsRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreditPurchase {
+    /// "cp\_…"
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub amount_cents: i64,
+    #[prost(int64, tag = "3")]
+    pub stripe_fee_cents: i64,
+    #[prost(int64, tag = "4")]
+    pub provider_fee_uusd: i64,
+    #[prost(int64, tag = "5")]
+    pub credits_uusd: i64,
+    /// pending | held | available | refunded | disputed | expired
+    #[prost(string, tag = "6")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub paid_at_ms: i64,
+    #[prost(int64, tag = "8")]
+    pub available_at_ms: i64,
+    #[prost(int64, tag = "9")]
+    pub refunded_cents: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreditAllocation {
+    /// "ca\_…"
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// provider-qualified project, org/…, people/… or "personal"
+    #[prost(string, tag = "2")]
+    pub target: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub amount_uusd: i64,
+    #[prost(int64, tag = "4")]
+    pub used_uusd: i64,
+    #[prost(string, tag = "5")]
+    pub gift_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub ends_at_ms: i64,
+    /// 0 = live
+    #[prost(int64, tag = "7")]
+    pub ended_at_ms: i64,
+    /// the target's Moochy Credits donation
+    #[prost(string, tag = "8")]
+    pub pledge_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Credits {
+    #[prost(int64, tag = "1")]
+    pub available_uusd: i64,
+    /// paid, still in the 72 h hold
+    #[prost(int64, tag = "2")]
+    pub held_uusd: i64,
+    /// in live allocations, not used yet
+    #[prost(int64, tag = "3")]
+    pub allocated_uusd: i64,
+    #[prost(bool, tag = "4")]
+    pub frozen: bool,
+    #[prost(message, repeated, tag = "5")]
+    pub purchases: ::prost::alloc::vec::Vec<CreditPurchase>,
+    #[prost(message, repeated, tag = "6")]
+    pub allocations: ::prost::alloc::vec::Vec<CreditAllocation>,
+    /// the web page that takes the card (never the CLI)
+    #[prost(string, tag = "7")]
+    pub add_url: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1676,6 +1869,122 @@ pub mod node_link_client {
                 .insert(GrpcMethod::new("moochy.v1.NodeLink", "ListOwned"));
             self.inner.unary(req, path, codec).await
         }
+        /// Gift links (plan 15 §3), authenticated like Donate. CreateGift is the only answer that carries
+        /// the link (Gift.url); the relay keeps only SHA-256 of its token. Errors as Donate, plus
+        /// RESOURCE_EXHAUSTED (20 open gifts, 3 claims a day, 10 live gift donations) and
+        /// FAILED_PRECONDITION "self_gift" / "not_eligible" / "already_donating".
+        pub async fn create_gift(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateGiftRequest>,
+        ) -> std::result::Result<tonic::Response<super::Gift>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/CreateGift",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "CreateGift"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_gifts(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListGiftsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListGiftsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/ListGifts",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "ListGifts"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// An open gift: revoke it, or with replace = true rotate its token (Gift.url is the new link).
+        pub async fn revoke_gift(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RevokeGiftRequest>,
+        ) -> std::result::Result<tonic::Response<super::Gift>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/RevokeGift",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "RevokeGift"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The session's user claims a gift for a target they own, or for their own use (personal).
+        /// Unknown, used, expired and revoked tokens are all NOT_FOUND, alike.
+        pub async fn claim_gift(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClaimGiftRequest>,
+        ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/ClaimGift",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "ClaimGift"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Credits (plan 15 §5): UNIMPLEMENTED unless the relay runs with --credits.
+        pub async fn get_credits(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCreditsRequest>,
+        ) -> std::result::Result<tonic::Response<super::Credits>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/moochy.v1.NodeLink/GetCredits",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("moochy.v1.NodeLink", "GetCredits"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1828,6 +2137,37 @@ pub mod node_link_server {
             tonic::Response<super::ListOwnedResponse>,
             tonic::Status,
         >;
+        /// Gift links (plan 15 §3), authenticated like Donate. CreateGift is the only answer that carries
+        /// the link (Gift.url); the relay keeps only SHA-256 of its token. Errors as Donate, plus
+        /// RESOURCE_EXHAUSTED (20 open gifts, 3 claims a day, 10 live gift donations) and
+        /// FAILED_PRECONDITION "self_gift" / "not_eligible" / "already_donating".
+        async fn create_gift(
+            &self,
+            request: tonic::Request<super::CreateGiftRequest>,
+        ) -> std::result::Result<tonic::Response<super::Gift>, tonic::Status>;
+        async fn list_gifts(
+            &self,
+            request: tonic::Request<super::ListGiftsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListGiftsResponse>,
+            tonic::Status,
+        >;
+        /// An open gift: revoke it, or with replace = true rotate its token (Gift.url is the new link).
+        async fn revoke_gift(
+            &self,
+            request: tonic::Request<super::RevokeGiftRequest>,
+        ) -> std::result::Result<tonic::Response<super::Gift>, tonic::Status>;
+        /// The session's user claims a gift for a target they own, or for their own use (personal).
+        /// Unknown, used, expired and revoked tokens are all NOT_FOUND, alike.
+        async fn claim_gift(
+            &self,
+            request: tonic::Request<super::ClaimGiftRequest>,
+        ) -> std::result::Result<tonic::Response<super::Donation>, tonic::Status>;
+        /// Credits (plan 15 §5): UNIMPLEMENTED unless the relay runs with --credits.
+        async fn get_credits(
+            &self,
+            request: tonic::Request<super::GetCreditsRequest>,
+        ) -> std::result::Result<tonic::Response<super::Credits>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct NodeLinkServer<T> {
@@ -2601,6 +2941,231 @@ pub mod node_link_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListOwnedSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/CreateGift" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateGiftSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::CreateGiftRequest>
+                    for CreateGiftSvc<T> {
+                        type Response = super::Gift;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateGiftRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::create_gift(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateGiftSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/ListGifts" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListGiftsSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::ListGiftsRequest>
+                    for ListGiftsSvc<T> {
+                        type Response = super::ListGiftsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListGiftsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::list_gifts(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListGiftsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/RevokeGift" => {
+                    #[allow(non_camel_case_types)]
+                    struct RevokeGiftSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::RevokeGiftRequest>
+                    for RevokeGiftSvc<T> {
+                        type Response = super::Gift;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RevokeGiftRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::revoke_gift(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RevokeGiftSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/ClaimGift" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClaimGiftSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::ClaimGiftRequest>
+                    for ClaimGiftSvc<T> {
+                        type Response = super::Donation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ClaimGiftRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::claim_gift(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClaimGiftSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/moochy.v1.NodeLink/GetCredits" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCreditsSvc<T: NodeLink>(pub Arc<T>);
+                    impl<
+                        T: NodeLink,
+                    > tonic::server::UnaryService<super::GetCreditsRequest>
+                    for GetCreditsSvc<T> {
+                        type Response = super::Credits;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCreditsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeLink>::get_credits(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCreditsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
