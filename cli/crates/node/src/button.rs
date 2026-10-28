@@ -230,6 +230,23 @@ pub fn project_chart(p: &Project, o: &Options) -> Result<String> {
     chart(&format!("{ORIGIN}/p/{}/{}", p.provider, p.path), act, o)
 }
 
+/// `moochy button --qr` (plan 15 §2): the target's `qr.svg` URL and a Markdown snippet linking
+/// the code to the donate page, canonical URLs as the studio's QR tab. `name` is the alt text's
+/// target (`owner/name`, the organisation or the login).
+pub fn qr(base: &str, act: &str, name: &str, o: &Options) -> Result<String> {
+    if o.label.is_some() || o.style.is_some() || o.theme.is_some() || o.size.is_some() || o.format.is_some() || o.metric.is_some() || o.series.is_some() || o.kind.is_some() || o.period.is_some() || o.goal || o.total {
+        return Err(usage("--qr takes no button or chart options"));
+    }
+    Ok(format!("{base}{act}qr.svg
+[![Scan to donate tokens to {name}]({base}{act}qr.svg)]({base}{act}donate)"))
+}
+
+/// A project's QR snippet, on the canonical `/p/PROVIDER/…` form.
+pub fn project_qr(p: &Project, o: &Options) -> Result<String> {
+    let act = if p.provider == "github" { "/" } else { "/-/" };
+    qr(&format!("{ORIGIN}/p/{}/{}", p.provider, p.path), act, &p.path, o)
+}
+
 /// The snippet. `Options` values are checked against the guide's `button.svg` reference.
 pub fn snippet(p: &Project, o: &Options) -> Result<String> {
     if o.metric.is_some() || o.series.is_some() || o.kind.is_some() || o.period.is_some() || o.goal || o.total {
@@ -298,6 +315,19 @@ mod tests {
         let (_, json) = step2.split_once("```json\n").unwrap();
         let v: serde_json::Value = serde_json::from_str(json.split_once("\n```").unwrap().0).unwrap();
         v[field].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn qr_snippets() {
+        let o = Options::default();
+        let gh = Project { provider: "github", path: "o/r".into() };
+        assert_eq!(project_qr(&gh, &o).unwrap(), "https://moochy.dev/p/github/o/r/qr.svg\n[![Scan to donate tokens to o/r](https://moochy.dev/p/github/o/r/qr.svg)](https://moochy.dev/p/github/o/r/donate)");
+        let gl = Project { provider: "gitlab", path: "g/sub/r".into() };
+        assert!(project_qr(&gl, &o).unwrap().starts_with("https://moochy.dev/p/gitlab/g/sub/r/-/qr.svg\n"));
+        let (base, act) = group_base(crate::donations::To::Org, "gitlab/g/sub").unwrap();
+        assert!(qr(&base, act, "g/sub", &o).unwrap().ends_with("(https://moochy.dev/org/gitlab/g/sub/-/donate)"));
+        let styled = Options { style: Some("text".into()), ..Options::default() };
+        assert!(project_qr(&gh, &styled).is_err());
     }
 
     #[test]

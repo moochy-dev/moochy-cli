@@ -76,6 +76,8 @@ COMMANDS:
          [--size s|m|l] [--label TEXT] [--goal] [--total] [--format markdown|html|rst|iframe]
                                   A live chart of the tokens donated to and used by the
                                   project or organisation (README image or website card)
+  button --qr [--repo P|--org ORG|--person PERSON]
+                                  The QR code of the donate page (its qr.svg URL and Markdown)
   audit --provider [--from-file usage.csv]
                                   What this device served (90 days), checked against the
                                   provider's usage export (date,model,cost_usd)
@@ -325,7 +327,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart"];
+                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart", "qr"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -1484,14 +1486,19 @@ fn spend_limit_page(provider: &str) -> &'static str {
 fn button(o: &Opts, rest: &[&str]) -> Result<()> {
     // CONTRACT §21.3: an organisation's chart (no project to detect).
     if o.org.is_some() || o.person.is_some() {
-        if !o.has("chart") || o.repo.is_some() || o.has("provider") || !rest.is_empty() {
-            return Err(usage("button --chart --org github/ORG|gitlab/GROUP[/SUB…] | --person github/LOGIN|gitlab/USERNAME (not with --repo or --provider)"));
+        if o.has("chart") == o.has("qr") || o.repo.is_some() || o.has("provider") || !rest.is_empty() {
+            return Err(usage("button --chart|--qr --org github/ORG|gitlab/GROUP[/SUB…] | --person github/LOGIN|gitlab/USERNAME (not with --repo or --provider)"));
         }
         let (base, act) = match (&o.org, person_arg(o)?) {
             (_, Some(p)) => crate::button::group_base(crate::donations::To::Person, &p)?,
             (Some(org), None) => crate::button::group_base(crate::donations::To::Org, org)?,
             (None, None) => return Err(internal("unreachable")),
         };
+        if o.has("qr") {
+            let name = base.rsplit_once("/github/").or_else(|| base.rsplit_once("/gitlab/")).map_or("", |(_, n)| n);
+            println!("{}", crate::button::qr(&base, act, name, &o.button)?);
+            return Ok(());
+        }
         println!("{}", crate::button::chart(&base, act, &o.button)?);
         return Ok(());
     }
@@ -1526,7 +1533,12 @@ fn button(o: &Opts, rest: &[&str]) -> Result<()> {
             p
         }
     };
-    let out = if o.has("chart") { crate::button::project_chart(&project, &o.button)? } else { crate::button::snippet(&project, &o.button)? };
+    let out = match (o.has("chart"), o.has("qr")) {
+        (true, true) => return Err(usage("--chart or --qr, not both")),
+        (true, false) => crate::button::project_chart(&project, &o.button)?,
+        (false, true) => crate::button::project_qr(&project, &o.button)?,
+        (false, false) => crate::button::snippet(&project, &o.button)?,
+    };
     println!("{out}");
     Ok(())
 }
