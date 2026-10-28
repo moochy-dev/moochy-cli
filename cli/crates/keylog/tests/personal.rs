@@ -6,7 +6,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::arithmetic_side_effects
+    clippy::arithmetic_side_effects,
+    clippy::similar_names
 )]
 
 use moochy_keylog::{State, entry::parse_record};
