@@ -20,7 +20,11 @@ x-moochy: &moochy
     - moochy-data:/data
   read_only: true
   cap_drop: [ALL]
-  security_opt: [no-new-privileges:true]
+  # Docker's default seccomp profile blocks the landlock_* syscalls, and the app refuses to
+  # serve when it cannot lock itself down (CONTRACT §15). It installs its own seccomp
+  # allow-list (stricter than Docker's) and Landlock rules at start, so Docker's filter is off
+  # for this container only.
+  security_opt: [no-new-privileges:true, seccomp=unconfined]
 
 services:
   moochy:

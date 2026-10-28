@@ -7,6 +7,8 @@ One file runs the Moochy app on a server and donates tokens from it. It has two 
 
 No port is published. The app only dials out.
 
+The app container runs with Docker's seccomp filter off (`seccomp=unconfined`), because that filter blocks Landlock. The app then locks itself down with its own seccomp allow-list and Landlock rules, and it refuses to run if it cannot. All capabilities are dropped and the root file system is read-only.
+
 ## 1. Get the files
 
 Download `compose.yaml` and `.env.example` from this directory (or from the release), then:
