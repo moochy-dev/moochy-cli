@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: core defaults and events only (plan 14 §2.2). No shell, fs, http, opener or updater.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

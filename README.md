@@ -35,6 +35,10 @@ This one-line command runs a script that moochy.dev serves before you can read i
 
 Each release also publishes signed archives for macOS and Linux (arm64 and x86_64), a shell installer, a Homebrew formula and an npm package. To check a release, see [`deploy/client/README.md`](deploy/client/README.md#verify-a-release-users).
 
+## Desktop app
+
+A small window for donors: sign in, add your key, set a monthly limit, pick a project, then pause or stop with one switch. It runs every step through the `moochy` binary it ships with, so the rules are the same as in the terminal. Linux (.deb, AppImage) and macOS (.dmg) bundles are attached to each release. See [`desktop/README.md`](desktop/README.md).
+
 ## Build and test
 
 You need Rust (the version is pinned in `cli/rust-toolchain.toml`; rustup installs it).
@@ -54,6 +58,7 @@ cargo clippy --all-targets -- -D warnings
 | `deploy/client/` | Release and supply-chain tooling, service units, containers, cloud boxes ([README](deploy/client/README.md)) |
 | `spec/proto/`, `spec/vectors/` | Protocol buffers and golden test vectors used by the build and the tests |
 | `cli/crates/node/assets/` | Files compiled into the app: the integrations guide (`moochy connect`), the service units (`moochy service install`); the donate-button guide its tests check |
+| `desktop/` | The desktop app (Tauri 2, its own Cargo workspace, not published) ([README](desktop/README.md)) |
 | `dist-workspace.toml`, `.github/` | cargo-dist release configuration and CI |
 
 ## Files shared with moochy-docs

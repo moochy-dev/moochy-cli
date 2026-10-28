@@ -69,6 +69,7 @@ pub fn demo() -> Snapshot {
             relay: s("relay.moochy.dev"),
             web: s("https://moochy.dev"),
             connected: true,
+            paused: false,
             roles: vec![s("donor"), s("maintainer")],
             lockdown: Lockdown::Enforced(s("landlock + seccomp")),
         },

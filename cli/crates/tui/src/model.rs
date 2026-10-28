@@ -5,6 +5,7 @@
 /// Everything the tabs render. `mo-tui` fills it from `node.sock` ([`crate::source::NodeSource`])
 /// or from fixtures ([`crate::source::FakeSource`]).
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Snapshot {
     pub me: Me,
     pub donations: Vec<Donation>,
@@ -27,6 +28,7 @@ pub struct Snapshot {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Me {
     pub handle: String,
     pub pseudonym: String,
@@ -35,12 +37,15 @@ pub struct Me {
     /// The public web origin (`https://moochy.dev`, CONTRACT §9): share links and /decide pages.
     pub web: String,
     pub connected: bool,
+    /// Serving is paused on this device (`moochy pause`), whatever each donation says.
+    pub paused: bool,
     pub roles: Vec<String>,
     pub lockdown: Lockdown,
 }
 
 /// The node's self-lockdown (CONTRACT §15): what `moochy doctor` reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "state", content = "detail", rename_all = "lowercase"))]
 pub enum Lockdown {
     /// Not reported yet (an old node, or still starting).
     #[default]
@@ -54,6 +59,7 @@ pub enum Lockdown {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Donation {
     pub id: String,
     /// `github/owner/name`, `gitlab/…`, or an org path when [`Donation::org`] is true.
@@ -80,6 +86,7 @@ pub struct Donation {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Served {
     pub at_ms: u64,
     /// "served" (my device served it) or "used" (my project used donated tokens).
@@ -94,6 +101,7 @@ pub struct Served {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Project {
     pub id: String,
     pub slug: String,
@@ -110,6 +118,7 @@ pub struct Project {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Org {
     pub id: String,
     pub path: String,
@@ -125,6 +134,7 @@ pub struct Org {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CoveredRepo {
     pub slug: String,
     pub used_uusd: u64,
@@ -134,6 +144,7 @@ pub struct CoveredRepo {
 
 /// Something waiting for this user: a donor to accept, an org repo to add, a revocation…
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Pending {
     pub request_id: String,
     pub kind: String,
@@ -147,6 +158,7 @@ pub struct Pending {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Decision {
     pub at_ms: u64,
     pub target: String,
@@ -157,6 +169,7 @@ pub struct Decision {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Device {
     pub id: String,
     pub name: String,
@@ -166,6 +179,7 @@ pub struct Device {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct BoxDevice {
     pub id: String,
     pub project: String,
@@ -176,6 +190,7 @@ pub struct BoxDevice {
 /// A box enrollment token (CONTRACT §17.1): metadata only — the token itself is shown once at
 /// creation and never again.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct BoxToken {
     pub id: String,
     pub project: String,
@@ -190,6 +205,7 @@ pub struct BoxToken {
 
 /// A provider key as the keystore reports it: presence and metadata, never the value.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ProviderKey {
     pub provider: String,
     pub present: bool,
@@ -197,6 +213,7 @@ pub struct ProviderKey {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Activity {
     pub at_ms: u64,
     /// The receipt this entry is about, if any, with its local verification.
@@ -205,12 +222,14 @@ pub struct Activity {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Alert {
     pub level: String,
     pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Receipt {
     pub id: String,
     pub check: ReceiptCheck,
@@ -218,6 +237,7 @@ pub struct Receipt {
 
 /// What `moochy verify` concluded about a receipt.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "state", content = "detail", rename_all = "lowercase"))]
 pub enum ReceiptCheck {
     #[default]
     Unchecked,

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- The Moochy mint hamster on a Sky tile (source of the PNG icons beside it). -->
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="#dcebfa"/>
+  <g transform="translate(46 40) scale(3.5)" stroke="#0f1b3d" stroke-linecap="round" stroke-linejoin="round">
+    <clipPath id="b"><path d="M60 28C86 28 104 48 104 72c0 21-18 33-44 33S16 93 16 72c0-24 18-44 44-44z"/></clipPath>
+    <circle cx="34" cy="37" r="12" fill="#5fdcb0" stroke-width="3.5"/>
+    <circle cx="86" cy="37" r="12" fill="#5fdcb0" stroke-width="3.5"/>
+    <circle cx="34" cy="37" r="5.5" fill="#ffb4c4" stroke="none"/>
+    <circle cx="86" cy="37" r="5.5" fill="#ffb4c4" stroke="none"/>
+    <path d="M60 28C86 28 104 48 104 72c0 21-18 33-44 33S16 93 16 72c0-24 18-44 44-44z" fill="#d8f7ea" stroke="none"/>
+    <g clip-path="url(#b)" stroke="none">
+      <ellipse cx="60" cy="116" rx="52" ry="26" fill="#93e8c8"/>
+      <ellipse cx="60" cy="88" rx="20" ry="14" fill="#fff" opacity=".75"/>
+    </g>
+    <path d="M60 28C86 28 104 48 104 72c0 21-18 33-44 33S16 93 16 72c0-24 18-44 44-44z" fill="none" stroke-width="3.5"/>
+    <ellipse cx="37" cy="74" rx="7" ry="4.5" fill="#ffb4c4" stroke="none"/>
+    <ellipse cx="83" cy="74" rx="7" ry="4.5" fill="#ffb4c4" stroke="none"/>
+    <circle cx="46" cy="63" r="4.8" fill="#0f1b3d" stroke="none"/>
+    <circle cx="74" cy="63" r="4.8" fill="#0f1b3d" stroke="none"/>
+    <circle cx="47.7" cy="61.3" r="1.6" fill="#fff" stroke="none"/>
+    <circle cx="75.7" cy="61.3" r="1.6" fill="#fff" stroke="none"/>
+    <path d="M56.6 69.2h6.8l-3.4 3.6z" fill="#f2879f" stroke-width="1.6"/>
+    <path d="M54 76q3 3 6 0q3 3 6 0" fill="none" stroke-width="2.2"/>
+    <ellipse cx="47" cy="104" rx="7.5" ry="4.5" fill="#d8f7ea" stroke-width="3"/>
+    <ellipse cx="73" cy="104" rx="7.5" ry="4.5" fill="#d8f7ea" stroke-width="3"/>
+  </g>
+</svg>

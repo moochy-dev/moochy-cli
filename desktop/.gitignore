@@ -1,0 +1,4 @@
+/target/
+# The `moochy` sidecar, built by CI (or by hand, see README.md) as bin/moochy-<target triple>.
+/bin/
+/gen/
