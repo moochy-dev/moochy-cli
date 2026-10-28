@@ -90,12 +90,14 @@ impl Session {
     }
 
     fn pool_models(&self) -> Vec<(String, Vec<String>)> {
-        self.node.pool_for(&self.slug).map(|p| p.models()).unwrap_or_default()
+        let mut ms = self.node.pool_for(&self.slug).map(|p| p.models()).unwrap_or_default();
+        self.node.catalog().by_price(&mut ms);
+        ms
     }
 
     fn tools(&self) -> Value {
         let models: Vec<String> = self.pool_models().into_iter().map(|(m, _)| m).collect();
-        let mut model = json!({"type":"string","description":"Model id donated to this project (see moochy_pool_status). Default: the first one."});
+        let mut model = json!({"type":"string","description":"Model id donated to this project (see moochy_pool_status), cheapest first. Default: the cheapest one whose output limit fits max_tokens."});
         if !models.is_empty()
             && let Some(o) = model.as_object_mut()
         {
@@ -229,8 +231,9 @@ impl Session {
         let models: Vec<Value> = pool
             .as_ref()
             .map(|p| {
-                p.models()
-                    .into_iter()
+                let mut ms = p.models();
+                self.node.catalog().by_price(&mut ms);
+                ms.into_iter()
                     .map(|(m, ds)| {
                         let donors = p.workers.iter().filter(|w| w.models.contains(&m)).count();
                         json!({"id": m, "dialects": ds, "donors": donors})
@@ -252,14 +255,16 @@ impl Session {
         }
         self.settle_pool().await;
         let models = self.pool_models();
+        let max_tokens = a.get("max_tokens").and_then(Value::as_u64).filter(|n| (1..=64_000).contains(n)).unwrap_or(DEFAULT_MAX_TOKENS);
+        // Plan 14 §4.1: the cheapest model whose output limit fits the request, else the cheapest.
+        let fits = |m: &str| self.node.catalog().resolve(m).is_some_and(|e| u64::from(e.max_output) >= max_tokens);
         let model = match s("model") {
             Some(m) => m.to_owned(),
-            None => models.first().map(|(m, _)| m.clone()).ok_or("no donor offers a model to this project right now")?,
+            None => models.iter().find(|(m, _)| fits(m)).or(models.first()).map(|(m, _)| m.clone()).ok_or("no donor offers a model to this project right now")?,
         };
         let dialects = models.iter().find(|(m, _)| *m == model).map(|(_, d)| d.clone()).ok_or_else(|| format!("no donor offers model `{model}` to this project"))?;
         let dialect = if dialects.iter().any(|d| d == Dialect::Anthropic.wire()) { Dialect::Anthropic } else { Dialect::OpenAi };
         let effort = s("effort").filter(|e| matches!(*e, "low" | "medium" | "high"));
-        let max_tokens = a.get("max_tokens").and_then(Value::as_u64).filter(|n| (1..=64_000).contains(n)).unwrap_or(DEFAULT_MAX_TOKENS);
         // §15.2: paths are read client-side (the stdio shim turns `files` into `file_contents`).
         if a.contains_key("files") {
             return Err("`files` paths are read by the stdio server (`moochy mcp`) on your machine; over HTTP send `file_contents` [{\"path\", \"text\"}]".into());

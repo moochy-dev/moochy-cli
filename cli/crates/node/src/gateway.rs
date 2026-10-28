@@ -283,8 +283,10 @@ fn narrow_pins(project: Vec<String>, session: Option<&str>) -> Vec<String> {
 /// One shape that satisfies both the Anthropic and the OpenAI model-list parsers.
 fn models(node: &Node, slug: &str) -> Resp {
     // Pool slugs, then the native aliases the catalog maps to them (05 §2.1).
-    let mut ids: Vec<String> = node.pool_for(slug).map(|p| p.models()).unwrap_or_default().into_iter().map(|(m, _)| m).collect();
     let cat = node.catalog();
+    let mut pool = node.pool_for(slug).map(|p| p.models()).unwrap_or_default();
+    cat.by_price(&mut pool);
+    let mut ids: Vec<String> = pool.into_iter().map(|(m, _)| m).collect();
     let aliases: Vec<String> = ids
         .iter()
         .flat_map(|m| cat.entries.iter().filter(move |e| &e.model == m))
@@ -332,7 +334,7 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
     let (mut body, headers, stripped) = (if strip_body { Bytes::from(pool.body) } else { body }, pool.headers, pool.stripped);
     // One strict tape parse (no tree allocation): the per-request hot path (CONTRACT §13).
     let mut tape = Vec::new();
-    let (entry, affinity, inject_max, auto_cache) = {
+    let (entry, affinity, inject_max, auto_cache, cache_key) = {
         let doc = wj::parse(&body, &mut tape).map_err(|e| bad(format!("moochy: invalid JSON body: {e}")))?;
         let root = doc.root();
         if root.kind() != Kind::Obj {
@@ -359,12 +361,15 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
             // Responses: `instructions`; `input` is a string or a list of items.
             Dialect::OpenAiResponses => (root.get("instructions"), root.get("input").filter(|i| i.kind() == Kind::Str).or_else(|| first("user"))),
         };
-        let affinity = affinity_key(&node.secrets, system, root.get("tools"), user, body.len());
+        let affinity = affinity_key(&node.secrets, &slug, system, root.get("tools"), user, body.len());
         let inject = missing.then(|| u64::from(entry.max_output).min(DEFAULT_MAX_TOKENS));
-        (entry, affinity, inject, cache)
+        // Plan 14 §4.4: OpenAI dialects with no `prompt_cache_key` get the session's affinity
+        // key (per device and project), so repeated prefixes land on the same provider cache.
+        let cache_key = dialect != Dialect::Anthropic && root.get("prompt_cache_key").is_none();
+        (entry, affinity, inject, cache, cache_key)
     };
     drop(tape);
-    if inject_max.is_some() || auto_cache {
+    if inject_max.is_some() || auto_cache || cache_key {
         if let Some(n) = inject_max
             && !MAX_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -373,6 +378,13 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         let mut members = inject_max.map(|n| format!("\"max_tokens\":{n},")).unwrap_or_default();
         if auto_cache {
             members.push_str("\"cache_control\":{\"type\":\"ephemeral\"},");
+        }
+        if cache_key {
+            members.push_str("\"prompt_cache_key\":\"");
+            for b in affinity {
+                let _ = std::fmt::Write::write_fmt(&mut members, format_args!("{b:02x}"));
+            }
+            members.push_str("\",");
         }
         body = insert_members(&body, &members);
     }
@@ -400,6 +412,7 @@ fn insert_members(body: &[u8], members: &str) -> Bytes {
 /// regrows (each regrowth copied everything written so far).
 fn affinity_key(
     secrets: &crate::keystore::Secrets,
+    slug: &str,
     system: Option<moochy_worker::json::Val<'_>>,
     tools: Option<moochy_worker::json::Val<'_>>,
     user: Option<moochy_worker::json::Val<'_>>,
@@ -414,7 +427,7 @@ fn affinity_key(
         *end = buf.len();
     }
     let [a, b, c] = ends;
-    secrets.affinity(buf.get(..a).unwrap_or_default(), buf.get(a..b).unwrap_or_default(), buf.get(b..c).unwrap_or_default())
+    secrets.affinity(slug.as_bytes(), buf.get(..a).unwrap_or_default(), buf.get(a..b).unwrap_or_default(), buf.get(b..c).unwrap_or_default())
 }
 
 fn catalog_entry(node: &Node, model: &str) -> Result<moochy_proto::money::CatalogEntry, Failure> {
@@ -563,7 +576,7 @@ mod affinity_tests {
         let doc = moochy_worker::json::parse(body.as_bytes(), &mut tape).unwrap();
         let root = doc.root();
         let user = root.get("messages").and_then(|m| m.items().next());
-        affinity_key(&crate::keystore::Secrets::default(), root.get("system"), root.get("tools"), user, 0)
+        affinity_key(&crate::keystore::Secrets::default(), "acme/widget", root.get("system"), root.get("tools"), user, 0)
     }
 
     #[test]
@@ -575,6 +588,10 @@ mod affinity_tests {
         let t1 = key(r#"{"tools":[{"name":"x"}],"messages":[{"role":"user","content":"p"}]}"#);
         let t2 = key(r#"{"tools":[{"name":"y"}],"messages":[{"role":"user","content":"p"}]}"#);
         assert_ne!(t1, t2, "tools must change the key");
+        let mut tape = Vec::new();
+        let doc = moochy_worker::json::parse(br#"{"messages":[{"role":"user","content":"probe 1"}]}"#, &mut tape).unwrap();
+        let user = doc.root().get("messages").and_then(|m| m.items().next());
+        assert_ne!(a, affinity_key(&crate::keystore::Secrets::default(), "acme/other", None, None, user, 0), "the project must change the key (it is also the prompt_cache_key)");
     }
 
     /// `cargo test --release -p moochy -- --ignored --nocapture prepare_cost`: the auto-cache
@@ -606,7 +623,7 @@ mod affinity_tests {
         let time = |cap: usize| {
             let t = std::time::Instant::now();
             for _ in 0..n {
-                std::hint::black_box(affinity_key(&s, root.get("system"), root.get("tools"), user, cap));
+                std::hint::black_box(affinity_key(&s, "acme/widget", root.get("system"), root.get("tools"), user, cap));
             }
             t.elapsed() / n
         };

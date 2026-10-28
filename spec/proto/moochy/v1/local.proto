@@ -108,7 +108,8 @@ message PoolSummary {
   string repo_id = 1;
   string slug = 2;
   uint32 workers = 3;
-  repeated string models = 4;
+  repeated string models = 4; // cheapest first (plan 14 §4.1)
+  repeated string model_dialects = 5; // the dialects of models[i], comma-separated
 }
 
 message PauseRequest {}

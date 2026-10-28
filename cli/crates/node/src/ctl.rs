@@ -150,13 +150,19 @@ fn person_arg(person: &str, org: &str, repo: &str, with_repo: bool) -> std::resu
 impl LocalControl for Ctl {
     async fn status(&self, _: Request<StatusRequest>) -> std::result::Result<Response<StatusResponse>, Status> {
         let n = &self.node;
+        let cat = n.catalog();
         let pools = lock(&n.pools)
             .values()
-            .map(|p| PoolSummary {
-                repo_id: p.repo_id.clone(),
-                slug: p.slug.clone().unwrap_or_default(),
-                workers: u32::try_from(p.workers.len()).unwrap_or(u32::MAX),
-                models: p.models().into_iter().map(|(m, _)| m).collect(),
+            .map(|p| {
+                let mut ms = p.models();
+                cat.by_price(&mut ms);
+                PoolSummary {
+                    repo_id: p.repo_id.clone(),
+                    slug: p.slug.clone().unwrap_or_default(),
+                    workers: u32::try_from(p.workers.len()).unwrap_or(u32::MAX),
+                    model_dialects: ms.iter().map(|(_, ds)| ds.join(",")).collect(),
+                    models: ms.into_iter().map(|(m, _)| m).collect(),
+                }
             })
             .collect();
         let url = n.gateway_url();
