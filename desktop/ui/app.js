@@ -377,8 +377,8 @@ function stepKey() {
   return setupFrame(2,
     [hamster('idle'), h('h1', null, 'Add your API key'), h('p', null, 'The key pays for the tokens you donate. Use a key made only for Moochy.')],
     h('div', { class: 'stack lg' }, field,
-      h('div', { class: 'field' }, h('span', { class: 'label', id: 'prov-label' }, 'Provider'), tiles),
-      h('div', { class: 'row' }, h('span', { class: 'coin' }), h('p', { class: 'small' }, 'Stored in your keychain on this machine. Never sent to Moochy.'))),
+      h('div', { class: 'row' }, h('span', { class: 'coin' }), h('p', { class: 'small' }, 'Stored in your keychain on this machine. Never sent to Moochy.')),
+      h('div', { class: 'field' }, h('span', { class: 'label', id: 'prov-label' }, 'Provider'), tiles)),
     [h('button', { class: 'btn primary wide', onclick: addKey, disabled: busy || !chosen || !(u.key || '').trim() },
       busy ? [h('span', { class: 'spin' }), `Checking with ${providerName(chosen)}…`] : 'Check and add key'),
     h('button', { class: 'btn link', onclick: () => openWeb(`${WEB}/docs/local-gpu`) }, 'Donate your own GPU instead')]);
