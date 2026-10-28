@@ -8,6 +8,7 @@ use crate::model::{Served, Snapshot};
 /// and keeps its rules (CONTRACT §20.1): signing actions decode the body and check the server's
 /// Lookup exactly like `moochy accept`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 pub enum Action {
     PauseDonation(String),
     ResumeDonation(String),

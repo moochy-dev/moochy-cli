@@ -1370,6 +1370,7 @@ version = "0.1.8"
 dependencies = [
  "crossterm",
  "ratatui",
+ "serde",
  "signal-hook 0.4.4",
 ]
 

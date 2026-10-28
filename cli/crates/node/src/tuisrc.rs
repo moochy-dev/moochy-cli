@@ -184,6 +184,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             // The public site, as `moochy decisions` and the share lines name it.
             web: web.clone(),
             connected: st.link_state == "up",
+            paused: st.paused,
             roles: st.roles.clone(),
             // ponytail: Status has only `locked`; mechanisms and failures once the node reports them.
             lockdown: match st.lockdown.as_str() {
