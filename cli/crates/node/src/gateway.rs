@@ -363,9 +363,11 @@ pub fn prepare(node: &Node, slug: String, dialect: Dialect, raw: Bytes, headers:
         };
         let affinity = affinity_key(&node.secrets, &slug, system, root.get("tools"), user, body.len());
         let inject = missing.then(|| u64::from(entry.max_output).min(DEFAULT_MAX_TOKENS));
-        // Plan 14 §4.4: OpenAI dialects with no `prompt_cache_key` get the session's affinity
-        // key (per device and project), so repeated prefixes land on the same provider cache.
-        let cache_key = dialect != Dialect::Anthropic && root.get("prompt_cache_key").is_none();
+        // Plan 14 §4.4: OpenAI models with no `prompt_cache_key` get the session's affinity key
+        // (per device and project), so repeated prefixes land on the same provider cache. Only
+        // `openai/*` (OpenAI or OpenRouter serve them, both document the field): xAI wants a
+        // header on Chat Completions, and DeepSeek and local servers do not document it.
+        let cache_key = dialect != Dialect::Anthropic && entry.model.starts_with("openai/") && root.get("prompt_cache_key").is_none();
         (entry, affinity, inject, cache, cache_key)
     };
     drop(tape);
