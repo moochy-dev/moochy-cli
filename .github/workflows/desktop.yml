@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# The desktop app (desktop/, moochy-docs plan 14 §2.6): Linux x86_64 .deb + AppImage and macOS
+# arm64 / x86_64 .dmg, each with the `moochy` binary built in the same job as its sidecar. On a
+# v* tag the bundles, their SHA-256 sums and build provenance go to the tag's release:
+#   gh attestation verify <file> --repo moochy-dev/moochy-cli --signer-workflow moochy-dev/moochy-cli/.github/workflows/desktop.yml
+# By hand (workflow_dispatch) they stay workflow artifacts. macOS bundles are unsigned until a
+# Developer ID exists (desktop/README.md says how to open them).
+name: desktop
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundles: 'deb,appimage' }
+          - { runner: macos-15, target: aarch64-apple-darwin, bundles: dmg }
+          - { runner: macos-15, target: x86_64-apple-darwin, bundles: dmg }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: write # upload to the tag's release
+      id-token: write # attestations (Sigstore via GitHub OIDC)
+      attestations: write
+    env:
+      TARGET: ${{ matrix.target }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            cli
+            desktop
+          key: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+      - name: The moochy binary (sidecar)
+        working-directory: cli
+        run: |
+          rustup target add "$TARGET" # the pinned toolchain of cli/rust-toolchain.toml
+          cargo build --release --locked -p moochy --target "$TARGET"
+          mkdir -p ../desktop/bin
+          cp "target/$TARGET/release/moochy" "../desktop/bin/moochy-$TARGET"
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version 2.12.4 --locked
+      - name: Test and bundle
+        working-directory: desktop
+        run: |
+          rustup target add "$TARGET"
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version="${GITHUB_REF_NAME#v}"; fi
+          cargo tauri build --target "$TARGET" --bundles "${{ matrix.bundles }}" --config "{\"version\":\"$version\"}"
+          mkdir -p "$RUNNER_TEMP/out"
+          for f in target/"$TARGET"/release/bundle/{deb/*.deb,appimage/*.AppImage,dmg/*.dmg}; do
+            [ -f "$f" ] && cp "$f" "$RUNNER_TEMP/out/"
+          done
+          cd "$RUNNER_TEMP/out"
+          ls ./* >/dev/null # at least one bundle
+          shasum -a 256 ./* | sed 's| \./| |' > "SHA256SUMS-desktop-$TARGET.txt"
+          cat "SHA256SUMS-desktop-$TARGET.txt"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/out/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-${{ matrix.target }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+      - name: Upload to the release
+        if: github.ref_type == 'tag'
+        run: |
+          # release.yml creates the release at its end: wait for it (up to 60 min).
+          for _ in $(seq 120); do
+            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+            sleep 30
+          done
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP"/out/*
