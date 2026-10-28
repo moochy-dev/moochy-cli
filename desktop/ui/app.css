@@ -368,5 +368,5 @@ p.error::before { content: ""; flex: none; width: 6px; height: 6px; border-radiu
 .plan li { list-style: none; display: flex; align-items: center; gap: 12px; min-height: 44px; color: var(--text); font-weight: 500; }
 .plan li::before { counter-increment: n; content: counter(n); flex: none; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; background: var(--surface-2); color: var(--muted); }
 .plan li:first-child::before { background: var(--mint); color: var(--on-mint); }
-.plan { margin: 0; padding: 4px 0; }
+.plan { margin: 0; padding: 4px 16px; }
 .card > .btn.link { justify-self: start; margin: -8px 0 0 28px; }
