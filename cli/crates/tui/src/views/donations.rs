@@ -34,6 +34,7 @@ struct Status {
 fn status(d: &Donation) -> Status {
     let s = |tone, glyph, label: &str, why| Status { tone, glyph, label: label.to_owned(), why };
     match d.status.as_str() {
+        "active" if d.total && d.budget_uusd > 0 && d.spent_uusd >= d.budget_uusd => s(Tone::Warn, Glyph::Warn, "limit reached", "its total is used up"),
         "active" if d.budget_uusd > 0 && d.spent_uusd >= d.budget_uusd => {
             s(Tone::Warn, Glyph::Warn, "limit reached", "its monthly limit is used up; it starts again next month")
         }
@@ -105,6 +106,16 @@ fn share_url(web: &str, d: &Donation) -> Option<String> {
     Some(format!("{}/{prefix}/{path}", w::web_origin(web)))
 }
 
+/// The donation's limit: `$20.00 a month`, or for a total donation (plan 15 §4)
+/// `Total $20.00 · ends 2027-10-28`.
+fn limit_text(d: &Donation) -> String {
+    if !d.total {
+        return format!("{} a month", w::dollars(d.budget_uusd));
+    }
+    let ends = if d.ends_at_ms > 0 { format!(" · ends {}", w::date(d.ends_at_ms)) } else { String::new() };
+    format!("Total {}{ends}", w::dollars(d.budget_uusd))
+}
+
 /// `(today, this ISO week)` spend from a per-day series that ends today (UTC days, oldest first);
 /// the week starts on Monday 00:00 UTC (1970-01-01 was a Thursday).
 fn window_spent(per_day: &[u64], now_ms: u64) -> (u64, u64) {
@@ -118,7 +129,7 @@ impl DonationsView {
     fn detail(&self, t: Theme, d: &Donation, web: &str, now: u64, width: u16) -> Vec<Line<'static>> {
         let st = status(d);
         let mut v = vec![Line::from(vec![Span::styled(format!("{:<10} ", "Status"), t.muted()), badge(t, d), w::muted(t, format!("  {}", st.why))])];
-        let mut limit = vec![Span::styled(format!("{:<10} ", "Limit"), t.muted()), Span::raw(format!("{} a month", w::dollars(d.budget_uusd)))];
+        let mut limit = vec![Span::styled(format!("{:<10} ", "Limit"), t.muted()), Span::raw(limit_text(d))];
         for (lim, per) in [(d.weekly_limit_uusd, "week"), (d.daily_limit_uusd, "day")] {
             if lim > 0 {
                 limit.push(Span::raw(format!("{}{} a {per}", w::dot(t), w::dollars(lim))));
@@ -126,6 +137,9 @@ impl DonationsView {
         }
         if d.per_task_cap_uusd > 0 {
             limit.push(w::muted(t, format!("{}{} per task", w::dot(t), w::dollars(d.per_task_cap_uusd))));
+        }
+        if d.credits {
+            limit.push(w::muted(t, format!("{}served by Moochy Credits", w::dot(t))));
         }
         v.push(Line::from(limit));
         let mut spent = vec![Span::styled(format!("{:<10} ", "Spent"), t.muted()), Span::styled(format!("{:<9}", w::dollars(d.spent_uusd)), t.money())];
@@ -410,6 +424,18 @@ mod tests {
         let e = Snapshot::default();
         let out = draw(&mut DonationsView::default(), &ctx(&e, &t, ""), 80, 24);
         assert!(out.contains("No donations yet") && out.contains("moochy donate"), "{out}");
+    }
+
+    #[test]
+    fn total_donation_shows_total_and_end() {
+        let mut s = snap();
+        s.donations[0].total = true;
+        s.donations[0].ends_at_ms = 1_824_768_000_000;
+        s.donations[0].credits = true;
+        let t = themes()[0];
+        let out = draw(&mut DonationsView::default(), &ctx(&s, &t, ""), 160, 48);
+        assert!(out.contains("Total $20.00 · ends 2027-10-29") && out.contains("served by Moochy"), "{out}");
+        assert!(!out.contains("$20.00 a month"), "{out}");
     }
 
     #[test]
