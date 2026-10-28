@@ -169,6 +169,12 @@ pub async fn link_call(node: &Node, r: LinkCallRequest) -> std::result::Result<L
             // CONTRACT §20 (the TUI): read-only views of the session's own account.
             "list_devices" => c.list_devices(crate::link::with_session(&link, crate::pb::link::ListDevicesRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
             "list_owned" => c.list_owned(crate::link::with_session(&link, crate::pb::link::ListOwnedRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            // Plan 15: gift links and credits (`moochy gift`, `moochy credits`).
+            "create_gift" => c.create_gift(crate::link::with_session(&link, crate::pb::link::CreateGiftRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            "list_gifts" => c.list_gifts(crate::link::with_session(&link, crate::pb::link::ListGiftsRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            "revoke_gift" => c.revoke_gift(crate::link::with_session(&link, crate::pb::link::RevokeGiftRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            "claim_gift" => c.claim_gift(crate::link::with_session(&link, crate::pb::link::ClaimGiftRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
+            "get_credits" => c.get_credits(crate::link::with_session(&link, crate::pb::link::GetCreditsRequest::decode(req).map_err(bad)?)).await?.into_inner().encode_to_vec(),
             _ => return Err(Status::invalid_argument("unknown op")),
         })
     };
@@ -176,7 +182,7 @@ pub async fn link_call(node: &Node, r: LinkCallRequest) -> std::result::Result<L
     Ok(LinkCallResponse { response })
 }
 
-fn status(s: &Status) -> crate::util::Error {
+pub(crate) fn status(s: &Status) -> crate::util::Error {
     let m = clean(s.message()).into_owned();
     match s.code() {
         tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => net(m),
@@ -190,6 +196,11 @@ fn status(s: &Status) -> crate::util::Error {
 
 /// CLI side: one call through the running app.
 pub fn call<Q: prost::Message, A: prost::Message + Default>(home: &Home, op: &str, q: &Q) -> Result<A> {
+    call_map(home, op, q, status)
+}
+
+/// [`call`] with the caller's reading of the relay's refusals.
+pub(crate) fn call_map<Q: prost::Message, A: prost::Message + Default>(home: &Home, op: &str, q: &Q, status: impl Fn(&Status) -> crate::util::Error) -> Result<A> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| internal(format!("runtime: {e}")))?;
     let bytes = rt.block_on(async {
         let mut c = crate::ctl::connect(&home.socket_path()).await?;

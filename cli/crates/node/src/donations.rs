@@ -56,7 +56,7 @@ fn status(op: &str, s: &Status) -> crate::util::Error {
         ("donate", tonic::Code::AlreadyExists) => return usage("you already have a live donation to this target: `moochy donations` shows it and its id. To change its limits, use the Dashboard on moochy.dev; to replace it, stop it first (`moochy donations stop <id>`)"),
         ("action", tonic::Code::FailedPrecondition) => return usage("this donation has already ended (stopped or refused), or this request was already decided: nothing is left to change. `moochy donations` lists the live ones"),
         // Donate exists on every relay: UNIMPLEMENTED is a credits donation on a relay without them.
-        ("donate", tonic::Code::Unimplemented) => return usage("Credits are off on this relay."),
+        ("donate", tonic::Code::Unimplemented) => return usage(crate::gift::CREDITS_OFF),
         _ => {}
     }
     match s.code() {

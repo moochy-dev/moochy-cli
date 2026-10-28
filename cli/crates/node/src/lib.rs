@@ -22,6 +22,7 @@ pub mod engine;
 pub mod files;
 pub mod gate;
 pub mod gateway;
+pub mod gift;
 pub mod journal;
 pub mod json;
 pub mod keycheck;
