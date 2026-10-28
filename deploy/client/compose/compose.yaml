@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# A Moochy donor node in one file (plan 14 §5). README.md beside this file has the steps.
+#   Provider API key:  docker compose --profile api up -d
+#   Your own GPU:      docker compose --profile gpu up -d
+# Then approve the sign-in code once: docker compose logs moochy (or moochy-gpu).
+# No port is published: the app only dials out, the model server listens on loopback.
+
+x-moochy: &moochy
+  image: ghcr.io/moochy-dev/moochy:${MOOCHY_VERSION:-latest}
+  restart: unless-stopped
+  environment:
+    # Dollars a month this machine may spend. Setting it accepts the safety step.
+    MOOCHY_MONTHLY_LIMIT: ${MOOCHY_MONTHLY_LIMIT:-}
+    MOOCHY_DONATE: ${MOOCHY_DONATE:-}
+    MOOCHY_DONATE_CAP: ${MOOCHY_DONATE_CAP:-}
+    MOOCHY_DEVICE_NAME: ${MOOCHY_DEVICE_NAME:-moochy-compose}
+    # The keystore passphrase: /run/secrets/moochy-passphrase.
+    CREDENTIALS_DIRECTORY: /run/secrets
+  volumes:
+    - moochy-data:/data
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+services:
+  moochy:
+    <<: *moochy
+    profiles: [api]
+    command: [start, --headless, "${MOOCHY_PROVIDER:-anthropic}", --key-file, /run/secrets/provider-key]
+    secrets:
+      - source: passphrase
+        target: moochy-passphrase
+      - source: provider_key
+        target: provider-key
+
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.3}
+    profiles: [gpu]
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NUM_PARALLEL: "4"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: [CMD, ollama, list]
+      interval: 5s
+      retries: 30
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Downloads the model once (later starts find it in the volume).
+  ollama-pull:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.3}
+    profiles: [gpu]
+    network_mode: service:ollama
+    entrypoint: [ollama, pull, "${OLLAMA_MODEL:-qwen2.5:7b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  moochy-gpu:
+    <<: *moochy
+    profiles: [gpu]
+    # Same network namespace as ollama: the model server is http://127.0.0.1:11434.
+    network_mode: service:ollama
+    command: [start, --headless, --local, "http://127.0.0.1:11434", --model, "${MOOCHY_LOCAL_MODEL:-local/qwen2.5-7b-q4}=${OLLAMA_MODEL:-qwen2.5:7b}"]
+    secrets:
+      - source: passphrase
+        target: moochy-passphrase
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+
+secrets:
+  passphrase:
+    file: ./secrets/passphrase
+  provider_key:
+    file: ./secrets/provider-key
+
+volumes:
+  moochy-data:
+  ollama:
