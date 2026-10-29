@@ -467,8 +467,11 @@ fn home_flag() -> Option<PathBuf> {
     None
 }
 
-fn sidecar() -> PathBuf {
-    std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("moochy"))).filter(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("moochy"))
+/// The `moochy` bundled beside the app (`exe`). A release build refuses to run without it: a
+/// `moochy` found on PATH is whatever anyone who can write a PATH directory put there. Only a
+/// debug build (`debug`) falls back to PATH, for development.
+fn sidecar(exe: Option<PathBuf>, debug: bool) -> Option<PathBuf> {
+    exe.and_then(|e| Some(e.parent()?.join("moochy"))).filter(|p| p.is_file()).or_else(|| debug.then(|| PathBuf::from("moochy")))
 }
 
 fn window_file(home: &Home) -> PathBuf {
@@ -490,8 +493,12 @@ fn main() {
             std::process::exit(10);
         }
     };
+    let Some(bin) = sidecar(std::env::current_exe().ok(), cfg!(debug_assertions)) else {
+        eprintln!("moochy-desktop: the bundled moochy binary is missing; reinstall the app.");
+        std::process::exit(10);
+    };
     let live = source.events();
-    let ctx = Arc::new(Ctx { bin: sidecar(), home, source: Mutex::new(source), web: Mutex::new(String::new()), login: Mutex::new((0, None)) });
+    let ctx = Arc::new(Ctx { bin, home, source: Mutex::new(source), web: Mutex::new(String::new()), login: Mutex::new((0, None)) });
     let built = tauri::Builder::default()
         .manage(Arc::clone(&ctx))
         .setup(move |app| {
@@ -578,6 +585,18 @@ mod tests {
         assert!(v["svg"].as_str().unwrap().contains("<svg"));
         assert!(shown_once("{\"url\":\"https://evil.com/g/AbCdEfGhIjKlMnOpQrSt_-\"}", "").is_err());
         assert!(shown_once("{\"gift_id\":\"gf_1\"}", "").is_err());
+    }
+
+    #[test]
+    fn sidecar_never_from_path_in_release() {
+        let dir = std::env::temp_dir().join(format!("moochy-desktop-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("moochy-desktop");
+        assert_eq!(sidecar(Some(exe.clone()), false), None, "release: no bundled moochy, no fallback");
+        assert_eq!(sidecar(Some(exe.clone()), true), Some(PathBuf::from("moochy")), "debug: PATH");
+        std::fs::write(dir.join("moochy"), "").unwrap();
+        assert_eq!(sidecar(Some(exe), false), Some(dir.join("moochy")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
