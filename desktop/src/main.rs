@@ -432,9 +432,22 @@ fn save_qr(app: tauri::AppHandle, ctx: Shared<'_>, url: String) -> Result<String
     };
     let svg = check::qr_svg(&url)?;
     let dir = app.path().download_dir().map_err(|_| "No Downloads folder on this computer.".to_owned())?;
+    save_new(&dir, &name, &svg)
+}
+
+/// Writes `moochy-{name}.svg` (or `-2`, `-3`, …) in `dir`, never over an existing file. A gift's
+/// QR is a bearer token: only the owner may read it (0600).
+fn save_new(dir: &std::path::Path, name: &str, svg: &str) -> Result<String, String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if name == "gift" {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
     for n in 1..100 {
         let path = dir.join(if n == 1 { format!("moochy-{name}.svg") } else { format!("moochy-{name}-{n}.svg") });
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match opts.open(&path) {
             Ok(mut f) => return f.write_all(svg.as_bytes()).map(|()| path.display().to_string()).map_err(|e| format!("Could not save the file ({e}).")),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(format!("Could not save the file ({e}).")),
@@ -596,6 +609,20 @@ mod tests {
         assert_eq!(sidecar(Some(exe.clone()), true), Some(PathBuf::from("moochy")), "debug: PATH");
         std::fs::write(dir.join("moochy"), "").unwrap();
         assert_eq!(sidecar(Some(exe), false), Some(dir.join("moochy")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gift_qr_is_private() {
+        let dir = std::env::temp_dir().join(format!("moochy-desktop-qr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gift = save_new(&dir, "gift", "<svg/>").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&gift).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(save_new(&dir, "gift", "<svg/>").unwrap().ends_with("moochy-gift-2.svg"), "never over an existing file");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
