@@ -60,6 +60,9 @@ COMMANDS:
                                   calls from donated tokens reach only sandboxed agents.
                                   --box-is-sandbox: in a single-purpose cloud box without user
                                   namespaces or Landlock, the box itself is the sandbox
+                                  --personal (also env, mcp, connect): use the donations made
+                                  for your own use, on any repository (also used when the
+                                  project is not on Moochy)
   box token create [--repo PROJECT] [--ttl 24h] [--cap 20] [--max-boxes 1]
                                   A token that lets cloud boxes (boat.dev, E2B, Daytona, Modal,
                                   Codespaces) use this project's donations: each box gets its own
@@ -86,6 +89,8 @@ COMMANDS:
          [--size s|m|l] [--label TEXT] [--goal] [--total] [--format markdown|html|rst|iframe]
                                   A live chart of the tokens donated to and used by the
                                   project or organisation (README image or website card)
+  button --qr [--repo P|--org ORG|--person PERSON]
+                                  The QR code of the donate page (its qr.svg URL and Markdown)
   audit --provider [--from-file usage.csv]
                                   What this device served (90 days), checked against the
                                   provider's usage export (date,model,cost_usd)
@@ -124,6 +129,20 @@ COMMANDS:
                                   gitlab/USERNAME): their own requests on the repos they cover
   donations [--json] | donations <pause|resume|stop> <id>
                                   Your donations: what each project or organisation used this month
+  donate --credits $N --repo PROJECT | --org ORG | --person PERSON [--yes]
+                                  Give a one-off total from your Moochy Credits balance
+  credits [--json] | credits add [$N]
+                                  Your Moochy Credits (balance, purchases, allocations); add
+                                  opens the web page (cards are only ever entered there)
+  gift create $N [--credits] [--note TEXT] [--models a,b] [--effort E]
+       [--visibility public|pseudonymous|anonymous] [--expires DAYS]
+                                  A gift link for $1 to $1,000 of tokens, shown once: the first
+                                  person to claim it gets it (30 days by default, 90 at most)
+  gift list [--json] | gift revoke <gf_…> [--replace]
+                                  Your gifts; revoke one, or replace its link
+  gift claim <LINK> --repo PROJECT | --org ORG | --person PERSON | --personal [--yes]
+                                  Claim a gift for your project, organisation, profile or own
+                                  use; accepted at once with an owner key on this machine
   owner trust <ok_id>             Mark an owner key you created elsewhere (a passkey added on
                                   the web) as yours, so the key-log monitor stops alerting
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
@@ -170,6 +189,8 @@ Donate tokens:
   start                           Set up this machine and donate, step by step (safe to repeat)
   donate --repo PROJECT --cap 20  Donate tokens to a project, up to $20 a month
   donations                       Your donations: what each project used this month
+  gift create 20                  A single-use link and QR code worth $20 of your tokens
+  gift claim <link>               Claim a gift for your project or your own use (--personal)
   pause | resume                  Stop or restart donating from this machine
   keys add <provider>             Add a provider API key (anthropic, openai, openrouter,
                                   deepseek, xai; local: your own GPU)
@@ -286,7 +307,17 @@ struct Opts {
     config: Option<PathBuf>,
     /// `moochy start --headless --key-file PATH`: the provider key from a file (a Docker secret).
     key_file: Option<PathBuf>,
+    /// `moochy gift create` (plan 15 §3): `--note`, `--effort`, `--visibility`, `--expires`.
+    gift: GiftOpts,
     flags: Vec<&'static str>,
+}
+
+#[derive(Default)]
+struct GiftOpts {
+    note: Option<String>,
+    effort: Option<String>,
+    visibility: Option<String>,
+    expires: Option<u32>,
 }
 
 impl Opts {
@@ -356,6 +387,11 @@ fn parse() -> Result<Opts> {
             Long("ttl") => o.ttl = Some(s(p.value().map_err(err)?)?),
             Long("max-boxes") => o.max_boxes = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--max-boxes is a whole number"))?),
             Long("model") => o.models.push(s(p.value().map_err(err)?)?),
+            Long("models") => o.models.extend(s(p.value().map_err(err)?)?.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned)),
+            Long("note") => o.gift.note = Some(s(p.value().map_err(err)?)?),
+            Long("effort") => o.gift.effort = Some(s(p.value().map_err(err)?)?),
+            Long("visibility") => o.gift.visibility = Some(s(p.value().map_err(err)?)?),
+            Long("expires") => o.gift.expires = Some(s(p.value().map_err(err)?)?.parse().ok().filter(|d| *d > 0).ok_or_else(|| usage("--expires is a number of days (1 to 90)"))?),
             Long("log-key") => o.log_key = Some(s(p.value().map_err(err)?)?),
             Long("budget-uusd") => o.cap = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--budget-uusd is a whole number of millionths of a dollar"))?),
             Long("monthly-limit") => {
@@ -371,7 +407,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart"];
+                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart", "qr", "credits", "replace", "personal"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -495,7 +531,7 @@ fn run() -> Result<()> {
         }
     }
     // A cloud box (§17.1) has no owner powers and no donor role.
-    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "org" | "person" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
+    if let [cmd @ ("approve" | "accept" | "claim" | "members" | "owner" | "org" | "person" | "pending" | "decisions" | "box" | "donate" | "safety" | "audit" | "gift" | "credits"), ..] | [cmd @ "keys", "add" | "revoke", ..] = w.as_slice() {
         crate::boxes::refuse_on_box(&home.load()?, cmd)?;
     }
     match w.as_slice() {
@@ -584,7 +620,13 @@ fn run() -> Result<()> {
             emit(&v);
             Ok(())
         }),
-        ["donate"] => donate(&home, &o),
+        ["donate"] if o.has("credits") => Err(usage("donate --credits AMOUNT --repo PROJECT | --org ORG | --person PERSON")),
+        ["donate"] => donate(&home, &o, None),
+        ["donate", amount] if o.has("credits") => donate(&home, &o, Some(amount)),
+        ["gift", rest @ ..] => gift_cmd(&home, &o, rest),
+        ["credits"] => crate::gift::show(&home, o.has("json")),
+        ["credits", "add"] => crate::gift::add(&home, None),
+        ["credits", "add", amount] => crate::gift::add(&home, Some(amount)),
         // `pledges` is the internal name, kept as a hidden alias (VOICE.md shows "donations").
         ["donations" | "pledges"] => crate::donations::list(&home, o.has("json")),
         ["donations", act, id] => crate::donations::action(&home, act, id),
@@ -782,7 +824,7 @@ fn window_amount(v: &str, which: &str) -> Result<i64> {
 }
 
 /// `moochy donate --repo PROJECT | --org ORG | --person PERSON --cap $N` (CONTRACT §19.6, §24.6).
-fn donate(home: &Home, o: &Opts) -> Result<()> {
+fn donate(home: &Home, o: &Opts, credits: Option<&str>) -> Result<()> {
     use crate::donations::To;
     let (target, to) = match (org_arg(o)?, person_arg(o)?) {
         (_, Some(p)) if p.is_empty() => return Err(usage(format!("--person is {PERSON_FORMS}"))),
@@ -791,13 +833,22 @@ fn donate(home: &Home, o: &Opts) -> Result<()> {
         (None, None) => (slug_or_detect(o)?, To::Repo),
     };
     let limits = crate::donations::Limits { monthly: o.cap.unwrap_or(0), weekly: o.weekly_limit, daily: o.daily_limit };
+    // Plan 15 §5.2: credits pay a one-off total, without a schedule or windows.
+    if credits.is_some() && (o.cap.is_some() || o.weekly_limit.is_some() || o.daily_limit.is_some()) {
+        return Err(usage("--credits gives a one-off total: no --cap, --weekly-limit or --daily-limit"));
+    }
+    if credits.is_none() {
+        limits.check()?;
+    }
     // Plan 14 §3: the donation goes through the app; start it rather than fail.
-    limits.check()?;
     if !running(home) {
         start_node(home, false)?;
         eprintln!("Started the Moochy app (`moochy down` stops it).");
     }
-    crate::donations::donate(home, &target, to, limits, o.has("yes"))?;
+    match credits {
+        Some(amount) => crate::gift::donate(home, &target, to, amount, o.has("yes"))?,
+        None => crate::donations::donate(home, &target, to, limits, o.has("yes"))?,
+    }
     share(home, &crate::button::page(to, &target)?);
     Ok(())
 }
@@ -1007,6 +1058,88 @@ fn start_headless(home: Home, o: &mut Opts, provider: Option<&str>) -> Result<()
         r?;
     }
     up_foreground(home, false, false)
+}
+
+/// `moochy gift …` (plan 15 §3.2).
+fn gift_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
+    match w {
+        ["create", amount] => {
+            let q = crate::pb::link::CreateGiftRequest {
+                source: if o.has("credits") { "credits" } else { "tokens" }.into(),
+                amount_uusd: crate::gift::amount(amount)?,
+                models: o.models.clone(),
+                max_effort: o.gift.effort.clone().unwrap_or_default(),
+                visibility: o.gift.visibility.clone().unwrap_or_else(|| "public".into()),
+                note: o.gift.note.clone().unwrap_or_default(),
+                expires_days: o.gift.expires.unwrap_or(0),
+                ..crate::pb::link::CreateGiftRequest::default()
+            };
+            crate::gift::create(home, q, o.has("json"))
+        }
+        ["list"] => crate::gift::list(home, o.has("json")),
+        ["revoke", id] => crate::gift::revoke(home, id, o.has("replace"), o.has("json")),
+        ["claim", link] => {
+            let mut q = crate::pb::link::ClaimGiftRequest::default();
+            match (o.has("personal"), org_arg(o)?, person_arg(o)?) {
+                (true, None, None) if o.repo.is_none() => q.personal = true,
+                (true, ..) => return Err(usage("--personal goes alone: the gift is for your own use")),
+                (false, _, Some(p)) => q.person = if p.is_empty() { own_person(home, o, false)? } else { p },
+                (false, Some(org), None) => q.org = org.to_ascii_lowercase(),
+                (false, None, None) => q.repo_slug = o.repo.as_deref().map(canonical_repo).transpose()?.ok_or_else(|| usage("gift claim <link> --repo PROJECT | --org ORG | --person PERSON | --personal"))?.to_ascii_lowercase(),
+            }
+            let d = crate::gift::claim(home, link, q.clone())?;
+            accept_gift(home, o, &q, &d)
+        }
+        _ => Err(usage("gift create AMOUNT [--credits] … | gift list | gift revoke <gf_…> [--replace] | gift claim <link> --repo PROJECT | --org ORG | --person PERSON | --personal")),
+    }
+}
+
+/// Plan 15 §3.2: a claimed gift waits for the claimer's acceptance. With an owner key here, accept
+/// it now through the `moochy accept` path (decoded body, Lookup A217/A218, one passphrase);
+/// otherwise say how.
+fn accept_gift(home: &Home, o: &Opts, q: &crate::pb::link::ClaimGiftRequest, d: &crate::pb::link::Donation) -> Result<()> {
+    use crate::org::{Group, Op, sign};
+    if d.status != "pending" {
+        return Ok(());
+    }
+    let cfg = home.load()?;
+    let id = clean(&d.pledge_id).into_owned();
+    if !crate::owner::key_path(home, cfg.relay.as_deref()).exists() {
+        eprintln!("Accept it with your passkey: {}/decide/{id}", crate::decisions::web_origin(home));
+        let flag = if q.personal {
+            "--personal".to_owned()
+        } else if !q.person.is_empty() {
+            format!("--person {}", q.person)
+        } else if q.org.is_empty() {
+            format!("--repo {}", q.repo_slug)
+        } else {
+            format!("--org {}", q.org)
+        };
+        eprintln!("(or with an owner key on this machine: moochy accept {id} {})", clean(&flag));
+        return Ok(());
+    }
+    // The donor's handle: in the answer, else from the signature request the relay pushes.
+    let mut donor = d.donor.clone();
+    for _ in 0..20 {
+        if !donor.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        donor = donor_of_request(home, &d.pledge_id).unwrap_or_default();
+    }
+    if donor.is_empty() {
+        donor = donor_of_request(home, &d.pledge_id)?;
+    }
+    let yes = o.has("yes");
+    if !q.person.is_empty() {
+        sign(home, Group::Person, &q.person, &[Op::Donor { donor: &donor, revoke: false }], yes)
+    } else if !q.org.is_empty() {
+        sign(home, Group::Org, &q.org, &[Op::Donor { donor: &donor, revoke: false }], yes)
+    } else if q.personal {
+        crate::owner::sign(home, crate::node::PERSONAL_SLUG, &["approve", &donor], yes, false, false, 0)
+    } else {
+        crate::owner::sign(home, &q.repo_slug, &["approve", &donor], yes, false, false, 0)
+    }
 }
 
 /// CONTRACT §22.3: the canonical page to share, after a donation or a claim.
@@ -1250,8 +1383,11 @@ fn checked_relay(o: &Opts, saved: Option<&str>) -> Result<String> {
 
 fn slug_or_detect(o: &Opts) -> Result<String> {
     match &o.repo {
+        // Plan 15: the donations made for this account's own use (the relay's personal pool).
+        None if o.has("personal") => Ok(crate::node::PERSONAL_SLUG.into()),
+        Some(_) if o.has("personal") => Err(usage("--personal and --repo exclude each other")),
         Some(r) => canonical_repo(r),
-        None => detect_repo().ok_or_else(|| usage(format!("--repo is required (no github.com or gitlab.com `origin` remote here): {REPO_FORMS}"))),
+        None => detect_repo().ok_or_else(|| usage(format!("--repo is required (no github.com or gitlab.com `origin` remote here, or --personal): {REPO_FORMS}"))),
     }
 }
 
@@ -1809,14 +1945,19 @@ fn spend_limit_page(provider: &str) -> &'static str {
 fn button(o: &Opts, rest: &[&str]) -> Result<()> {
     // CONTRACT §21.3: an organisation's chart (no project to detect).
     if o.org.is_some() || o.person.is_some() {
-        if !o.has("chart") || o.repo.is_some() || o.has("provider") || !rest.is_empty() {
-            return Err(usage("button --chart --org github/ORG|gitlab/GROUP[/SUB…] | --person github/LOGIN|gitlab/USERNAME (not with --repo or --provider)"));
+        if o.has("chart") == o.has("qr") || o.repo.is_some() || o.has("provider") || !rest.is_empty() {
+            return Err(usage("button --chart|--qr --org github/ORG|gitlab/GROUP[/SUB…] | --person github/LOGIN|gitlab/USERNAME (not with --repo or --provider)"));
         }
         let (base, act) = match (&o.org, person_arg(o)?) {
             (_, Some(p)) => crate::button::group_base(crate::donations::To::Person, &p)?,
             (Some(org), None) => crate::button::group_base(crate::donations::To::Org, org)?,
             (None, None) => return Err(internal("unreachable")),
         };
+        if o.has("qr") {
+            let name = base.rsplit_once("/github/").or_else(|| base.rsplit_once("/gitlab/")).map_or("", |(_, n)| n);
+            println!("{}", crate::button::qr(&base, act, name, &o.button)?);
+            return Ok(());
+        }
         println!("{}", crate::button::chart(&base, act, &o.button)?);
         return Ok(());
     }
@@ -1851,7 +1992,12 @@ fn button(o: &Opts, rest: &[&str]) -> Result<()> {
             p
         }
     };
-    let out = if o.has("chart") { crate::button::project_chart(&project, &o.button)? } else { crate::button::snippet(&project, &o.button)? };
+    let out = match (o.has("chart"), o.has("qr")) {
+        (true, true) => return Err(usage("--chart or --qr, not both")),
+        (true, false) => crate::button::project_chart(&project, &o.button)?,
+        (false, true) => crate::button::project_qr(&project, &o.button)?,
+        (false, false) => crate::button::snippet(&project, &o.button)?,
+    };
     println!("{out}");
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! `moochy.v1.LocalControl` (spec/proto/moochy/v1/local.proto): gRPC over HTTP/2 cleartext on the
 //! Unix socket `<home>/state/node.sock` (dir 0700, socket 0600, peer uid checked).
 
-use crate::config::valid_slug;
+use crate::config::valid_target;
 use crate::node::{LinkState, Node, lock};
 use crate::pb::local::local_control_client::LocalControlClient;
 use crate::pb::local::local_control_server::{LocalControl, LocalControlServer};
@@ -212,7 +212,7 @@ impl LocalControl for Ctl {
 
     async fn env(&self, r: Request<EnvRequest>) -> std::result::Result<Response<EnvResponse>, Status> {
         let r = r.into_inner();
-        if !valid_slug(&r.repo) {
+        if !valid_target(&r.repo) {
             return Err(Status::invalid_argument("repo must be owner/name"));
         }
         let n = &self.node;
@@ -352,7 +352,7 @@ impl LocalControl for Ctl {
         let Ok(Some(McpUp { msg: Some(mcp_up::Msg::Open(open)) })) = inp.message().await else {
             return Err(Status::invalid_argument("first message must be McpOpen"));
         };
-        if !valid_slug(&open.repo) {
+        if !valid_target(&open.repo) {
             return Err(Status::invalid_argument("repo must be owner/name"));
         }
         let cwd = PathBuf::from(&open.cwd);

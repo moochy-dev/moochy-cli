@@ -679,3 +679,17 @@ fn responses_usage_and_cost() {
     assert_eq!((with("openrouter", Some(42)), with("xai", Some(43)), with("xai", None)), (Ok(42), Ok(43), Ok(113)));
     assert_eq!((with("openrouter", None), with("openai", Some(1))), (Err(Error::Malformed), Err(Error::Malformed)));
 }
+
+/// Plan 15: a route may target the requester's own pseudonym (personal); nothing else widens.
+#[test]
+fn repo_id_personal() {
+    let p: RepoId = "ps_0123456789abcdef".parse().unwrap();
+    assert!(p.is_personal() && p.text() == "ps_0123456789abcdef");
+    let r: RepoId = "r_01K6A0000000000000000000R1".parse().unwrap();
+    assert!(!r.is_personal() && r.text() == "r_01K6A0000000000000000000R1");
+    for bad in ["ps_0123456789ABCDEF", "ps_0123456789abcde", "ps_0123456789abcdefg", "ps_i123456789abcdef", "ps_", "m_01K6A0000000000000000000R1", "o_01K6A0000000000000000000R1", "p_01K6A0000000000000000000R1"] {
+        assert!(bad.parse::<RepoId>().is_err(), "{bad}");
+    }
+    assert_eq!(serde_json::to_string(&p).unwrap(), "\"ps_0123456789abcdef\"");
+    assert_eq!(serde_json::from_str::<RepoId>("\"ps_0123456789abcdef\"").unwrap(), p);
+}

@@ -86,7 +86,9 @@ fn targets<'a>(kind: Kind, body: &Body<'a>) -> Result<Targets<'a>, &'static str>
         Body::Grant { repo_id, subject, signer, issued_at_ms } => t(repo_id, "", "", subject, signer, issued_at_ms),
         _ => return Err("body does not match its kind"),
     };
-    let repo_ok = t.repo.is_empty() || t.repo.starts_with("r_") || t.repo == t.org || t.repo == t.person;
+    // Plan 15: a DONOR_* on a pseudonym is the account's own (personal) target.
+    let personal = donor && t.repo.starts_with("ps_");
+    let repo_ok = t.repo.is_empty() || t.repo.starts_with("r_") || t.repo == t.org || t.repo == t.person || personal;
     let (org_ok, person_ok) = (t.org.is_empty() || t.org.starts_with("o_"), t.person.is_empty() || t.person.starts_with("m_"));
     if !repo_ok || !org_ok || !person_ok || [t.repo, t.org, t.person].iter().all(|s| s.is_empty()) {
         return Err("body names neither a project, an organisation nor a person");
@@ -113,6 +115,9 @@ fn decode(q: &ApprovalRequest, me: Option<&str>) -> Result<SignResponse, String>
     }
     if person_id != q.person_id {
         return Err("body names another person than the request".into());
+    }
+    if repo_id.starts_with("ps_") && me != Some(repo_id) {
+        return Err("body names another account's own use than this account".into());
     }
     if matches!(kind, Kind::RepoClaimed | Kind::OrgClaimed | Kind::PersonClaimed) {
         // A claim names its owner: it must be this user.

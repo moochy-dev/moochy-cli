@@ -83,6 +83,12 @@ pub struct Donation {
     pub per_day_uusd: Vec<u64>,
     /// When the monthly limit starts again (Unix ms); 0 = one-off or unknown.
     pub renews_at_ms: u64,
+    /// Plan 15 §4: a total donation (gifts, credits): `budget_uusd` is the lifetime total, it ends
+    /// at `ends_at_ms` (0 = unknown) and never renews.
+    pub total: bool,
+    pub ends_at_ms: u64,
+    /// Served by Moochy Credits (plan 15 §5).
+    pub credits: bool,
 }
 
 #[derive(Clone, Debug, Default)]

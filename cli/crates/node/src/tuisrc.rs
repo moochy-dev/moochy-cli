@@ -202,7 +202,8 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
         .iter()
         .map(|d| model::Donation {
             id: d.pledge_id.clone(),
-            target: [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone(),
+            // Plan 15: a donation for the recipient's own use names no project.
+            target: if d.personal { "For my own use".into() } else { [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone() },
             org: !d.org.is_empty(),
             person: d.person.clone(),
             status: d.status.clone(),
@@ -216,7 +217,10 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             per_repo_uusd: d.per_repo.iter().map(|r| (r.repo_slug.clone(), uusd(r.spent_uusd))).collect(),
             // Account-wide from the relay; an older relay: what THIS device served for it.
             per_day_uusd: relay_series(&d.per_day_uusd).unwrap_or_else(|| per_day(entries.iter().filter(|e| e.role == "worker" && served_for(e, d)), now)),
-            renews_at_ms: if matches!(d.status.as_str(), "active" | "paused") { renews_at(d.period_start_ms) } else { 0 },
+            renews_at_ms: if matches!(d.status.as_str(), "active" | "paused") && !d.total { renews_at(d.period_start_ms) } else { 0 },
+            total: d.total,
+            ends_at_ms: ms(d.ends_at_ms),
+            credits: d.credits,
         })
         .collect();
     // Decisions: the trail of every donation to my projects; projects: grouped from the same list.
@@ -300,7 +304,7 @@ async fn fetch(home: &Home, c: &mut Client) -> Result<Snapshot, String> {
             kind: "DONATION_REQUEST".into(),
             target: [&d.org, &d.person].into_iter().find(|t| !t.is_empty()).unwrap_or(&d.repo_slug).clone(),
             subject: d.donor.clone(),
-            summary: format!("{} µ$/month", d.budget_uusd),
+            summary: crate::donations::total(d).unwrap_or_else(|| format!("{} µ$/month", d.budget_uusd)),
             created_at_ms: ms(d.created_at_ms),
             // As `moochy decisions` prints it: the passkey accept page on the public site.
             decide_url: name_arg(&d.pledge_id).map(|id| format!("{web}/decide/{id}")).unwrap_or_default(),

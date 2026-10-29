@@ -55,6 +55,8 @@ fn status(op: &str, s: &Status) -> crate::util::Error {
     match (op, s.code()) {
         ("donate", tonic::Code::AlreadyExists) => return usage("you already have a live donation to this target: `moochy donations` shows it and its id. To change its limits, use the Dashboard on moochy.dev; to replace it, stop it first (`moochy donations stop <id>`)"),
         ("action", tonic::Code::FailedPrecondition) => return usage("this donation has already ended (stopped or refused), or this request was already decided: nothing is left to change. `moochy donations` lists the live ones"),
+        // Donate exists on every relay: UNIMPLEMENTED is a credits donation on a relay without them.
+        ("donate", tonic::Code::Unimplemented) => return usage(crate::gift::CREDITS_OFF),
         _ => {}
     }
     match s.code() {
@@ -82,7 +84,9 @@ pub enum To {
 
 /// What a donation funds, for people: the project, `org github/acme` or `person github/alice`.
 pub(crate) fn target(d: &Donation) -> String {
-    if !d.person.is_empty() {
+    if d.personal {
+        "For my own use".into()
+    } else if !d.person.is_empty() {
         format!("person {}", clean(&d.person))
     } else if d.org.is_empty() {
         clean(&d.repo_slug).into_owned()
@@ -91,16 +95,31 @@ pub(crate) fn target(d: &Donation) -> String {
     }
 }
 
-fn donation_json(d: &Donation) -> serde_json::Value {
+pub(crate) fn donation_json(d: &Donation) -> serde_json::Value {
     json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
         "weekly_limit_uusd": d.weekly_limit_uusd, "daily_limit_uusd": d.daily_limit_uusd, "per_request_limit_uusd": d.per_task_cap_uusd, "spent_uusd": d.spent_uusd, "reserved_uusd": d.reserved_uusd,
-        "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule)})
+        "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule),
+        "total": d.total, "ends_at_ms": d.ends_at_ms, "gift_id": clean(&d.gift_id), "credits": d.credits, "personal": d.personal})
+}
+
+/// Plan 15 §4: a total donation's limit, `Total $20.00 · ends 2027-10-28`, in place of the monthly
+/// one; `None` for a monthly donation.
+pub(crate) fn total(d: &Donation) -> Option<String> {
+    d.total.then(|| {
+        let ends = u64::try_from(d.ends_at_ms).ok().filter(|&t| t > 0).map(|t| format!(" · ends {}", crate::journal::utc_day(t))).unwrap_or_default();
+        format!("Total {}{ends}", dollars(d.budget_uusd))
+    })
+}
+
+/// ` · served by Moochy Credits` for a credits donation (plan 15 §5), else nothing.
+pub(crate) fn served_by(d: &Donation) -> &'static str {
+    if d.credits { " · served by Moochy Credits" } else { "" }
 }
 
 /// CONTRACT D19: default per-request limit of a donation.
 const DEFAULT_PER_REQUEST_UUSD: i64 = 5_000_000;
 
-fn dollars(uusd: i64) -> String {
+pub(crate) fn dollars(uusd: i64) -> String {
     format!("${}.{:02}", uusd / 1_000_000, (uusd % 1_000_000) / 10_000)
 }
 
@@ -112,7 +131,11 @@ pub fn list(home: &crate::config::Home, json_out: bool) -> Result<()> {
             emit(&donation_json(d));
         } else {
             let windows = Limits { monthly: d.budget_uusd, weekly: (d.weekly_limit_uusd > 0).then_some(d.weekly_limit_uusd), daily: (d.daily_limit_uusd > 0).then_some(d.daily_limit_uusd) };
-            println!("{:<28} {:<9} {} of {} this month{}  ({})", target(d), clean(&d.status), dollars(d.spent_uusd), dollars(d.budget_uusd), windows.extra(), clean(&d.pledge_id));
+            let used = match total(d) {
+                Some(t) => format!("{} spent · {t}", dollars(d.spent_uusd)),
+                None => format!("{} of {} this month{}", dollars(d.spent_uusd), dollars(d.budget_uusd), windows.extra()),
+            };
+            println!("{:<28} {:<9} {used}{}  ({})", target(d), clean(&d.status), served_by(d), clean(&d.pledge_id));
         }
     }
     if donations.is_empty() && !json_out {
@@ -207,6 +230,7 @@ pub fn donate(home: &crate::config::Home, slug: &str, to: To, limits: Limits, ye
         schedule: "always".into(),
         weekly_limit_uusd: limits.weekly.unwrap_or(0),
         daily_limit_uusd: limits.daily.unwrap_or(0),
+        credits: false,
     };
     let b = call(home, "donate", q.encode_to_vec())?;
     let d = Donation::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;
@@ -255,5 +279,15 @@ mod tests {
         assert!(!l(20, Some(21), None), "weekly > monthly");
         assert!(!l(20, Some(8), Some(9)), "daily > weekly");
         assert!(!l(20, Some(0), None) && !l(20, None, Some(-1)), "positive amounts");
+    }
+
+    #[test]
+    fn total_donations_show_total_and_end() {
+        use crate::pb::link::Donation;
+        let d = Donation { total: true, budget_uusd: 20_000_000, ends_at_ms: 1_824_768_000_000, ..Donation::default() };
+        assert_eq!(super::total(&d).as_deref(), Some("Total $20.00 · ends 2027-10-29"));
+        assert_eq!(super::total(&Donation { ends_at_ms: 0, ..d.clone() }).as_deref(), Some("Total $20.00"));
+        assert_eq!(super::total(&Donation { total: false, ..d }), None);
+        assert_eq!(super::target(&Donation { personal: true, ..Donation::default() }), "For my own use");
     }
 }

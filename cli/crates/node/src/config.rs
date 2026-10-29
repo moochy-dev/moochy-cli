@@ -355,6 +355,11 @@ pub fn valid_slug(s: &str) -> bool {
     canonical_slug(s).is_some()
 }
 
+/// A project slug, or the personal pool's name (plan 15: the account's own use, `--personal`).
+pub fn valid_target(s: &str) -> bool {
+    valid_slug(s) || s == crate::node::PERSONAL_SLUG
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

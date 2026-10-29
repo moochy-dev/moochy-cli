@@ -153,6 +153,11 @@ fn show_code(origin: &Origin, user_code: &str, browse: bool) {
     eprintln!("{}\n{}", p.dim(how), p.dim("Waiting for approval (Ctrl-C to stop)…"));
 }
 
+/// Open `url` in a browser when one can show up (`moochy credits add`); `false` when not opened.
+pub(crate) fn browse(url: &str) -> bool {
+    should_open(crate::style::err().tty, |k| std::env::var_os(k).is_some_and(|v| !v.is_empty())) && open_browser(url)
+}
+
 /// Open a browser only where one can show up: a terminal, not over SSH, and on Linux a display.
 fn should_open(tty: bool, set: impl Fn(&str) -> bool) -> bool {
     tty && !set("SSH_CONNECTION") && !set("SSH_TTY") && (cfg!(target_os = "macos") || set("DISPLAY") || set("WAYLAND_DISPLAY"))

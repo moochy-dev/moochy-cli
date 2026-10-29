@@ -263,7 +263,66 @@ id_type!(
 );
 id_type!(DeviceId, "d_");
 id_type!(UserId, "u_");
-id_type!(RepoId, "r_");
+/// A route's target: a repo (`r_` + ULID), or a personal target (plan 15, the recipient's own
+/// use): the requester's own pseudonym, `ps_` + 16 lowercase Crockford base32 chars.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RepoId {
+    Repo(Ulid),
+    /// The 16 pseudonym characters after `ps_` (validated ASCII).
+    Personal([u8; 16]),
+}
+impl RepoId {
+    pub fn new(now_ms: u64) -> Result<Self, Error> {
+        Ulid::new(now_ms).map(Self::Repo)
+    }
+    /// Exact text form; this is what goes inside `lp` and JSON.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.to_string()
+    }
+    /// A personal target (`ps_…`)?
+    #[must_use]
+    pub fn is_personal(&self) -> bool {
+        matches!(self, Self::Personal(_))
+    }
+}
+impl FromStr for RepoId {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        if let Some(p) = s.strip_prefix("ps_") {
+            let b: [u8; 16] = p.as_bytes().try_into().map_err(|_| Error::Malformed)?;
+            // Lowercase Crockford base32 (no i, l, o, u): the key log's pseudonym grammar.
+            if !b.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z')) {
+                return Err(Error::Malformed);
+            }
+            return Ok(Self::Personal(b));
+        }
+        s.strip_prefix("r_").ok_or(Error::Malformed).and_then(Ulid::parse).map(Self::Repo)
+    }
+}
+impl fmt::Display for RepoId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Repo(u) => write!(f, "r_{u}"),
+            Self::Personal(b) => write!(f, "ps_{}", std::str::from_utf8(b).map_err(|_| fmt::Error)?),
+        }
+    }
+}
+impl fmt::Debug for RepoId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+impl Serialize for RepoId {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+impl<'de> Deserialize<'de> for RepoId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_str(StrV(|s: &str| s.parse()))
+    }
+}
 id_type!(PledgeId, "p_");
 
 impl TaskId {

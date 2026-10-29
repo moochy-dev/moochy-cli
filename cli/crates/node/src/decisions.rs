@@ -38,7 +38,7 @@ fn decision_json(d: &Donation, origin: &str) -> serde_json::Value {
     let mut v = json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "donor": clean(&d.donor), "status": clean(&d.status),
         "monthly_limit": money(d.budget_uusd), "weekly_limit": (d.weekly_limit_uusd > 0).then(|| money(d.weekly_limit_uusd)),
         "daily_limit": (d.daily_limit_uusd > 0).then(|| money(d.daily_limit_uusd)), "per_request_limit": money(d.per_task_cap_uusd), "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(),
-        "created_at_ms": d.created_at_ms,
+        "created_at_ms": d.created_at_ms, "total": d.total, "ends_at_ms": d.ends_at_ms, "gift_id": clean(&d.gift_id), "credits": d.credits, "personal": d.personal,
         "events": d.events.iter().map(|e| json!({"event": clean(&e.event), "via": clean(&e.via), "at_ms": e.at_ms, "reason": clean(&e.reason), "log_index": e.log_index})).collect::<Vec<_>>()});
     if d.status == "pending"
         && let Some(o) = v.as_object_mut()
@@ -75,7 +75,8 @@ pub fn list(home: &Home, slug: Option<&str>, org: Option<&str>, json_out: bool) 
         }
         let who = if d.donor.is_empty() { "a hidden donor".into() } else { clean(&d.donor) };
         let windows = crate::donations::Limits { monthly: d.budget_uusd, weekly: (d.weekly_limit_uusd > 0).then_some(d.weekly_limit_uusd), daily: (d.daily_limit_uusd > 0).then_some(d.daily_limit_uusd) };
-        let line = format!("{:<28} {:<9} {who}, up to {} a month{} ({})", crate::donations::target(d), clean(&d.status), fmt_dollars(u64::try_from(d.budget_uusd).unwrap_or(0)), windows.extra(), clean(&d.pledge_id));
+        let limit = crate::donations::total(d).unwrap_or_else(|| format!("up to {} a month{}", fmt_dollars(u64::try_from(d.budget_uusd).unwrap_or(0)), windows.extra()));
+        let line = format!("{:<28} {:<9} {who}, {limit}{} ({})", crate::donations::target(d), clean(&d.status), crate::donations::served_by(d), clean(&d.pledge_id));
         println!("{line}");
         if d.status == "pending" {
             println!("    accept with your passkey: {origin}/decide/{}   refuse: moochy decisions refuse {} [--reason TEXT]", clean(&d.pledge_id), clean(&d.pledge_id));
