@@ -138,6 +138,22 @@ pub fn install(home: &Home, system: bool, print: bool) -> Result<()> {
     Ok(())
 }
 
+/// The user unit (launchd agent on macOS) is installed.
+pub fn installed() -> bool {
+    unit_path(false).is_ok_and(|p| p.exists())
+}
+
+/// Restart the app through the user unit (launchd agent), so it stays under the service manager.
+// ponytail: assumes the installed unit runs the same --home; compare its ExecStart if homes differ.
+pub fn restart() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(user_home()?).ctx("home")?);
+        run("launchctl", &["kickstart", "-k", &format!("gui/{uid}/{LABEL}")])
+    } else {
+        run("systemctl", &["--user", "restart", UNIT])
+    }
+}
+
 /// `moochy service uninstall [--system]`.
 pub fn uninstall(system: bool) -> Result<()> {
     let path = unit_path(system)?;

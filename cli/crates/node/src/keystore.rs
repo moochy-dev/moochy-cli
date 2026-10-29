@@ -183,32 +183,12 @@ pub fn passphrase_source() -> Result<Option<Zeroizing<String>>> {
 /// credential `cred` (`$CREDENTIALS_DIRECTORY/<cred>`). Used for the keystore passphrase and the
 /// box enrollment token (`MOOCHY_ENROLL`, credential `moochy-enroll`).
 pub fn secret_source(var: &str, cred: &str, what: &str) -> Result<Option<Zeroizing<String>>> {
-    use std::io::Read as _;
     if let Ok(p) = std::env::var(var).map(Zeroizing::new)
         && !p.is_empty()
     {
         return Ok(Some(p));
     }
-    let read = |path: &std::path::Path, owner_only: bool| -> Result<Option<Zeroizing<String>>> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
-        // Non-blocking open: a FIFO in its place cannot hang the start (the type is checked on
-        // the opened descriptor right after).
-        let nonblock = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap_or(0);
-        let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(nonblock).open(path) else { return Ok(None) };
-        let md = f.metadata().map_err(|e| auth(format!("{}: {e}", path.display())))?;
-        let mine = md.uid() == rustix::process::geteuid().as_raw();
-        if !md.is_file() || (owner_only && (md.permissions().mode() & 0o077 != 0 || !mine)) {
-            return Err(auth(format!("{}: the {what} file must be a regular file of yours, readable only by you (chmod 600)", path.display())));
-        }
-        let mut raw = Zeroizing::new(Vec::new());
-        f.take(4097).read_to_end(&mut raw).map_err(|e| auth(format!("{}: {e}", path.display())))?;
-        if raw.len() > 4096 {
-            return Err(auth(format!("the {what} file is larger than 4 KiB")));
-        }
-        let s = std::str::from_utf8(&raw).map_err(|_| auth(format!("the {what} file is not UTF-8")))?;
-        let s = s.strip_suffix('\n').map_or(s, |t| t.strip_suffix('\r').unwrap_or(t));
-        Ok((!s.is_empty()).then(|| Zeroizing::new(s.to_owned())))
-    };
+    let read = |path: &std::path::Path, owner_only: bool| read_secret(path, owner_only, what);
     let file_var = format!("{var}_FILE");
     if let Some(p) = std::env::var_os(&file_var) {
         return match read(std::path::Path::new(&p), true)? {
@@ -220,6 +200,30 @@ pub fn secret_source(var: &str, cred: &str, what: &str) -> Result<Option<Zeroizi
         Some(d) => read(&std::path::Path::new(&d).join(cred), false),
         None => Ok(None),
     }
+}
+
+/// A secret file (at most 4 KiB, UTF-8, one trailing newline dropped); `None` when it cannot be
+/// opened or is empty. `owner_only`: a regular file of this user with no group/other bits.
+pub(crate) fn read_secret(path: &std::path::Path, owner_only: bool, what: &str) -> Result<Option<Zeroizing<String>>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    // Non-blocking open: a FIFO in its place cannot hang the start (the type is checked on
+    // the opened descriptor right after).
+    let nonblock = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap_or(0);
+    let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(nonblock).open(path) else { return Ok(None) };
+    let md = f.metadata().map_err(|e| auth(format!("{}: {e}", path.display())))?;
+    let mine = md.uid() == rustix::process::geteuid().as_raw();
+    if !md.is_file() || (owner_only && (md.permissions().mode() & 0o077 != 0 || !mine)) {
+        return Err(auth(format!("{}: the {what} file must be a regular file of yours, readable only by you (chmod 600)", path.display())));
+    }
+    let mut raw = Zeroizing::new(Vec::new());
+    f.take(4097).read_to_end(&mut raw).map_err(|e| auth(format!("{}: {e}", path.display())))?;
+    if raw.len() > 4096 {
+        return Err(auth(format!("the {what} file is larger than 4 KiB")));
+    }
+    let s = std::str::from_utf8(&raw).map_err(|_| auth(format!("the {what} file is not UTF-8")))?;
+    let s = s.strip_suffix('\n').map_or(s, |t| t.strip_suffix('\r').unwrap_or(t));
+    Ok((!s.is_empty()).then(|| Zeroizing::new(s.to_owned())))
 }
 
 fn derive(pass: &str, salt: &[u8], log_n: u8, r: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {

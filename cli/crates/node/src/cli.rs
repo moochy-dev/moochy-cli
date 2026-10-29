@@ -24,11 +24,21 @@ PROJECT: owner/name or github/owner/name (GitHub), gitlab/group[/subgroup…]/na
          default: the github.com or gitlab.com `origin` remote of the current directory
 
 COMMANDS:
+  start [<provider>] [--key-stdin] [--repo PROJECT] [--cap N] [--no-browser]
+                                  Set up this machine and donate, step by step: sign in, add
+                                  the provider key (hidden input), the safety step, start the
+                                  app, donate. Done steps are skipped: safe to run again
+  start --headless <provider> --key-file PATH | start --headless --local URL --model local/<slug>=<id>
+                                  The same with no terminal (containers): MOOCHY_MONTHLY_LIMIT,
+                                  optional MOOCHY_DONATE=PROJECT with MOOCHY_DONATE_CAP; prints
+                                  the sign-in code when needed, then runs the app in the foreground
+  help [all]                      The short list, or every command and option
   tui [--demo] [--snapshot COLSxROWS [--keys K] [--ansi]] [--theme light|dark] [--ascii]
                                   The dashboard in your terminal (also: `moochy` alone)
   login [--relay URL] [--ca-file PEM] [--log-key VKEY] [--roles gateway,worker] [--name NAME] [--headless] [--no-browser]
                                   Add this device to your account (opens the approval page). Roles: gateway uses donated
-                                  tokens, worker donates yours. Only the default server unless
+                                  tokens, worker donates yours (asked on a terminal; scripts:
+                                  gateway). Only the default server unless
                                   MOOCHY_INSECURE_DEV=1 (a separate keystore per server)
   logout                          Remove this device: revoke its keys, then delete them here
   up [--foreground] [--headless] [--unsafe-no-lockdown]
@@ -50,7 +60,7 @@ COMMANDS:
                                   calls from donated tokens reach only sandboxed agents.
                                   --box-is-sandbox: in a single-purpose cloud box without user
                                   namespaces or Landlock, the box itself is the sandbox
-  box token create [--repo PROJECT] [--ttl 24h] [--cap $20] [--max-boxes 1]
+  box token create [--repo PROJECT] [--ttl 24h] [--cap 20] [--max-boxes 1]
                                   A token that lets cloud boxes (boat.dev, E2B, Daytona, Modal,
                                   Codespaces) use this project's donations: each box gets its own
                                   keys, its own monthly limit and expires with the token. Shown once
@@ -58,9 +68,9 @@ COMMANDS:
   box list [--repo P] | box revoke <d_…>
                                   Boxes enrolled for your projects; revoke one, or a token and all
                                   its boxes
-  keys add <anthropic|openai|openrouter|deepseek|xai> --key-stdin [--base-url URL]
-                                  Add a provider API key (xai = Grok), read from stdin, never
-                                  from the command line. It is checked with the provider's free
+  keys add <anthropic|openai|openrouter|deepseek|xai> [--key-stdin] [--base-url URL]
+                                  Add a provider API key (xai = Grok), read from stdin (asked
+                                  with hidden input on a terminal), never from the command line. It is checked with the provider's free
                                   models call and never leaves this machine (`local`: below)
   keys add local --base-url http://127.0.0.1:11434 --model local/<slug>=<server id> [--key-stdin]
                                   Donate your own GPU: an OpenAI-compatible server on this
@@ -79,7 +89,7 @@ COMMANDS:
   audit --provider [--from-file usage.csv]
                                   What this device served (90 days), checked against the
                                   provider's usage export (date,model,cost_usd)
-  safety [--monthly-limit $N] [--accept-safety]
+  safety [--monthly-limit N] [--accept-safety]
                                   The safety step before donating: a monthly limit for this
                                   machine, and a provider-side spend limit (required once)
   keys list | keys remove <provider> | keys rotate
@@ -103,9 +113,9 @@ COMMANDS:
   doctor                          Check the keystore, connection, clock, provider keys, socket
                                   and the sandbox support of this machine
   update --from-file BINARY       Install a signed release (unsigned files are refused)
-  donate --repo PROJECT | --org ORG | --person PERSON --cap $N [--weekly-limit $N]
-         [--daily-limit $N] [--yes]
-                                  Donate tokens to a project, up to $N a month (it starts once
+  donate --repo PROJECT | --org ORG | --person PERSON --cap N [--weekly-limit N]
+         [--daily-limit N] [--yes]
+                                  Donate tokens to a project, up to N dollars a month (it starts once
                                   the project owner accepts you); optional weekly (Monday 00:00
                                   UTC) and daily (00:00 UTC) limits, no higher than the monthly
                                   one; --org donates to an organisation
@@ -130,9 +140,9 @@ COMMANDS:
                                   Accept a donor for your project, or once for your organisation
                                   or your person profile
                                   (--revoke removes them); `approve` is the same command
-  members <add|remove> <user> --repo PROJECT [--device] [--cap $N | --cap-uusd N] [--yes]
+  members <add|remove> <user> --repo PROJECT [--device] [--cap N | --cap-uusd N] [--yes]
                                   Let a person (or a CI device) use your project's donations,
-                                  up to $N a month
+                                  up to N dollars a month
   claim <PROJECT> [--yes]         Confirm you maintain a project, signed by your owner key
                                   (also: claim --repo PROJECT)
   claim --org ORG [--yes]         Confirm you own an organisation (github/ORG: an admin;
@@ -147,6 +157,34 @@ COMMANDS:
 
 ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_ENROLL (cloud box enrollment token),
      MOOCHY_INSECURE_DEV=1 (development only)
+";
+
+/// `moochy --help` (plan 14 §3): the commands people use. `moochy help all` prints [`HELP`].
+pub(crate) const HELP_SHORT: &str = "moochy: donate tokens to open source, and use tokens donated to your projects.
+Open-source client (Apache-2.0) · 100% free
+
+USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
+PROJECT: owner/name (GitHub) or gitlab/group/name; default: the `origin` remote here
+
+Donate tokens:
+  start                           Set up this machine and donate, step by step (safe to repeat)
+  donate --repo PROJECT --cap 20  Donate tokens to a project, up to $20 a month
+  donations                       Your donations: what each project used this month
+  pause | resume                  Stop or restart donating from this machine
+  keys add <provider>             Add a provider API key (anthropic, openai, openrouter,
+                                  deepseek, xai; local: your own GPU)
+
+Use donated tokens:
+  connect <client> [--repo PROJECT]
+                                  Set up a coding tool (`moochy connect list` shows the tools)
+  run [--repo PROJECT] -- <cmd>   Run your coding agent in a sandbox wired to Moochy
+
+This machine:
+  status                          Connection, slots in use, donations available
+  tui                             The dashboard in your terminal (also: `moochy` alone)
+  doctor                          Check the keystore, connection, clock and provider keys
+
+More: moochy help all (every command and option)
 ";
 
 pub fn main() -> ExitCode {
@@ -246,6 +284,8 @@ struct Opts {
     ttl: Option<String>,
     max_boxes: Option<u32>,
     config: Option<PathBuf>,
+    /// `moochy start --headless --key-file PATH`: the provider key from a file (a Docker secret).
+    key_file: Option<PathBuf>,
     flags: Vec<&'static str>,
 }
 
@@ -307,6 +347,12 @@ fn parse() -> Result<Opts> {
             Long("allow-host") => o.allow_hosts.push(s(p.value().map_err(err)?)?),
             Long("worktree") => o.worktree = Some(PathBuf::from(p.value().map_err(err)?)),
             Long("config") => o.config = Some(PathBuf::from(p.value().map_err(err)?)),
+            Long("key-file") => o.key_file = Some(PathBuf::from(p.value().map_err(err)?)),
+            // `moochy start --headless --local URL`: a model server, as `keys add local --base-url`.
+            Long("local") => {
+                o.base_url = Some(s(p.value().map_err(err)?)?);
+                o.flags.push("local");
+            }
             Long("ttl") => o.ttl = Some(s(p.value().map_err(err)?)?),
             Long("max-boxes") => o.max_boxes = Some(s(p.value().map_err(err)?)?.parse().map_err(|_| usage("--max-boxes is a whole number"))?),
             Long("model") => o.models.push(s(p.value().map_err(err)?)?),
@@ -393,9 +439,20 @@ fn run() -> Result<()> {
         println!("moochy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if o.has("help") {
-        print!("{HELP}");
-        return Ok(());
+    match o.words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["help", "all"] => {
+            print!("{HELP}");
+            return Ok(());
+        }
+        _ if o.has("help") => {
+            print!("{HELP_SHORT}");
+            return Ok(());
+        }
+        ["help"] => {
+            print!("{HELP_SHORT}");
+            return Ok(());
+        }
+        _ => {}
     }
     if o.words.is_empty() {
         use std::io::IsTerminal as _;
@@ -403,7 +460,7 @@ fn run() -> Result<()> {
         if o.flags.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             return tui(o.home.clone(), &[]);
         }
-        eprint!("{HELP}");
+        eprint!("{HELP_SHORT}");
         return Err(usage("missing command"));
     }
     let home = Home::resolve(o.home.clone())?;
@@ -422,6 +479,9 @@ fn run() -> Result<()> {
             }
             None => return Ok(()),
         }
+    }
+    if o.words.first().is_some_and(|c| c == "start") {
+        return start(home, &mut o);
     }
     let donor: String;
     let mut w: Vec<&str> = o.words.iter().map(String::as_str).collect();
@@ -603,10 +663,21 @@ fn running(home: &Home) -> bool {
 
 /// M2: the running app read its keys and settings once, at start: the keychain is read by a child
 /// process before the lockdown, which forbids starting one afterwards, and the lockdown fixed the
-/// provider ports it may reach. A change applies at the next start: say so.
+/// provider ports it may reach. A change applies at the next start. Plan 14 §3: for a person at a
+/// terminal, restart it (through the service when one is installed) and say so; scripts and test
+/// harnesses run their own `up --foreground`, so they only get the note.
 fn restart_note(home: &Home, what: &str) {
-    if running(home) {
+    if !running(home) {
+        return;
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         eprintln!("The app is running: restart it with `moochy down && moochy up` to use the new {what}.");
+        return;
+    }
+    let r = if crate::service::installed() { crate::service::restart() } else { stop(home).and_then(|()| start_node(home, false).map(drop)) };
+    match r {
+        Ok(()) => eprintln!("Restarted the app to use the new {what}."),
+        Err(e) => eprintln!("Could not restart the app ({}): run `moochy down && moochy up`.", clean(&e.msg)),
     }
 }
 
@@ -720,9 +791,222 @@ fn donate(home: &Home, o: &Opts) -> Result<()> {
         (None, None) => (slug_or_detect(o)?, To::Repo),
     };
     let limits = crate::donations::Limits { monthly: o.cap.unwrap_or(0), weekly: o.weekly_limit, daily: o.daily_limit };
+    // Plan 14 §3: the donation goes through the app; start it rather than fail.
+    limits.check()?;
+    if !running(home) {
+        start_node(home, false)?;
+        eprintln!("Started the Moochy app (`moochy down` stops it).");
+    }
     crate::donations::donate(home, &target, to, limits, o.has("yes"))?;
     share(home, &crate::button::page(to, &target)?);
     Ok(())
+}
+
+/// Plan 14 §3: what `moochy start` still has to do on this machine, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Login,
+    Key,
+    Safety,
+    Up,
+    Donate,
+}
+
+/// What is already done here (read from the config, the keystore and the socket).
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(clippy::struct_excessive_bools, reason = "one flag per start step")]
+struct Done {
+    login: bool,
+    key: bool,
+    safety: bool,
+    running: bool,
+}
+
+/// The steps left; donating is checked with the app (it knows the account's donations).
+fn todo(d: Done) -> Vec<Step> {
+    [(Step::Login, d.login), (Step::Key, d.key), (Step::Safety, d.safety), (Step::Up, d.running), (Step::Donate, false)].into_iter().filter(|(_, done)| !done).map(|(s, _)| s).collect()
+}
+
+fn safety_done(cfg: &crate::config::Config) -> bool {
+    cfg.donor_safety_ack_ms.is_some() && cfg.device_monthly_cap_uusd.is_some()
+}
+
+fn done(home: &Home) -> Result<Done> {
+    let cfg = home.load()?;
+    let login = cfg.device_id.is_some();
+    if login && !cfg.roles.iter().any(|r| r == "worker") {
+        return Err(usage("this device is signed in to use donated tokens only: to donate from this machine, use another --home, or `moochy logout` and run `moochy start` again"));
+    }
+    let key = login && keystore::load(home, &cfg)?.is_some_and(|s| !s.providers.is_empty());
+    Ok(Done { login, key, safety: safety_done(&cfg), running: running(home) })
+}
+
+/// `moochy start` (plan 14 §3): the first run in a terminal. `--headless`: [`start_headless`].
+fn start(home: Home, o: &mut Opts) -> Result<()> {
+    use std::io::IsTerminal as _;
+    crate::boxes::refuse_on_box(&home.load()?, "start")?;
+    let provider = match o.words.as_slice() {
+        [_] => None,
+        [_, p] => Some(p.clone()),
+        _ => return Err(usage("moochy start [<provider>] (the key is asked, or read with --key-stdin)")),
+    };
+    if o.has("headless") {
+        return start_headless(home, o, provider.as_deref());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(usage("moochy start asks questions: run it in a terminal (containers and scripts: moochy start --headless)"));
+    }
+    let p = crate::style::err();
+    let mut offered_safety = false;
+    for step in todo(done(&home)?) {
+        match step {
+            Step::Login => {
+                let relay = checked_relay(o, None)?;
+                let name = o.name.clone().unwrap_or_else(crate::login::default_name);
+                rt_small()?.block_on(crate::login::login(&home, &relay, o.ca_file.clone(), vec!["gateway".into(), "worker".into()], name, None, !o.has("no-browser")))?;
+            }
+            Step::Key => {
+                let provider = if let Some(p) = &provider {
+                    p.clone()
+                } else {
+                    let a = crate::owner::ask(&format!("Provider ({}) [anthropic]: ", crate::keycheck::PROVIDERS.join(", ")), false)?;
+                    if a.trim().is_empty() { "anthropic".into() } else { a.trim().to_ascii_lowercase() }
+                };
+                keys_add(&home, &provider, o)?;
+                offered_safety = provider != "local";
+            }
+            Step::Safety => {
+                if !offered_safety {
+                    safety(&home, o, provider.as_deref())?;
+                }
+                if !safety_done(&home.load()?) {
+                    return Ok(());
+                }
+            }
+            Step::Up => {
+                let service = !crate::service::installed() && crate::owner::ask("Start Moochy when you log in? [Y/n] ", false).is_ok_and(|a| !a.trim().eq_ignore_ascii_case("n") && !a.trim().eq_ignore_ascii_case("no"));
+                if service {
+                    crate::service::install(&home, false, false)?;
+                    if !(0..60).any(|_| {
+                        std::thread::sleep(Duration::from_millis(250));
+                        running(&home)
+                    }) {
+                        return Err(internal("the service did not start the app: `moochy up` starts it without the service (log: journalctl --user -u moochy)"));
+                    }
+                } else {
+                    start_node(&home, false)?;
+                }
+                eprintln!("{}{}", p.mark(true), p.ok("Moochy is running."));
+            }
+            Step::Donate => start_donate(&home, o)?,
+        }
+    }
+    eprintln!(
+        "{}\n  The maintainer accepts you first; then requests use your key, up to your limits. Your key never leaves this machine.\n  `moochy donations` shows what each project used. `moochy pause` stops donating from this machine.",
+        p.bold("What happens next:")
+    );
+    Ok(())
+}
+
+/// The donation step of `moochy start`: skipped when this account already donates.
+fn start_donate(home: &Home, o: &Opts) -> Result<()> {
+    let n = crate::donations::mine(home)?.len();
+    if n > 0 {
+        eprintln!("You already donate tokens ({n} donation{}): `moochy donations` shows them.", if n == 1 { "" } else { "s" });
+        return Ok(());
+    }
+    let detected = o.repo.as_deref().map(canonical_repo).transpose()?.or_else(detect_repo);
+    let a = crate::owner::ask(&format!("Project to donate tokens to (owner/name){}: ", detected.as_deref().map(|d| format!(" [{d}]")).unwrap_or_default()), false)?;
+    let Some(slug) = (if a.trim().is_empty() { detected } else { Some(canonical_repo(a.trim())?) }) else {
+        eprintln!("Not donating yet. Later: moochy donate --repo OWNER/NAME --cap 20");
+        return Ok(());
+    };
+    let monthly = if let Some(c) = o.cap {
+        c
+    } else {
+        let a = crate::owner::ask("Monthly amount in dollars [20]: ", false)?;
+        let v = crate::util::parse_amount(if a.trim().is_empty() { "20" } else { a.trim() }).map_err(|e| usage(format!("the monthly amount (dollars, e.g. 20): {e}")))?;
+        i64::try_from(v).map_err(|_| usage("the monthly amount is too large"))?
+    };
+    crate::donations::donate(home, &slug, crate::donations::To::Repo, crate::donations::Limits { monthly, weekly: o.weekly_limit, daily: o.daily_limit }, true)?;
+    share(home, &crate::button::page(crate::donations::To::Repo, &slug)?);
+    Ok(())
+}
+
+/// `moochy start --headless` settings from the environment (plan 14 §5).
+#[derive(Debug, PartialEq, Eq)]
+struct Headless {
+    /// `MOOCHY_MONTHLY_LIMIT` (µ$): the safety step; setting it accepts the spend-limit advice.
+    monthly_limit: Option<u64>,
+    /// `MOOCHY_DONATE` (a project) and `MOOCHY_DONATE_CAP` (dollars a month, µ$ here).
+    donate: Option<(String, i64)>,
+}
+
+fn headless_env(get: impl Fn(&str) -> Option<String>) -> Result<Headless> {
+    let get = |k: &str| get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let monthly_limit = get("MOOCHY_MONTHLY_LIMIT").map(|v| crate::config::device_limit(&v)).transpose()?;
+    let donate = match (get("MOOCHY_DONATE"), get("MOOCHY_DONATE_CAP")) {
+        (None, None) => None,
+        (Some(p), Some(c)) => {
+            let cap = crate::util::parse_amount(&c).map_err(|e| usage(format!("MOOCHY_DONATE_CAP (dollars a month, e.g. 20): {e}")))?;
+            Some((canonical_repo(&p)?, i64::try_from(cap).map_err(|_| usage("MOOCHY_DONATE_CAP is too large"))?))
+        }
+        (Some(_), None) => return Err(usage("MOOCHY_DONATE needs MOOCHY_DONATE_CAP (dollars a month, e.g. 20)")),
+        (None, Some(_)) => return Err(usage("MOOCHY_DONATE_CAP needs MOOCHY_DONATE (the project, owner/name)")),
+    };
+    Ok(Headless { monthly_limit, donate })
+}
+
+/// `moochy start --headless` (plan 14 §5): the same steps with no terminal, each one skipped when
+/// done, so a container can run it at every start. Ends as `up --foreground` in this process.
+fn start_headless(home: Home, o: &mut Opts, provider: Option<&str>) -> Result<()> {
+    let env = headless_env(|k| std::env::var(k).ok())?;
+    let local = o.has("local");
+    let provider = if local { "local" } else { provider.ok_or_else(|| usage("start --headless needs <provider> --key-file PATH, or --local URL --model local/<slug>=<id>"))? };
+    if !local && o.key_file.is_none() {
+        return Err(usage("start --headless <provider> needs --key-file PATH (a file with the key, e.g. a Docker secret)"));
+    }
+    let cfg = home.load()?;
+    if env.monthly_limit.is_none() && !safety_done(&cfg) {
+        return Err(usage("set MOOCHY_MONTHLY_LIMIT (dollars a month for this machine, e.g. 25): the safety step before donating"));
+    }
+    if let Some(l) = env.monthly_limit {
+        o.monthly_limit = Some(l);
+        o.flags.push("accept-safety");
+    }
+    if cfg.device_id.is_none() {
+        let relay = checked_relay(o, None)?;
+        let name = o.name.clone().unwrap_or_else(crate::login::default_name);
+        let roles = o.roles.as_deref().unwrap_or("gateway,worker").split(',').map(|r| r.trim().to_owned()).collect();
+        rt_small()?.block_on(crate::login::login(&home, &relay, o.ca_file.clone(), roles, name, None, false))?;
+    }
+    let cfg = home.load()?;
+    if local {
+        // Re-read at every start: the server's model list may have changed.
+        crate::keycheck::add_local(&home, o.base_url.as_deref(), false, false, &o.models)?;
+    } else {
+        let sec = keystore::load(&home, &cfg)?.unwrap_or_default();
+        let key = provider_key(provider, o)?;
+        if !sec.providers.iter().any(|p| p.provider == provider && p.key == *key) {
+            keys_add(&home, provider, o)?;
+        }
+    }
+    let cfg = home.load()?;
+    if !safety_done(&cfg) || env.monthly_limit.is_some_and(|l| Some(l) != cfg.device_monthly_cap_uusd) {
+        safety(&home, o, Some(provider))?;
+    }
+    if let Some((slug, monthly)) = env.donate {
+        start_node(&home, false)?;
+        let r = (|| {
+            if crate::donations::mine(&home)?.iter().any(|d| d.repo_slug.eq_ignore_ascii_case(&slug)) {
+                return Ok(());
+            }
+            crate::donations::donate(&home, &slug, crate::donations::To::Repo, crate::donations::Limits { monthly, weekly: None, daily: None }, true)
+        })();
+        stop(&home)?;
+        r?;
+    }
+    up_foreground(home, false, false)
 }
 
 /// CONTRACT §22.3: the canonical page to share, after a donation or a claim.
@@ -746,27 +1030,27 @@ fn decisions_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
 
 /// `moochy down`: ask the app to stop.
 fn down(home: &Home) -> Result<()> {
+    stop(home)?;
+    emit(&json!({"event": "stopped"}));
+    let p = crate::style::err();
+    if p.tty {
+        eprintln!("{}{}", p.mark(true), p.ok("Moochy stopped."));
+    }
+    Ok(())
+}
+
+/// Ask the app to stop and wait (bounded) until its socket is gone.
+fn stop(home: &Home) -> Result<()> {
     rt_small()?.block_on(async {
-        if let Err(s) = crate::ctl::connect(&home.socket_path()).await?.shutdown(ShutdownRequest {}).await {
-            // The app may exit before its answer is flushed: stopped means the socket is gone.
-            let mut gone = false;
-            for _ in 0..40 {
-                if crate::ctl::connect(&home.socket_path()).await.is_err() {
-                    gone = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        let r = crate::ctl::connect(&home.socket_path()).await?.shutdown(ShutdownRequest {}).await;
+        // The app may exit before its answer is flushed: stopped means the socket is gone.
+        for _ in 0..if r.is_ok() { 200 } else { 40 } {
+            if crate::ctl::connect(&home.socket_path()).await.is_err() {
+                return Ok(());
             }
-            if !gone {
-                return Err(internal(s.message().to_owned()));
-            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        emit(&json!({"event": "stopped"}));
-        let p = crate::style::err();
-        if p.tty {
-            eprintln!("{}{}", p.mark(true), p.ok("Moochy stopped."));
-        }
-        Ok(())
+        r.map(drop).map_err(|s| internal(s.message().to_owned()))
     })
 }
 
@@ -1393,7 +1677,16 @@ fn login_cmd(home: &Home, o: &Opts) -> Result<()> {
     // A175 (pinned CA) and A135 (lookalike relay): development and tests only.
     let relay = checked_relay(o, None)?;
     let relay = relay.as_str();
-    let roles: Vec<String> = o.roles.as_deref().unwrap_or("gateway").split(',').map(|r| r.trim().to_owned()).collect();
+    let roles = match &o.roles {
+        Some(r) => r.clone(),
+        // Plan 14 §3: a person at a terminal chooses; scripts keep the old default.
+        None if !o.has("headless") && std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            let a = crate::owner::ask("Use donated tokens, donate yours, or both? [use/donate/both] (both): ", false)?;
+            role_choice(&a).ok_or_else(|| usage("answer use, donate or both (or pass --roles gateway,worker)"))?.to_owned()
+        }
+        None => "gateway".into(),
+    };
+    let roles: Vec<String> = roles.split(',').map(|r| r.trim().to_owned()).collect();
     let name = o.name.clone().unwrap_or_else(crate::login::default_name);
     if let Some(k) = &o.log_key {
         moochy_keylog::NoteKey::parse(k).map_err(|e| usage(format!("--log-key: {e}")))?;
@@ -1405,6 +1698,16 @@ fn login_cmd(home: &Home, o: &Opts) -> Result<()> {
         home.save(&cfg)?;
     }
     Ok(())
+}
+
+/// `moochy login` on a terminal: the answer to "use, donate or both" as `--roles`.
+fn role_choice(answer: &str) -> Option<&'static str> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "both" | "b" => Some("gateway,worker"),
+        "use" | "u" => Some("gateway"),
+        "donate" | "d" => Some("worker"),
+        _ => None,
+    }
 }
 
 fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
@@ -1426,19 +1729,10 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     if !crate::keycheck::PROVIDERS.contains(&provider) {
         return Err(usage(format!("provider must be one of: {}, local (your own model server: see --help)", crate::keycheck::PROVIDERS.join(", "))));
     }
-    if !o.has("key-stdin") {
-        return Err(usage("pass the key on stdin with --key-stdin (never as an argument)"));
-    }
     if let Some(u) = &o.base_url {
         crate::keycheck::check_base_url(u, dev_mode())?;
     }
-    let mut raw = zeroize::Zeroizing::new(Vec::new());
-    std::io::Read::read_to_end(&mut std::io::Read::take(std::io::stdin(), 4097), &mut raw).ctx("read stdin")?;
-    if raw.len() > 4096 {
-        return Err(usage("key too long"));
-    }
-    // A190: borrow, never an un-zeroized intermediate copy of the key.
-    let key = zeroize::Zeroizing::new(std::str::from_utf8(&raw).map_err(|_| usage("key must be UTF-8"))?.trim().to_owned());
+    let key = provider_key(provider, o)?;
     if key.is_empty() || !key.bytes().all(|c| c.is_ascii_graphic()) {
         return Err(usage("key must be non-empty printable ASCII"));
     }
@@ -1453,6 +1747,28 @@ fn keys_add(home: &Home, provider: &str, o: &Opts) -> Result<()> {
     emit(&json!({"event": "key_added", "provider": provider}));
     stored_where(home)?;
     safety(home, o, Some(provider)).map(drop)
+}
+
+/// The provider key: stdin (`--key-stdin`), a file (`--key-file`, `start --headless`), or asked with
+/// echo off on a terminal. Never from argv. Trimmed; empty or non-printable keys are refused later.
+fn provider_key(provider: &str, o: &Opts) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::IsTerminal as _;
+    let raw = if o.has("key-stdin") {
+        let mut raw = zeroize::Zeroizing::new(Vec::new());
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::io::stdin(), 4097), &mut raw).ctx("read stdin")?;
+        if raw.len() > 4096 {
+            return Err(usage("key too long"));
+        }
+        // A190: borrow, never an un-zeroized intermediate copy of the key.
+        zeroize::Zeroizing::new(std::str::from_utf8(&raw).map_err(|_| usage("key must be UTF-8"))?.to_owned())
+    } else if let Some(p) = &o.key_file {
+        keystore::read_secret(p, false, "provider key")?.ok_or_else(|| usage(format!("--key-file {}: no readable, non-empty file", p.display())))?
+    } else if std::io::stdin().is_terminal() {
+        crate::owner::ask(&format!("{provider} API key (hidden): "), true)?
+    } else {
+        return Err(usage("pass the key on stdin with --key-stdin (never as an argument)"));
+    };
+    Ok(zeroize::Zeroizing::new(raw.trim().to_owned()))
 }
 
 /// Where the keystore keeps provider keys on this machine (CONTRACT §23), for humans: never a value.
@@ -1946,5 +2262,46 @@ mod waiting_tests {
                 ("bob".into(), "--person", "github/carol".into()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::{Done, HELP_SHORT, Headless, Step, headless_env, role_choice, todo};
+
+    #[test]
+    fn login_role_answers() {
+        for (a, r) in [("", "gateway,worker"), ("both", "gateway,worker"), (" Donate\n", "worker"), ("use", "gateway"), ("u", "gateway")] {
+            assert_eq!(role_choice(a), Some(r), "{a:?}");
+        }
+        assert_eq!(role_choice("all"), None);
+    }
+
+    #[test]
+    fn start_skips_done_steps() {
+        assert_eq!(todo(Done::default()), [Step::Login, Step::Key, Step::Safety, Step::Up, Step::Donate]);
+        assert_eq!(todo(Done { login: true, key: true, safety: true, running: true }), [Step::Donate]);
+        assert_eq!(todo(Done { login: true, key: false, safety: true, running: true }), [Step::Key, Step::Donate]);
+    }
+
+    #[test]
+    fn headless_env_parsing() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned());
+        assert_eq!(headless_env(env(&[])).unwrap(), Headless { monthly_limit: None, donate: None });
+        assert_eq!(headless_env(env(&[("MOOCHY_MONTHLY_LIMIT", "$25"), ("MOOCHY_DONATE", "github/acme/widget"), ("MOOCHY_DONATE_CAP", "20.50")])).unwrap(), Headless { monthly_limit: Some(25_000_000), donate: Some(("acme/widget".into(), 20_500_000)) });
+        assert_eq!(headless_env(env(&[("MOOCHY_MONTHLY_LIMIT", " "), ("MOOCHY_DONATE", "")])).unwrap().monthly_limit, None, "blank means unset");
+        assert!(headless_env(env(&[("MOOCHY_DONATE", "acme/widget")])).is_err(), "a donation needs its cap");
+        assert!(headless_env(env(&[("MOOCHY_DONATE_CAP", "20")])).is_err(), "a cap needs a project");
+        assert!(headless_env(env(&[("MOOCHY_DONATE", "not a project"), ("MOOCHY_DONATE_CAP", "20")])).is_err());
+        assert!(headless_env(env(&[("MOOCHY_MONTHLY_LIMIT", "0")])).is_err());
+    }
+
+    #[test]
+    fn short_help_is_short_and_lists_start() {
+        assert!(HELP_SHORT.lines().count() <= 30, "{}", HELP_SHORT.lines().count());
+        for c in ["  start", "  donate", "  donations", "  pause | resume", "  status", "  keys add", "  connect", "  run", "  tui", "  doctor", "help all"] {
+            assert!(HELP_SHORT.contains(c), "{c}");
+        }
+        assert!(!HELP_SHORT.contains("$N") && !super::HELP.contains("$N"), "amounts are plain numbers");
     }
 }
