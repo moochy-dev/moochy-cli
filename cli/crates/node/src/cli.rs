@@ -817,12 +817,18 @@ fn accept_gift(home: &Home, o: &Opts, q: &crate::pb::link::ClaimGiftRequest, d: 
     }
     let cfg = home.load()?;
     let id = clean(&d.pledge_id).into_owned();
-    if q.personal || !crate::owner::key_path(home, cfg.relay.as_deref()).exists() {
+    if !crate::owner::key_path(home, cfg.relay.as_deref()).exists() {
         eprintln!("Accept it with your passkey: {}/decide/{id}", crate::decisions::web_origin(home));
-        let flag = if !q.person.is_empty() { format!("--person {}", q.person) } else if q.org.is_empty() { format!("--repo {}", q.repo_slug) } else { format!("--org {}", q.org) };
-        if !q.personal {
-            eprintln!("(or with an owner key on this machine: moochy accept {id} {})", clean(&flag));
-        }
+        let flag = if q.personal {
+            "--personal".to_owned()
+        } else if !q.person.is_empty() {
+            format!("--person {}", q.person)
+        } else if q.org.is_empty() {
+            format!("--repo {}", q.repo_slug)
+        } else {
+            format!("--org {}", q.org)
+        };
+        eprintln!("(or with an owner key on this machine: moochy accept {id} {})", clean(&flag));
         return Ok(());
     }
     // The donor's handle: in the answer, else from the signature request the relay pushes.
@@ -842,6 +848,8 @@ fn accept_gift(home: &Home, o: &Opts, q: &crate::pb::link::ClaimGiftRequest, d: 
         sign(home, Group::Person, &q.person, &[Op::Donor { donor: &donor, revoke: false }], yes)
     } else if !q.org.is_empty() {
         sign(home, Group::Org, &q.org, &[Op::Donor { donor: &donor, revoke: false }], yes)
+    } else if q.personal {
+        crate::owner::sign(home, crate::node::PERSONAL_SLUG, &["approve", &donor], yes, false, false, 0)
     } else {
         crate::owner::sign(home, &q.repo_slug, &["approve", &donor], yes, false, false, 0)
     }
