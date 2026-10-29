@@ -30,7 +30,7 @@ const MAX_RESULT: usize = 1 << 20;
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 const MAX_INFLIGHT: usize = 32;
 
-const INSTRUCTIONS: &str = "Moochy runs self-contained sub-tasks on compute donated to this open-source repository. \
+const INSTRUCTIONS: &str = "Moochy runs self-contained sub-tasks on AI tokens given to this project or to you. \
 Use moochy_delegate for large reads, reviews of many files, summaries, drafting tests or docs, translations, and \
 second opinions: pass file paths in `files` (the moochy stdio server reads them, so their content never enters your \
 context; over HTTP send `file_contents`). \

@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-pub(crate) const HELP: &str = "moochy: donate tokens to open source, and use tokens donated to your projects.
+pub(crate) const HELP: &str = "moochy: give AI tokens from your own key or GPU, to open source or anyone, and use the tokens given to you.
 Open-source client (Apache-2.0) · 100% free
 
 USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
@@ -129,12 +129,12 @@ COMMANDS:
                                   gitlab/USERNAME): their own requests on the repos they cover
   donations [--json] | donations <pause|resume|stop> <id>
                                   Your donations: what each project or organisation used this month
-  donate --credits $N --repo PROJECT | --org ORG | --person PERSON [--yes]
+  donate --credits N --repo PROJECT | --org ORG | --person PERSON [--yes]
                                   Give a one-off total from your Moochy Credits balance
-  credits [--json] | credits add [$N]
+  credits [--json] | credits add [N]
                                   Your Moochy Credits (balance, purchases, allocations); add
                                   opens the web page (cards are only ever entered there)
-  gift create $N [--credits] [--note TEXT] [--models a,b] [--effort E]
+  gift create N [--credits] [--note TEXT] [--models a,b] [--effort E]
        [--visibility public|pseudonymous|anonymous] [--expires DAYS]
                                   A gift link for $1 to $1,000 of tokens, shown once: the first
                                   person to claim it gets it (30 days by default, 90 at most)
@@ -179,13 +179,13 @@ ENV: MOOCHY_HOME, MOOCHY_PASSPHRASE (encrypted-file keystore), MOOCHY_ENROLL (cl
 ";
 
 /// `moochy --help` (plan 14 §3): the commands people use. `moochy help all` prints [`HELP`].
-pub(crate) const HELP_SHORT: &str = "moochy: donate tokens to open source, and use tokens donated to your projects.
+pub(crate) const HELP_SHORT: &str = "moochy: give AI tokens from your own key or GPU, to open source or anyone, and use the tokens given to you.
 Open-source client (Apache-2.0) · 100% free
 
 USAGE: moochy [--home DIR] <COMMAND> [OPTIONS]
 PROJECT: owner/name (GitHub) or gitlab/group/name; default: the `origin` remote here
 
-Donate tokens:
+Donate or gift tokens:
   start                           Set up this machine and donate, step by step (safe to repeat)
   donate --repo PROJECT --cap 20  Donate tokens to a project, up to $20 a month
   donations                       Your donations: what each project used this month
@@ -195,7 +195,7 @@ Donate tokens:
   keys add <provider>             Add a provider API key (anthropic, openai, openrouter,
                                   deepseek, xai; local: your own GPU)
 
-Use donated tokens:
+Use the tokens given to you:
   connect <client> [--repo PROJECT]
                                   Set up a coding tool (`moochy connect list` shows the tools)
   run [--repo PROJECT] -- <cmd>   Run your coding agent in a sandbox wired to Moochy
