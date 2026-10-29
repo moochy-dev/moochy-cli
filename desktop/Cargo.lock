@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "moochy"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "moochy-desktop"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "moochy",
  "moochy-tui",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "moochy-keylog"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "ed25519-zebra",
  "ring",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "moochy-proto"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "moochy-sandbox"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "landlock",
  "libc",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "moochy-tui"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "moochy-worker"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
