@@ -439,7 +439,12 @@ fn bind(ask: &Ask<'_>, me: Option<&str>, p: &SignResponse) -> Result<Bound> {
     };
     // §19: these commands name a project. The same body on an organisation id (`o_…`) would
     // accept the donor for every project the organisation covers, behind a project's label.
-    if !b.repo_id.starts_with("r_") {
+    // Plan 15: `--personal` names this account's own use, its own pseudonym and nothing else.
+    let personal = ask.repo_slug == crate::node::PERSONAL_SLUG;
+    if personal && (b.kind == Kind::RepoClaimed || me != Some(b.repo_id.as_str())) {
+        return Err(refuse(&format!("an entry for {}, not your own use", clean(&b.repo_id))));
+    }
+    if !personal && !b.repo_id.starts_with("r_") {
         return Err(refuse(&format!("an entry for {}, not a project", clean(&b.repo_id))));
     }
     Ok(b)
@@ -698,7 +703,8 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
     }
     // An approval needs an owner-signed claim of the same project naming this account
     // (KEYLOG §5): offered as its own entry, shown in full, confirmed on its own.
-    let mut claim = (want.kind != Kind::RepoClaimed)
+    let personal = slug == crate::node::PERSONAL_SLUG;
+    let mut claim = (want.kind != Kind::RepoClaimed && !personal)
         .then(|| rt.block_on(async {
             let mut c = crate::ctl::connect(&home.socket_path()).await.ok()?;
             c.claim(ClaimRequest { repo: slug.into(), dry_run: true, ..ClaimRequest::default() }).await.ok().map(tonic::Response::into_inner)
@@ -728,13 +734,19 @@ fn sign_entries(home: &Home, slug: &str, words: &[&str], yes: bool, revoke: bool
             (Some(_), None) => return Err(auth("not logged in: run `moochy login` first")),
             _ => None,
         };
-        let l = lookup(&cfg, &rt, slug, who)?;
-        check_lookup(&mut main, handle, &l)?;
-        if let Some((b, _)) = claim.as_mut() {
-            b.slug.clone_from(&l.repo_slug);
+        // Personal (plan 15): the target is this account's own pseudonym (checked in `bind`); a
+        // pseudonym donor is matched exactly, so only a handle needs the server's word.
+        if personal && who.is_none() {
+            eprintln!("Signing for your own use ({}): {} is matched exactly", clean(&main.repo_id), clean(&main.subject));
+        } else {
+            let l = lookup(&cfg, &rt, slug, who)?;
+            check_lookup(&mut main, handle, &l)?;
+            if let Some((b, _)) = claim.as_mut() {
+                b.slug.clone_from(&l.repo_slug);
+            }
+            let person = handle.map(|h| format!("; {} is {}", clean(h), clean(&l.pseudonym))).unwrap_or_default();
+            eprintln!("Checked with the Moochy server (not through the app): {} is {}{person}", clean(&l.repo_slug), clean(&l.repo_id));
         }
-        let person = handle.map(|h| format!("; {} is {}", clean(h), clean(&l.pseudonym))).unwrap_or_default();
-        eprintln!("Checked with the Moochy server (not through the app): {} is {}{person}", clean(&l.repo_slug), clean(&l.repo_id));
     }
     if let Some((b, _)) = &claim {
         confirm(b, &signer, "", yes)?;

@@ -504,7 +504,9 @@ impl Mirror {
                 person_id: repo_id,
                 signer,
                 ..
-            } if owner_before.as_deref() == Some(me.pseudonym.as_str())
+            } if (owner_before.as_deref() == Some(me.pseudonym.as_str())
+                // A personal target (plan 15) is my own pseudonym, from its first approval on.
+                || repo_id == me.pseudonym)
                 && !signer_known(signer) =>
             {
                 alerts.push(Alert::NotSignedByMe {

@@ -715,7 +715,8 @@ pub fn parse_body(kind: Kind, b: &[u8]) -> Result<Body<'_>, Error> {
             let [r, sub, sg, t] = unlp::<4>(b)?;
             let (r, sub, sg, t) = (s(r)?, s(sub)?, s(sg)?, u64_of(t)?);
             let donor = matches!(kind, Kind::DonorApproved | Kind::DonorRevoked);
-            if !(is_id(r, "r_") || donor && (is_id(r, "o_") || is_id(r, "m_")))
+            // A DONOR_* target may also be a pseudonym: the recipient's own use (personal, plan 15).
+            if !(is_id(r, "r_") || donor && (is_id(r, "o_") || is_id(r, "m_") || is_pseudonym(r)))
                 || !is_pseudonym(sub)
                 || !is_owner_key_id(sg)
                 || t == 0
