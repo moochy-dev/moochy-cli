@@ -58,7 +58,7 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
 scrypt = { version = "0.11", default-features = false }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 # HMAC-SHA256 for local tokens and affinity keys (Secrets::mac): ring is already in the tree
 # (rustls' crypto provider) and uses the CPU's SHA instructions; replaces the hmac crate.
 ring = { version = "0.17", default-features = false }
