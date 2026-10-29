@@ -363,6 +363,14 @@ fn requester_key(node: &Node, person: Option<&str>, device: &str, repo_id: &str)
     let Some(person_id) = person else {
         return Ok(l.gateway_key(device, repo_id));
     };
+    // A personal donation (plan 15) serves only its recipient: `own_donation` bound the request's
+    // target to the donation's, and the key log decides that the requester is the recipient.
+    if repo_id.starts_with("ps_") {
+        return match l.personal_gateway_key(node.device_id().unwrap_or_default(), device, repo_id) {
+            Ok(pk) => Ok(Some(pk)),
+            Err(c) => Err(format!("{}: this personal donation does not cover this request (key log)", c.as_str())),
+        };
+    }
     match l.person_gateway_key(node.device_id().unwrap_or_default(), device, repo_id, person_id) {
         Ok(pk) => Ok(Some(pk)),
         Err(c) => Err(format!("{}: this person sponsorship does not cover this request (key log)", c.as_str())),
@@ -388,6 +396,12 @@ async fn own_donation(node: &Arc<Node>, pledge: &str, repo_id: &str) -> Result<O
         Some((false, _)) => return Err("this donation is not active"),
         None => return Err("not one of this donor's donations"),
     };
+    // Plan 15: a personal donation serves exactly its recipient's own target (`Donation.person_id`
+    // = the recipient's pseudonym), and a personal target is served only by personal donations.
+    let target = lock(&node.own_people).get(pledge).cloned();
+    if repo_id.starts_with("ps_") != target.as_deref().is_some_and(|t| t.starts_with("ps_")) || repo_id.starts_with("ps_") && target.as_deref() != Some(repo_id) {
+        return Err("this donation is not for this requester's own use");
+    }
     if !person
         && let Some(l) = &node.keylog
         && l.verified()
@@ -431,8 +445,10 @@ async fn refresh_own_pledges(node: &Arc<Node>, want: &str) -> Result<(), &'stati
         Ok(Ok(r)) => {
             *last = now_ms();
             let ds = r.into_inner().donations;
-            *lock(&node.own_people) = ds.iter().take(10_000).filter(|d| !d.person.is_empty() && !d.person_id.is_empty()).map(|d| (d.pledge_id.clone(), d.person_id.clone())).collect();
-            *lock(&node.own_pledges) = ds.into_iter().take(10_000).map(|d| (d.pledge_id.clone(), (d.status.clone(), !d.person.is_empty(), crate::donations::target(&d)))).collect();
+            // A personal donation (plan 15) is a person-like route: `person_id` names the recipient's pseudonym.
+            let person = |d: &pb::Donation| !d.person.is_empty() || d.personal;
+            *lock(&node.own_people) = ds.iter().take(10_000).filter(|d| person(d) && !d.person_id.is_empty()).map(|d| (d.pledge_id.clone(), d.person_id.clone())).collect();
+            *lock(&node.own_pledges) = ds.into_iter().take(10_000).map(|d| (d.pledge_id.clone(), (d.status.clone(), person(&d), crate::donations::target(&d)))).collect();
         }
         Ok(Err(s)) if s.code() == tonic::Code::Unimplemented && node.insecure_dev => {
             lock(&node.own_pledges).insert(want.to_owned(), ("active".into(), false, String::new()));

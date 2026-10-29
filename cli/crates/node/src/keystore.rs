@@ -132,7 +132,7 @@ impl Secrets {
         }
         let (slug_b64, mac_b64) = token.strip_prefix(TOKEN_PREFIX)?.split_once('.')?;
         let slug = String::from_utf8(b64d(slug_b64)?).ok()?;
-        if !crate::config::valid_slug(&slug) {
+        if !crate::config::valid_target(&slug) {
             return None;
         }
         let given = b64d(mac_b64)?;

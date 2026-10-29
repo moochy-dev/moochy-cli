@@ -174,6 +174,9 @@ const MAX_SESSIONS: usize = 4096;
 const MAX_CATALOGS: usize = 8;
 /// Relays ask workers to reconnect within 10 s of a drain (jitter), plus backoff.
 const POOL_REFILL_MS: u64 = 20_000;
+/// `PoolSync.repo_slug` of the account's personal pool (plan 15: donations for its own use, route
+/// repo id = the account's own pseudonym). Never a provider-qualified project slug.
+pub const PERSONAL_SLUG: &str = "personal";
 const JOURNAL_KEEP: usize = 512;
 /// `moochy report` evidence: the newest 32 consumed tasks, and at most 8 MiB of response text
 /// together (each one holds up to 1 MiB: 32 of them would keep an idle node far above its
@@ -377,7 +380,15 @@ impl Node {
             w.models = vec![STUB_MODEL.into()];
             return Some(RepoPool { repo_id: format!("local:{slug}"), slug: Some(slug.into()), workers: vec![w], auto_cache: true, ..RepoPool::default() });
         }
-        let repo = lock(&self.pools).values().find(|p| p.slug.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(slug))).map(|p| p.repo_id.clone())?;
+        // Plan 15: a project the relay pushes no pool for (not on Moochy, or not a member) is served
+        // by the account's personal pool when it has one (`PoolSync.repo_slug` = PERSONAL_SLUG).
+        let repo = {
+            let pools = lock(&self.pools);
+            // A pool named personal counts only for this account's own pseudonym, whatever the relay says.
+            let mine = |p: &RepoPool| !p.slug.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(PERSONAL_SLUG)) || self.cfg.pseudonym.as_deref() == Some(p.repo_id.as_str());
+            let find = |s: &str| pools.values().find(|p| p.slug.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(s)) && mine(p)).map(|p| p.repo_id.clone());
+            find(slug).or_else(|| find(PERSONAL_SLUG))?
+        };
         let p = self.sealable_pool(&repo)?;
         // Right after a (re)connect, e.g. a relay restart, donors are still reconnecting: an empty
         // pool then means "not loaded yet" (retryable), not "nobody donates this model".
@@ -438,7 +449,7 @@ impl Node {
             // GitLab projects are `gitlab/group[/sub…]/name` on the client (CONTRACT §9), with or
             // without the prefix in the relay's slug.
             let slug = if v.repo_provider == "gitlab" && !v.repo_slug.starts_with("gitlab/") { format!("gitlab/{}", v.repo_slug) } else { v.repo_slug.clone() };
-            if crate::config::valid_slug(&slug) {
+            if crate::config::valid_target(&slug) {
                 p.slug = Some(slug.to_ascii_lowercase());
             }
             p.auto_cache = v.auto_cache;

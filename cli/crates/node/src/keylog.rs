@@ -456,6 +456,15 @@ impl KeyLog {
         self.view().state(|st| person_requester(st, me, gateway, repo_id, person_id))?
     }
 
+    /// Worker side for a personal donation of this donor (plan 15): the logged signing key of
+    /// `gateway` when its own pseudonym is `target` and approved this donor device `me`.
+    pub fn personal_gateway_key(&self, me: &str, gateway: &str, target: &str) -> Result<[u8; 32], Code> {
+        if !self.verified() {
+            return Err(Code::NoCheckpoint);
+        }
+        self.view().state(|st| personal_requester(st, me, gateway, target))?
+    }
+
     /// Gateway sealing rule (CONTRACT §15.4, A174, A184): the gate is verified, the worker is
     /// logged, unrevoked and owner-approved for `repo_id` at exactly the relay's indexes, and the
     /// relay-advertised keys are the logged ones. Returns the LOGGED signing key (receipts and
@@ -467,6 +476,10 @@ impl KeyLog {
         let s = match view.seal_check(&w.worker_device, repo_id, w.key_log_index, w.approval_log_index) {
             // The gate already passed: only a route denial falls through to the person rule; when
             // no person route exists either, the refusal keeps the repo/org rule's code.
+            // A personal target (plan 15): only the personal rule, never the repo or person one.
+            Err(Code::Unclaimed) if !gateway.is_empty() && repo_id.starts_with("ps_") => {
+                view.state(|st| personal_seal(st, &w.worker_device, repo_id, gateway, w.key_log_index, w.approval_log_index))??
+            }
             Err(e @ (Code::NotApproved | Code::IndexMismatch | Code::Unclaimed)) if !gateway.is_empty() => {
                 match view.state(|st| person_seal(st, &w.worker_device, repo_id, gateway, w.key_log_index, w.approval_log_index))? {
                     Err(Code::NotApproved) => return Err(e),
@@ -502,6 +515,26 @@ fn person_requester(st: &State, me: &str, gateway: &str, repo_id: &str, person_i
             return Err(Code::NotApproved);
         }
     }
+    Ok(g.sign_pub)
+}
+
+/// Plan 15, Gateway side: a personal task for `target` (this device's own pseudonym) may be sealed
+/// to `worker` when the target approved the worker's donor, at exactly the relay's indexes.
+fn personal_seal(st: &State, worker: &str, target: &str, gateway: &str, key_idx: u64, approval_idx: u64) -> Result<Sealable, Code> {
+    st.personal_gateway_allowed(gateway, target)?;
+    let s = st.personal_sealable(worker, gateway)?;
+    if s.key_idx != key_idx || s.approval_idx != approval_idx {
+        return Err(Code::IndexMismatch);
+    }
+    Ok(s)
+}
+
+/// Plan 15, Worker side: a personal task for `target` from `gateway` to this device `me`: the
+/// target is the gateway's own pseudonym and approved this donor. Returns the gateway's logged
+/// signing key.
+fn personal_requester(st: &State, me: &str, gateway: &str, target: &str) -> Result<[u8; 32], Code> {
+    let g = st.personal_gateway_allowed(gateway, target)?;
+    st.personal_sealable(me, gateway)?;
     Ok(g.sign_pub)
 }
 
@@ -845,6 +878,34 @@ mod tests {
                     assert_eq!(worker.err().map(Code::as_str), Some(c), "{q}");
                     assert_eq!(gateway.err().map(Code::as_str), Some(c), "{q}");
                 }
+            }
+        }
+    }
+
+    /// Plan 15: the personal gate on both sides, from spec/vectors/keylog/personal.json.
+    #[test]
+    fn personal_gate_follows_the_vectors() {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../spec/vectors/keylog/personal.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        let mut st = State::default();
+        for (i, s) in v["log"].as_array().unwrap().iter().enumerate() {
+            let h = s["record_hex"].as_str().unwrap();
+            let rec: Vec<u8> = (0..h.len()).step_by(2).map(|j| u8::from_str_radix(&h[j..j + 2], 16).unwrap()).collect();
+            let _ = st.apply(i as u64, &parse_record(&rec).unwrap(), true);
+        }
+        for q in v["personal_sealable"].as_array().unwrap() {
+            let (w, g, code) = (q["worker"].as_str().unwrap(), q["gateway"].as_str().unwrap(), q["code"].as_str().unwrap());
+            let Some(target) = st.device(g).map(|d| d.pseudonym.clone()) else { continue };
+            let idx = q["approval_idx"].as_u64().unwrap();
+            let (worker, gateway) = (super::personal_requester(&st, w, g, &target), super::personal_seal(&st, w, &target, g, st.device(w).map_or(0, |d| d.idx), idx));
+            if code.is_empty() {
+                assert_eq!(worker.ok(), st.device(g).map(|d| d.sign_pub), "{q}");
+                assert_eq!(gateway.map(|s| s.approval_idx).ok(), Some(idx), "{q}");
+                // Another account's target, or the relay pointing at another approval: refused.
+                assert_eq!(super::personal_requester(&st, w, g, "ps_0000000000000000"), Err(Code::NotMember));
+                assert_eq!(super::personal_seal(&st, w, &target, g, st.device(w).map_or(0, |d| d.idx), idx + 1).err(), Some(Code::IndexMismatch));
+            } else {
+                assert!(worker.is_err() && gateway.is_err(), "{q}");
             }
         }
     }

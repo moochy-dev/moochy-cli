@@ -82,7 +82,9 @@ pub enum To {
 
 /// What a donation funds, for people: the project, `org github/acme` or `person github/alice`.
 pub(crate) fn target(d: &Donation) -> String {
-    if !d.person.is_empty() {
+    if d.personal {
+        "personal (own use)".into()
+    } else if !d.person.is_empty() {
         format!("person {}", clean(&d.person))
     } else if d.org.is_empty() {
         clean(&d.repo_slug).into_owned()
@@ -92,7 +94,7 @@ pub(crate) fn target(d: &Donation) -> String {
 }
 
 fn donation_json(d: &Donation) -> serde_json::Value {
-    json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
+    json!({"pledge_id": clean(&d.pledge_id), "repo": clean(&d.repo_slug), "org": clean(&d.org), "person": clean(&d.person), "personal": d.personal, "status": clean(&d.status), "monthly_limit_uusd": d.budget_uusd,
         "weekly_limit_uusd": d.weekly_limit_uusd, "daily_limit_uusd": d.daily_limit_uusd, "per_request_limit_uusd": d.per_task_cap_uusd, "spent_uusd": d.spent_uusd, "reserved_uusd": d.reserved_uusd,
         "models": d.models.iter().map(|m| clean(m).into_owned()).collect::<Vec<_>>(), "visibility": clean(&d.visibility), "schedule": clean(&d.schedule)})
 }
@@ -202,6 +204,7 @@ pub fn donate(home: &crate::config::Home, slug: &str, to: To, limits: Limits, ye
         schedule: "always".into(),
         weekly_limit_uusd: limits.weekly.unwrap_or(0),
         daily_limit_uusd: limits.daily.unwrap_or(0),
+        credits: false,
     };
     let b = call(home, "donate", q.encode_to_vec())?;
     let d = Donation::decode(b.as_slice()).map_err(|_| internal("malformed answer"))?;

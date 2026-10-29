@@ -50,6 +50,9 @@ COMMANDS:
                                   calls from donated tokens reach only sandboxed agents.
                                   --box-is-sandbox: in a single-purpose cloud box without user
                                   namespaces or Landlock, the box itself is the sandbox
+                                  --personal (also env, mcp, connect): use the donations made
+                                  for your own use, on any repository (also used when the
+                                  project is not on Moochy)
   box token create [--repo PROJECT] [--ttl 24h] [--cap $20] [--max-boxes 1]
                                   A token that lets cloud boxes (boat.dev, E2B, Daytona, Modal,
                                   Codespaces) use this project's donations: each box gets its own
@@ -327,7 +330,7 @@ fn parse() -> Result<Opts> {
             Long("help") | Short('h') => o.flags.push("help"),
             Long("version") | Short('V') => o.flags.push("version"),
             Long(f) => {
-                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart", "qr"];
+                let known = ["headless", "no-browser", "foreground", "offline", "json", "rotate", "follow", "key-stdin", "shell", "yes", "revoke", "device", "write", "unsafe-no-lockdown", "unsafe-no-sandbox", "git-writable", "allow-unvetted-host", "accept-safety", "system", "print", "provider", "box-is-sandbox", "chart", "qr", "personal"];
                 match known.iter().find(|k| **k == f) {
                     Some(k) => o.flags.push(k),
                     None => return Err(usage(format!("unknown option --{f}"))),
@@ -968,8 +971,11 @@ fn checked_relay(o: &Opts, saved: Option<&str>) -> Result<String> {
 
 fn slug_or_detect(o: &Opts) -> Result<String> {
     match &o.repo {
+        // Plan 15: the donations made for this account's own use (the relay's personal pool).
+        None if o.has("personal") => Ok(crate::node::PERSONAL_SLUG.into()),
+        Some(_) if o.has("personal") => Err(usage("--personal and --repo exclude each other")),
         Some(r) => canonical_repo(r),
-        None => detect_repo().ok_or_else(|| usage(format!("--repo is required (no github.com or gitlab.com `origin` remote here): {REPO_FORMS}"))),
+        None => detect_repo().ok_or_else(|| usage(format!("--repo is required (no github.com or gitlab.com `origin` remote here, or --personal): {REPO_FORMS}"))),
     }
 }
 
