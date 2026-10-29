@@ -1,10 +1,22 @@
 # moochy-cli
 
-The open-source Moochy client: the `moochy` app that runs on donors' and maintainers' machines.
+The open-source Moochy client: the `moochy` app that runs on the machines of the people who give AI tokens and the people who use them.
 
-Moochy lets you donate tokens to open-source projects from your own LLM API account, with a monthly limit you choose. Maintainers use those tokens from any MCP client, or from any tool that lets them set a provider base URL. Your key never leaves your machine: it stays in your keychain and only this app uses it. Every request is end-to-end encrypted, so the relay only sees encrypted bytes.
+Moochy lets you share your AI tokens without sharing your API key. Give tokens from your own LLM API account or your own GPU to open-source projects, organisations and maintainers, or to anyone with a link or a QR code. The people who get them use the tokens from any MCP client, or from any tool that lets them set a provider base URL. Your key never leaves your machine: it stays in your keychain and only this app uses it. Every request is end-to-end encrypted, so the relay only sees encrypted bytes, and every request has a signed public receipt. Use the app in the terminal or in the [desktop app](#desktop-app).
 
 Open-source client (Apache-2.0) · 100% free. No fees, no commission, no paid tier.
+
+## Get started
+
+After you [install](#install) the app:
+
+```sh
+moochy start                          # sign in, add your provider key, the safety step, then donate
+moochy gift create 20                 # a single-use link for $20 of your tokens: send it or print its QR code
+moochy gift claim <link> --personal   # claim a gift for your own use
+```
+
+`moochy start` skips the steps that are done, so you can run it again. `moochy --help` lists the commands people use, and `moochy help all` lists every command. The guides are on [moochy.dev/docs](https://moochy.dev/docs).
 
 ## Install
 
@@ -82,7 +94,7 @@ All crates share one version.
 ## Related repositories
 
 - [moochy-docs](https://github.com/moochy-dev/moochy-docs): guides, protocol specification ([`spec/protocol.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/protocol.md), [`spec/KEYLOG.md`](https://github.com/moochy-dev/moochy-docs/blob/main/spec/KEYLOG.md)), design documents.
-- [moochy-skills](https://github.com/moochy-dev/moochy-skills): agent skills for donating tokens and using donated tokens.
+- [moochy-skills](https://github.com/moochy-dev/moochy-skills): agent skills for donating and gifting tokens and for using the tokens given to you.
 
 ## Security
 
