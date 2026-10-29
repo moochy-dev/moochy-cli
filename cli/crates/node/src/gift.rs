@@ -159,6 +159,18 @@ pub fn revoke(home: &Home, id: &str, replace: bool, json_out: bool) -> Result<()
     Ok(())
 }
 
+/// The gift link of `moochy gift claim -` (or no link): one line read from `r` (stdin), at most
+/// 4 KiB, so the bearer token never shows in the process list or the shell history.
+pub fn read_link(r: impl std::io::Read) -> Result<String> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    std::io::BufReader::new(r.take(4097)).read_line(&mut line).map_err(|_| usage("could not read the gift link from stdin"))?;
+    if line.len() > 4096 {
+        return Err(usage("a gift link is https://moochy.dev/g/… (or its 22-character token)"));
+    }
+    Ok(token(&line)?.to_owned())
+}
+
 /// `moochy gift claim <link|token> …`: the donation the gift made (pending until accepted).
 pub fn claim(home: &Home, link: &str, mut q: ClaimGiftRequest) -> Result<Donation> {
     token(link)?.clone_into(&mut q.token);
@@ -283,6 +295,15 @@ pub fn donate(home: &Home, slug: &str, to: crate::donations::To, amount: &str, y
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_from_stdin() {
+        let t = "AbCdEfGhIjKlMnOpQrSt_-";
+        assert_eq!(read_link(format!("https://moochy.dev/g/{t}\n").as_bytes()).unwrap(), t);
+        assert_eq!(read_link(format!("{t}\nmore").as_bytes()).unwrap(), t, "one line");
+        assert!(read_link(&b""[..]).is_err());
+        assert!(read_link("x".repeat(5000).as_bytes()).is_err());
+    }
 
     #[test]
     fn links_and_tokens() {

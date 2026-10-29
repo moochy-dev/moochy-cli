@@ -140,9 +140,10 @@ COMMANDS:
                                   person to claim it gets it (30 days by default, 90 at most)
   gift list [--json] | gift revoke <gf_…> [--replace]
                                   Your gifts; revoke one, or replace its link
-  gift claim <LINK> --repo PROJECT | --org ORG | --person PERSON | --personal [--yes]
+  gift claim [<LINK>|-] --repo PROJECT | --org ORG | --person PERSON | --personal [--yes]
                                   Claim a gift for your project, organisation, profile or own
-                                  use; accepted at once with an owner key on this machine
+                                  use; accepted at once with an owner key on this machine. With
+                                  `-` or no link, the link is read from stdin (keeps it out of ps)
   owner trust <ok_id>             Mark an owner key you created elsewhere (a passkey added on
                                   the web) as yours, so the key-log monitor stops alerting
   owner init | owner rotate       Create (or replace) your owner key: a separate key, encrypted
@@ -190,7 +191,7 @@ Donate or gift tokens:
   donate --repo PROJECT --cap 20  Donate tokens to a project, up to $20 a month
   donations                       Your donations: what each project used this month
   gift create 20                  A single-use link and QR code worth $20 of your tokens
-  gift claim <link>               Claim a gift for your project or your own use (--personal)
+  gift claim --personal           Claim a gift for your own use (paste the link when asked)
   pause | resume                  Stop or restart donating from this machine
   keys add <provider>             Add a provider API key (anthropic, openai, openrouter,
                                   deepseek, xai; local: your own GPU)
@@ -1078,19 +1079,30 @@ fn gift_cmd(home: &Home, o: &Opts, w: &[&str]) -> Result<()> {
         }
         ["list"] => crate::gift::list(home, o.has("json")),
         ["revoke", id] => crate::gift::revoke(home, id, o.has("replace"), o.has("json")),
-        ["claim", link] => {
+        ["claim", rest @ ..] if rest.len() <= 1 => {
+            // `-` or no link: read it from stdin (a bearer token in argv shows in `ps`).
+            let link = match rest {
+                [l] if *l != "-" => (*l).to_owned(),
+                _ => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        eprint!("Gift link: ");
+                    }
+                    crate::gift::read_link(std::io::stdin().lock())?
+                }
+            };
+            let link = link.as_str();
             let mut q = crate::pb::link::ClaimGiftRequest::default();
             match (o.has("personal"), org_arg(o)?, person_arg(o)?) {
                 (true, None, None) if o.repo.is_none() => q.personal = true,
                 (true, ..) => return Err(usage("--personal goes alone: the gift is for your own use")),
                 (false, _, Some(p)) => q.person = if p.is_empty() { own_person(home, o, false)? } else { p },
                 (false, Some(org), None) => q.org = org.to_ascii_lowercase(),
-                (false, None, None) => q.repo_slug = o.repo.as_deref().map(canonical_repo).transpose()?.ok_or_else(|| usage("gift claim <link> --repo PROJECT | --org ORG | --person PERSON | --personal"))?.to_ascii_lowercase(),
+                (false, None, None) => q.repo_slug = o.repo.as_deref().map(canonical_repo).transpose()?.ok_or_else(|| usage("gift claim [<link>|-] --repo PROJECT | --org ORG | --person PERSON | --personal"))?.to_ascii_lowercase(),
             }
             let d = crate::gift::claim(home, link, q.clone())?;
             accept_gift(home, o, &q, &d)
         }
-        _ => Err(usage("gift create AMOUNT [--credits] … | gift list | gift revoke <gf_…> [--replace] | gift claim <link> --repo PROJECT | --org ORG | --person PERSON | --personal")),
+        _ => Err(usage("gift create AMOUNT [--credits] … | gift list | gift revoke <gf_…> [--replace] | gift claim [<link>|-] --repo PROJECT | --org ORG | --person PERSON | --personal")),
     }
 }
 

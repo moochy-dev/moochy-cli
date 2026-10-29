@@ -13,7 +13,7 @@ After you [install](#install) the app:
 ```sh
 moochy start                          # sign in, add your provider key, the safety step, then donate
 moochy gift create 20                 # a single-use link for $20 of your tokens: send it or print its QR code
-moochy gift claim <link> --personal   # claim a gift for your own use
+moochy gift claim --personal          # claim a gift for your own use (paste the link when asked)
 ```
 
 `moochy start` skips the steps that are done, so you can run it again. `moochy --help` lists the commands people use, and `moochy help all` lists every command. The guides are on [moochy.dev/docs](https://moochy.dev/docs).
