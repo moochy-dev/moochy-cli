@@ -62,7 +62,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # HMAC-SHA256 for local tokens and affinity keys (Secrets::mac): ring is already in the tree
 # (rustls' crypto provider) and uses the CPU's SHA instructions; replaces the hmac crate.
 ring = { version = "0.17", default-features = false }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 # SIMD substring search for the per-request body scans (CONTRACT §13): already in the tree via
 # futures-util (same version and features), so no new code is compiled in.
 memchr = { version = "2", default-features = false, features = ["std"] }
