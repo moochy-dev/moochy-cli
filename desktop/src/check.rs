@@ -123,11 +123,59 @@ const FIXED: [&str; 6] = [
 ];
 
 /// Links open in the system browser only on `https://moochy.dev/…`, the snapshot's web origin, and
-/// the [`FIXED`] pages.
+/// the [`FIXED`] pages. A `/g/…` path must be exactly a gift link.
 pub fn web_url(url: &str, web: &str) -> Result<(), String> {
     let clean = url.len() <= 2048 && url.chars().all(|c| c.is_ascii_graphic() && c != '\\');
-    let on = |o: &str| url.strip_prefix(o).is_some_and(|r| r.starts_with('/'));
-    if clean && (on("https://moochy.dev") || (is_origin(web) && on(web)) || FIXED.contains(&url)) { Ok(()) } else { Err("This link is not on moochy.dev, so the app does not open it.".into()) }
+    let path = url.strip_prefix("https://moochy.dev").or_else(|| url.strip_prefix(web).filter(|_| is_origin(web))).filter(|r| r.starts_with('/'));
+    let page = path.is_some_and(|p| p.strip_prefix("/g/").is_none_or(gift_token));
+    if clean && (page || FIXED.contains(&url)) { Ok(()) } else { Err("This link is not on moochy.dev, so the app does not open it.".into()) }
+}
+
+/// The 22 base64url characters of a gift link (CONTRACT §25.2).
+fn gift_token(t: &str) -> bool {
+    t.len() == 22 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Exactly `https://moochy.dev/g/<token>`, or the same on the snapshot's web origin (a dev relay).
+pub fn gift_url(url: &str, web: &str) -> bool {
+    url.strip_prefix("https://moochy.dev/g/").or_else(|| url.strip_prefix(web).filter(|_| is_origin(web))?.strip_prefix("/g/")).is_some_and(gift_token)
+}
+
+/// A donate page as `moochy button --qr` names it: `https://moochy.dev/p/<slug>[/-]/donate`.
+pub fn donate_url(url: &str) -> Option<&str> {
+    let slug = url.strip_prefix("https://moochy.dev/p/")?.strip_suffix("/donate")?;
+    let ok = slug.len() <= 300 && !slug.contains("..") && !slug.contains("//") && !slug.starts_with(['/', '-', '.']) && slug.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b));
+    ok.then_some(slug)
+}
+
+/// A gift is $1 to $1,000 (plan 15 §3.1).
+pub fn gift_dollars(d: u32) -> Result<u32, String> {
+    if (1..=1000).contains(&d) { Ok(d) } else { Err("A gift is a whole number of dollars, from 1 to 1,000.".into()) }
+}
+
+/// A gift note: trimmed, at most 140 characters, no control or direction-changing characters.
+pub fn note(n: &str) -> Result<String, String> {
+    let n = n.trim();
+    let bad = |c: char| c.is_control() || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
+    if n.chars().count() > 140 || n.chars().any(bad) { Err("A note is one line of at most 140 characters.".into()) } else { Ok(n.to_owned()) }
+}
+
+/// A gift link lives 1 to 90 days (30 by default).
+pub fn days(d: u32) -> Result<u32, String> {
+    if (1..=90).contains(&d) { Ok(d) } else { Err("A gift link lasts 1 to 90 days.".into()) }
+}
+
+/// `gf_` and a ULID (26 Crockford base32 characters).
+pub fn gift_id(s: &str) -> Result<(), String> {
+    let ulid = s.strip_prefix("gf_").filter(|u| u.len() == 26 && u.bytes().all(|b| b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b))));
+    if ulid.is_some() { Ok(()) } else { Err("not a gift id".into()) }
+}
+
+/// The QR code of `url` as SVG (ECC M, quiet zone, dark on light), drawn here (plan 15 D5).
+pub fn qr_svg(url: &str) -> Result<String, String> {
+    use qrcode::render::svg;
+    let code = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M).map_err(|e| format!("QR code: {e}"))?;
+    Ok(code.render::<svg::Color<'_>>().min_dimensions(256, 256).dark_color(svg::Color("#0f1b3d")).light_color(svg::Color("#ffffff")).build())
 }
 
 /// One line of `moochy doctor`: `ok  ` / `note` / `FAIL`, the check, the detail.
@@ -224,6 +272,48 @@ mod tests {
         assert!(web_url("https://evil.com/x", "https://evil.com/path").is_err(), "an origin has no path");
         assert!(web_url("https://console.x.ai", web).is_ok());
         assert!(web_url("https://console.x.ai/../evil", web).is_err() && web_url("https://github.com/moochy-dev/moochy-cli/x", web).is_err(), "fixed pages match exactly");
+    }
+
+    #[test]
+    fn gifts() {
+        let t = "AbCdEfGhIjKlMnOpQrSt_-";
+        let web = "https://moochy.dev";
+        assert!(gift_url(&format!("https://moochy.dev/g/{t}"), web));
+        assert!(gift_url(&format!("http://127.0.0.1:8080/g/{t}"), "http://127.0.0.1:8080"), "dev relay");
+        for bad in [format!("https://moochy.dev/g/{t}x"), format!("https://moochy.dev/g/{t}/"), format!("https://moochy.dev/g/{t}?a"), format!("http://moochy.dev/g/{t}"), format!("https://evil.com/g/{t}"), "https://moochy.dev/g/AbCdEfGhIjKlMnOpQrSt_=".into()] {
+            assert!(!gift_url(&bad, web), "{bad}");
+        }
+        // open_web: `/g/` only in the exact shape; other pages as before.
+        assert!(web_url(&format!("https://moochy.dev/g/{t}"), web).is_ok());
+        assert!(web_url("https://moochy.dev/g/short", web).is_err() && web_url(&format!("https://moochy.dev/g/{t}/x"), web).is_err());
+        assert!(web_url(&format!("http://127.0.0.1:8080/g/{t}"), "http://127.0.0.1:8080").is_ok() && web_url("http://127.0.0.1:8080/g/x", "http://127.0.0.1:8080").is_err());
+        assert!(web_url("https://moochy.dev/credits", web).is_ok());
+
+        assert_eq!(donate_url("https://moochy.dev/p/github/tokio-rs/axum/donate"), Some("github/tokio-rs/axum"));
+        assert_eq!(donate_url("https://moochy.dev/p/gitlab/inkscape/inkscape/-/donate"), Some("gitlab/inkscape/inkscape/-"));
+        for bad in ["https://moochy.dev/p/../x/donate", "https://moochy.dev/p//x/donate", "https://evil.com/p/a/b/donate", "https://moochy.dev/p/a/b/donate?x", "https://moochy.dev/p/a b/donate"] {
+            assert!(donate_url(bad).is_none(), "{bad}");
+        }
+
+        assert!(gift_dollars(0).is_err() && gift_dollars(1001).is_err() && gift_dollars(1).is_ok() && gift_dollars(1000).is_ok());
+        assert!(days(0).is_err() && days(91).is_err() && days(30).is_ok());
+        assert_eq!(note("  for the axum team  ").unwrap(), "for the axum team");
+        assert!(note(&"é".repeat(140)).is_ok() && note(&"é".repeat(141)).is_err(), "characters, not bytes");
+        for bad in ["two\nlines", "tab\there", "\u{1b}[2J", "rtl\u{202E}txt", "zw\u{200B}j"] {
+            assert!(note(bad).is_err(), "{bad:?}");
+        }
+        assert!(gift_id("gf_01JB8ZK3M4N5P6Q7R8S9T0VWXY").is_ok());
+        for bad in ["gf_01JB8ZK3M4N5P6Q7R8S9T0VWX", "gf_01JB8ZK3M4N5P6Q7R8S9T0VWXI", "gf_01jb8zk3m4n5p6q7r8s9t0vwxy", "p_01JB8ZK3M4N5P6Q7R8S9T0VWXY", "--replace", ""] {
+            assert!(gift_id(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn qr() {
+        let a = qr_svg("https://moochy.dev/g/AbCdEfGhIjKlMnOpQrSt_-").unwrap();
+        assert!(a.contains("<svg") && a.contains("crispEdges") && a.ends_with("</svg>"));
+        assert_eq!(a, qr_svg("https://moochy.dev/g/AbCdEfGhIjKlMnOpQrSt_-").unwrap(), "deterministic");
+        assert_ne!(a, qr_svg("https://moochy.dev/g/AbCdEfGhIjKlMnOpQrSt_x").unwrap());
     }
 
     #[test]

@@ -327,6 +327,20 @@ p.error::before { content: ""; flex: none; width: 6px; height: 6px; border-radiu
 .dot.warn { background: var(--butter-soft); color: var(--text); }
 .dot.fail { background: var(--coral-soft); color: var(--coral-text); }
 
+/* Gifts, QR codes, credits */
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.duo .btn { padding: 0 12px; }
+.qr-card { margin: 0; justify-self: center; display: grid; justify-items: center; gap: 10px; padding: 18px 18px 14px; border-radius: 20px; background: #ffffff; border: 1px solid var(--line); box-shadow: var(--shadow-lift); }
+.setup-body.gift-done { padding-top: 28px; }
+.qr { display: block; width: min(220px, 50vw); height: auto; aspect-ratio: 1; image-rendering: pixelated; }
+.qr-card figcaption { font-size: 13px; font-weight: 600; color: #0f1b3d; }
+.link-text { font: 500 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; background: var(--surface-2); border-radius: 10px; padding: 10px 12px; user-select: all; }
+.big { font-size: 26px; font-weight: 650; letter-spacing: -.02em; line-height: 1.15; }
+.gift { padding: 14px 0; gap: 10px; }
+.gift:first-child { padding-top: 10px; }
+.gift-head { gap: 8px; }
+.gift-head b { font-size: 17px; font-weight: 650; }
+
 /* Toasts */
 #toasts { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%); display: grid; gap: 8px; width: min(380px, calc(100% - 32px)); pointer-events: none; z-index: 10; }
 .toast { background: var(--ink); color: var(--paper); padding: 12px 16px; border-radius: 12px; box-shadow: var(--shadow-lift); font-weight: 500; animation: rise var(--mid) var(--ease); }

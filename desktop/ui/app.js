@@ -51,6 +51,11 @@ const S = {
   lastView: '',
   doctor: null,
   clients: [],
+  gift: null, // the link just made, shown once: memory only, wiped when its screen closes
+  gifts: null, // `gift list`: null until loaded
+  giftsErr: '',
+  credits: null, // `credits --json` when credits are on, else null (and nothing is shown)
+  money: false, // gifts and credits asked for
 };
 
 // ---------- DOM helpers ----------
@@ -100,6 +105,9 @@ const ICONS = {
   out: ['M14 4h6v6M20 4l-8.5 8.5M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5'],
   back: ['M15 18l-6-6 6-6'],
   bang: ['M12 7v6M12 16.5v.5'],
+  gift: ['M4 11h16v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19.5z', 'M3 7.5h18V11H3z', 'M12 7.5V21', 'M12 7.5C10 4 7 3.5 7 5.5s3 2 5 2zM12 7.5c2-3.5 5-4 5-2s-3 2-5 2z'],
+  qr: ['M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z', 'M14 14h2.5v2.5H14zM17.5 17.5H20V20h-2.5zM14 20h1M20 14v1'],
+  save: ['M12 4v11M7.5 10.5 12 15l4.5-4.5M5 20h14'],
 };
 
 function icon(name, size = 22) {
@@ -597,15 +605,172 @@ function setPaused(paused) {
 function donationsView() {
   const n = S.snap;
   const list = (n?.donations || []);
-  const head = h('div', { class: 'row between' }, h('h2', null, 'Your donations'),
-    list.length > 0 && h('button', { class: 'btn primary', id: 'donate-more', onclick: () => openSheet('donate') }, icon('plus', 18), 'Donate tokens'));
-  if (!n) return [head, offlineNote()];
-  if (!list.length) {
-    return [head, h('div', { class: 'card empty' }, hamster('idle'), h('h3', null, 'No donations yet'),
-      h('p', null, 'Pick an open-source project and a monthly amount.'),
-      h('button', { class: 'btn primary', onclick: () => openSheet('donate') }, 'Donate tokens'))];
+  if (!n) return [h('h2', null, 'Your donations'), offlineNote()];
+  loadMoney();
+  const head = h('div', { class: 'stack' }, h('h2', null, 'Your donations'),
+    h('div', { class: 'duo' },
+      h('button', { class: 'btn primary', id: 'donate-more', onclick: () => openSheet('donate') }, icon('plus', 18), 'Donate tokens'),
+      h('button', { class: 'btn outline', id: 'gift-new', onclick: () => openSheet('gift') }, icon('gift', 18), 'Gift tokens')));
+  const donations = list.length ? list.map(donationCard) : h('div', { class: 'card empty' }, hamster('idle'), h('h3', null, 'No donations yet'),
+    h('p', null, 'Pick an open-source project and a monthly amount, or gift tokens with a link.'));
+  return [head, donations, S.credits && creditsCard(S.credits), giftsSection(), claimSection()];
+}
+
+// ---------- gifts and credits (plan 15 §3.2, §5.8) ----------
+
+function loadMoney() {
+  if (S.money) return;
+  S.money = true;
+  loadGifts();
+  invoke('credits').then((c) => { S.credits = c; render(); }, () => {});
+}
+
+function loadGifts() {
+  invoke('gift_list').then((g) => { S.gifts = g; S.giftsErr = ''; }, (e) => { S.giftsErr = String(e); }).finally(() => { if (!S.sheet) render(); });
+}
+
+const GIFT_LINK = /^https:\/\/moochy\.dev\/g\/[A-Za-z0-9_-]{22}$/;
+const svgSrc = (svg) => `data:image/svg+xml,${encodeURIComponent(svg)}`;
+
+function qrCard(svg, alt, caption) {
+  return h('figure', { class: 'qr-card' }, h('img', { class: 'qr', src: svgSrc(svg), alt, width: 240, height: 240 }), caption && h('figcaption', { class: 'num' }, caption));
+}
+
+async function saveQr(url) {
+  try { toast(`Saved to ${await invoke('save_qr', { url })}`); } catch (e) { toast(String(e)); }
+}
+
+function giftForm() {
+  const u = S.ui;
+  const amt = u.giftAmt ?? 10;
+  const days = u.giftDays ?? 30;
+  const note = u.giftNote || '';
+  const busy = u.gift === 'busy';
+  const valid = Number.isInteger(amt) && amt >= 1 && amt <= 1000;
+  const chips = h('div', { class: 'chips', role: 'radiogroup', 'aria-labelledby': 'gift-amt-label' },
+    [5, 10, 20].map((d) => h('button', { class: 'chip num', role: 'radio', 'aria-checked': String(!u.giftCustom && amt === d), onclick: () => { u.giftAmt = d; u.giftCustom = false; render(); } }, `$${d}`)),
+    h('button', { class: 'chip', role: 'radio', 'aria-checked': String(!!u.giftCustom), id: 'gift-custom', onclick: () => { u.giftCustom = true; render(); document.getElementById('gift-amt')?.focus(); } }, 'Custom'));
+  return setupFrame(0,
+    [hamster('happy'), h('h1', null, 'Gift tokens'), h('p', null, 'A single-use link and QR code. The first person to claim it gets the tokens, for a project or for their own use.')],
+    h('div', { class: 'stack lg' },
+      h('div', { class: 'field' }, h('span', { class: 'label', id: 'gift-amt-label' }, 'Amount'), chips),
+      u.giftCustom && h('div', { class: 'field enter' }, h('label', { for: 'gift-amt' }, 'Dollars, from 1 to 1,000'),
+        h('div', { class: 'prefix-wrap' }, h('input', { class: 'input num', id: 'gift-amt', inputmode: 'numeric', value: String(amt || ''), oninput: (e) => { u.giftAmt = parseInt(e.target.value.replace(/\D/g, ''), 10) || 0; render(); } }))),
+      h('div', { class: 'field' },
+        h('div', { class: 'row between' }, h('label', { for: 'gift-note' }, 'Note (optional)'), h('span', { class: 'help num' }, `${note.length}/140`)),
+        h('input', { class: 'input', id: 'gift-note', maxlength: 140, value: note, placeholder: 'Thanks for the fixes', autocomplete: 'off', oninput: (e) => { u.giftNote = e.target.value; u.giftErr = ''; render(); } })),
+      h('div', { class: 'field' }, h('span', { class: 'label', id: 'gift-days-label' }, 'The link expires after'),
+        h('div', { class: 'seg', role: 'radiogroup', 'aria-labelledby': 'gift-days-label' },
+          [7, 30, 90].map((d) => h('button', { role: 'radio', 'aria-checked': String(days === d), onclick: () => { u.giftDays = d; render(); } }, `${d} days`)))),
+      h('div', { class: 'row' }, h('span', { class: 'coin' }), h('p', { class: 'small' }, 'Served from your API key, like a donation. Your API keys stay on your machine.')),
+      u.giftErr && h('p', { class: 'error', role: 'alert' }, u.giftErr)),
+    [h('button', { class: 'btn primary wide', id: 'gift-create', disabled: busy || !valid, onclick: () => createGift(amt, note, days) },
+      busy ? [h('span', { class: 'spin' }), 'Making the link…'] : `Create a ${valid ? `$${amt.toLocaleString('en-US')} ` : ''}gift link`)]);
+}
+
+function createGift(dollars, note, days) {
+  run('gift', async () => {
+    S.gift = await invoke('gift_create', { dollars, note, days });
+    Object.assign(S.ui, { giftAmt: undefined, giftCustom: false, giftNote: '', giftDays: undefined });
+    S.sheet = 'gift-done';
+    loadGifts();
+  });
+}
+
+// The link, once: nothing keeps it after Done (or Escape).
+function giftDone() {
+  const g = S.gift;
+  return h('div', { class: 'setup' }, h('div'),
+    h('div', { class: 'setup-body gift-done' },
+      h('h1', null, 'Your gift link'),
+      h('div', { class: 'alert', role: 'note' }, h('p', { class: 'grow' }, 'Anyone who scans this first can claim it. Treat it like cash.')),
+      qrCard(g.svg, 'QR code of the gift link', `${usdWhole(g.amount_uusd)} of tokens · expires ${day(g.expires_at_ms)}`),
+      h('div', { class: 'card stack' },
+        h('div', { class: 'link-text', id: 'gift-url' }, g.url),
+        h('div', { class: 'duo' },
+          h('button', { class: 'btn outline', id: 'gift-copy', onclick: () => copy(g.url, 'Link copied') }, icon('copy', 18), 'Copy link'),
+          h('button', { class: 'btn outline', onclick: () => saveQr(g.url) }, icon('save', 18), 'Save SVG'))),
+      h('p', { class: 'small' }, 'Shown once: Moochy does not keep this link. If you lose it, use Replace link in Your gifts.')),
+    h('div', { class: 'setup-foot' }, h('button', { class: 'btn primary wide', id: 'gift-done', onclick: closeSheet }, 'Done')));
+}
+
+function giftsSection() {
+  if (S.giftsErr) return [h('h2', null, 'Your gifts'), h('p', { class: 'error' }, S.giftsErr)];
+  if (!S.gifts?.length) return [];
+  return [h('h2', { id: 'gifts' }, 'Your gifts'), h('div', { class: 'group list' }, S.gifts.map(giftRow))];
+}
+
+function giftRow(g) {
+  const u = S.ui;
+  const id = g.gift_id;
+  const [label, tone] = { open: ['Open', 'wait'], claimed: ['Claimed', 'ok'], revoked: ['Revoked', 'stop'], expired: ['Expired', ''] }[g.status] || [g.status, ''];
+  const line = {
+    open: `The link expires ${day(g.expires_at_ms)}`,
+    claimed: `Claimed by @${g.claimer} for ${g.target === 'personal' ? 'their own use' : target(g.target)[0]}`,
+    expired: `Expired ${day(g.expires_at_ms)}`,
+  }[g.status] || `Made ${day(g.created_at_ms)}`;
+  const err = u[`g${id}Err`] && h('p', { class: 'error', role: 'alert' }, u[`g${id}Err`]);
+  let actions = null;
+  if (u.confirm === `revoke:${id}`) {
+    actions = h('div', { class: 'confirm', role: 'group', 'aria-label': 'Confirm' }, h('p', null, `Revoke this ${usdWhole(g.amount_uusd)} gift? Its link no longer works after this.`),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn danger solid', id: `revoke-yes-${id}`, disabled: u[`g${id}`] === 'busy', onclick: () => revokeGift(g, false) }, 'Revoke gift'),
+        h('button', { class: 'btn ghost', onclick: () => { u.confirm = null; render(); } }, 'Keep it')));
+  } else if (g.status === 'open') {
+    actions = h('div', { class: 'actions' },
+      h('button', { class: 'btn outline', disabled: u[`g${id}`] === 'busy', onclick: () => revokeGift(g, true) }, u[`g${id}`] === 'busy' ? h('span', { class: 'spin' }) : null, 'Replace link'),
+      h('button', { class: 'btn danger', onclick: () => { u.confirm = `revoke:${id}`; render(); document.getElementById(`revoke-yes-${id}`)?.focus(); } }, 'Revoke'));
   }
-  return [head, ...list.map(donationCard)];
+  return h('div', { class: 'gift stack' },
+    h('div', { class: 'row between' },
+      h('div', { class: 'grow' },
+        h('div', { class: 'row gift-head' }, h('b', { class: 'num' }, usdWhole(g.amount_uusd)), g.note && h('span', { class: 'muted ellipsis' }, `“${g.note}”`)),
+        h('div', { class: 'small muted' }, line)),
+      h('span', { class: `pill ${tone}` }, label)),
+    actions, err);
+}
+
+function revokeGift(g, replace) {
+  run(`g${g.gift_id}`, async () => {
+    const r = await invoke('gift_revoke', { id: g.gift_id, replace });
+    S.ui.confirm = null;
+    if (replace) {
+      S.gift = r;
+      S.sheet = 'gift-done';
+    } else toast('Gift revoked');
+    loadGifts();
+  });
+}
+
+function claimSection() {
+  const u = S.ui;
+  const go = () => {
+    const link = (u.claim || '').trim();
+    if (!GIFT_LINK.test(link)) {
+      u.claimErr = 'A gift link is https://moochy.dev/g/ and 22 letters, digits, - or _.';
+      render();
+      return;
+    }
+    u.claim = '';
+    render();
+    openWeb(link);
+  };
+  return [h('h2', null, 'Claim a gift'), h('section', { class: 'card stack' },
+    h('div', { class: 'field' }, h('label', { for: 'claim' }, 'Gift link'),
+      h('input', { class: `input${u.claimErr ? ' bad' : ''}`, id: 'claim', value: u.claim || '', placeholder: 'https://moochy.dev/g/…', autocomplete: 'off', spellcheck: 'false', 'aria-invalid': u.claimErr ? 'true' : null, 'aria-describedby': 'claim-help',
+        oninput: (e) => { u.claim = e.target.value; u.claimErr = ''; render(); }, onkeydown: (e) => { if (e.key === 'Enter') go(); } }),
+      h('span', { class: 'help', id: 'claim-help' }, 'Opens moochy.dev, where you pick one of your projects or For my own use.')),
+    u.claimErr && h('p', { class: 'error', role: 'alert' }, u.claimErr),
+    h('button', { class: 'btn outline', id: 'claim-go', disabled: !(u.claim || '').trim(), onclick: go }, icon('out', 18), 'Claim the gift'))];
+}
+
+function creditsCard(c) {
+  return [h('h2', { id: 'credits' }, 'Moochy Credits'), h('section', { class: 'card stack' },
+    h('div', { class: 'row between wrap' },
+      h('div', { class: 'grow' }, h('div', { class: 'big num' }, usd(c.available_uusd)),
+        h('div', { class: 'small muted num' }, ['available', c.held_uusd > 0 && `${usd(c.held_uusd)} held`, c.allocated_uusd > 0 && `${usd(c.allocated_uusd)} given`].filter(Boolean).join(' · '))),
+      h('button', { class: 'btn outline', onclick: () => openWeb(`${S.snap?.me.web || WEB}/credits`) }, icon('out', 18), 'Add credits')),
+    c.frozen && h('p', { class: 'error' }, 'Your credits are frozen after a card dispute: nothing new can be spent.'))];
 }
 
 function donationCard(d) {
@@ -684,7 +849,8 @@ function projectsView() {
         h('div', { class: 'row between' }, h('div', { class: 'grow' }, h('h3', { class: 'ellipsis' }, name), h('span', { class: 'small muted' }, `${host} · ${plural(p.donors, 'donor', 'donors')}`)),
           p.paused_since_ms > 0 ? h('span', { class: 'pill wait' }, 'Paused') : h('span', { class: 'pill ok' }, 'Active')),
         h('div', { class: 'row between small' }, h('span', { class: 'num' }, `${usd(p.month_uusd)} used this month`), p.goal_uusd > 0 && h('span', { class: 'muted num' }, `Goal ${usdWhole(p.goal_uusd)}`)),
-        p.goal_uusd > 0 && h('div', { class: 'bar' }, h('i', { 'data-pct': pct })));
+        p.goal_uusd > 0 && h('div', { class: 'bar' }, h('i', { 'data-pct': pct })),
+        projectQr(p.slug, name));
     }));
   }
   // Connect your tools.
@@ -707,6 +873,29 @@ function projectsView() {
         h('button', { class: 'btn outline', onclick: () => copy(u.snippet) }, icon('copy', 18), 'Copy'))));
   }
   return parts;
+}
+
+function projectQr(slug, name) {
+  const u = S.ui;
+  const open = u.qr?.slug === slug;
+  const toggle = () => {
+    if (open) {
+      u.qr = null;
+      render();
+      return;
+    }
+    u.qrFor = slug;
+    run('qrLoad', async () => { u.qr = { slug, ...(await invoke('project_qr', { repo: slug })) }; });
+  };
+  return [
+    h('div', { class: 'actions' }, h('button', { class: 'btn outline', 'aria-expanded': String(open), disabled: u.qrLoad === 'busy', onclick: toggle }, icon('qr', 18), open ? 'Hide QR code' : 'QR code')),
+    open && h('div', { class: 'stack enter' },
+      qrCard(u.qr.svg, `QR code of the donate page of ${name}`, `Scan to donate tokens to ${name}`),
+      h('div', { class: 'duo' },
+        h('button', { class: 'btn outline', onclick: () => copy(u.qr.url, 'Link copied') }, icon('copy', 18), 'Copy link'),
+        h('button', { class: 'btn outline', onclick: () => saveQr(u.qr.url) }, icon('save', 18), 'Save SVG'))),
+    u.qrFor === slug && u.qrLoadErr && h('p', { class: 'error', role: 'alert' }, u.qrLoadErr),
+  ];
 }
 
 function pendingRow(p) {
@@ -827,6 +1016,7 @@ function logout() {
   run('logout', async () => {
     await invoke('logout');
     S.ui = {};
+    Object.assign(S, { gifts: null, giftsErr: '', credits: null, money: false });
     S.screen = 'setup';
     pref.set('setupDone', '');
     await refresh();
@@ -841,10 +1031,12 @@ function openSheet(name) {
   S.sheet = name;
   S.ui.addKeyErr = '';
   S.ui.donateErr = '';
+  S.ui.giftErr = '';
   render();
 }
 function closeSheet() {
   S.sheet = null;
+  S.gift = null;
   render();
 }
 
@@ -876,6 +1068,8 @@ function render() {
     key = 'loading';
   } else if (S.sheet === 'key') [view, key] = [stepKey(), 'sheet-key'];
   else if (S.sheet === 'donate') [view, key] = [stepDonate(), 'sheet-donate'];
+  else if (S.sheet === 'gift') [view, key] = [giftForm(), 'sheet-gift'];
+  else if (S.sheet === 'gift-done' && S.gift) [view, key] = [giftDone(), 'sheet-gift-done'];
   else if (S.screen === 'setup') {
     key = `step-${S.step}`;
     view = { 1: stepConnect, 2: stepKey, 3: stepLimit, 4: stepDonate, done: stepDone }[S.step]();

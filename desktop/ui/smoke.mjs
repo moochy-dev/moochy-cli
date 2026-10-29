@@ -1,5 +1,6 @@
 // UI smoke test (plan 14 §2.6): loads index.html in headless Chromium with a fake
-// window.__TAURI__ serving fixture state, walks the first run and the four tabs at 420x680 and
+// window.__TAURI__ serving fixture state, walks the first run, the four tabs, gifts (form, link
+// with its QR code, list, claim) and a project's QR code at 420x680 and
 // 900x700 in light and dark, and fails on a console error, a page error or horizontal overflow.
 //
 //   NODE_PATH=<dir with playwright> node ui/smoke.mjs <screenshot dir>
@@ -36,6 +37,35 @@ const base = `http://127.0.0.1:${server.address().port}/`;
 function fake(scenario) {
   const now = Date.now();
   const min = 60000;
+  // A QR-shaped stand-in (the real one is drawn by the Rust side): finder squares, seeded modules.
+  const fakeQr = (text) => {
+    const n = 29;
+    let seed = [...text].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+    const bit = () => { seed = (seed * 1103515245 + 12345) >>> 0; return (seed >>> 16) & 1; };
+    let d = '';
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const fx = x < 8 ? x : x >= n - 8 ? x - (n - 7) : -1;
+        const fy = y < 8 ? y : y >= n - 8 ? y - (n - 7) : -1;
+        const finder = fx >= -1 && fy >= -1 && fx !== -1 && fy !== -1 && !(x >= n - 8 && y >= n - 8);
+        const r = Math.max(Math.abs(fx - 3), Math.abs(fy - 3));
+        if (finder ? r === 3 || r <= 1 : bit()) d += `M${x + 4} ${y + 4}h1v1h-1z`;
+      }
+    }
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n + 8} ${n + 8}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><path fill="#0f1b3d" d="${d}"/></svg>`;
+  };
+  const giftLink = (dollars, days) => {
+    const url = 'https://moochy.dev/g/Xk3pQ9vT2mLw8RzA4nYb_c';
+    return { gift_id: 'gf_01JB8ZK3M4N5P6Q7R8S9T0VWXY', amount_uusd: dollars * 1e6, expires_at_ms: now + days * 864e5, url, svg: fakeQr(url) };
+  };
+  const gift = (status, amount, extra) => ({ gift_id: `gf_01JB8ZK3M4N5P6Q7R8S9T0V${status.slice(0, 3).toUpperCase()}`, source: 'tokens', amount_uusd: amount * 1e6, status, note: '', models: [], created_at_ms: now - 5 * 864e5, expires_at_ms: now + 25 * 864e5, claimer: '', target: '', ...extra });
+  const gifts = [
+    gift('open', 20, { note: 'Thanks for the axum fixes' }),
+    gift('claimed', 10, { claimer: 'bob', target: 'tokio-rs/axum' }),
+    gift('claimed', 5, { gift_id: 'gf_01JB8ZK3M4N5P6Q7R8S9T0VPER', claimer: 'carol', target: 'personal', note: 'For your weekend project, a long note that goes on so it has to be cut short' }),
+    gift('expired', 50, { expires_at_ms: now - 2 * 864e5 }),
+    gift('revoked', 25, {}),
+  ];
   const snap = {
     me: { handle: 'alice', pseudonym: 'brave-otter-42', relay: 'https://relay.moochy.dev:443', web: 'https://moochy.dev', connected: true, paused: false, roles: ['gateway', 'worker'], lockdown: { state: 'enforced', detail: 'landlock + seccomp' } },
     donations: [
@@ -87,6 +117,12 @@ function fake(scenario) {
           case 'doctor': return [{ level: 'ok', what: 'keystore', detail: 'opens (keychain), device keys present' }, { level: 'ok', what: 'relay', detail: 'https://relay.moochy.dev connected' }, { level: 'warn', what: 'clock', detail: 'off by 2 s' }, { level: 'fail', what: 'sandbox', detail: 'user namespaces are off: moochy run cannot start' }];
           case 'connect': return args.write ? 'Set up in ~/.claude/settings.json' : 'export ANTHROPIC_BASE_URL=http://127.0.0.1:41234/p/alice/tinyhttp-arrow\nexport ANTHROPIC_MODEL=claude-sonnet-5-5\n';
           case 'add_key': if (args.key.includes('bad')) throw new Error('the provider refused this key (401)'); return [];
+          case 'gift_create': return giftLink(args.dollars, args.days);
+          case 'gift_list': return structuredClone(gifts);
+          case 'gift_revoke': return args.replace ? giftLink(20, 25) : null;
+          case 'credits': return scenario === 'main' ? { available_uusd: 18120000, held_uusd: 0, allocated_uusd: 25000000, frozen: false, purchases: [], allocations: [] } : null;
+          case 'project_qr': return { url: `https://moochy.dev/p/github/${args.repo}/donate`, svg: fakeQr(args.repo) };
+          case 'save_qr': return '/home/alice/Downloads/moochy-gift.svg';
           default: return null;
         }
       },
@@ -169,10 +205,35 @@ for (const [w, hgt] of [[420, 680], [900, 700]]) {
     await p.keyboard.press('2');
     await p.click('text=Stop >> nth=0');
     await check(p, `6-donations-${tag}`);
+    await p.click('#gift-new');
+    await p.click('.chips .chip >> nth=2');
+    await p.fill('#gift-note', 'Thanks for the axum fixes');
+    await check(p, `10-gift-form-${tag}`);
+    await p.click('#gift-create');
+    await p.waitForSelector('.qr');
+    await check(p, `11-gift-link-${tag}`);
+    await p.click('#gift-done');
+    await p.waitForSelector('#gifts');
+    if (await p.locator('.qr, #gift-url').count()) failures.push(`gift link still on screen after Done (${tag})`);
+    await p.evaluate(() => document.getElementById('credits').scrollIntoView());
+    await check(p, `12-credits-${tag}`);
+    await p.click('.gift .btn.danger >> nth=0');
+    await p.evaluate(() => document.getElementById('gifts').scrollIntoView());
+    await check(p, `12-gifts-${tag}`);
+    await p.fill('#claim', 'https://moochy.dev/g/not-a-gift');
+    await p.click('#claim-go');
+    await p.waitForSelector('#claim[aria-invalid]');
+    await p.evaluate(() => document.getElementById('claim').scrollIntoView({ block: 'center' }));
+    await check(p, `13-claim-${tag}`);
+    await p.evaluate(() => document.activeElement.blur());
     await p.keyboard.press('3');
     await p.click('text=Show the settings');
     await p.waitForSelector('pre.code');
     await check(p, `7-projects-${tag}`);
+    await p.click('text=QR code');
+    await p.waitForSelector('.qr');
+    await p.evaluate(() => document.querySelector('.qr-card').scrollIntoView({ block: 'center' }));
+    await check(p, `7b-project-qr-${tag}`);
     await p.keyboard.press('4');
     await p.click('text=Run checks');
     await p.waitForSelector('.doctor');

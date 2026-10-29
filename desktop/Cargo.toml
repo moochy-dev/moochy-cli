@@ -30,6 +30,8 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # window never opens the keystore, the `moochy` child does.
 moochy = { path = "../cli/crates/node", default-features = false }
 moochy-tui = { path = "../cli/crates/tui", features = ["serde"] }
+# Gift and donate-link QR codes drawn on this machine as SVG (plan 15 D5): no image codec, no deps.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [profile.release]
 opt-level = 3

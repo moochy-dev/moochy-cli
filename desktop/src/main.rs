@@ -347,6 +347,102 @@ async fn logout(ctx: Shared<'_>) -> Result<(), String> {
     blocking(&ctx, |c| c.run(&["logout"], None).into_result().map(drop)).await
 }
 
+/// A gift link a child printed (`gift create` or `gift revoke --replace`), with its QR code. The
+/// link is shown once: it goes to the window and nowhere else (no log, no file, no event).
+fn shown_once(stdout: &str, web: &str) -> Result<Value, String> {
+    let g = events(stdout).into_iter().find(|e| e.get("url").is_some()).ok_or("The gift was made, but its link did not come back. Use Replace link in Your gifts.")?;
+    let url = g.get("url").and_then(Value::as_str).filter(|u| check::gift_url(u, web)).ok_or("The server sent a gift link that is not on moochy.dev.")?;
+    let pick = |k: &str| g.get(k).cloned().unwrap_or_default();
+    Ok(json!({"gift_id": pick("gift_id"), "amount_uusd": pick("amount_uusd"), "expires_at_ms": pick("expires_at_ms"), "url": url, "svg": check::qr_svg(url)?}))
+}
+
+/// `gift create N --expires D [--note=T] --json` (plan 15 §3.2).
+#[tauri::command]
+async fn gift_create(ctx: Shared<'_>, dollars: u32, note: String, days: u32) -> Result<Value, String> {
+    let d = check::gift_dollars(dollars)?.to_string();
+    let note = check::note(&note)?;
+    let days = check::days(days)?.to_string();
+    blocking(&ctx, move |c| {
+        let note = format!("--note={note}");
+        let mut args = vec!["gift", "create", d.as_str(), "--expires", days.as_str(), "--json"];
+        if note.len() > "--note=".len() {
+            args.push(note.as_str());
+        }
+        let o = c.run(&args, None).into_result()?;
+        shown_once(&o, &lock(&c.web))
+    })
+    .await
+}
+
+/// `gift list --json`: status, claimer and target per gift (never a link).
+#[tauri::command]
+async fn gift_list(ctx: Shared<'_>) -> Result<Vec<Value>, String> {
+    blocking(&ctx, |c| {
+        let mut v = events(&c.run(&["gift", "list", "--json"], None).into_result()?);
+        v.iter_mut().filter_map(Value::as_object_mut).for_each(|g| {
+            g.remove("url");
+        });
+        Ok(v)
+    })
+    .await
+}
+
+/// `gift revoke <gf_…> [--replace] --json`: with `replace`, the new link and its QR code.
+#[tauri::command]
+async fn gift_revoke(ctx: Shared<'_>, id: String, replace: bool) -> Result<Value, String> {
+    check::gift_id(&id)?;
+    blocking(&ctx, move |c| {
+        let mut args = vec!["gift", "revoke", id.as_str(), "--json"];
+        if replace {
+            args.push("--replace");
+        }
+        let o = c.run(&args, None).into_result()?;
+        if replace { shown_once(&o, &lock(&c.web)) } else { Ok(Value::Null) }
+    })
+    .await
+}
+
+/// `credits --json`, or null when credits are off on the relay (or anything else fails): the
+/// window then shows nothing about credits.
+#[tauri::command]
+async fn credits(ctx: Shared<'_>) -> Result<Value, String> {
+    blocking(&ctx, |c| Ok(c.run(&["credits", "--json"], None).into_result().ok().and_then(|o| events(&o).into_iter().next()).unwrap_or(Value::Null))).await
+}
+
+/// `button --qr --repo P`: the project's donate page and its QR code.
+#[tauri::command]
+async fn project_qr(ctx: Shared<'_>, repo: String) -> Result<Value, String> {
+    let repo = check::project(&repo).ok_or("not a project")?;
+    blocking(&ctx, move |c| {
+        let o = c.run(&["button", "--qr", "--repo", &repo], None).into_result()?;
+        let url = o.lines().next().and_then(|l| l.trim().strip_suffix("qr.svg")).map(|b| format!("{b}donate")).filter(|u| check::donate_url(u).is_some()).ok_or("moochy printed no donate link")?;
+        Ok(json!({"svg": check::qr_svg(&url)?, "url": url}))
+    })
+    .await
+}
+
+/// Saves the QR code of a gift link or a donate page as an SVG file in Downloads (never over an
+/// existing file) and returns where. The window cannot pick a folder: no dialog plugin (§2.2).
+#[tauri::command]
+fn save_qr(app: tauri::AppHandle, ctx: Shared<'_>, url: String) -> Result<String, String> {
+    let name = if check::gift_url(&url, &lock(&ctx.web)) {
+        "gift".to_owned()
+    } else {
+        check::donate_url(&url).ok_or("not a Moochy link")?.trim_end_matches("/-").replace('/', "-")
+    };
+    let svg = check::qr_svg(&url)?;
+    let dir = app.path().download_dir().map_err(|_| "No Downloads folder on this computer.".to_owned())?;
+    for n in 1..100 {
+        let path = dir.join(if n == 1 { format!("moochy-{name}.svg") } else { format!("moochy-{name}-{n}.svg") });
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => return f.write_all(svg.as_bytes()).map(|()| path.display().to_string()).map_err(|e| format!("Could not save the file ({e}).")),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("Could not save the file ({e}).")),
+        }
+    }
+    Err("Downloads has too many Moochy QR files: remove some first.".into())
+}
+
 /// Opens `url` in the system browser, only on moochy.dev (or the snapshot's web origin).
 #[tauri::command]
 fn open_web(ctx: Shared<'_>, url: String) -> Result<(), String> {
@@ -431,7 +527,7 @@ fn main() {
                 let _ = std::fs::write(window_file(&w.state::<Arc<Ctx>>().home), format!("{:.0} {:.0}\n", s.width, s.height));
             }
         })
-        .invoke_handler(tauri::generate_handler![state, act, login_start, login_cancel, add_key, set_limit, donate, donation, set_paused, connect, clients, doctor, remove_key, logout, open_web])
+        .invoke_handler(tauri::generate_handler![state, act, login_start, login_cancel, add_key, set_limit, donate, donation, set_paused, connect, clients, doctor, remove_key, logout, open_web, gift_create, gift_list, gift_revoke, credits, project_qr, save_qr])
         .run(tauri::generate_context!());
     if let Err(e) = built {
         eprintln!("moochy-desktop: {e}");
@@ -471,6 +567,17 @@ mod tests {
         let mut src = moochy_tui::fixtures::hostile();
         let text = serde_json::to_string(&cleaned(serde_json::to_value(src.snapshot().unwrap()).unwrap())).unwrap();
         assert!(!text.contains('\u{1b}') && !text.contains('\u{202E}'), "escape sequences and bidi overrides are gone");
+    }
+
+    #[test]
+    fn gift_link_once() {
+        let url = "https://moochy.dev/g/AbCdEfGhIjKlMnOpQrSt_-";
+        let v = shown_once(&format!("{{\"gift_id\":\"gf_1\",\"amount_uusd\":20000000,\"expires_at_ms\":1,\"url\":\"{url}\"}}\n"), "").unwrap();
+        assert_eq!(v["url"], url);
+        assert_eq!(v["amount_uusd"], 20_000_000);
+        assert!(v["svg"].as_str().unwrap().contains("<svg"));
+        assert!(shown_once("{\"url\":\"https://evil.com/g/AbCdEfGhIjKlMnOpQrSt_-\"}", "").is_err());
+        assert!(shown_once("{\"gift_id\":\"gf_1\"}", "").is_err());
     }
 
     #[test]
