@@ -6,7 +6,7 @@
 # No port is published: the app only dials out, the model server listens on loopback.
 
 x-moochy: &moochy
-  image: ghcr.io/moochy-dev/moochy:${MOOCHY_VERSION:-latest}
+  image: ghcr.io/moochy-dev/moochy:${MOOCHY_VERSION:-v0.2.0} # a release tag, never latest
   restart: unless-stopped
   environment:
     # Dollars a month this machine may spend. Setting it accepts the safety step.
@@ -38,7 +38,7 @@ services:
         target: provider-key
 
   ollama:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.40.3}
+    image: ollama/ollama:0.40.3@sha256:adca95a12c2b386a8f9a995e7fa0600e187e3323b5e5522f5a6c3b1ec73eff99 # 0.40.3, pinned by digest
     profiles: [gpu]
     restart: unless-stopped
     environment:
@@ -60,7 +60,7 @@ services:
 
   # Downloads the model once (later starts find it in the volume).
   ollama-pull:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.40.3}
+    image: ollama/ollama:0.40.3@sha256:adca95a12c2b386a8f9a995e7fa0600e187e3323b5e5522f5a6c3b1ec73eff99 # 0.40.3, pinned by digest
     profiles: [gpu]
     network_mode: service:ollama
     entrypoint: [ollama, pull, "${OLLAMA_MODEL:-qwen2.5:7b}"]

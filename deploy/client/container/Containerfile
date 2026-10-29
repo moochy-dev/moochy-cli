@@ -6,8 +6,9 @@
 # in, key from a Docker secret, safety step, optional donation, then the app in
 # the foreground). The provider key stays in the encrypted-file keystore on the
 # volume you control.
-# Pin both images by digest when publishing (`@sha256:…`).
-FROM rust:1-alpine AS build
+# The build image is pinned by digest (rust:1-alpine, resolved 2026-10-29); to move it:
+#   docker buildx imagetools inspect rust:1-alpine   (the index Digest)
+FROM rust:1-alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY cli/ cli/
