@@ -58,6 +58,10 @@ jobs:
         working-directory: desktop
         run: |
           rustup target add "$TARGET"
+          # clippy and test build for the runner's own triple, whose sidecar Tauri's build script
+          # wants to exist (x86_64 dmg on an arm64 runner); the bundle uses only $TARGET's.
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          [ -f "bin/moochy-$host" ] || cp "bin/moochy-$TARGET" "bin/moochy-$host"
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --locked
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
