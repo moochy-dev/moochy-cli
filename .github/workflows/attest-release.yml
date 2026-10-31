@@ -40,7 +40,7 @@ jobs:
       - run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "moochy-${{ matrix.target }}.tar.xz" --dir "$RUNNER_TEMP/release"
       - name: Independent rebuild must equal the release
         run: deploy/client/scripts/repro-check.sh --target "${{ matrix.target }}" --against "$RUNNER_TEMP/release/moochy-${{ matrix.target }}.tar.xz"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rebuilt-${{ matrix.target }}
           path: ${{ runner.temp }}/release/moochy-${{ matrix.target }}.tar.xz
@@ -57,7 +57,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { pattern: rebuilt-*, path: rebuilt, merge-multiple: true }
       - name: Sign the rebuilt archives, and only those
         run: |
