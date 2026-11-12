@@ -29,7 +29,7 @@ bytes = { version = "1", default-features = false, features = ["std"] }
 # far below the 800 MB/s target. ring is already in the Node via rustls' ring provider.
 ring = { version = "0.17", default-features = false }
 # HPKE RFC 9180 base mode, X25519/HKDF-SHA256/ChaCha20Poly1305 only.
-hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+hpke = { version = "0.14", default-features = false, features = ["alloc", "x25519"] }
 # Ed25519 with ZIP-215 verification (CONTRACT §1).
 ed25519-zebra = { version = "4", default-features = false, features = ["std"] }
 # OS randomness (rand_core 0.9 is what hpke 0.13 takes).
