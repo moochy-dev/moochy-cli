@@ -31,7 +31,7 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # Pure-Rust zstd decoder for hostile request payloads (CONTRACT §15.2: no C on hostile input).
 ruzstd = { version = "0.9.0", default-features = false, features = ["std"] }
 # Strict canonical base64url (already in the tree via moochy-proto/node, same version).
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
