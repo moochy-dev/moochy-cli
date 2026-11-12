@@ -6,7 +6,9 @@ use crate::firewall::{F, Hook, R};
 
 // --- Anthropic Messages (06 §7.1) ------------------------------------------------------
 
-pub(crate) const ANTHROPIC_VERSIONS: &[&str] = &["2023-06-01"];
+// 2026-10-21: the version current SDKs send (ant CLI 2.9, Anthropic SDKs of late 2026). It only
+// changes what the provider accepts and answers; the body allowlists below still apply.
+pub(crate) const ANTHROPIC_VERSIONS: &[&str] = &["2023-06-01", "2026-10-21"];
 pub(crate) const ANTHROPIC_VERSION_DEFAULT: &str = "2023-06-01";
 
 /// `anthropic-beta` values that only change plain inference; gated ones need the flag.

@@ -174,6 +174,8 @@ fn headers_allowlist() {
     let body = anth(r#""hi""#, "");
     let ok = |h: &[(&str, &str)]| analyze(Dialect::AnthropicMessages, &body, h, policy(Flags::NONE));
     assert!(ok(&[("Anthropic-Version", "2023-06-01")]).is_ok());
+    // what current SDKs send (the ant CLI 2.9 was refused before this was listed)
+    assert!(ok(&[("anthropic-version", "2026-10-21")]).is_ok());
     for (h, path) in [
         (vec![("anthropic-version", "2024-01-01")], "header anthropic-version"),
         (vec![("anthropic-beta", "files-api-2025-04-14")], "header anthropic-beta"),
