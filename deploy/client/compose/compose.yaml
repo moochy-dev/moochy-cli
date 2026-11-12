@@ -6,7 +6,7 @@
 # No port is published: the app only dials out, the model server listens on loopback.
 
 x-moochy: &moochy
-  image: ghcr.io/moochy-dev/moochy:${MOOCHY_VERSION:-v0.2.0} # a release tag, never latest
+  image: ghcr.io/moochy-dev/moochy:${MOOCHY_VERSION:-v0.2.1} # a release tag, never latest
   restart: unless-stopped
   environment:
     # Dollars a month this machine may spend. Setting it accepts the safety step.
