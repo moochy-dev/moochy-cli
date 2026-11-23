@@ -15,7 +15,7 @@ description = "Moochy wire protocol: encodings, frames, messages, envelopes, sig
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # base64url-no-pad (strict, canonical) for every byte field in JSON.
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Generated link.proto code (CONTRACT §12): messages (prost) + client/server stubs (tonic
 # codegen only; the Node picks transport/TLS features itself).
 prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
